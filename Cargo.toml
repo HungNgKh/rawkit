@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rawkit-editstate",
+    "crates/rawkit-decode",
+    "crates/rawkit-engine",
+    "crates/rawkit-catalog",
+    "crates/rawkit-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/HungNgKh/rawkit"
+authors = ["HungNgKh"]
+
+# Every dependency is declared here so licence auditing has one place to look.
+# Adding one anywhere else is a review smell.
+#
+# The allowed-licence list is enforced by `cargo deny check licenses` in CI
+# (see deny.toml and docs/licence-policy.md). Apache-2.0 outbound means
+# GPL-2.0-only is categorically excluded and LGPL is avoided; the one planned
+# exception is LibRaw's CDDL, quarantined inside rawkit-decode.
+[workspace.dependencies]
+rawkit-editstate = { path = "crates/rawkit-editstate", version = "0.0.1" }
+rawkit-decode = { path = "crates/rawkit-decode", version = "0.0.1" }
+rawkit-engine = { path = "crates/rawkit-engine", version = "0.0.1" }
+rawkit-catalog = { path = "crates/rawkit-catalog", version = "0.0.1" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+blake3 = "1"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+wgpu = "29"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+
+# Rendering work is unusably slow in a debug build; keep dev fast but not naive.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

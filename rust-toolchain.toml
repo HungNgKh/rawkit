@@ -1,0 +1,7 @@
+# Pinned rather than "stable" on purpose. The v1 invariant is "same RAW + same
+# EditState -> same pixels on Linux, Windows and macOS", and three CI runners
+# silently drifting onto three different compilers is one more way for that to
+# stop being true. Bump deliberately, in its own commit.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,12 @@
+[package]
+name = "rawkit-decode"
+description = "RAW file decoding. The one crate allowed to link CDDL code, and the boundary that keeps it there."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,69 @@
+name: ci
+
+# Three OSes from commit one, while the surface area is small enough that
+# divergence is a config change rather than a rewrite. The dev box is Linux,
+# so Windows and macOS are the ones that have to be *proven*.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reads the pinned channel and components from rust-toolchain.toml, so
+      # all three runners compile with the identical compiler.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Format
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all --check
+
+      # `-- -D warnings` is not redundant with RUSTFLAGS above: that denies
+      # rustc lints, this denies clippy's own.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-features
+
+      # The engine's GPU tests are opt-in: hosted runners have no real GPU, and
+      # a test that silently skips is worse than one that is explicitly gated.
+      # Linux gets a software Vulkan device so the wgpu path is exercised
+      # somewhere; the golden render tests join this step in P0 step 8.
+      - name: Install software Vulkan (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+      - name: GPU-backed tests (Linux, lavapipe)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          WGPU_BACKEND: vulkan
+        run: cargo test --workspace --all-features -- --ignored
+
+  deny:
+    name: licences & advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Enforces the allowed-licence list in deny.toml. This job existing before
+      # the dependencies do is the entire point: over an 18-24 month build, an
+      # incompatible transitive dependency slipping in unnoticed is far likelier
+      # than a bad deliberate choice.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check all

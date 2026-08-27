@@ -1,0 +1,15 @@
+[package]
+name = "rawkit-engine"
+description = "The render engine: EditState in, pixels out. One engine, three platforms, shared WGSL."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rawkit-editstate.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+thiserror.workspace = true
