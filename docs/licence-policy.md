@@ -49,7 +49,7 @@ The authoritative copy of this list is `deny.toml`; if the two ever disagree,
 | Component | Licence | Verdict |
 |---|---|---|
 | LibRaw (CDDL mode) | CDDL-1.0 | ✅ Use, quarantined in `rawkit-decode`. ~1,284 cameras; Adobe DNG Converter is the documented fallback for newer bodies |
-| vkdt RCD demosaic kernel | BSD-2-Clause | ✅ Port to WGSL, attribution travels with the file |
+| vkdt RCD demosaic kernel | BSD-2-Clause | ✅ **Ported 2026-08-28.** Verified per-file, not per-repo: vkdt ships both `LICENCE.bsd2` and `LICENCE.gpl3`, and its readme says the code is BSD-2 *"if not clearly marked otherwise in the respective source files, which contain a bit of viral GPLv3"*. `rcd_conv.comp` and `rcd_fill.comp` carry no marking, which is what makes the port BSD-2. Attribution and full licence text in `NOTICE`; provenance in the shader header |
 | lcms2 | MIT | ✅ ICC handling on export |
 | OpenColorIO | BSD-3-Clause | ✅ LUT / look handling |
 | Tauri | MIT / Apache-2.0 | ✅ Desktop shell |

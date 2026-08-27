@@ -12,4 +12,5 @@ authors.workspace = true
 rawkit-editstate.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
+bytemuck.workspace = true
 thiserror.workspace = true

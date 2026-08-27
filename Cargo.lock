@@ -868,6 +868,7 @@ dependencies = [
 name = "rawkit-engine"
 version = "0.0.1"
 dependencies = [
+ "bytemuck",
  "pollster",
  "rawkit-editstate",
  "thiserror",

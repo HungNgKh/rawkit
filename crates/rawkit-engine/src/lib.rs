@@ -23,8 +23,10 @@
 
 use rawkit_editstate::EditState;
 
+pub mod demosaic;
 pub mod pipeline;
 
+pub use demosaic::{BayerPhase, Demosaic, Mosaic};
 pub use pipeline::{Domain, Stage};
 
 /// Failures the engine can produce that are not programmer error.

@@ -20,7 +20,41 @@ once it is genuinely part of a build:
   (planned) LibRaw            -- CDDL-1.0    RAW decoding, ~1,284 cameras.
                                              Quarantined in crates/rawkit-decode;
                                              those files stay CDDL permanently.
-  (planned) vkdt RCD demosaic -- BSD-2-Clause Demosaic kernel, ported to WGSL.
+
+  vkdt                        -- BSD-2-Clause Copyright 2019 johannes hanika.
+                                             https://github.com/hanatos/vkdt
+
+      crates/rawkit-engine/shaders/demosaic_rcd.wgsl is a port of vkdt's
+      rcd_conv.comp and rcd_fill.comp from GLSL to WGSL. vkdt's readme states
+      its code is BSD-2-Clause unless a source file is marked otherwise;
+      neither file carries a marking. The BSD-2 licence text is reproduced in
+      full below, as the licence requires of a source redistribution.
+
+      Redistribution and use in source and binary forms, with or without
+      modification, are permitted provided that the following conditions are
+      met:
+
+      1. Redistributions of source code must retain the above copyright
+         notice, this list of conditions and the following disclaimer.
+
+      2. Redistributions in binary form must reproduce the above copyright
+         notice, this list of conditions and the following disclaimer in the
+         documentation and/or other materials provided with the distribution.
+
+      THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+      IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+      TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+      PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+      HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+      SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+      TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+      PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+      LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+      NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+      SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+      The RCD algorithm is Luis Sanz Rodriguez's. darktable's and
+      RawTherapee's implementations of it are GPL and were not consulted.
   (planned) Little CMS (lcms2)-- MIT         ICC colour management on export.
   (planned) OpenColorIO       -- BSD-3-Clause LUT / look handling.
   (planned) Tauri             -- MIT/Apache-2.0  Desktop shell.
