@@ -57,11 +57,17 @@ exceptions = []
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-# Populated when there is something to ban. The standing rule it will encode:
-# one GPU abstraction and one SQLite binding, ever. A second of either forks the
-# invariant it was supposed to guarantee -- identical pixels on three OSes, and
-# one catalog format.
-deny = []
+# The audit's conclusions, made executable. Every pure-Rust RAW decoder is
+# LGPL-2.1 (dcraw ancestry), and LGPL plus Rust's static linking would oblige us
+# to ship relinkable object files with every release. Documenting that is not
+# enough -- in eighteen months someone will reasonably suggest "why not just use
+# rawler?", and the build should answer instead of a person having to remember.
+# See docs/licence-policy.md.
+deny = [
+    { crate = "rawler", reason = "LGPL-2.1. See docs/licence-policy.md: no permissive pure-Rust decoder exists; LibRaw in CDDL mode stays." },
+    { crate = "rawloader", reason = "LGPL-2.1, same lineage and same conclusion as rawler." },
+    { crate = "quickraw", reason = "LGPL-2.1, same lineage and same conclusion as rawler." },
+]
 
 [advisories]
 yanked = "deny"
