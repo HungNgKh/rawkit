@@ -60,6 +60,21 @@ jobs:
           WGPU_BACKEND: vulkan
         run: cargo test -p rawkit-engine --all-features -- --ignored
 
+      # The golden test is the only one that must run on *every* platform,
+      # because it is the only one whose subject is the platforms themselves:
+      # "same RAW + same EditState -> same pixels on Linux, Windows and macOS"
+      # is not a claim a single runner can check. Linux has already run it in
+      # the step above; these two are the ones that have to be proven.
+      #
+      # Each run prints its adapter and a hash per case, so three logs answer
+      # "are these bit-identical or merely within tolerance?" for free.
+      - name: Golden renders (macOS, Metal)
+        if: matrix.os == 'macos-latest'
+        run: cargo test -p rawkit-engine --test golden -- --ignored --nocapture
+      - name: Golden renders (Windows)
+        if: matrix.os == 'windows-latest'
+        run: cargo test -p rawkit-engine --test golden -- --ignored --nocapture
+
   deny:
     name: licences & advisories
     runs-on: ubuntu-latest

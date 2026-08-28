@@ -43,6 +43,9 @@ libraw-rs-sys = "0.0.4"
 wgpu = "29"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
+# Golden-test references are 16-bit PNGs so a reviewer can look at what changed;
+# the export pipeline will want this too. Pure Rust, MIT/Apache-2.0.
+png = "0.17"
 
 # Rendering work is unusably slow in a debug build; keep dev fast but not naive.
 [profile.dev]
