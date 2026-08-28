@@ -11,7 +11,9 @@ it.
   decided to make it.
 - Subject line in the imperative, under ~72 characters.
 - The body explains **why**, not what — the diff already says what.
-- Commit only when asked. Never push to `main` without being told to.
+- Commit straight to `main` and push. This is a solo repo; branches and pull
+  requests are ceremony here, not safety. CI runs on every push to `main` and is
+  what catches a bad change.
 
 ## Invariants that are not yours to break
 
