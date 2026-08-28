@@ -9,4 +9,5 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+libraw-rs-sys.workspace = true
 thiserror.workspace = true

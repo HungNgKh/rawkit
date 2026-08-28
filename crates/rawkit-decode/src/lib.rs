@@ -21,9 +21,12 @@
 //! with the metadata needed to interpret it. Demosaic is stage B in
 //! `rawkit-engine` and runs on the GPU.
 //!
-//! The LibRaw binding itself lands with the P0 RCD spike. Until then this crate
-//! defines the shape that spike has to produce, which is the part that other
-//! crates get to depend on.
+//! The binding lives in [`libraw`]; everything below is the shape it produces,
+//! which is the part other crates depend on.
+
+pub mod libraw;
+
+pub use libraw::decode_file;
 
 /// Failures that decoding can produce. Every variant is something a user can
 /// hit with a real file, which is why "unsupported camera" is a first-class
@@ -102,6 +105,14 @@ pub struct RawImage {
     /// As-shot white balance as per-channel multipliers, as the camera recorded
     /// them. `EditState::white_balance` being `None` (as-shot) resolves to this.
     pub as_shot_neutral: [f32; 4],
+    /// Camera native RGB to CIE XYZ, from the decoder's built-in camera table.
+    ///
+    /// A stopgap, and labelled as one: the real colour path is a DCP profile
+    /// with a forward matrix, an HSL look table and a tone curve. This is the
+    /// matrix alone, which is enough to see whether an image is right and not
+    /// enough to call the result colour-managed. All-zero when the decoder has
+    /// no data for the body.
+    pub cam_to_xyz: [[f32; 3]; 4],
     pub data: Vec<u16>,
 }
 
@@ -140,6 +151,7 @@ mod tests {
                 white: 16383,
             },
             as_shot_neutral: [2.1, 1.0, 1.5, 1.0],
+            cam_to_xyz: [[0.0; 3]; 4],
             data: vec![1000; (width * height) as usize],
         }
     }

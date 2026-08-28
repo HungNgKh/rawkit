@@ -26,7 +26,7 @@ use rawkit_editstate::EditState;
 pub mod demosaic;
 pub mod pipeline;
 
-pub use demosaic::{BayerPhase, Demosaic, Mosaic};
+pub use demosaic::{normalise, BayerPhase, Demosaic, Mosaic};
 pub use pipeline::{Domain, Stage};
 
 /// Failures the engine can produce that are not programmer error.
@@ -71,9 +71,21 @@ impl Gpu {
             .await
             .map_err(|_| EngineError::NoAdapter)?;
 
+        // Ask for what this adapter can actually do rather than WebGPU's
+        // defaults, which cap a buffer at 256 MB and a storage binding at
+        // 128 MB. A 24 MP frame as RGBA f32 is 388 MB, so the defaults cannot
+        // hold one whole image — on any GPU, however large.
+        //
+        // Raising the limits makes the whole-frame path work today; it does not
+        // make it right. Desktop GPUs differ in what they allow, so a render
+        // that fits on this machine and not on someone else's would break the
+        // one invariant the engine exists to hold. **The frame has to be tiled,
+        // and this is the reason** — it is an architectural requirement that
+        // happens to also be the 60fps requirement, not a memory optimisation.
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("rawkit engine"),
+                required_limits: adapter.limits(),
                 ..Default::default()
             })
             .await

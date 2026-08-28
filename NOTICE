@@ -17,9 +17,23 @@ engine. They are listed here so the attribution obligation is visible from the
 first commit rather than discovered at release time. An entry appears here only
 once it is genuinely part of a build:
 
-  (planned) LibRaw            -- CDDL-1.0    RAW decoding, ~1,284 cameras.
-                                             Quarantined in crates/rawkit-decode;
-                                             those files stay CDDL permanently.
+  LibRaw                      -- CDDL-1.0    RAW decoding. Copyright 2008-2021
+                                             LibRaw LLC (info@libraw.org).
+                                             https://www.libraw.org
+
+      Linked via the `libraw-rs-sys` crate, which vendors LibRaw's sources.
+      LibRaw is triple-licensed (LGPL-2.1, CDDL-1.0, commercial) and rawkit
+      elects **CDDL-1.0**, which permits static linking and source inclusion
+      without disclosing the application's own source. Attribution is required
+      under all three, and this notice is it.
+
+      CDDL is file-level copyleft: LibRaw's files remain under CDDL and any
+      modification to them stays CDDL. They are confined to crates/rawkit-decode,
+      which is why that crate is a hard boundary. LibRaw's optional GPL demosaic
+      packs are not compiled into this build.
+
+      The CDDL-1.0 text accompanies the LibRaw sources in the vendored crate
+      and is available at https://opensource.org/licenses/CDDL-1.0
 
   vkdt                        -- BSD-2-Clause Copyright 2019 johannes hanika.
                                              https://github.com/hanatos/vkdt

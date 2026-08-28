@@ -57,6 +57,28 @@ The authoritative copy of this list is `deny.toml`; if the two ever disagree,
 | RapidRAW | AGPL | ❌ Reference only. Read it for architecture, never copy code |
 | darktable / RawTherapee | GPL | ❌ Ruled out as an engine base; the reason this project builds its own |
 
+## ⚠️ What `cargo-deny` cannot see: vendored source
+
+**It checks crate metadata, not what a crate vendors.**
+
+The live case is `libraw-rs-sys`. It declares `MIT/Apache-2.0`, which is true of
+the binding, and ships 2.4 MB of LibRaw C++ inside the crate. `cargo deny check`
+passes it without comment, because nothing in the tool inspects the `libraw/`
+directory. LibRaw is triple-licensed and we elect CDDL, so the answer happens to
+be fine — but the tool did not tell us that, and would not have told us if the
+answer were GPL.
+
+The rule that follows, and it is a real one:
+
+> **Any dependency that vendors or links C/C++ gets a manual licence check on
+> the vendored source, every time it is added or its version is bumped.**
+> `cargo deny` passing is necessary and not sufficient.
+
+For LibRaw specifically, that check found: `LICENSE.CDDL` and `LICENSE.LGPL`
+alongside the sources (dual, we elect CDDL); LibRaw's optional GPL demosaic
+packs present in the tree as `internal/demosaic_packs.cpp` but **not** in the
+build's file list, and unwanted anyway since the engine has its own demosaic.
+
 ## Resolved — the pre-code audit (2026-08-28)
 
 All three questions that were blocking are answered. Nothing structural changed:

@@ -50,7 +50,9 @@ so licence auditing has one place to look. Adding one anywhere else is a review
 smell.
 
 Before adding any dependency, check it against `docs/licence-policy.md` and run
-`cargo deny check`. GPL-2.0-only is categorically excluded (incompatible with
+`cargo deny check`. **If the crate vendors or links C/C++, also read the licence
+of what it vendors** — `cargo-deny` reads crate metadata and never opens the
+vendored directory, so a permissively-declared crate can carry anything at all. GPL-2.0-only is categorically excluded (incompatible with
 our Apache-2.0). LGPL is avoided. The allow-list in `deny.toml` is what actually
 runs; widening it is a deliberate, reviewable act, never a fix for a red build.
 

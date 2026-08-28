@@ -22,6 +22,22 @@ pub enum BayerPhase {
 }
 
 impl BayerPhase {
+    /// The decoder's CFA layout, or `None` for a sensor RCD cannot handle.
+    ///
+    /// Returning an `Option` rather than defaulting to RGGB is the point: a
+    /// wrong phase produces a plausible image with subtly wrong colour, and an
+    /// X-Trans file run through a Bayer kernel produces a confident mess.
+    pub fn from_cfa(pattern: rawkit_decode::CfaPattern) -> Option<Self> {
+        use rawkit_decode::CfaPattern;
+        match pattern {
+            CfaPattern::Rggb => Some(BayerPhase::Rggb),
+            CfaPattern::Bggr => Some(BayerPhase::Bggr),
+            CfaPattern::Grbg => Some(BayerPhase::Grbg),
+            CfaPattern::Gbrg => Some(BayerPhase::Gbrg),
+            CfaPattern::XTrans => None,
+        }
+    }
+
     /// The offset that makes the kernel's RGGB reasoning land on this layout.
     /// One kernel, four patterns — a per-pattern kernel would be four places for
     /// the same bug to hide.
@@ -270,4 +286,48 @@ impl Demosaic {
         staging.unmap();
         Ok(pixels)
     }
+}
+
+/// Sensor readings to scene-linear [0, 1]: subtract black, divide by headroom.
+///
+/// This is the first arithmetic in the pipeline and the first place it can go
+/// quietly wrong. The two failure modes are worth naming because neither
+/// announces itself:
+///
+/// - Skip the black level and every shadow lifts toward grey with a colour cast,
+///   because the offset is per channel.
+/// - Use the wrong white and either the highlights clip early or nothing ever
+///   reaches 1.0, which the tone map then interprets as an underexposed frame.
+///
+/// Values above white — sensors do produce them — are kept rather than clipped.
+/// Highlight reconstruction needs to know a channel blew past full scale, and
+/// clamping here would destroy that information before the stage that wants it.
+pub fn normalise(raw: &rawkit_decode::RawImage) -> Vec<f32> {
+    let phase = BayerPhase::from_cfa(raw.cfa).unwrap_or(BayerPhase::Rggb);
+    let (dx, dy) = phase.offset();
+    let white = raw.levels.white as f32;
+
+    raw.data
+        .iter()
+        .enumerate()
+        .map(|(i, &sample)| {
+            let x = (i as u32 % raw.width) + dx;
+            let y = (i as u32 / raw.width) + dy;
+            // Index the per-channel black by the sensor's own channel order:
+            // 0 = red, 1 and 3 = the two greens, 2 = blue.
+            let channel = if (x + y) % 2 == 1 {
+                if y % 2 == 0 {
+                    1
+                } else {
+                    3
+                }
+            } else if y % 2 == 0 {
+                0
+            } else {
+                2
+            };
+            let black = raw.levels.black[channel] as f32;
+            (sample as f32 - black) / (white - black)
+        })
+        .collect()
 }

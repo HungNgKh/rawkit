@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 rawkit-editstate.workspace = true
+rawkit-decode.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
 bytemuck.workspace = true

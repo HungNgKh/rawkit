@@ -5,8 +5,11 @@
 //! here first: it makes the behaviour scriptable and, more usefully, testable on
 //! three operating systems without a display attached.
 
+mod render;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "rawkit", version, about = "RAW editor — headless tools")]
@@ -28,6 +31,24 @@ enum Command {
     /// domain. The order is a compile-time fact in `rawkit-engine`; this prints
     /// it so a human can check it against the design without reading Rust.
     Stages,
+
+    /// Decode, demosaic and write a viewable image.
+    ///
+    /// The whole chain on real sensor data, and the first answer to "does this
+    /// look like the photo". Not colour management: no DCP profile, no tone
+    /// map, no output transform — see the module docs before judging the
+    /// result.
+    Render {
+        /// RAW file to read.
+        input: PathBuf,
+        /// Where to write the PPM.
+        #[arg(short, long, default_value = "render.ppm")]
+        output: PathBuf,
+        /// Box-downsample so the longest edge is at most this many pixels.
+        /// 0 writes full resolution, which for a 24 MP sensor is a 72 MB file.
+        #[arg(long, default_value_t = 2000)]
+        max_dim: u32,
+    },
 
     /// Report the GPU adapter this machine would render on.
     ///
@@ -60,6 +81,11 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Command::Render {
+            input,
+            output,
+            max_dim,
+        } => render::render(&input, &output, max_dim)?,
         Command::Gpu => {
             let gpu = rawkit_engine::Gpu::new()?;
             let info = &gpu.adapter_info;
