@@ -56,20 +56,35 @@ struct Params {
     // Camera-native RGB to the display's linear primaries, one row per vec4 so
     // the uniform stays std140-friendly. `.w` is unused.
     cam_to_display: array<vec4<f32>, 3>,
-    // `.x` is the exposure multiplier (2^EV). The rest is reserved so adding a
-    // scalar does not shuffle the whole uniform.
+    // Working space back to display, used only when a hue/saturation table is
+    // active. Identity otherwise, so the second multiply is harmless.
+    working_to_display: array<vec4<f32>, 3>,
+    // `.x` is the exposure multiplier (2^EV). `.y` is 1 when a hue/saturation
+    // table is bound, 0 when it is not — the table buffer always exists because
+    // a bind group cannot have holes, so a flag is what distinguishes "no
+    // correction" from "a correction that happens to be identity".
     develop: vec4<f32>,
+    // Hue, saturation and value divisions of the table. `.w` unused.
+    hsm_dims: vec4<u32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> cfa: array<f32>;
 @group(0) @binding(2) var<storage, read_write> vh: array<f32>;
-@group(0) @binding(3) var<storage, read_write> pq: array<f32>;
-@group(0) @binding(4) var<storage, read_write> lp: array<f32>;
-@group(0) @binding(5) var<storage, read_write> ch_r: array<f32>;
-@group(0) @binding(6) var<storage, read_write> ch_g: array<f32>;
-@group(0) @binding(7) var<storage, read_write> ch_b: array<f32>;
-@group(0) @binding(8) var<storage, read_write> rgba_out: array<vec4<f32>>;
+// The two half-resolution helpers share one binding, `pq` first and `lp` after
+// it. WebGPU guarantees only eight storage buffers per stage and the develop
+// stage needs one for the profile table, so something had to give — and these
+// two are the natural pair: identical shape, written in the same dispatch,
+// never aliasing because the ranges are disjoint.
+@group(0) @binding(3) var<storage, read_write> helpers: array<f32>;
+@group(0) @binding(4) var<storage, read_write> ch_r: array<f32>;
+@group(0) @binding(5) var<storage, read_write> ch_g: array<f32>;
+@group(0) @binding(6) var<storage, read_write> ch_b: array<f32>;
+@group(0) @binding(7) var<storage, read_write> rgba_out: array<vec4<f32>>;
+// The profile's hue/saturation deltas, one vec4 per cell: hue shift in degrees,
+// saturation scale, value scale. Padded to vec4 because a vec3 array has a
+// stride of 16 bytes anyway.
+@group(0) @binding(8) var<storage, read> hue_sat_map: array<vec4<f32>>;
 
 const EPS: f32 = 1e-5;
 
@@ -118,8 +133,11 @@ fn packed_index(x: i32, y: i32) -> u32 {
     return u32(cy) * params.packed_width + slot;
 }
 
-fn pq_at(x: i32, y: i32) -> f32 { return pq[packed_index(x, y)]; }
-fn lp_at(x: i32, y: i32) -> f32 { return lp[packed_index(x, y)]; }
+/// Where `lp` starts inside the shared helper buffer.
+fn lp_base() -> u32 { return params.packed_width * params.height; }
+
+fn pq_at(x: i32, y: i32) -> f32 { return helpers[packed_index(x, y)]; }
+fn lp_at(x: i32, y: i32) -> f32 { return helpers[lp_base() + packed_index(x, y)]; }
 
 // vkdt picks between a discriminator and the mean of its diagonal neighbours,
 // preferring whichever is further from 0.5 — i.e. whichever is more confident
@@ -177,7 +195,7 @@ fn conv(@builtin(global_invocation_id) gid: vec3<u32>) {
             );
         }
         pqs = pqs * pqs;
-        pq[u32(y) * params.packed_width + u32(x / 2)] = pqs.x / (pqs.x + pqs.y);
+        helpers[u32(y) * params.packed_width + u32(x / 2)] = pqs.x / (pqs.x + pqs.y);
     } else {
         // Low-pass, green sites only, but centred on the red/blue column *of
         // this same packed pair* — because that is where it gets read from.
@@ -193,7 +211,7 @@ fn conv(@builtin(global_invocation_id) gid: vec3<u32>) {
                 low = low + w[j + 1] * w[i + 1] * cfa_at(x + i + off, y + j);
             }
         }
-        lp[u32(y) * params.packed_width + u32(x / 2)] = max(1e-6, low);
+        helpers[lp_base() + u32(y) * params.packed_width + u32(x / 2)] = max(1e-6, low);
     }
 
     // Seed the colour planes: each site knows one channel, the other two are 0.
@@ -436,8 +454,135 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
         dot(params.cam_to_display[2].rgb, balanced),
     );
 
-    let exposed = display * params.develop.x;
+    // The hue/saturation correction, when the profile brought one. `display`
+    // is in the table's working space at this point rather than in the display
+    // space, which is why the second matrix exists.
+    var corrected = display;
+    if (params.develop.y > 0.5) {
+        corrected = apply_hue_sat(display);
+    }
+    let shown = vec3<f32>(
+        dot(params.working_to_display[0].rgb, corrected),
+        dot(params.working_to_display[1].rgb, corrected),
+        dot(params.working_to_display[2].rgb, corrected),
+    );
+
+    let exposed = shown * params.develop.x;
     rgba_out[p] = vec4<f32>(tone_map(exposed), 1.0);
+}
+
+/// RGB to hue/saturation/value, with hue in degrees.
+///
+/// The table is indexed in HSV because that is the space a colour correction is
+/// naturally expressed in: "rotate this hue a little, pull this saturation
+/// down". Negative components are possible here — a wide working space holds
+/// colours outside the sensor's gamut — and are handled by the clamping below
+/// rather than by pretending they cannot happen.
+fn rgb_to_hsv(rgb: vec3<f32>) -> vec3<f32> {
+    let maximum = max(rgb.r, max(rgb.g, rgb.b));
+    let minimum = min(rgb.r, min(rgb.g, rgb.b));
+    let span = maximum - minimum;
+
+    var hue = 0.0;
+    if (span > 0.0) {
+        if (maximum == rgb.r) {
+            hue = (rgb.g - rgb.b) / span;
+            if (hue < 0.0) { hue = hue + 6.0; }
+        } else if (maximum == rgb.g) {
+            hue = 2.0 + (rgb.b - rgb.r) / span;
+        } else {
+            hue = 4.0 + (rgb.r - rgb.g) / span;
+        }
+        hue = hue * 60.0;
+    }
+    var saturation = 0.0;
+    if (maximum > 0.0) {
+        saturation = span / maximum;
+    }
+    return vec3<f32>(hue, saturation, maximum);
+}
+
+fn hsv_to_rgb(hsv: vec3<f32>) -> vec3<f32> {
+    let sector = hsv.x / 60.0;
+    let i = floor(sector);
+    let f = sector - i;
+    let v = hsv.z;
+    let p = v * (1.0 - hsv.y);
+    let q = v * (1.0 - hsv.y * f);
+    let t = v * (1.0 - hsv.y * (1.0 - f));
+    let which = i32(i) % 6;
+    if (which == 0) { return vec3<f32>(v, t, p); }
+    if (which == 1) { return vec3<f32>(q, v, p); }
+    if (which == 2) { return vec3<f32>(p, v, t); }
+    if (which == 3) { return vec3<f32>(p, q, v); }
+    if (which == 4) { return vec3<f32>(t, p, v); }
+    return vec3<f32>(v, p, q);
+}
+
+fn hsm_at(h: u32, s: u32, v: u32) -> vec4<f32> {
+    // DNG ordering: value outermost, then hue, then saturation innermost.
+    let index = (v * params.hsm_dims.x + h) * params.hsm_dims.y + s;
+    return hue_sat_map[index];
+}
+
+/// Look the colour up in the profile's table and apply the delta it finds.
+///
+/// Trilinear, with **hue wrapping** and saturation and value clamping. The
+/// wrap is not a detail: hue is circular, so a table sampled without it would
+/// produce a visible seam at 0 degrees — which lands squarely on reds.
+fn apply_hue_sat(rgb: vec3<f32>) -> vec3<f32> {
+    let hsv = rgb_to_hsv(rgb);
+    let dims = params.hsm_dims;
+
+    // Hue spans the full circle across `hue_divisions` cells and wraps, so the
+    // spacing is 360/divisions rather than 360/(divisions-1).
+    let hue_step = 360.0 / f32(dims.x);
+    let hue_pos = hsv.x / hue_step;
+    let h0 = u32(floor(hue_pos)) % dims.x;
+    let h1 = (h0 + 1u) % dims.x;
+    let hf = fract(hue_pos);
+
+    // Saturation and value are endpoints-inclusive: cell 0 is 0.0 and the last
+    // cell is 1.0.
+    let sat_pos = clamp(hsv.y, 0.0, 1.0) * f32(dims.y - 1u);
+    let s0 = min(u32(floor(sat_pos)), dims.y - 1u);
+    let s1 = min(s0 + 1u, dims.y - 1u);
+    let sf = fract(sat_pos);
+
+    var v0 = 0u;
+    var v1 = 0u;
+    var vf = 0.0;
+    if (dims.z > 1u) {
+        let val_pos = clamp(hsv.z, 0.0, 1.0) * f32(dims.z - 1u);
+        v0 = min(u32(floor(val_pos)), dims.z - 1u);
+        v1 = min(v0 + 1u, dims.z - 1u);
+        vf = fract(val_pos);
+    }
+
+    let c000 = hsm_at(h0, s0, v0);
+    let c100 = hsm_at(h1, s0, v0);
+    let c010 = hsm_at(h0, s1, v0);
+    let c110 = hsm_at(h1, s1, v0);
+    let c001 = hsm_at(h0, s0, v1);
+    let c101 = hsm_at(h1, s0, v1);
+    let c011 = hsm_at(h0, s1, v1);
+    let c111 = hsm_at(h1, s1, v1);
+
+    let d00 = mix(c000, c100, hf);
+    let d10 = mix(c010, c110, hf);
+    let d01 = mix(c001, c101, hf);
+    let d11 = mix(c011, c111, hf);
+    let d0 = mix(d00, d10, sf);
+    let d1 = mix(d01, d11, sf);
+    let delta = mix(d0, d1, vf);
+
+    var hue = hsv.x + delta.x;
+    // Wrap rather than clamp, for the same reason the lookup wraps.
+    hue = hue - 360.0 * floor(hue / 360.0);
+    let saturation = clamp(hsv.y * delta.y, 0.0, 1.0);
+    let value = max(hsv.z * delta.z, 0.0);
+
+    return hsv_to_rgb(vec3<f32>(hue, saturation, value));
 }
 
 /// Fixed sigmoid roll-off, applied per channel.

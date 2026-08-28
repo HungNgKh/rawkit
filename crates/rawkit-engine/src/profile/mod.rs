@@ -16,23 +16,27 @@
 //!
 //! # What this implements, and what it does not
 //!
-//! Implemented: the Adobe colour-matrix model — one or two calibration
-//! illuminants, interpolated by correlated colour temperature; temperature and
-//! tint in the CIE 1960 UCS the way Adobe defines them, so the numbers are
-//! comparable with what other editors show; and the white-balance-aware
-//! camera-to-display transform.
+//! # The line this module draws
 //!
-//! **Not implemented:** parsing `.dcp` files, `ProfileHueSatMap`,
-//! `ProfileLookTable` and the profile's own tone curve. Those carry the parts of
-//! a profile that are a *look* rather than a measurement, and they are what
-//! separates "colour that is defensible" from "colour that matches Adobe". The
-//! structure here is shaped to take them without rework: a profile is already a
-//! value that the renderer asks for a matrix, rather than a matrix the renderer
-//! assumes.
+//! A profile file carries two different kinds of thing, and only one of them is
+//! adopted here.
 //!
-//! Note also that Adobe's own bundled `.dcp` files are not redistributable, so
-//! shipping profiles is not a thing this project can do regardless — a parser
-//! reads what the *user* already has.
+//! **Measurement — used.** The colour matrices, the forward matrices, and the
+//! hue/saturation table. These describe how the sensor responds. The tell is
+//! that a profile carries *two* of each, one per calibration illuminant,
+//! interpolated by temperature: a description of the sensor has to depend on the
+//! light, and a look does not.
+//!
+//! **Look — deliberately not used.** `ProfileLookTable` and `ProfileToneCurve`,
+//! of which there is exactly one regardless of illuminant. These encode what
+//! Adobe thinks a photograph should look like. Adopting them would mean the
+//! product renders differently depending on whether a user happened to have
+//! Adobe software installed, would leave our tone map dead code for profiled
+//! files, and would quietly reverse the decision to stop chasing rendering
+//! parity. The tags are named in [`dcp`] so the omission reads as a choice.
+//!
+//! Adobe's own bundled `.dcp` files are not redistributable in any case, so this
+//! reads what the *user* already has; the project can never ship one.
 
 /// A 3x3 matrix, row-major. Small enough that a dedicated type earns nothing
 /// beyond an alias, and this keeps it obvious which way round the rows are.
@@ -56,6 +60,28 @@ pub const SRGB_FROM_XYZ_D50: Matrix3 = [
     [0.0719453, -0.2289914, 1.4052427],
 ];
 
+/// CIE XYZ (D50) to linear ProPhoto RGB.
+///
+/// The working space the hue/saturation table is defined in. It has to be this
+/// one and not ours: the table's hue angles were measured in ProPhoto, and
+/// applying them in a different space rotates every correction by the angle
+/// between the two gamuts — which shows up as a profile making colour slightly
+/// worse rather than better.
+#[allow(clippy::excessive_precision)]
+pub const PROPHOTO_FROM_XYZ_D50: Matrix3 = [
+    [1.3459433, -0.2556075, -0.0511118],
+    [-0.5445989, 1.5081673, 0.0205351],
+    [0.0000000, 0.0000000, 1.2118128],
+];
+
+/// Linear ProPhoto RGB to CIE XYZ (D50).
+#[allow(clippy::excessive_precision)]
+pub const XYZ_D50_FROM_PROPHOTO: Matrix3 = [
+    [0.7976749, 0.1351917, 0.0313534],
+    [0.2880402, 0.7118741, 0.0000857],
+    [0.0000000, 0.0000000, 0.8252100],
+];
+
 /// sRGB primaries to CIE XYZ (D65).
 pub const XYZ_FROM_SRGB: Matrix3 = [
     [0.412_453, 0.357_580, 0.180_423],
@@ -74,6 +100,81 @@ const TINT_SCALE: f32 = 3000.0;
 /// allowed to produce nonsense.
 pub const MIN_TEMPERATURE: f32 = 1667.0;
 pub const MAX_TEMPERATURE: f32 = 25000.0;
+
+/// A profile's hue/saturation correction table.
+///
+/// A 3x3 matrix is a linear map, and a sensor's departure from one is not
+/// linear: deep blues drift purple, foliage greens go yellow, skin tones shift.
+/// This table is where a profile stores those corrections, as deltas indexed by
+/// hue, saturation and value.
+///
+/// **This is measurement, not taste**, and the structure says so: a profile
+/// carries *two* of these, one per calibration illuminant, interpolated exactly
+/// like the colour matrices. A look would not depend on what light the scene was
+/// under. That is why this is adopted while `ProfileLookTable` and
+/// `ProfileToneCurve` — of which there is one, regardless of illuminant — are
+/// deliberately not.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HueSatMap {
+    pub hue_divisions: u32,
+    pub sat_divisions: u32,
+    pub value_divisions: u32,
+    /// `(hue shift in degrees, saturation scale, value scale)` per cell, in the
+    /// DNG ordering: value outermost, then hue, then saturation.
+    pub deltas: Vec<[f32; 3]>,
+}
+
+impl HueSatMap {
+    pub fn cell_count(&self) -> usize {
+        (self.hue_divisions * self.sat_divisions * self.value_divisions) as usize
+    }
+
+    /// Whether the table is well-formed. A profile whose declared dimensions do
+    /// not match its data is corrupt, and applying it would read whatever
+    /// happened to be next in the file.
+    pub fn is_valid(&self) -> bool {
+        self.hue_divisions > 0
+            && self.sat_divisions > 0
+            && self.value_divisions > 0
+            && self.deltas.len() == self.cell_count()
+    }
+
+    /// The table that sits `t` of the way from `self` to `other`, where 1 is
+    /// fully `other`.
+    ///
+    /// Interpolating the tables rather than applying both and blending the
+    /// results is what the DNG specification calls for, and it is also the only
+    /// version that is cheap: one table is uploaded per render instead of two
+    /// sampled per pixel.
+    fn blend(&self, other: &Self, t: f32) -> Option<Self> {
+        if self.hue_divisions != other.hue_divisions
+            || self.sat_divisions != other.sat_divisions
+            || self.value_divisions != other.value_divisions
+        {
+            // Mismatched dimensions mean the two illuminants disagree about the
+            // shape of the correction, which is not something to average.
+            return None;
+        }
+        let deltas = self
+            .deltas
+            .iter()
+            .zip(&other.deltas)
+            .map(|(a, b)| {
+                [
+                    a[0] * (1.0 - t) + b[0] * t,
+                    a[1] * (1.0 - t) + b[1] * t,
+                    a[2] * (1.0 - t) + b[2] * t,
+                ]
+            })
+            .collect();
+        Some(Self {
+            hue_divisions: self.hue_divisions,
+            sat_divisions: self.sat_divisions,
+            value_divisions: self.value_divisions,
+            deltas,
+        })
+    }
+}
 
 /// One calibration illuminant: the temperature it represents, and the matrix
 /// taking CIE XYZ to this camera's native RGB under it.
@@ -102,6 +203,8 @@ pub struct CameraProfile {
     /// when absent the colour matrix is inverted instead, which is what a
     /// decoder's built-in table leaves us with.
     forward: Vec<Option<Matrix3>>,
+    /// Hue/saturation correction per calibration illuminant.
+    hue_sat: Vec<Option<HueSatMap>>,
     /// What the profile calls itself, for a UI to show. `None` for a profile
     /// synthesised from a decoder table, which has no name to give.
     pub name: Option<String>,
@@ -125,6 +228,7 @@ impl CameraProfile {
         Self {
             calibrations: vec![Calibration { cct, xyz_to_camera }],
             forward: vec![None],
+            hue_sat: vec![None],
             name: None,
         }
     }
@@ -145,6 +249,7 @@ impl CameraProfile {
         Self {
             calibrations,
             forward: vec![None, None],
+            hue_sat: vec![None, None],
             name: None,
         }
     }
@@ -159,14 +264,56 @@ impl CameraProfile {
     /// nowhere, and has nothing to point at. Stating the temperature makes that
     /// mistake unrepresentable instead of merely documented.
     pub fn set_forward_matrix(&mut self, cct: f32, matrix: Matrix3) {
-        let nearest = self
-            .calibrations
+        if let Some(i) = self.nearest_calibration(cct) {
+            self.forward[i] = Some(matrix);
+        }
+    }
+
+    /// Which calibration a given illuminant temperature belongs to.
+    ///
+    /// Shared by everything that attaches per-illuminant data, so a forward
+    /// matrix and a hue/saturation table quoted at the same temperature always
+    /// land on the same calibration.
+    fn nearest_calibration(&self, cct: f32) -> Option<usize> {
+        self.calibrations
             .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| (a.cct - cct).abs().total_cmp(&(b.cct - cct).abs()))
-            .map(|(i, _)| i);
-        if let Some(i) = nearest {
-            self.forward[i] = Some(matrix);
+            .map(|(i, _)| i)
+    }
+
+    /// Attach a hue/saturation table to the calibration it belongs to, named by
+    /// its illuminant temperature — for the same reason forward matrices are.
+    pub fn set_hue_sat_map(&mut self, cct: f32, map: HueSatMap) {
+        if !map.is_valid() {
+            return;
+        }
+        if let Some(i) = self.nearest_calibration(cct) {
+            self.hue_sat[i] = Some(map);
+        }
+    }
+
+    /// The hue/saturation table for a temperature, interpolated between the
+    /// calibration illuminants.
+    ///
+    /// `None` when the profile has none, when the two tables disagree about
+    /// their dimensions, or — deliberately — when the profile has no forward
+    /// matrix. See [`Self::camera_to_working`] for why that last one.
+    pub fn hue_sat_map(&self, cct: f32) -> Option<HueSatMap> {
+        // Gated on the transform actually being available at *this*
+        // temperature, not on the profile merely carrying one somewhere. The
+        // first version asked `has_forward_matrix()` and the two answers could
+        // differ, which a real profile — one forward matrix, two illuminants —
+        // turned into a panic.
+        self.camera_to_working(cct)?;
+        match (self.calibrations.as_slice(), self.hue_sat.as_slice()) {
+            ([_], [only]) => only.clone(),
+            ([low, high], [a, b]) => match (a, b) {
+                (Some(a), Some(b)) => a.blend(b, 1.0 - mired_blend(low.cct, high.cct, cct)),
+                (Some(only), None) | (None, Some(only)) => Some(only.clone()),
+                (None, None) => None,
+            },
+            _ => None,
         }
     }
 
@@ -206,6 +353,29 @@ impl CameraProfile {
         }
     }
 
+    /// Camera to the working space the hue/saturation table lives in, and that
+    /// space back to the display.
+    ///
+    /// Returns `None` when there is no table to apply, in which case the caller
+    /// uses [`Self::camera_to_display`] directly and the extra hop is skipped
+    /// entirely.
+    ///
+    /// **Only offered for profiles with a forward matrix.** The DNG reference
+    /// space is reached *through* the forward matrix, and with a colour matrix
+    /// alone there is no unambiguous route to it — the white balance is folded
+    /// into the matrix by a normalisation of our own choosing, so "which linear
+    /// space is this" has no single answer. Applying the table anyway would
+    /// rotate its hue corrections by an unknown angle, making colour worse in a
+    /// way that looks like the profile being wrong. Skipping it is the honest
+    /// option and is what [`Self::hue_sat_map`] enforces.
+    pub fn camera_to_working(&self, temperature_k: f32) -> Option<(Matrix3, Matrix3)> {
+        let forward = self.forward_matrix(temperature_k)?;
+        Some((
+            multiply(&PROPHOTO_FROM_XYZ_D50, &forward),
+            multiply(&SRGB_FROM_XYZ_D50, &XYZ_D50_FROM_PROPHOTO),
+        ))
+    }
+
     /// The forward matrix for a temperature, interpolated the same way the
     /// colour matrices are. `None` when the profile has none — a decoder table
     /// never does.
@@ -223,11 +393,13 @@ impl CameraProfile {
                     }
                     Some(out)
                 }
-                // One matrix and not the other is a malformed profile. Using
-                // the one that exists across the whole range would apply a
-                // tungsten fit to daylight; falling back to the colour-matrix
-                // path is worse colour but not wrong colour.
-                _ => None,
+                // A profile may give one forward matrix for both illuminants,
+                // and the specification says to use it unconditionally. Doing
+                // so also keeps this in step with `has_forward_matrix`: two
+                // notions of "has one" that disagree is how a caller ends up
+                // holding an impossible state.
+                (Some(only), None) | (None, Some(only)) => Some(*only),
+                (None, None) => None,
             },
             _ => None,
         }

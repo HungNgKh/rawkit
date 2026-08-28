@@ -107,7 +107,7 @@ impl Frame<'_> {
     /// to be the one for *this* illuminant, and the multipliers have to be the
     /// ones that neutralise it; computing them apart is how an image ends up
     /// with a cast that looks like a white-balance error and is not one.
-    fn colour(&self, state: &EditState) -> Result<([f32; 3], Matrix3), EngineError> {
+    fn colour(&self, state: &EditState) -> Result<Colour, EngineError> {
         let (multipliers, temperature) = match state.white_balance.temperature_k {
             Some(temperature) => (
                 self.profile
@@ -130,7 +130,31 @@ impl Frame<'_> {
                 (as_shot, temperature)
             }
         };
-        Ok((multipliers, self.profile.camera_to_display(temperature)))
+        // With a hue/saturation table the render goes camera -> working space
+        // -> table -> display; without one it goes straight to display and the
+        // second matrix is the identity, so the kernel has a single path either
+        // way.
+        // Ask for the transform and the table together, so there is no way to
+        // end up with one and not the other.
+        let with_table = self
+            .profile
+            .camera_to_working(temperature)
+            .zip(self.profile.hue_sat_map(temperature));
+
+        Ok(match with_table {
+            Some(((to_working, to_display), map)) => Colour {
+                multipliers,
+                cam_to_display: to_working,
+                working_to_display: to_display,
+                hue_sat: Some(map),
+            },
+            None => Colour {
+                multipliers,
+                cam_to_display: self.profile.camera_to_display(temperature),
+                working_to_display: crate::profile::IDENTITY,
+                hue_sat: None,
+            },
+        })
     }
 
     /// The temperature and tint this frame was shot at, for a UI to display.
@@ -155,7 +179,9 @@ struct Params {
     _pad: [u32; 3],
     wb: [f32; 4],
     cam_to_display: [[f32; 4]; 3],
+    working_to_display: [[f32; 4]; 3],
     develop: [f32; 4],
+    hsm_dims: [u32; 4],
 }
 
 /// What the caller wants back.
@@ -262,7 +288,8 @@ impl Renderer {
             count: None,
         }];
         entries.push(entry(1, true));
-        entries.extend((2..=8).map(|b| entry(b, false)));
+        entries.extend((2..=7).map(|b| entry(b, false)));
+        entries.push(entry(8, true));
 
         let layout = gpu
             .device
@@ -340,7 +367,10 @@ impl Renderer {
         // Green normalised to 1.0. The demosaic kernel estimates green at red
         // and blue sites from unscaled CFA values, so any other normalisation
         // would mix scaled and unscaled greens in the same subtraction.
-        let (wb, m) = image.colour(state)?;
+        let colour = image.colour(state)?;
+        let (wb, m) = (colour.multipliers, colour.cam_to_display);
+        let working = colour.working_to_display;
+        let hsm = colour.hue_sat.as_ref();
         let params = Params {
             width: padded,
             height: padded,
@@ -354,7 +384,21 @@ impl Renderer {
                 [m[1][0], m[1][1], m[1][2], 0.0],
                 [m[2][0], m[2][1], m[2][2], 0.0],
             ],
-            develop: [crate::exposure_multiplier(state), 0.0, 0.0, 0.0],
+            working_to_display: [
+                [working[0][0], working[0][1], working[0][2], 0.0],
+                [working[1][0], working[1][1], working[1][2], 0.0],
+                [working[2][0], working[2][1], working[2][2], 0.0],
+            ],
+            develop: [
+                crate::exposure_multiplier(state),
+                if hsm.is_some() { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ],
+            hsm_dims: match hsm {
+                Some(m) => [m.hue_divisions, m.sat_divisions, m.value_divisions, 0],
+                None => [1, 1, 1, 0],
+            },
         };
 
         let device = &gpu.device;
@@ -377,13 +421,33 @@ impl Renderer {
         // interactive path needs: a render must not allocate.
         let cfa_buf = plane("cfa", px, wgpu::BufferUsages::COPY_DST);
         let vh = plane("vh", px, wgpu::BufferUsages::empty());
-        let packed = params.packed_width as usize * padded as usize;
-        let pq = plane("pq", packed, wgpu::BufferUsages::empty());
-        let lp = plane("lp", packed, wgpu::BufferUsages::empty());
+        // `pq` and `lp` share one buffer: WebGPU guarantees only eight storage
+        // buffers per shader stage, and the develop stage needs one for the
+        // profile's hue/saturation table. Raising the limit instead would make
+        // the engine work here and fail on a conforming device, which is the
+        // divergence the default-limits decision exists to prevent.
+        let helpers = plane(
+            "pq+lp",
+            2 * params.packed_width as usize * padded as usize,
+            wgpu::BufferUsages::empty(),
+        );
         let ch_r = plane("r", px, wgpu::BufferUsages::empty());
         let ch_g = plane("g", px, wgpu::BufferUsages::empty());
         let ch_b = plane("b", px, wgpu::BufferUsages::empty());
         let out = plane("rgba", px * 4, wgpu::BufferUsages::COPY_SRC);
+
+        // A bind group cannot have holes, so the table buffer always exists;
+        // when there is no correction it holds one identity cell and the kernel
+        // is told to skip it. One dummy vec4 is cheaper than a second pipeline.
+        let table: Vec<[f32; 4]> = match hsm {
+            Some(m) => m.deltas.iter().map(|d| [d[0], d[1], d[2], 0.0]).collect(),
+            None => vec![[0.0, 1.0, 1.0, 0.0]],
+        };
+        let hue_sat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("hue/sat map"),
+            contents: bytemuck::cast_slice(&table),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
 
         let out_size = (px * 4 * std::mem::size_of::<f32>()) as u64;
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
@@ -393,7 +457,16 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        let buffers = [&cfa_buf, &vh, &pq, &lp, &ch_r, &ch_g, &ch_b, &out];
+        let buffers = [
+            &cfa_buf,
+            &vh,
+            &helpers,
+            &ch_r,
+            &ch_g,
+            &ch_b,
+            &out,
+            &hue_sat_buf,
+        ];
         let mut bindings = vec![wgpu::BindGroupEntry {
             binding: 0,
             resource: params_buf.as_entire_binding(),
@@ -477,6 +550,15 @@ impl Renderer {
 
         Ok(result)
     }
+}
+
+/// Everything the develop stage needs to know about colour, resolved from the
+/// frame's profile and the edit together.
+struct Colour {
+    multipliers: [f32; 3],
+    cam_to_display: Matrix3,
+    working_to_display: Matrix3,
+    hue_sat: Option<crate::profile::HueSatMap>,
 }
 
 /// Fill `out` with the tile at `(ox, oy)` plus its halo, clamping at the image

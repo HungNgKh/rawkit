@@ -28,7 +28,7 @@
 //! Adobe's bundled profiles are not redistributable, so this reads what the
 //! user already has; the project can never ship them.
 
-use super::{CameraProfile, Matrix3};
+use super::{CameraProfile, HueSatMap, Matrix3};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DcpError {
@@ -55,15 +55,15 @@ mod tag {
     pub const FORWARD_MATRIX_1: u16 = 50964;
     pub const FORWARD_MATRIX_2: u16 = 50965;
 
-    // Present in most profiles, deliberately not read yet — see the module
-    // docs. Named rather than left as bare numbers so a future reader does not
-    // have to rediscover which tag is which.
-    #[allow(dead_code)]
     pub const PROFILE_HUE_SAT_MAP_DIMS: u16 = 50937;
-    #[allow(dead_code)]
     pub const PROFILE_HUE_SAT_MAP_DATA_1: u16 = 50938;
-    #[allow(dead_code)]
     pub const PROFILE_HUE_SAT_MAP_DATA_2: u16 = 50939;
+
+    // Read by no one, deliberately. These carry the profile's *look* — what
+    // Adobe thinks a photograph should look like — rather than what the sensor
+    // measured, and adopting a look would fork this product's rendering by
+    // whether a user happened to have Adobe software installed. Named rather
+    // than left as bare numbers so the omission is visibly a decision.
     #[allow(dead_code)]
     pub const PROFILE_TONE_CURVE: u16 = 50940;
     #[allow(dead_code)]
@@ -117,6 +117,29 @@ pub fn parse(bytes: &[u8]) -> Result<CameraProfile, DcpError> {
     if let Some(m) = forward2 {
         profile.set_forward_matrix(cct2, m);
     }
+    // Both tables share one dimensions tag, as the specification requires: a
+    // profile whose two illuminants disagreed about the shape of the correction
+    // could not be interpolated.
+    if let Some(dims) = find(tag::PROFILE_HUE_SAT_MAP_DIMS).and_then(|e| reader.longs(e, 3)) {
+        let build = |t: u16| -> Option<HueSatMap> {
+            let entry = find(t)?;
+            let floats = reader.floats(entry)?;
+            let map = HueSatMap {
+                hue_divisions: dims[0],
+                sat_divisions: dims[1],
+                value_divisions: dims[2],
+                deltas: floats.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect(),
+            };
+            map.is_valid().then_some(map)
+        };
+        if let Some(m) = build(tag::PROFILE_HUE_SAT_MAP_DATA_1) {
+            profile.set_hue_sat_map(cct1, m);
+        }
+        if let Some(m) = build(tag::PROFILE_HUE_SAT_MAP_DATA_2) {
+            profile.set_hue_sat_map(cct2, m);
+        }
+    }
+
     profile.name = name;
     Ok(profile)
 }
@@ -275,6 +298,29 @@ impl<'a> Tiff<'a> {
             };
         }
         Ok(out)
+    }
+
+    /// A run of LONGs. Used for the table dimensions, which are three of them
+    /// and therefore always out of line.
+    fn longs(&self, entry: &Entry, expected: usize) -> Option<Vec<u32>> {
+        if entry.kind != 4 || entry.count as usize != expected {
+            return None;
+        }
+        let base = self.data_offset(entry).ok()?;
+        (0..expected)
+            .map(|i| self.u32_at(base + i * 4).ok())
+            .collect()
+    }
+
+    /// A run of FLOATs, which is how the tables themselves are stored.
+    fn floats(&self, entry: &Entry) -> Option<Vec<f32>> {
+        if entry.kind != 11 {
+            return None;
+        }
+        let base = self.data_offset(entry).ok()?;
+        (0..entry.count as usize)
+            .map(|i| self.u32_at(base + i * 4).ok().map(f32::from_bits))
+            .collect()
     }
 
     fn short(&self, entry: &Entry) -> Option<u16> {

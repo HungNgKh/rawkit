@@ -82,6 +82,13 @@ pub fn render(
                     "colour matrix only"
                 },
             );
+            match profile.hue_sat_map(5000.0) {
+                Some(map) => eprintln!(
+                    "hue/sat    : {}x{}x{} correction table",
+                    map.hue_divisions, map.sat_divisions, map.value_divisions
+                ),
+                None => eprintln!("hue/sat    : none (matrix correction only)"),
+            }
             profile
         }
         None => match single_illuminant_profile(&raw.cam_to_xyz) {
