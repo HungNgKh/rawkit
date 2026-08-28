@@ -38,18 +38,37 @@ slip past. Closing that needs a fixture on each runner and is a separate problem
 Bit-exactness across three GPU vendors is not something to demand by default —
 a test that fails for last-bit reasons gets disabled within a month. The policy:
 
-- A per-pixel tolerance of **24 / 65535**, roughly 4 parts in 10,000: far below
-  anything visible, far above rounding. It is a committed constant with the
-  reasoning next to it, and loosening it is a reviewable change that wants a
-  recorded reason.
+- A per-pixel tolerance of **8 / 65535**, set from measurement rather than
+  guesswork — see below. It is a committed constant with the reasoning next to
+  it, and loosening it is a reviewable change that wants a recorded reason.
 - Failures report **which platform diverged, on which adapter and backend, at
   which pixel**. A three-way test whose output does not say who disagreed is a
   test nobody acts on.
-- Every run also prints a hash per case. Three CI logs therefore answer "are
-  these platforms bit-identical, or merely within tolerance?" without anyone
-  building tooling for it. As of the first run, the kernels use only add,
-  multiply, divide, min/max and mix — all IEEE-exact, no transcendentals — so
-  bit-identical is a reasonable expectation rather than a hope.
+- Every run also prints a hash per case, so three CI logs answer "bit-identical
+  or merely within tolerance?" without anyone building tooling for it.
+
+## What the first cross-platform run actually showed
+
+References blessed on Linux / Vulkan / AMD RADV, then compared:
+
+| Platform | Backend | Adapter | Worst difference |
+|---|---|---|---|
+| macOS | Metal | Apple Paravirtual | 1 / 65535 |
+| Windows | Dx12 | Microsoft Basic Render Driver (WARP, software) | 1 / 65535 |
+
+**The hashes differ, so the renders are not bit-identical** — which disproves
+the expectation this file was originally written with. The kernels use only
+add, multiply, divide, min/max and mix, with no transcendentals and no
+fast-math, and that still was not enough for three drivers to agree to the last
+bit.
+
+They agree to one part in 65535, roughly four orders of magnitude below
+anything visible. So the tolerance approach was the right call and the number
+is now evidence-based rather than defensive.
+
+Worth noting for CI purposes: the Windows runner has no GPU and wgpu fell back
+to WARP, Microsoft's software DX12 rasteriser, without being asked to. The
+three-platform matrix therefore costs nothing extra to keep running.
 
 ## Blessing a reference
 

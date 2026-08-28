@@ -9,9 +9,22 @@
 //! `cargo test -p rawkit-engine --test develop -- --ignored`
 
 use rawkit_editstate::EditState;
-use rawkit_engine::{BayerPhase, Frame, Gpu, Output, Renderer};
+use rawkit_engine::{BayerPhase, CameraProfile, Frame, Gpu, Output, Renderer};
 
 const N: u32 = 64;
+
+/// A camera whose native primaries *are* sRGB's, so the profile stage has
+/// nothing to do and its transform comes out as the identity.
+///
+/// Note this is not the identity matrix: a profile stores XYZ-to-camera, so the
+/// camera that needs no correction is the one holding the inverse of sRGB's
+/// primaries. Using the identity here instead would silently insert a real
+/// colour transform into tests that mean to isolate tone and white balance —
+/// which is exactly what it did before this comment existed.
+fn neutral_profile() -> CameraProfile {
+    use rawkit_engine::profile::{invert, XYZ_FROM_SRGB};
+    CameraProfile::from_color_matrix(invert(&XYZ_FROM_SRGB).expect("sRGB primaries are invertible"))
+}
 
 /// Render a flat frame of one scene-linear value and return the developed
 /// result at its centre.
@@ -30,7 +43,7 @@ fn develop(gpu: &Gpu, renderer: &Renderer, value: f32, state: &EditState) -> [f3
                 height: N,
                 phase: BayerPhase::Rggb,
                 as_shot_wb: [1.0, 1.0, 1.0],
-                cam_to_display: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                profile: neutral_profile(),
             },
             state,
             Output::Display,
@@ -156,7 +169,7 @@ fn white_balance_multiplies_channels_independently() {
                 height: N,
                 phase: BayerPhase::Rggb,
                 as_shot_wb: wb,
-                cam_to_display: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                profile: neutral_profile(),
             },
             &EditState::default(),
             Output::Display,
@@ -177,34 +190,79 @@ fn white_balance_multiplies_channels_independently() {
 
 #[test]
 #[ignore = "requires a GPU adapter"]
-fn an_unsupported_edit_is_refused_not_approximated() {
-    // Temperature and tint need the camera profile to become multipliers. Until
-    // that exists, a slider that silently does nothing is worse than one that
-    // reports itself unimplemented — the user cannot tell the difference between
-    // "no effect" and "broken".
+fn setting_a_temperature_warms_or_cools_the_render() {
+    // The white-balance slider, end to end: an explicit temperature now becomes
+    // multipliers through the profile instead of being refused. Direction is the
+    // thing to pin — a slider that works perfectly and backwards is a real
+    // failure mode, and no test of the maths alone would catch the wiring being
+    // reversed between EditState and the kernel.
     let gpu = Gpu::new().expect("no usable GPU adapter");
     let renderer = Renderer::new(&gpu);
+    let profile = CameraProfile::from_color_matrix([
+        [0.6941, -0.2164, -0.0644],
+        [-0.3850, 1.1349, 0.2779],
+        [-0.0031, 0.1055, 0.6511],
+    ]);
+
     let cfa = vec![0.2f32; (N * N) as usize];
+    let render_at = |kelvin: f32| {
+        let mut state = EditState::default();
+        state.white_balance.temperature_k = Some(kelvin);
+        let out = renderer
+            .run(
+                &gpu,
+                &Frame {
+                    data: &cfa,
+                    width: N,
+                    height: N,
+                    phase: BayerPhase::Rggb,
+                    as_shot_wb: [1.0, 1.0, 1.0],
+                    profile: profile.clone(),
+                },
+                &state,
+                Output::Display,
+            )
+            .expect("render failed");
+        let i = ((N / 2 * N + N / 2) * 4) as usize;
+        [out[i], out[i + 1], out[i + 2]]
+    };
+
+    let cool = render_at(3000.0);
+    let warm = render_at(9000.0);
+    assert!(
+        warm[0] / warm[2] > cool[0] / cool[2],
+        "raising the stated temperature did not warm the image: \
+         3000K gave {cool:?}, 9000K gave {warm:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn as_shot_reports_a_plausible_temperature() {
+    // "As Shot 5200 K" is a label the UI has to produce from multipliers, and
+    // the render uses the same conversion to pick its matrix. Checking it here
+    // means the number shown to a user and the number used to render cannot
+    // drift apart.
+    let profile = CameraProfile::from_color_matrix([
+        [0.6941, -0.2164, -0.0644],
+        [-0.3850, 1.1349, 0.2779],
+        [-0.0031, 0.1055, 0.6511],
+    ]);
+    let cfa = vec![0.2f32; (N * N) as usize];
+    // The real ILCE-6400 sample's as-shot multipliers.
     let frame = Frame {
         data: &cfa,
         width: N,
         height: N,
         phase: BayerPhase::Rggb,
-        as_shot_wb: [1.0, 1.0, 1.0],
-        cam_to_display: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        as_shot_wb: [2.750, 1.0, 1.695],
+        profile,
     };
-
-    let mut state = EditState::default();
-    state.white_balance.temperature_k = Some(5200.0);
-    let err = renderer
-        .run(&gpu, &frame, &state, Output::Display)
-        .expect_err("an explicit temperature must be refused");
+    let (temperature, tint) = frame.as_shot_temperature();
+    println!("as-shot: {temperature:.0} K, tint {tint:.1}");
     assert!(
-        err.to_string().contains("not implemented"),
-        "wrong error for an unimplemented edit: {err}"
+        (2000.0..12000.0).contains(&temperature),
+        "as-shot temperature {temperature} K is not a temperature a camera would report"
     );
-
-    let mut state = EditState::default();
-    state.white_balance.tint = 10.0;
-    assert!(renderer.run(&gpu, &frame, &state, Output::Display).is_err());
+    assert!(tint.abs() < 60.0, "implausible as-shot tint {tint}");
 }

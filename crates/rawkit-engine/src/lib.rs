@@ -24,9 +24,11 @@
 use rawkit_editstate::EditState;
 
 pub mod pipeline;
+pub mod profile;
 pub mod render;
 
 pub use pipeline::{Domain, Stage};
+pub use profile::CameraProfile;
 pub use render::{normalise, BayerPhase, Frame, Output, Renderer};
 
 /// Failures the engine can produce that are not programmer error.

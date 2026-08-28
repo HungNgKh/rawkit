@@ -50,13 +50,22 @@ the start rather than a later disentangling.
 ## Build
 
 ```sh
-cargo test --workspace          # unit tests, no GPU required
-cargo test --workspace -- --ignored   # GPU-backed tests, needs a real adapter
-cargo run -p rawkit-cli -- stages     # print the render pipeline
-cargo run -p rawkit-cli -- gpu        # which backend would render here
-cargo run -p rawkit-cli -- schema     # EditState JSON Schema
-cargo deny check                # licence + advisory audit (cargo install cargo-deny)
+cargo test --workspace                     # unit tests, no GPU required
+cargo test -p rawkit-engine -- --ignored   # GPU-backed tests, needs an adapter
+cargo run -p rawkit-cli -- stages          # print the render pipeline
+cargo run -p rawkit-cli -- gpu             # which backend would render here
+cargo run -p rawkit-cli -- schema          # EditState JSON Schema
+cargo deny check                           # licence audit (cargo install cargo-deny)
+
+# A RAW file to a viewable image, end to end. A diagnostic, not a render:
+# no DCP profile, no output ICC transform. See the command's docs.
+cargo run --release -p rawkit-cli -- render photo.ARW -o out.ppm
 ```
+
+The decode tests want a RAW file, which is large and not redistributable, so
+they read from `~/rawkit-fixtures` (or `$RAWKIT_FIXTURES`) and fail loudly when
+it is empty rather than passing quietly. CI does not run them; it runs the
+golden tests instead, which generate their input from a formula.
 
 The toolchain is pinned in `rust-toolchain.toml` so all three CI runners compile
 with the identical compiler.

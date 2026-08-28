@@ -28,24 +28,31 @@
 //! at the picture is not a reference.
 
 use rawkit_editstate::EditState;
-use rawkit_engine::{BayerPhase, Frame, Gpu, Output, Renderer};
+use rawkit_engine::{BayerPhase, CameraProfile, Frame, Gpu, Output, Renderer};
 use std::path::PathBuf;
 
 const N: u32 = 96;
 
 /// How far a channel may differ from the reference, in 16-bit units.
 ///
-/// The maths in these kernels is add, multiply, divide, min/max and mix — all
-/// IEEE-exact, with no transcendentals and no fast-math — so identical results
-/// across vendors are plausible, and the tolerance exists for the cases where
-/// that expectation is wrong rather than as an allowance for sloppiness.
+/// **Measured, not guessed.** The first CI run across three platforms, against
+/// references blessed on Linux/Vulkan/AMD RADV:
 ///
-/// 24 / 65535 is roughly 4 parts in 10,000: far below anything visible, and far
-/// above last-bit rounding. Loosening this is a reviewable change and wants a
-/// reason recorded next to it. Every run prints the actual worst difference and
-/// a hash of the output, so the CI logs of three platforms answer "are these
-/// bit-identical?" for free.
-const TOLERANCE: u16 = 24;
+/// | Platform | Backend | Adapter | Worst |
+/// |---|---|---|---|
+/// | macOS | Metal | Apple Paravirtual | 1 |
+/// | Windows | Dx12 | Microsoft Basic Render Driver (WARP, software) | 1 |
+///
+/// So the expectation that these kernels — add, multiply, divide, min/max and
+/// mix, no transcendentals, no fast-math — would be *bit*-identical across
+/// vendors was wrong: the hashes differ. They agree to one part in 65535, which
+/// is last-bit rounding and about four orders of magnitude below visible.
+///
+/// 8 leaves eight times the observed headroom while staying sensitive enough to
+/// catch a real algorithmic difference. Loosening it is a reviewable change and
+/// wants a reason recorded here; the printed hashes and worst-difference lines
+/// are what such a reason would be built from.
+const TOLERANCE: u16 = 8;
 
 struct Case {
     name: &'static str,
@@ -193,14 +200,16 @@ fn renders_match_the_committed_references() {
                     height: N,
                     phase: case.phase,
                     as_shot_wb: [1.9, 1.0, 1.4],
-                    // A plausible camera-ish matrix rather than the identity, so
-                    // the reference would catch the profile stage silently
-                    // becoming a no-op.
-                    cam_to_display: [
-                        [1.71, -0.62, -0.09],
-                        [-0.18, 1.34, -0.16],
-                        [0.02, -0.32, 1.30],
-                    ],
+                    // A real camera's matrix rather than the identity, so a
+                    // reference would catch the profile stage silently becoming
+                    // a no-op. These are the decoder's numbers for an
+                    // ILCE-6400: XYZ to camera, which is the direction a
+                    // profile stores.
+                    profile: CameraProfile::from_color_matrix([
+                        [0.6941, -0.2164, -0.0644],
+                        [-0.3850, 1.1349, 0.2779],
+                        [-0.0031, 0.1055, 0.6511],
+                    ]),
                 },
                 &(case.state)(),
                 Output::Display,

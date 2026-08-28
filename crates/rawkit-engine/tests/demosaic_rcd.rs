@@ -22,7 +22,7 @@
 //! GPU-gated like the rest: `cargo test -- --ignored`.
 
 use rawkit_editstate::EditState;
-use rawkit_engine::{BayerPhase, Frame, Gpu, Output, Renderer};
+use rawkit_engine::{BayerPhase, CameraProfile, Frame, Gpu, Output, Renderer};
 
 const W: u32 = 256;
 const H: u32 = 256;
@@ -84,7 +84,7 @@ fn frame<'a>(cfa: &'a [f32], w: u32, h: u32, phase: BayerPhase) -> Frame<'a> {
         height: h,
         phase,
         as_shot_wb: [1.0, 1.0, 1.0],
-        cam_to_display: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        profile: CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
     }
 }
 

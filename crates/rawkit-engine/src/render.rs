@@ -30,6 +30,7 @@
 //! not allocate; the remaining per-call allocation is the next thing to lift out
 //! when there is a canvas to keep state for.
 
+use crate::profile::{CameraProfile, Matrix3};
 use crate::{EngineError, Gpu};
 use rawkit_editstate::EditState;
 use wgpu::util::DeviceExt;
@@ -92,33 +93,54 @@ pub struct Frame<'a> {
     pub phase: BayerPhase,
     /// As-shot white balance as per-channel multipliers, green-referenced.
     pub as_shot_wb: [f32; 3],
-    /// Camera-native RGB to the display's linear primaries. Identity is
-    /// acceptable and means "no profile for this body"; the result then carries
-    /// a strong cast, which is honest rather than hidden.
-    pub cam_to_display: [[f32; 3]; 3],
+    /// How this sensor sees colour. Carried rather than a bare matrix so that
+    /// the renderer can ask it for the transform *at the chosen temperature* —
+    /// which is the whole reason a profile is a profile and not a constant.
+    pub profile: CameraProfile,
 }
 
 impl Frame<'_> {
-    /// The white balance this frame renders with, given an edit.
+    /// The white balance and colour transform this frame renders with, given an
+    /// edit.
     ///
-    /// `None` means as-shot, which is the only mode the renderer honours today.
-    /// An explicit temperature needs the camera profile to turn Kelvin into
-    /// multipliers, so it is refused rather than quietly rendered as-shot: a
-    /// slider that appears to do nothing is worse than one that says so.
-    fn white_balance(&self, state: &EditState) -> Result<[f32; 3], EngineError> {
-        if state.white_balance.temperature_k.is_some() || state.white_balance.tint != 0.0 {
-            return Err(EngineError::Unsupported(
-                "explicit white balance needs the camera profile, which is not \
-                 implemented yet - leave temperature as-shot and tint at 0",
-            ));
-        }
-        let g = self.as_shot_wb[1];
-        if g <= 0.0 {
-            return Err(EngineError::DeviceRequest(
-                "as-shot white balance has no green multiplier".into(),
-            ));
-        }
-        Ok([self.as_shot_wb[0] / g, 1.0, self.as_shot_wb[2] / g])
+    /// The two come back together because they are one decision. The matrix has
+    /// to be the one for *this* illuminant, and the multipliers have to be the
+    /// ones that neutralise it; computing them apart is how an image ends up
+    /// with a cast that looks like a white-balance error and is not one.
+    fn colour(&self, state: &EditState) -> Result<([f32; 3], Matrix3), EngineError> {
+        let (multipliers, temperature) = match state.white_balance.temperature_k {
+            Some(temperature) => (
+                self.profile
+                    .multipliers_for(temperature, state.white_balance.tint),
+                temperature,
+            ),
+            None => {
+                let g = self.as_shot_wb[1];
+                if g <= 0.0 {
+                    return Err(EngineError::DeviceRequest(
+                        "as-shot white balance has no green multiplier".into(),
+                    ));
+                }
+                let as_shot = [self.as_shot_wb[0] / g, 1.0, self.as_shot_wb[2] / g];
+                // As-shot still needs a temperature, because the matrix depends
+                // on one. Recovering it from the multipliers is exactly the
+                // conversion a UI needs to display "As Shot 5200 K", so the same
+                // path serves both and cannot disagree with itself.
+                let (temperature, _) = self.profile.temperature_from_multipliers(as_shot);
+                (as_shot, temperature)
+            }
+        };
+        Ok((multipliers, self.profile.camera_to_display(temperature)))
+    }
+
+    /// The temperature and tint this frame was shot at, for a UI to display.
+    pub fn as_shot_temperature(&self) -> (f32, f32) {
+        let g = self.as_shot_wb[1].max(1e-6);
+        self.profile.temperature_from_multipliers([
+            self.as_shot_wb[0] / g,
+            1.0,
+            self.as_shot_wb[2] / g,
+        ])
     }
 }
 
@@ -318,8 +340,7 @@ impl Renderer {
         // Green normalised to 1.0. The demosaic kernel estimates green at red
         // and blue sites from unscaled CFA values, so any other normalisation
         // would mix scaled and unscaled greens in the same subtraction.
-        let wb = image.white_balance(state)?;
-        let m = image.cam_to_display;
+        let (wb, m) = image.colour(state)?;
         let params = Params {
             width: padded,
             height: padded,

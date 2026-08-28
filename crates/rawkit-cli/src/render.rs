@@ -23,16 +23,8 @@
 
 use anyhow::{bail, Context, Result};
 use rawkit_editstate::EditState;
-use rawkit_engine::{normalise, BayerPhase, Frame, Gpu, Output, Renderer};
+use rawkit_engine::{normalise, BayerPhase, CameraProfile, Frame, Gpu, Output, Renderer};
 use std::path::Path;
-
-/// sRGB primaries to CIE XYZ (D65). The decoder's camera matrix is the other
-/// direction — XYZ to camera — so the two get composed and inverted below.
-const XYZ_RGB: [[f32; 3]; 3] = [
-    [0.412453, 0.357580, 0.180423],
-    [0.212671, 0.715160, 0.072169],
-    [0.019334, 0.119193, 0.950227],
-];
 
 pub fn render(input: &Path, output: &Path, max_dim: u32, tile: u32) -> Result<()> {
     let raw = rawkit_decode::decode_file(input)
@@ -64,14 +56,19 @@ pub fn render(input: &Path, output: &Path, max_dim: u32, tile: u32) -> Result<()
         );
     }
 
-    let matrix = camera_to_srgb(&raw.cam_to_xyz);
-    match matrix {
-        Some(_) => eprintln!("colour     : camera matrix from the decoder table (no DCP)"),
-        None => eprintln!(
-            "colour     : NONE — no camera matrix for this body; \
-             the image will be strongly cast"
-        ),
-    }
+    let profile = match single_illuminant_profile(&raw.cam_to_xyz) {
+        Some(p) => {
+            eprintln!("colour     : decoder camera matrix, single illuminant (no DCP)");
+            p
+        }
+        None => {
+            eprintln!(
+                "colour     : NONE — no camera matrix for this body; \
+                 the image will be strongly cast"
+            );
+            CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY)
+        }
+    };
 
     let gpu = Gpu::new()?;
     eprintln!(
@@ -85,23 +82,21 @@ pub fn render(input: &Path, output: &Path, max_dim: u32, tile: u32) -> Result<()
     // makes it a baseline worth looking at.
     let state = EditState::default();
     let renderer = Renderer::with_tile_size(&gpu, tile);
-    let rgba = renderer.run(
-        &gpu,
-        &Frame {
-            data: &mosaic,
-            width: raw.width,
-            height: raw.height,
-            phase,
-            as_shot_wb: [
-                raw.as_shot_neutral[0],
-                raw.as_shot_neutral[1],
-                raw.as_shot_neutral[2],
-            ],
-            cam_to_display: matrix.unwrap_or(IDENTITY),
-        },
-        &state,
-        Output::Display,
-    )?;
+    let frame = Frame {
+        data: &mosaic,
+        width: raw.width,
+        height: raw.height,
+        phase,
+        as_shot_wb: [
+            raw.as_shot_neutral[0],
+            raw.as_shot_neutral[1],
+            raw.as_shot_neutral[2],
+        ],
+        profile,
+    };
+    let (temperature, tint) = frame.as_shot_temperature();
+    eprintln!("as-shot    : {temperature:.0} K, tint {tint:+.0}");
+    let rgba = renderer.run(&gpu, &frame, &state, Output::Display)?;
 
     let step = downsample_step(raw.width, raw.height, max_dim);
     write_ppm(output, &rgba, raw.width, raw.height, step)?;
@@ -114,59 +109,23 @@ pub fn render(input: &Path, output: &Path, max_dim: u32, tile: u32) -> Result<()
     Ok(())
 }
 
-/// Compose the decoder's XYZ-to-camera matrix with sRGB's primaries and invert,
-/// giving camera to sRGB.
+/// Build a profile from the decoder's camera table.
 ///
-/// The row normalisation is what makes a neutral subject come out neutral: it
-/// forces each camera channel's row to sum to one, so equal camera RGB (after
-/// white balance) maps to equal sRGB. Skip it and every image carries a cast
-/// that looks like a white-balance error and is not one.
-fn camera_to_srgb(cam_xyz: &[[f32; 3]; 4]) -> Option<[[f32; 3]; 3]> {
+/// The table gives one XYZ-to-camera matrix, which the profile treats as a D65
+/// characterisation. That is a real limitation and not a placeholder to be
+/// embarrassed about: a single illuminant means a tungsten scene is rendered
+/// with a daylight characterisation, which is defensible but not accurate. Two
+/// illuminants need a `.dcp`.
+///
+/// LibRaw pads its matrix to four rows for four-colour sensors; we take the
+/// three that describe an RGB camera.
+fn single_illuminant_profile(cam_xyz: &[[f32; 3]; 4]) -> Option<CameraProfile> {
     if cam_xyz.iter().flatten().all(|&v| v == 0.0) {
         return None;
     }
-
-    let mut cam_rgb = [[0.0f32; 3]; 3];
-    for (i, row) in cam_rgb.iter_mut().enumerate() {
-        for (j, cell) in row.iter_mut().enumerate() {
-            *cell = (0..3).map(|k| cam_xyz[i][k] * XYZ_RGB[k][j]).sum();
-        }
-        let sum: f32 = row.iter().sum();
-        if sum.abs() < 1e-6 {
-            return None;
-        }
-        for cell in row.iter_mut() {
-            *cell /= sum;
-        }
-    }
-    invert3(&cam_rgb)
-}
-
-fn invert3(m: &[[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
-    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-    if det.abs() < 1e-9 {
-        return None;
-    }
-    let inv_det = 1.0 / det;
-    Some([
-        [
-            (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det,
-            (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det,
-            (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det,
-        ],
-        [
-            (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det,
-            (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det,
-            (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv_det,
-        ],
-        [
-            (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det,
-            (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det,
-            (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det,
-        ],
-    ])
+    Some(CameraProfile::from_color_matrix([
+        cam_xyz[0], cam_xyz[1], cam_xyz[2],
+    ]))
 }
 
 /// The sRGB transfer function. Not a tone curve — see the module header.
@@ -186,10 +145,6 @@ fn downsample_step(width: u32, height: u32, max_dim: u32) -> u32 {
     let longest = width.max(height);
     (longest.div_ceil(max_dim)).max(1)
 }
-
-/// Used when the decoder has no matrix for this body: render camera-native and
-/// let the cast be obvious rather than inventing a plausible-looking one.
-const IDENTITY: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
 fn write_ppm(path: &Path, rgba: &[f32], width: u32, height: u32, step: u32) -> Result<()> {
     let out_w = width / step;
