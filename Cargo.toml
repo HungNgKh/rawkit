@@ -6,6 +6,7 @@ members = [
     "crates/rawkit-engine",
     "crates/rawkit-catalog",
     "crates/rawkit-export",
+    "crates/rawkit-session",
     "crates/rawkit-cli",
 ]
 
@@ -30,6 +31,7 @@ rawkit-decode = { path = "crates/rawkit-decode", version = "0.0.1" }
 rawkit-engine = { path = "crates/rawkit-engine", version = "0.0.1" }
 rawkit-catalog = { path = "crates/rawkit-catalog", version = "0.0.1" }
 rawkit-export = { path = "crates/rawkit-export", version = "0.0.1" }
+rawkit-session = { path = "crates/rawkit-session", version = "0.0.1" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

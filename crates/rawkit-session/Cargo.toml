@@ -1,0 +1,24 @@
+[package]
+name = "rawkit-session"
+description = "The command bus: an interactive editing session as a pure state machine. Decides what to render; never touches pixels."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Deliberately *not* depending on rawkit-engine. This crate decides what needs
+# rendering; it must not be able to render. Keeping wgpu out is what makes the
+# "no pixels on the bus" rule structural rather than a convention — and it means
+# the whole bus is testable on a machine with no GPU.
+[dependencies]
+rawkit-editstate.workspace = true
+serde.workspace = true
+
+# The engine is a *dev*-dependency only. Tests may check that the two crates
+# agree on a constant; the library still cannot render, because a dev-dependency
+# is not part of what ships.
+[dev-dependencies]
+serde_json.workspace = true
+rawkit-engine.workspace = true

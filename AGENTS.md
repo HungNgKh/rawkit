@@ -44,6 +44,12 @@ and say so rather than working around it.
 8. **v1 makes no network calls**, ships no telemetry, and contains no AI. Do not
    add a dependency that phones home, and do not add an AI crate to this
    workspace — v2 consumes `EditState` through the public API from outside it.
+9. **No pixels cross the command bus.** The UI sends intent and subscribes to
+   state; the engine owns the canvas and renders into a surface. Routing frames
+   through the webview works on a small preview and fails at full resolution, so
+   the failure arrives late and looks like "the app got slow". `rawkit-session`
+   holds no pixel type and no GPU handle — if you find yourself wanting to add
+   one, that is the invariant, not an obstacle to it.
 
 ## Dependencies
 

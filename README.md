@@ -41,6 +41,7 @@ by operating system is not a look. Golden render tests run on all three in CI.
 | `rawkit-engine` | `EditState` → pixels. Pipeline stage order, WGSL kernels, wgpu device |
 | `rawkit-catalog` | SQLite schema, forward-only migrations, volume identity |
 | `rawkit-export` | Pixels to a colour-managed file. The only crate that knows about image formats |
+| `rawkit-session` | The command bus. An editing session as a pure state machine: decides which tiles need rendering, and holds no pixels so it cannot send any |
 | `rawkit-cli` | Headless entry point for CI, the golden harness and scripting |
 
 **The v2 AI is deliberately not in this workspace.** It consumes `EditState`
