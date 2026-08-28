@@ -1,8 +1,16 @@
-//! RCD demosaic on the GPU — pipeline stage B.
+//! The render: a decoded frame plus an `EditState`, in; pixels, out.
 //!
-//! The kernel is `shaders/demosaic_rcd.wgsl`, ported from vkdt (BSD-2-Clause);
-//! that file carries the provenance and the two assumptions the port makes.
-//! This module is the plumbing: buffers in, five dispatches, pixels out.
+//! Covers pipeline stages B through H — demosaic, white balance, camera
+//! profile, exposure, tone map. The kernels are in
+//! `shaders/demosaic_rcd.wgsl`; the RCD half is ported from vkdt (BSD-2-Clause)
+//! and that file carries the provenance. This module is the plumbing: buffers
+//! in, six dispatches per tile, pixels out.
+//!
+//! The signature is the architecture's central claim written as a function.
+//! Everything the camera contributes is in [`Frame`]; everything the user
+//! contributes is in `EditState`; nothing else influences the result. That is
+//! what makes "same RAW + same EditState -> same pixels" checkable rather than
+//! aspirational.
 //!
 //! # Tiling
 //!
@@ -23,6 +31,7 @@
 //! when there is a canvas to keep state for.
 
 use crate::{EngineError, Gpu};
+use rawkit_editstate::EditState;
 use wgpu::util::DeviceExt;
 
 /// Which colour sits at pixel (0,0). Bayer only: RCD is a Bayer algorithm, and
@@ -65,19 +74,52 @@ impl BayerPhase {
     }
 }
 
-/// One mosaiced image to demosaic.
+/// One decoded frame, ready to render: the mosaic plus what the sensor knows
+/// about its own colour.
 ///
 /// `data` is one sample per photosite, row-major, black-subtracted and scaled
-/// however the caller likes — RCD only cares about ratios, so the unit is the
-/// caller's business.
-pub struct Mosaic<'a> {
+/// to roughly [0, 1]. Values above 1 are expected and preserved, because a
+/// clipped channel is information the highlight stage will need.
+///
+/// This is deliberately *not* an `EditState`. The frame is what the camera
+/// recorded and cannot be edited; the `EditState` is what the user decided.
+/// Keeping them apart is what makes "same RAW + same EditState -> same pixels"
+/// a statement with two independent halves.
+pub struct Frame<'a> {
     pub data: &'a [f32],
     pub width: u32,
     pub height: u32,
     pub phase: BayerPhase,
-    /// Per-channel white balance. Normalised internally so green is 1.0, which
-    /// the kernel depends on.
-    pub wb: [f32; 3],
+    /// As-shot white balance as per-channel multipliers, green-referenced.
+    pub as_shot_wb: [f32; 3],
+    /// Camera-native RGB to the display's linear primaries. Identity is
+    /// acceptable and means "no profile for this body"; the result then carries
+    /// a strong cast, which is honest rather than hidden.
+    pub cam_to_display: [[f32; 3]; 3],
+}
+
+impl Frame<'_> {
+    /// The white balance this frame renders with, given an edit.
+    ///
+    /// `None` means as-shot, which is the only mode the renderer honours today.
+    /// An explicit temperature needs the camera profile to turn Kelvin into
+    /// multipliers, so it is refused rather than quietly rendered as-shot: a
+    /// slider that appears to do nothing is worse than one that says so.
+    fn white_balance(&self, state: &EditState) -> Result<[f32; 3], EngineError> {
+        if state.white_balance.temperature_k.is_some() || state.white_balance.tint != 0.0 {
+            return Err(EngineError::Unsupported(
+                "explicit white balance needs the camera profile, which is not \
+                 implemented yet - leave temperature as-shot and tint at 0",
+            ));
+        }
+        let g = self.as_shot_wb[1];
+        if g <= 0.0 {
+            return Err(EngineError::DeviceRequest(
+                "as-shot white balance has no green multiplier".into(),
+            ));
+        }
+        Ok([self.as_shot_wb[0] / g, 1.0, self.as_shot_wb[2] / g])
+    }
 }
 
 #[repr(C)]
@@ -90,9 +132,36 @@ struct Params {
     cfa_y_offset: u32,
     _pad: [u32; 3],
     wb: [f32; 4],
+    cam_to_display: [[f32; 4]; 3],
+    develop: [f32; 4],
 }
 
-const STAGES: [&str; 5] = ["conv", "green_at_rb", "rb_at_br", "rb_at_g", "pack"];
+/// What the caller wants back.
+///
+/// Not two code paths: both run the same kernels in the same order, and
+/// `Display` simply runs one stage more. The distinction is real product
+/// behaviour rather than test scaffolding — a 16-bit linear export for a
+/// specialist denoiser wants the scene-linear result, and so does the golden
+/// harness, which should not be measuring the tone map when it means to be
+/// measuring the demosaic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Output {
+    /// Camera-native, demosaiced, scene-linear. No white balance, no profile,
+    /// no tone map.
+    SceneLinear,
+    /// White balanced, profiled, exposed and tone mapped. Display-referred
+    /// **linear** — the transfer function belongs to the output transform.
+    Display,
+}
+
+const STAGES: [&str; 6] = [
+    "conv",
+    "green_at_rb",
+    "rb_at_br",
+    "rb_at_g",
+    "pack",
+    "develop",
+];
 
 /// How far outside a tile the kernel reaches, in pixels.
 ///
@@ -118,13 +187,13 @@ pub const DEFAULT_TILE: u32 = 512;
 
 /// Compiled RCD pipelines. Build once, reuse — shader compilation is far too
 /// slow to sit on a render path.
-pub struct Demosaic {
+pub struct Renderer {
     layout: wgpu::BindGroupLayout,
     pipelines: Vec<wgpu::ComputePipeline>,
     tile: u32,
 }
 
-impl Demosaic {
+impl Renderer {
     pub fn new(gpu: &Gpu) -> Self {
         Self::with_tile_size(gpu, DEFAULT_TILE)
     }
@@ -221,7 +290,14 @@ impl Demosaic {
     /// mirroring, which would flip CFA parity. Crop before showing the result.
     /// Tile seams are not in that category — they are exact, and a test asserts
     /// it.
-    pub fn run(&self, gpu: &Gpu, image: &Mosaic<'_>) -> Result<Vec<f32>, EngineError> {
+    pub fn run(
+        &self,
+        gpu: &Gpu,
+        image: &Frame<'_>,
+        state: &EditState,
+        intent: Output,
+    ) -> Result<Vec<f32>, EngineError> {
+        state.validate()?;
         let (w, h) = (image.width as usize, image.height as usize);
         if image.data.len() != w * h {
             return Err(EngineError::DeviceRequest(format!(
@@ -239,10 +315,11 @@ impl Demosaic {
         // border and removes a whole class of index bug.
         let padded = self.tile + 2 * HALO;
         let (dx, dy) = image.phase.offset();
-        // Green normalised to 1.0. The kernel estimates green at red and blue
-        // sites from unscaled CFA values, so any other normalisation would mix
-        // scaled and unscaled greens in the same subtraction.
-        let g = image.wb[1];
+        // Green normalised to 1.0. The demosaic kernel estimates green at red
+        // and blue sites from unscaled CFA values, so any other normalisation
+        // would mix scaled and unscaled greens in the same subtraction.
+        let wb = image.white_balance(state)?;
+        let m = image.cam_to_display;
         let params = Params {
             width: padded,
             height: padded,
@@ -250,7 +327,13 @@ impl Demosaic {
             cfa_x_offset: dx,
             cfa_y_offset: dy,
             _pad: [0; 3],
-            wb: [image.wb[0] / g, 1.0, image.wb[2] / g, 1.0],
+            wb: [wb[0], wb[1], wb[2], 1.0],
+            cam_to_display: [
+                [m[0][0], m[0][1], m[0][2], 0.0],
+                [m[1][0], m[1][1], m[1][2], 0.0],
+                [m[2][0], m[2][1], m[2][2], 0.0],
+            ],
+            develop: [crate::exposure_multiplier(state), 0.0, 0.0, 0.0],
         };
 
         let device = &gpu.device;
@@ -325,7 +408,11 @@ impl Demosaic {
                     // barriers: each reads what the previous one wrote, so they
                     // cannot be merged without reintroducing the
                     // workgroup-memory version.
-                    for (pipeline, stage) in self.pipelines.iter().zip(STAGES) {
+                    let stages = match intent {
+                        Output::SceneLinear => &self.pipelines[..STAGES.len() - 1],
+                        Output::Display => &self.pipelines[..],
+                    };
+                    for (pipeline, stage) in stages.iter().zip(STAGES) {
                         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                             label: Some(stage),
                             timestamp_writes: None,
@@ -377,7 +464,7 @@ impl Demosaic {
 /// Clamping here has to match what the shader does when it reads out of bounds,
 /// or the tiled result would differ from an untiled one along the image border.
 /// Both clamp to the nearest edge pixel.
-fn gather_padded(image: &Mosaic<'_>, ox: u32, oy: u32, padded: u32, out: &mut [f32]) {
+fn gather_padded(image: &Frame<'_>, ox: u32, oy: u32, padded: u32, out: &mut [f32]) {
     let w = image.width as i64;
     let h = image.height as i64;
     for py in 0..padded as i64 {

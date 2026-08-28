@@ -23,11 +23,11 @@
 
 use rawkit_editstate::EditState;
 
-pub mod demosaic;
 pub mod pipeline;
+pub mod render;
 
-pub use demosaic::{normalise, BayerPhase, Demosaic, Mosaic};
 pub use pipeline::{Domain, Stage};
+pub use render::{normalise, BayerPhase, Frame, Output, Renderer};
 
 /// Failures the engine can produce that are not programmer error.
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +36,12 @@ pub enum EngineError {
     NoAdapter,
     #[error("GPU device request refused: {0}")]
     DeviceRequest(String),
+    /// An edit the renderer understands but cannot honour yet. Distinct from a
+    /// malformed edit: the parameters are valid, the code is missing.
+    #[error("not implemented: {0}")]
+    Unsupported(&'static str),
+    #[error(transparent)]
+    EditState(#[from] rawkit_editstate::EditStateError),
 }
 
 /// An initialised GPU device and queue.

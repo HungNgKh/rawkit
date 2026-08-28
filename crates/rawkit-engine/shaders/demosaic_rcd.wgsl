@@ -53,6 +53,12 @@ struct Params {
     _pad2: u32,
     // Per-channel multipliers, green normalised to 1.0. `.a` is unused.
     wb: vec4<f32>,
+    // Camera-native RGB to the display's linear primaries, one row per vec4 so
+    // the uniform stays std140-friendly. `.w` is unused.
+    cam_to_display: array<vec4<f32>, 3>,
+    // `.x` is the exposure multiplier (2^EV). The rest is reserved so adding a
+    // scalar does not shuffle the whole uniform.
+    develop: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -389,4 +395,71 @@ fn pack(@builtin(global_invocation_id) gid: vec3<u32>) {
         ch_b[p] / params.wb.b,
         1.0,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Stage 6 — develop: white balance, camera profile, exposure, tone map.
+//
+// Runs on the same tile, in the same dispatch chain, reading the demosaiced
+// pixels in place. Keeping it here rather than on the CPU is not an
+// optimisation: it is what makes preview and export share the arithmetic, and
+// what will let the interactive canvas re-render a tile when a slider moves
+// without touching the demosaic again.
+//
+// The pipeline order is `Stage`'s order, not a convenient one:
+//   white balance (D) -> camera profile (E) -> exposure (F) -> tone map (H)
+// Exposure commutes with the matrix, so applying it after costs nothing and
+// keeps the code readable against the declared stage list.
+//
+// Output is display-referred **linear**, not encoded. The transfer function
+// belongs to the output transform (stage L), which is lcms2's job and is not
+// written yet; encoding here would bake sRGB into every consumer.
+// ---------------------------------------------------------------------------
+@compute @workgroup_size(8, 8)
+fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    if (x >= i32(params.width) || y >= i32(params.height)) {
+        return;
+    }
+    let p = idx(x, y);
+    let camera = rgba_out[p].rgb;
+
+    // White balance is a plain multiply because the working space is
+    // scene-linear. That is the payoff of the linear core, and the reason this
+    // is three multiplies rather than a colour-appearance model.
+    let balanced = camera * params.wb.rgb;
+
+    let display = vec3<f32>(
+        dot(params.cam_to_display[0].rgb, balanced),
+        dot(params.cam_to_display[1].rgb, balanced),
+        dot(params.cam_to_display[2].rgb, balanced),
+    );
+
+    let exposed = display * params.develop.x;
+    rgba_out[p] = vec4<f32>(tone_map(exposed), 1.0);
+}
+
+/// Fixed sigmoid roll-off, applied per channel.
+///
+/// `y = x / (x + k)` with `k` chosen so that scene mid-grey (0.18) lands on
+/// display mid-grey (0.18): 0.18 = 0.18 / (0.18 + k) gives k = 0.82.
+///
+/// Three properties matter more than the exact curve:
+///
+/// - **It never clips.** y approaches 1 asymptotically, so a highlight three
+///   stops over full scale still carries detail instead of becoming a flat
+///   patch — and, more importantly, does not become a *coloured* flat patch
+///   when one channel saturates before the others.
+/// - **It is monotonic**, so it cannot invert local contrast.
+/// - **Mid-grey is fixed**, so exposure remains the control that moves
+///   brightness and the tone map is not secretly a second one.
+///
+/// This is the roll-off, not the look. A curve that *feels* like a photograph
+/// is a taste problem with its own iteration loop, and pretending otherwise by
+/// tuning constants here would bury it.
+fn tone_map(x: vec3<f32>) -> vec3<f32> {
+    let k = 0.82;
+    let clamped = max(x, vec3<f32>(0.0));
+    return clamped / (clamped + vec3<f32>(k));
 }

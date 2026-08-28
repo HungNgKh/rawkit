@@ -9,19 +9,21 @@
 //!
 //! It is **not** colour management, and the difference matters enough to name:
 //!
-//! - The camera matrix here comes from the decoder's built-in table, not from a
-//!   DCP profile. There is no forward matrix, no HSL look table and no
-//!   synthesised tone curve, so hue and saturation are approximate.
-//! - There is no tone map. The transfer function below is the plain sRGB curve,
-//!   which is not a rendering intent — highlights will feel abrupt compared to
-//!   any real editor, because nothing is rolling them off.
-//! - There is no output ICC transform. The result is sRGB by assertion.
+//! - The camera matrix comes from the decoder's built-in table, not from a DCP
+//!   profile. There is no forward matrix, no HSL look table and no synthesised
+//!   tone curve, so hue and saturation are approximate.
+//! - The tone map is a fixed sigmoid that rolls highlights off and pins
+//!   mid-grey. It is the roll-off, not a look — a curve that *feels* like a
+//!   photograph is a taste problem with its own iteration loop.
+//! - There is no output ICC transform. The sRGB encode below stands in for it,
+//!   so the result is sRGB by assertion rather than by conversion.
 //!
 //! Those three are separate P0 items. Until they land this command is a
 //! diagnostic, and the PPM it writes should not be judged as a render.
 
 use anyhow::{bail, Context, Result};
-use rawkit_engine::{normalise, BayerPhase, Demosaic, Gpu, Mosaic};
+use rawkit_editstate::EditState;
+use rawkit_engine::{normalise, BayerPhase, Frame, Gpu, Output, Renderer};
 use std::path::Path;
 
 /// sRGB primaries to CIE XYZ (D65). The decoder's camera matrix is the other
@@ -53,32 +55,14 @@ pub fn render(input: &Path, output: &Path, max_dim: u32, tile: u32) -> Result<()
         );
     };
 
-    // As-shot multipliers, green-referenced.
     let g = raw.as_shot_neutral[1];
-    if g <= 0.0 {
-        bail!("as-shot white balance has no green multiplier");
+    if g > 0.0 {
+        eprintln!(
+            "as-shot wb : [{:.3}, 1.0, {:.3}]",
+            raw.as_shot_neutral[0] / g,
+            raw.as_shot_neutral[2] / g
+        );
     }
-    let wb = [raw.as_shot_neutral[0] / g, 1.0, raw.as_shot_neutral[2] / g];
-    eprintln!("as-shot wb : [{:.3}, 1.0, {:.3}]", wb[0], wb[2]);
-
-    let gpu = Gpu::new()?;
-    eprintln!(
-        "gpu        : {} ({:?})",
-        gpu.adapter_info.name, gpu.adapter_info.backend
-    );
-
-    let mosaic = normalise(&raw);
-    let demosaic = Demosaic::with_tile_size(&gpu, tile);
-    let rgba = demosaic.run(
-        &gpu,
-        &Mosaic {
-            data: &mosaic,
-            width: raw.width,
-            height: raw.height,
-            phase,
-            wb,
-        },
-    )?;
 
     let matrix = camera_to_srgb(&raw.cam_to_xyz);
     match matrix {
@@ -89,8 +73,38 @@ pub fn render(input: &Path, output: &Path, max_dim: u32, tile: u32) -> Result<()
         ),
     }
 
+    let gpu = Gpu::new()?;
+    eprintln!(
+        "gpu        : {} ({:?})",
+        gpu.adapter_info.name, gpu.adapter_info.backend
+    );
+
+    let mosaic = normalise(&raw);
+    // The identity edit: no exposure change, as-shot white balance. Everything
+    // the renderer does to this frame comes from the frame itself, which is what
+    // makes it a baseline worth looking at.
+    let state = EditState::default();
+    let renderer = Renderer::with_tile_size(&gpu, tile);
+    let rgba = renderer.run(
+        &gpu,
+        &Frame {
+            data: &mosaic,
+            width: raw.width,
+            height: raw.height,
+            phase,
+            as_shot_wb: [
+                raw.as_shot_neutral[0],
+                raw.as_shot_neutral[1],
+                raw.as_shot_neutral[2],
+            ],
+            cam_to_display: matrix.unwrap_or(IDENTITY),
+        },
+        &state,
+        Output::Display,
+    )?;
+
     let step = downsample_step(raw.width, raw.height, max_dim);
-    write_ppm(output, &rgba, raw.width, raw.height, step, wb, matrix)?;
+    write_ppm(output, &rgba, raw.width, raw.height, step)?;
     eprintln!(
         "wrote      : {} ({}x{})",
         output.display(),
@@ -173,16 +187,11 @@ fn downsample_step(width: u32, height: u32, max_dim: u32) -> u32 {
     (longest.div_ceil(max_dim)).max(1)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_ppm(
-    path: &Path,
-    rgba: &[f32],
-    width: u32,
-    height: u32,
-    step: u32,
-    wb: [f32; 3],
-    matrix: Option<[[f32; 3]; 3]>,
-) -> Result<()> {
+/// Used when the decoder has no matrix for this body: render camera-native and
+/// let the cast be obvious rather than inventing a plausible-looking one.
+const IDENTITY: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+fn write_ppm(path: &Path, rgba: &[f32], width: u32, height: u32, step: u32) -> Result<()> {
     let out_w = width / step;
     let out_h = height / step;
     let mut buf = format!("P6\n{out_w} {out_h}\n255\n").into_bytes();
@@ -205,22 +214,12 @@ fn write_ppm(
                     n += 1.0;
                 }
             }
-            let linear = [acc[0] / n, acc[1] / n, acc[2] / n];
-
-            // White balance, then camera to sRGB. The demosaic divides its own
-            // internal multipliers back out, so this is the first place white
-            // balance is actually applied to the image.
-            let balanced = [linear[0] * wb[0], linear[1] * wb[1], linear[2] * wb[2]];
-            let srgb = match matrix {
-                Some(m) => [
-                    m[0][0] * balanced[0] + m[0][1] * balanced[1] + m[0][2] * balanced[2],
-                    m[1][0] * balanced[0] + m[1][1] * balanced[1] + m[1][2] * balanced[2],
-                    m[2][0] * balanced[0] + m[2][1] * balanced[1] + m[2][2] * balanced[2],
-                ],
-                None => balanced,
-            };
-            for c in srgb {
-                buf.push((encode_srgb(c) * 255.0).round() as u8);
+            // The engine hands back display-referred *linear* values: white
+            // balanced, profiled, exposed and tone mapped. All that is left is
+            // the transfer function, which is the output transform's job and
+            // lives here only until lcms2 does it properly.
+            for c in acc {
+                buf.push((encode_srgb(c / n) * 255.0).round() as u8);
             }
         }
     }

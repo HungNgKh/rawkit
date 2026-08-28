@@ -21,7 +21,8 @@
 //!
 //! GPU-gated like the rest: `cargo test -- --ignored`.
 
-use rawkit_engine::{BayerPhase, Demosaic, Gpu, Mosaic};
+use rawkit_editstate::EditState;
+use rawkit_engine::{BayerPhase, Frame, Gpu, Output, Renderer};
 
 const W: u32 = 256;
 const H: u32 = 256;
@@ -69,6 +70,22 @@ fn ground_truth() -> Vec<[f32; 3]> {
         }
     }
     img
+}
+
+/// A frame with no colour opinions: identity matrix, neutral white balance.
+///
+/// The demosaic tests are about interpolation, so anything that would tint the
+/// result is deliberately switched off — a PSNR that moved because the matrix
+/// changed would be measuring the wrong thing.
+fn frame<'a>(cfa: &'a [f32], w: u32, h: u32, phase: BayerPhase) -> Frame<'a> {
+    Frame {
+        data: cfa,
+        width: w,
+        height: h,
+        phase,
+        as_shot_wb: [1.0, 1.0, 1.0],
+        cam_to_display: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+    }
 }
 
 fn colour_at(x: u32, y: u32, phase: BayerPhase) -> usize {
@@ -167,20 +184,16 @@ fn write_ppm(path: &str, pixels: impl Fn(u32, u32) -> [f32; 3]) {
 #[ignore = "requires a GPU adapter"]
 fn rcd_reconstructs_better_than_a_direction_blind_baseline() {
     let gpu = Gpu::new().expect("no usable GPU adapter");
-    let demosaic = Demosaic::new(&gpu);
+    let renderer = Renderer::new(&gpu);
     let truth = ground_truth();
     let cfa = mosaic(&truth, BayerPhase::Rggb);
 
-    let rgba = demosaic
+    let rgba = renderer
         .run(
             &gpu,
-            &Mosaic {
-                data: &cfa,
-                width: W,
-                height: H,
-                phase: BayerPhase::Rggb,
-                wb: [1.0, 1.0, 1.0],
-            },
+            &frame(&cfa, W, H, BayerPhase::Rggb),
+            &EditState::default(),
+            Output::SceneLinear,
         )
         .expect("demosaic failed");
     assert_eq!(rgba.len(), (W * H * 4) as usize);
@@ -218,7 +231,7 @@ fn rcd_reconstructs_better_than_a_direction_blind_baseline() {
 #[ignore = "requires a GPU adapter"]
 fn every_bayer_phase_reconstructs_equally_well() {
     let gpu = Gpu::new().expect("no usable GPU adapter");
-    let demosaic = Demosaic::new(&gpu);
+    let renderer = Renderer::new(&gpu);
     let truth = ground_truth();
 
     let phases = [
@@ -231,16 +244,12 @@ fn every_bayer_phase_reconstructs_equally_well() {
         .iter()
         .map(|&phase| {
             let cfa = mosaic(&truth, phase);
-            let rgba = demosaic
+            let rgba = renderer
                 .run(
                     &gpu,
-                    &Mosaic {
-                        data: &cfa,
-                        width: W,
-                        height: H,
-                        phase,
-                        wb: [1.0, 1.0, 1.0],
-                    },
+                    &frame(&cfa, W, H, phase),
+                    &EditState::default(),
+                    Output::SceneLinear,
                 )
                 .expect("demosaic failed");
             let db = psnr(&truth, |x, y| {
@@ -277,20 +286,22 @@ fn tiling_does_not_change_a_single_pixel() {
     let gpu = Gpu::new().expect("no usable GPU adapter");
     let truth = ground_truth();
     let cfa = mosaic(&truth, BayerPhase::Rggb);
-    let image = || Mosaic {
-        data: &cfa,
-        width: W,
-        height: H,
-        phase: BayerPhase::Rggb,
-        wb: [1.0, 1.0, 1.0],
-    };
-
-    let whole = Demosaic::with_tile_size(&gpu, 512)
-        .run(&gpu, &image())
-        .expect("single-tile demosaic failed");
-    let tiled = Demosaic::with_tile_size(&gpu, 96)
-        .run(&gpu, &image())
-        .expect("tiled demosaic failed");
+    let whole = Renderer::with_tile_size(&gpu, 512)
+        .run(
+            &gpu,
+            &frame(&cfa, W, H, BayerPhase::Rggb),
+            &EditState::default(),
+            Output::SceneLinear,
+        )
+        .expect("single-tile render failed");
+    let tiled = Renderer::with_tile_size(&gpu, 96)
+        .run(
+            &gpu,
+            &frame(&cfa, W, H, BayerPhase::Rggb),
+            &EditState::default(),
+            Output::SceneLinear,
+        )
+        .expect("tiled render failed");
 
     assert_eq!(whole.len(), tiled.len());
     let mut worst = 0.0f32;
@@ -336,16 +347,12 @@ fn a_full_frame_renders_within_webgpu_default_limits() {
     // storage-binding cap that an untiled render would need.
     let (w, h) = (4000u32, 3000u32);
     let cfa = vec![0.25f32; (w * h) as usize];
-    let out = Demosaic::new(&gpu)
+    let out = Renderer::new(&gpu)
         .run(
             &gpu,
-            &Mosaic {
-                data: &cfa,
-                width: w,
-                height: h,
-                phase: BayerPhase::Rggb,
-                wb: [1.0, 1.0, 1.0],
-            },
+            &frame(&cfa, w, h, BayerPhase::Rggb),
+            &EditState::default(),
+            Output::SceneLinear,
         )
         .expect("a full frame must render on default limits");
 

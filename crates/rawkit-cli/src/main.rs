@@ -50,7 +50,7 @@ enum Command {
         max_dim: u32,
         /// Tile edge in pixels. Exposed for benchmarking and for proving that
         /// the choice does not change the output.
-        #[arg(long, default_value_t = rawkit_engine::demosaic::DEFAULT_TILE)]
+        #[arg(long, default_value_t = rawkit_engine::render::DEFAULT_TILE)]
         tile: u32,
     },
 
