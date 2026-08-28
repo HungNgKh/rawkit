@@ -69,7 +69,25 @@ once it is genuinely part of a build:
 
       The RCD algorithm is Luis Sanz Rodriguez's. darktable's and
       RawTherapee's implementations of it are GPL and were not consulted.
-  (planned) Little CMS (lcms2)-- MIT         ICC colour management on export.
+  Little CMS (lcms2)          -- MIT         Copyright (c) 2023 Marti Maria Saguer
+                                             https://littlecms.com
+
+      ICC colour management, statically linked. Version 2.19, vendored by the
+      lcms2-sys crate. Export converts through it and embeds the profile it
+      produces, so a file's pixels and its label come from one source.
+
+  jpeg-encoder                -- (MIT OR Apache-2.0) AND IJG
+                                             https://github.com/vstroebel/jpeg-encoder
+
+      This software is based in part on the work of the Independent JPEG Group.
+
+      That sentence is not decoration. It is the acknowledgement the IJG licence
+      requires of anything built on its code, and jpeg-encoder's forward DCT
+      descends from it.
+
+  png                         -- MIT / Apache-2.0
+                                             https://github.com/image-rs/image-png
+
   (planned) OpenColorIO       -- BSD-3-Clause LUT / look handling.
   (planned) Tauri             -- MIT/Apache-2.0  Desktop shell.
   (planned) wgpu              -- MIT/Apache-2.0  GPU abstraction (Vulkan/DX12/Metal).

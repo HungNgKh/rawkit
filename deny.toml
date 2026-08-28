@@ -33,19 +33,26 @@ allow = [
     "CC0-1.0",
     "Unicode-3.0",
     "Unlicense",
+    # Added 2026-08-29 for jpeg-encoder, whose forward DCT descends from the
+    # Independent JPEG Group's code. Permissive and FSF-recognised; its one real
+    # obligation is an acknowledgement in the documentation, which NOTICE
+    # carries. See docs/licence-policy.md.
+    "IJG",
 ]
 confidence-threshold = 0.93
 
 # Per-crate exceptions: a licence that is NOT acceptable project-wide, tolerated
-# in exactly one quarantined crate. Empty until the LibRaw binding lands, which
-# is the one planned entry:
+# in exactly one quarantined crate.
 #
-#   { name = "<libraw binding crate>", allow = ["CDDL-1.0"] }
+# Still empty, and *not* because nothing needs quarantining. LibRaw is CDDL and
+# is linked, but the `libraw-rs-sys` crate declares MIT/Apache-2.0 for its own
+# binding code, so cargo-deny never sees the CDDL at all — the check reads crate
+# metadata, not vendored source. That gap is the reason docs/licence-policy.md
+# requires a manual read of anything vendoring C or C++.
 #
-# CDDL is file-level copyleft. Those files stay CDDL permanently and can never be
+# CDDL is file-level copyleft: those files stay CDDL permanently and can never be
 # relicensed under Apache-2.0, so they live behind the rawkit-decode boundary and
-# nothing else in the workspace links them directly. Adding a second entry here
-# should be about as comfortable as adding a second engine.
+# nothing else in the workspace links them directly.
 exceptions = []
 
 # GPL/LGPL/AGPL are absent from `allow` on purpose, not by oversight:

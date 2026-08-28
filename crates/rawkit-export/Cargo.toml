@@ -1,0 +1,18 @@
+[package]
+name = "rawkit-export"
+description = "Rendered pixels to a colour-managed file. The only crate that knows about file formats."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+lcms2.workspace = true
+jpeg-encoder.workspace = true
+png.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+jpeg-decoder.workspace = true

@@ -40,6 +40,7 @@ by operating system is not a look. Golden render tests run on all three in CI.
 | `rawkit-decode` | RAW file → sensor mosaic. The one crate allowed to link CDDL code, and the boundary that keeps it contained |
 | `rawkit-engine` | `EditState` → pixels. Pipeline stage order, WGSL kernels, wgpu device |
 | `rawkit-catalog` | SQLite schema, forward-only migrations, volume identity |
+| `rawkit-export` | Pixels to a colour-managed file. The only crate that knows about image formats |
 | `rawkit-cli` | Headless entry point for CI, the golden harness and scripting |
 
 **The v2 AI is deliberately not in this workspace.** It consumes `EditState`
@@ -57,9 +58,10 @@ cargo run -p rawkit-cli -- gpu             # which backend would render here
 cargo run -p rawkit-cli -- schema          # EditState JSON Schema
 cargo deny check                           # licence audit (cargo install cargo-deny)
 
-# A RAW file to a viewable image, end to end. A diagnostic, not a render:
-# no DCP profile, no output ICC transform. See the command's docs.
-cargo run --release -p rawkit-cli -- render photo.ARW -o out.ppm
+# A RAW file to a colour-managed image, end to end. Format comes from the
+# extension: .jpg, .png, or .ppm for an unmanaged look at intermediate results.
+cargo run --release -p rawkit-cli -- render photo.ARW -o out.jpg
+cargo run --release -p rawkit-cli -- render photo.ARW -o out.jpg --profile camera.dcp
 ```
 
 The decode tests want a RAW file, which is large and not redistributable, so

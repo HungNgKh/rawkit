@@ -15,8 +15,9 @@
 //! - The tone map is a fixed sigmoid that rolls highlights off and pins
 //!   mid-grey. It is the roll-off, not a look — a curve that *feels* like a
 //!   photograph is a taste problem with its own iteration loop.
-//! - There is no output ICC transform. The sRGB encode below stands in for it,
-//!   so the result is sRGB by assertion rather than by conversion.
+//! - Output *is* colour managed: `rawkit-export` converts through Little CMS
+//!   and embeds the profile, so a `.jpg` or `.png` written here says what its
+//!   numbers mean. A `.ppm` does not, because the format cannot.
 //!
 //! Those three are separate P0 items. Until they land this command is a
 //! diagnostic, and the PPM it writes should not be judged as a render.
@@ -137,7 +138,8 @@ pub fn render(
     let rgba = renderer.run(&gpu, &frame, &state, Output::Display)?;
 
     let step = downsample_step(raw.width, raw.height, max_dim);
-    write_ppm(output, &rgba, raw.width, raw.height, step)?;
+    let (scaled, out_w, out_h) = downsample(&rgba, raw.width, raw.height, step);
+    write_image(output, &scaled, out_w, out_h)?;
     eprintln!(
         "wrote      : {} ({}x{})",
         output.display(),
@@ -184,39 +186,67 @@ fn downsample_step(width: u32, height: u32, max_dim: u32) -> u32 {
     (longest.div_ceil(max_dim)).max(1)
 }
 
-fn write_ppm(path: &Path, rgba: &[f32], width: u32, height: u32, step: u32) -> Result<()> {
-    let out_w = width / step;
-    let out_h = height / step;
-    let mut buf = format!("P6\n{out_w} {out_h}\n255\n").into_bytes();
-
+/// Box-average down to the requested size, in linear light.
+///
+/// Averaging before the transfer function is the only correct order;
+/// downsampling encoded values darkens detailed areas, which reads as the
+/// resize "losing contrast" and is really a gamma error.
+fn downsample(rgba: &[f32], width: u32, height: u32, step: u32) -> (Vec<f32>, u32, u32) {
+    if step <= 1 {
+        return (rgba.to_vec(), width, height);
+    }
+    let (out_w, out_h) = (width / step, height / step);
+    let mut out = Vec::with_capacity((out_w * out_h * 4) as usize);
     for oy in 0..out_h {
         for ox in 0..out_w {
-            // Box average over the source block. Averaging in linear light is
-            // the only correct place to do it; downsampling after the transfer
-            // function darkens detailed areas.
             let mut acc = [0.0f32; 3];
             let mut n = 0.0f32;
             for sy in 0..step {
                 for sx in 0..step {
-                    let x = ox * step + sx;
-                    let y = oy * step + sy;
-                    let i = ((y * width + x) * 4) as usize;
+                    let i = (((oy * step + sy) * width + ox * step + sx) * 4) as usize;
                     for c in 0..3 {
                         acc[c] += rgba[i + c];
                     }
                     n += 1.0;
                 }
             }
-            // The engine hands back display-referred *linear* values: white
-            // balanced, profiled, exposed and tone mapped. All that is left is
-            // the transfer function, which is the output transform's job and
-            // lives here only until lcms2 does it properly.
-            for c in acc {
-                buf.push((encode_srgb(c / n) * 255.0).round() as u8);
-            }
+            out.extend_from_slice(&[acc[0] / n, acc[1] / n, acc[2] / n, 1.0]);
         }
     }
+    (out, out_w, out_h)
+}
 
-    std::fs::write(path, buf).with_context(|| format!("writing {}", path.display()))?;
+/// Write the file, choosing the format from the name the user gave it.
+///
+/// PPM stays available and stays *unmanaged*: the format has nowhere to put a
+/// profile, so it is for looking at intermediate results rather than for
+/// anything that leaves this machine. Everything else goes through the export
+/// crate and carries its profile.
+fn write_image(path: &Path, rgba: &[f32], width: u32, height: u32) -> Result<()> {
+    let extension = path
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    if extension.eq_ignore_ascii_case("ppm") {
+        let mut buf = format!("P6\n{width} {height}\n255\n").into_bytes();
+        for pixel in rgba.chunks_exact(4) {
+            for c in &pixel[..3] {
+                buf.push((encode_srgb(*c) * 255.0).round() as u8);
+            }
+        }
+        std::fs::write(path, buf).with_context(|| format!("writing {}", path.display()))?;
+        eprintln!("note       : PPM carries no profile; use .jpg or .png to export");
+        return Ok(());
+    }
+
+    let format = rawkit_export::Format::from_extension(&extension).ok_or_else(|| {
+        anyhow::anyhow!(
+            "do not know how to write {:?}; try .jpg, .png or .ppm",
+            extension
+        )
+    })?;
+    let bytes = rawkit_export::encode(rgba, width, height, format)?;
+    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }

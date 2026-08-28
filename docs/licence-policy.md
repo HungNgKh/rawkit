@@ -30,7 +30,18 @@ accept an LGPL dependency here.
 ## Allowed
 
 Apache-2.0 · Apache-2.0 WITH LLVM-exception · MIT · MIT-0 · BSD-2-Clause ·
-BSD-3-Clause · ISC · Zlib · BSL-1.0 · CC0-1.0 · Unicode-3.0 · Unlicense
+BSD-3-Clause · ISC · Zlib · BSL-1.0 · CC0-1.0 · Unicode-3.0 · Unlicense · IJG
+
+### The one entry that was added rather than chosen at the start
+
+**IJG**, added 2026-08-29. `jpeg-encoder`'s forward DCT descends from the
+Independent JPEG Group's code, so the crate is `(MIT OR Apache-2.0) AND IJG` and
+`cargo deny` refused it — which is the process working rather than a nuisance.
+
+It is permissive, FSF-recognised and Apache-2.0-compatible. Its one real
+obligation is an acknowledgement in the documentation, in the IJG's own words:
+*"this software is based in part on the work of the Independent JPEG Group"*.
+`NOTICE` carries exactly that sentence, which is the whole cost of the entry.
 
 The authoritative copy of this list is `deny.toml`; if the two ever disagree,
 `deny.toml` is what actually runs.
@@ -54,6 +65,9 @@ The authoritative copy of this list is `deny.toml`; if the two ever disagree,
 | OpenColorIO | BSD-3-Clause | ✅ LUT / look handling |
 | Tauri | MIT / Apache-2.0 | ✅ Desktop shell |
 | wgpu | MIT / Apache-2.0 | ✅ GPU abstraction |
+| Little CMS (lcms2) | MIT | ✅ **In use since 2026-08-29.** Statically linked via `lcms2-sys`, which vendors Little CMS 2.19. Vendored source checked by hand per the rule above: MIT, copyright Marti Maria Saguer, matching the crate's declaration |
+| jpeg-encoder | (MIT OR Apache-2.0) AND IJG | ✅ Pure Rust. See the IJG note above |
+| png | MIT / Apache-2.0 | ✅ Pure Rust, used for output and for golden references |
 | RapidRAW | AGPL | ❌ Reference only. Read it for architecture, never copy code |
 | darktable / RawTherapee | GPL | ❌ Ruled out as an engine base; the reason this project builds its own |
 

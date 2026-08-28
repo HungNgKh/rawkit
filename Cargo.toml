@@ -5,6 +5,7 @@ members = [
     "crates/rawkit-decode",
     "crates/rawkit-engine",
     "crates/rawkit-catalog",
+    "crates/rawkit-export",
     "crates/rawkit-cli",
 ]
 
@@ -28,6 +29,7 @@ rawkit-editstate = { path = "crates/rawkit-editstate", version = "0.0.1" }
 rawkit-decode = { path = "crates/rawkit-decode", version = "0.0.1" }
 rawkit-engine = { path = "crates/rawkit-engine", version = "0.0.1" }
 rawkit-catalog = { path = "crates/rawkit-catalog", version = "0.0.1" }
+rawkit-export = { path = "crates/rawkit-export", version = "0.0.1" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -44,8 +46,15 @@ wgpu = "29"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 # Golden-test references are 16-bit PNGs so a reviewer can look at what changed;
-# the export pipeline will want this too. Pure Rust, MIT/Apache-2.0.
+# the export pipeline uses the same crate. Pure Rust, MIT/Apache-2.0.
 png = "0.17"
+# Little CMS, statically linked. The transform and the profile we embed then
+# come from one source, so they cannot describe different things.
+lcms2 = { version = "6", default-features = false, features = ["static"] }
+# Carries an IJG-licensed forward DCT; see docs/licence-policy.md for why that
+# licence is on the allowed list and what it obliges.
+jpeg-encoder = "0.7"
+jpeg-decoder = "0.3"
 
 # Rendering work is unusably slow in a debug build; keep dev fast but not naive.
 [profile.dev]
