@@ -128,6 +128,8 @@ pub fn render(
             raw.as_shot_neutral[1],
             raw.as_shot_neutral[2],
         ],
+        // `normalise` puts the decoder's white level at 1.0.
+        clip_level: 1.0,
         profile,
     };
     let (temperature, tint) = frame.as_shot_temperature();

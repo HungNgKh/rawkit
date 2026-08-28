@@ -93,6 +93,15 @@ pub struct Frame<'a> {
     pub phase: BayerPhase,
     /// As-shot white balance as per-channel multipliers, green-referenced.
     pub as_shot_wb: [f32; 3],
+    /// The value in `data` at which the sensor saturated.
+    ///
+    /// Normally 1.0, because [`normalise`] scales the white level there. It is
+    /// a field rather than a constant because some bodies record usable signal
+    /// above the level the decoder reports, and because a caller feeding
+    /// synthetic data may have no clipping at all — passing `f32::INFINITY`
+    /// turns highlight reconstruction off, which is what a test measuring
+    /// something else wants.
+    pub clip_level: f32,
     /// How this sensor sees colour. Carried rather than a bare matrix so that
     /// the renderer can ask it for the transform *at the chosen temperature* —
     /// which is the whole reason a profile is a profile and not a constant.
@@ -392,7 +401,7 @@ impl Renderer {
             develop: [
                 crate::exposure_multiplier(state),
                 if hsm.is_some() { 1.0 } else { 0.0 },
-                0.0,
+                image.clip_level,
                 0.0,
             ],
             hsm_dims: match hsm {

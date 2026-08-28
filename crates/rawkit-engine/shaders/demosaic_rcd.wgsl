@@ -62,7 +62,8 @@ struct Params {
     // `.x` is the exposure multiplier (2^EV). `.y` is 1 when a hue/saturation
     // table is bound, 0 when it is not — the table buffer always exists because
     // a bind group cannot have holes, so a flag is what distinguishes "no
-    // correction" from "a correction that happens to be identity".
+    // correction" from "a correction that happens to be identity". `.z` is the
+    // camera-space value the sensor saturates at, normally 1.0.
     develop: vec4<f32>,
     // Hue, saturation and value divisions of the table. `.w` unused.
     hsm_dims: vec4<u32>,
@@ -448,10 +449,18 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
     // is three multiplies rather than a colour-appearance model.
     let balanced = camera * params.wb.rgb;
 
+    // Highlight reconstruction runs *here*, between white balance and the
+    // profile, and not at the scene-linear stage where the design originally
+    // placed it. It has to: a channel's clipping is a fact about the sensor, so
+    // it is only visible while the channels are still the sensor's own. One
+    // matrix multiply later they are mixed and there is no longer any such
+    // thing as "the green channel clipped".
+    let recovered = reconstruct_highlights(balanced);
+
     let display = vec3<f32>(
-        dot(params.cam_to_display[0].rgb, balanced),
-        dot(params.cam_to_display[1].rgb, balanced),
-        dot(params.cam_to_display[2].rgb, balanced),
+        dot(params.cam_to_display[0].rgb, recovered),
+        dot(params.cam_to_display[1].rgb, recovered),
+        dot(params.cam_to_display[2].rgb, recovered),
     );
 
     // The hue/saturation correction, when the profile brought one. `display`
@@ -583,6 +592,60 @@ fn apply_hue_sat(rgb: vec3<f32>) -> vec3<f32> {
     let value = max(hsv.z * delta.z, 0.0);
 
     return hsv_to_rgb(vec3<f32>(hue, saturation, value));
+}
+
+/// How far below the clip point reconstruction starts to take effect.
+///
+/// Without a run-up, reconstruction switches on at a hard boundary and leaves a
+/// visible edge around every highlight — which is a worse artefact than the one
+/// being fixed, and harder to explain.
+const CLIP_RUNUP: f32 = 0.02;
+
+/// Estimate what a clipped channel should have been.
+///
+/// # Why blown highlights go magenta without this
+///
+/// The sensor saturates in its own units, and white balance then scales the
+/// channels apart. For a daylight scene green carries the most signal, so green
+/// saturates first: its true value might be 1.5 but it records 1.0. Red is
+/// nowhere near its own limit and records correctly, then gets multiplied up.
+/// The result is a pixel where red and blue exceed green — magenta — in the one
+/// part of the picture the eye most expects to be white.
+///
+/// # What this does, and what it does not
+///
+/// A channel we no longer believe is raised to the brightest channel we do
+/// believe, which restores neutrality and keeps whatever structure the surviving
+/// channels still carry. When nothing is left to believe, the only defensible
+/// estimate is neutral at the highest clip point.
+///
+/// This is **not** colour propagation. The strong version of this algorithm
+/// borrows the ratio between channels from unclipped neighbours, so a blown red
+/// flower stays red instead of being pulled toward white; that needs a
+/// neighbourhood search, its own halo, and its own pass. What is here is the
+/// local approximation: right for specular highlights, skies and light sources,
+/// which is most of what actually blows out, and wrong in the direction of white
+/// for a saturated subject that clips.
+fn reconstruct_highlights(balanced: vec3<f32>) -> vec3<f32> {
+    // The sensor clips at one value in its own space; white balance moves that
+    // to a different height per channel, which is why the threshold is a vector.
+    let thresholds = params.wb.rgb * params.develop.z;
+    let clipped = smoothstep(thresholds * (1.0 - CLIP_RUNUP), thresholds, balanced);
+
+    // The brightest channel still below its own limit.
+    let believable = balanced * (1.0 - clipped);
+    let brightest = max(believable.r, max(believable.g, believable.b));
+
+    // Everything clipped: nothing survives to take a level from, so aim for
+    // neutral at the highest clip point rather than leaving the channels at
+    // their own limits, which is the colour of the white balance itself.
+    let all_clipped = min(clipped.r, min(clipped.g, clipped.b));
+    let neutral = max(thresholds.r, max(thresholds.g, thresholds.b));
+    let level = mix(brightest, neutral, all_clipped);
+
+    // `clipped` is exactly zero below the run-up, so an unclipped pixel comes
+    // through this untouched rather than merely almost untouched.
+    return mix(balanced, max(balanced, vec3<f32>(level)), clipped);
 }
 
 /// Fixed sigmoid roll-off, applied per channel.

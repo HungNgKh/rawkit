@@ -50,11 +50,19 @@ pub enum Stage {
     Demosaic,
     /// Distortion, vignette, chromatic aberration, defringe.
     LensCorrection,
-    /// Channel multipliers, from `EditState` or the camera's as-shot values.
+    /// Channel multipliers, from `EditState` or the camera's as-shot values —
+    /// and, with them, highlight reconstruction.
+    ///
+    /// Reconstruction belongs here and not with the other scene-linear ops,
+    /// which is where the design first placed it. Clipping is a fact about the
+    /// sensor, so it is only legible while the channels are still the sensor's
+    /// own; one matrix multiply later they are mixed and there is no longer any
+    /// such thing as "the green channel clipped".
     WhiteBalance,
     /// DCP: camera matrix, forward matrix, HSL look table, tone curve.
     CameraProfile,
-    /// Exposure, highlight reconstruction, noise reduction.
+    /// Exposure and noise reduction. Highlight reconstruction was expected here
+    /// and is not — see [`Stage::WhiteBalance`].
     SceneLinearOps,
     /// Mask textures composited. Generic by construction — see module docs.
     LocalAdjustments,

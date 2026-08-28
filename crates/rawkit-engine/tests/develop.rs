@@ -43,6 +43,10 @@ fn develop(gpu: &Gpu, renderer: &Renderer, value: f32, state: &EditState) -> [f3
                 height: N,
                 phase: BayerPhase::Rggb,
                 as_shot_wb: [1.0, 1.0, 1.0],
+                // These measure the tone curve, with inputs far above full
+                // scale on purpose. Reconstruction would rewrite exactly the
+                // values under test.
+                clip_level: f32::INFINITY,
                 profile: neutral_profile(),
             },
             state,
@@ -169,6 +173,7 @@ fn white_balance_multiplies_channels_independently() {
                 height: N,
                 phase: BayerPhase::Rggb,
                 as_shot_wb: wb,
+                clip_level: f32::INFINITY,
                 profile: neutral_profile(),
             },
             &EditState::default(),
@@ -217,6 +222,7 @@ fn setting_a_temperature_warms_or_cools_the_render() {
                     height: N,
                     phase: BayerPhase::Rggb,
                     as_shot_wb: [1.0, 1.0, 1.0],
+                    clip_level: f32::INFINITY,
                     profile: profile.clone(),
                 },
                 &state,
@@ -256,6 +262,7 @@ fn as_shot_reports_a_plausible_temperature() {
         height: N,
         phase: BayerPhase::Rggb,
         as_shot_wb: [2.750, 1.0, 1.695],
+        clip_level: 1.0,
         profile,
     };
     let (temperature, tint) = frame.as_shot_temperature();

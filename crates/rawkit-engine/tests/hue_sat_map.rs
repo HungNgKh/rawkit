@@ -83,6 +83,7 @@ fn render_colour(gpu: &Gpu, profile: &CameraProfile, camera_rgb: [f32; 3]) -> [f
                 height: N,
                 phase: BayerPhase::Rggb,
                 as_shot_wb: [1.0, 1.0, 1.0],
+                clip_level: 1.0,
                 profile: profile.clone(),
             },
             &EditState::default(),

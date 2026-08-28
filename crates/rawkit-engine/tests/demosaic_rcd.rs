@@ -84,6 +84,7 @@ fn frame<'a>(cfa: &'a [f32], w: u32, h: u32, phase: BayerPhase) -> Frame<'a> {
         height: h,
         phase,
         as_shot_wb: [1.0, 1.0, 1.0],
+        clip_level: 1.0,
         profile: CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
     }
 }
