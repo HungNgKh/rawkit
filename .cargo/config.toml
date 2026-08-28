@@ -1,0 +1,13 @@
+# LibRaw's headers mark every public symbol `__declspec(dllimport)` on MSVC
+# unless `LIBRAW_NODLL` is defined. We link it statically, so without this the
+# Windows build fails with a wall of C2491 ("definition of dllimport ... not
+# allowed") on the first C++ file. The `libraw-rs-sys` build script does not set
+# it — the crate has been unmaintained since 2021 — so it is set here, where the
+# fix applies to everyone's build rather than only to CI.
+#
+# Harmless on Linux and macOS: the same macro simply expands to nothing there.
+#
+# Cargo does not override an existing `CXXFLAGS`, so if you have one set for
+# other reasons, the Windows build will fail until you add this define to it.
+[env]
+CXXFLAGS = "-DLIBRAW_NODLL"

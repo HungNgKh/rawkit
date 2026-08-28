@@ -49,11 +49,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+      # Scoped to the engine on purpose. The other `#[ignore]`d tests need a RAW
+      # fixture, and fixtures are large and not redistributable, so they cannot
+      # exist on a hosted runner. They are written to fail loudly when the file
+      # is missing rather than pass quietly — which is right for a developer and
+      # wrong for CI, so CI does not run them.
       - name: GPU-backed tests (Linux, lavapipe)
         if: matrix.os == 'ubuntu-latest'
         env:
           WGPU_BACKEND: vulkan
-        run: cargo test --workspace --all-features -- --ignored
+        run: cargo test -p rawkit-engine --all-features -- --ignored
 
   deny:
     name: licences & advisories
