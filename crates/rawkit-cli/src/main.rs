@@ -52,6 +52,13 @@ enum Command {
         /// the choice does not change the output.
         #[arg(long, default_value_t = rawkit_engine::render::DEFAULT_TILE)]
         tile: u32,
+        /// A `.dcp` camera profile to render with, instead of the decoder's
+        /// built-in single-illuminant matrix.
+        ///
+        /// Point this at a profile you already have; none are bundled, and none
+        /// can be — Adobe's are not redistributable.
+        #[arg(long)]
+        profile: Option<PathBuf>,
     },
 
     /// Report the GPU adapter this machine would render on.
@@ -90,7 +97,8 @@ fn main() -> Result<()> {
             output,
             max_dim,
             tile,
-        } => render::render(&input, &output, max_dim, tile)?,
+            profile,
+        } => render::render(&input, &output, max_dim, tile, profile.as_deref())?,
         Command::Gpu => {
             let gpu = rawkit_engine::Gpu::new()?;
             let info = &gpu.adapter_info;

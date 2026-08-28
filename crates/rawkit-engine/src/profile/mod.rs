@@ -38,6 +38,24 @@
 /// beyond an alias, and this keeps it obvious which way round the rows are.
 pub type Matrix3 = [[f32; 3]; 3];
 
+pub mod dcp;
+
+/// CIE XYZ (D50) to linear sRGB, Bradford-adapted.
+///
+/// D50 rather than D65 because that is the connection space the DNG forward
+/// matrices land in — a profile's forward matrix rows sum to the D50 white
+/// point by definition, which is what makes a balanced neutral come out neutral
+/// without any further normalisation.
+/// Quoted at published precision for the same reason as the locus polynomial:
+/// the extra digits do not survive `f32`, and their job is to be checkable
+/// against the source rather than to be stored.
+#[allow(clippy::excessive_precision)]
+pub const SRGB_FROM_XYZ_D50: Matrix3 = [
+    [3.1338561, -1.6168667, -0.4906146],
+    [-0.9787684, 1.9161415, 0.0334540],
+    [0.0719453, -0.2289914, 1.4052427],
+];
+
 /// sRGB primaries to CIE XYZ (D65).
 pub const XYZ_FROM_SRGB: Matrix3 = [
     [0.412_453, 0.357_580, 0.180_423],
@@ -74,6 +92,19 @@ struct Calibration {
 #[derive(Debug, Clone)]
 pub struct CameraProfile {
     calibrations: Vec<Calibration>,
+    /// Camera to CIE XYZ (D50) for each calibration illuminant, when the
+    /// profile provides them.
+    ///
+    /// This is the path Adobe's own renderer takes, and it is not merely the
+    /// inverse of the colour matrix: a forward matrix is fitted so that the
+    /// *white-balanced* camera values map to XYZ, which lets the profile encode
+    /// corrections the single matrix cannot express. When present it is used;
+    /// when absent the colour matrix is inverted instead, which is what a
+    /// decoder's built-in table leaves us with.
+    forward: Vec<Option<Matrix3>>,
+    /// What the profile calls itself, for a UI to show. `None` for a profile
+    /// synthesised from a decoder table, which has no name to give.
+    pub name: Option<String>,
 }
 
 impl CameraProfile {
@@ -86,11 +117,15 @@ impl CameraProfile {
     /// daylight characterisation and the colour will be *defensible but not
     /// accurate*. A two-illuminant profile is the fix, and it needs a `.dcp`.
     pub fn from_color_matrix(xyz_to_camera: Matrix3) -> Self {
+        Self::from_color_matrix_at(6504.0, xyz_to_camera)
+    }
+
+    /// A single-illuminant profile whose calibration temperature is known.
+    pub fn from_color_matrix_at(cct: f32, xyz_to_camera: Matrix3) -> Self {
         Self {
-            calibrations: vec![Calibration {
-                cct: 6504.0,
-                xyz_to_camera,
-            }],
+            calibrations: vec![Calibration { cct, xyz_to_camera }],
+            forward: vec![None],
+            name: None,
         }
     }
 
@@ -107,7 +142,45 @@ impl CameraProfile {
             },
         ];
         calibrations.sort_by(|a, b| a.cct.total_cmp(&b.cct));
-        Self { calibrations }
+        Self {
+            calibrations,
+            forward: vec![None, None],
+            name: None,
+        }
+    }
+
+    /// Attach a forward matrix to the calibration it belongs to, named by its
+    /// illuminant temperature.
+    ///
+    /// Taking the temperature rather than a position is deliberate. The
+    /// constructor sorts calibrations, so an index-based API would let a caller
+    /// pass matrices in file order and pair a tungsten forward matrix with a
+    /// daylight colour matrix — colour that is subtly wrong everywhere, correct
+    /// nowhere, and has nothing to point at. Stating the temperature makes that
+    /// mistake unrepresentable instead of merely documented.
+    pub fn set_forward_matrix(&mut self, cct: f32, matrix: Matrix3) {
+        let nearest = self
+            .calibrations
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| (a.cct - cct).abs().total_cmp(&(b.cct - cct).abs()))
+            .map(|(i, _)| i);
+        if let Some(i) = nearest {
+            self.forward[i] = Some(matrix);
+        }
+    }
+
+    /// Whether this profile carries the forward matrices Adobe's rendering path
+    /// uses, or only a colour matrix to invert.
+    pub fn has_forward_matrix(&self) -> bool {
+        self.forward.iter().any(Option::is_some)
+    }
+
+    /// Whether the profile characterises the sensor under two illuminants. One
+    /// means every scene is rendered with the same characterisation regardless
+    /// of its light, which is the main thing a real profile improves on.
+    pub fn is_dual_illuminant(&self) -> bool {
+        self.calibrations.len() > 1
     }
 
     /// The XYZ-to-camera matrix for a given colour temperature.
@@ -120,10 +193,7 @@ impl CameraProfile {
         match self.calibrations.as_slice() {
             [only] => only.xyz_to_camera,
             [low, high] => {
-                let (a, b) = (1e6 / low.cct, 1e6 / high.cct);
-                let m = 1e6 / cct.clamp(MIN_TEMPERATURE, MAX_TEMPERATURE);
-                // `a` is the larger mired value (lower temperature).
-                let t = ((m - b) / (a - b)).clamp(0.0, 1.0);
+                let t = mired_blend(low.cct, high.cct, cct);
                 let mut out = [[0.0f32; 3]; 3];
                 for (r, row) in out.iter_mut().enumerate() {
                     for (c, cell) in row.iter_mut().enumerate() {
@@ -133,6 +203,33 @@ impl CameraProfile {
                 out
             }
             _ => unreachable!("a profile always has one or two calibrations"),
+        }
+    }
+
+    /// The forward matrix for a temperature, interpolated the same way the
+    /// colour matrices are. `None` when the profile has none — a decoder table
+    /// never does.
+    fn forward_matrix(&self, cct: f32) -> Option<Matrix3> {
+        match (self.calibrations.as_slice(), self.forward.as_slice()) {
+            ([_], [only]) => *only,
+            ([low, high], [a, b]) => match (a, b) {
+                (Some(a), Some(b)) => {
+                    let t = mired_blend(low.cct, high.cct, cct);
+                    let mut out = [[0.0f32; 3]; 3];
+                    for (r, row) in out.iter_mut().enumerate() {
+                        for (c, cell) in row.iter_mut().enumerate() {
+                            *cell = b[r][c] * (1.0 - t) + a[r][c] * t;
+                        }
+                    }
+                    Some(out)
+                }
+                // One matrix and not the other is a malformed profile. Using
+                // the one that exists across the whole range would apply a
+                // tungsten fit to daylight; falling back to the colour-matrix
+                // path is worse colour but not wrong colour.
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -212,6 +309,13 @@ impl CameraProfile {
     /// maps to display neutral; skip that and every image carries a cast which
     /// looks exactly like a white-balance error and is not one.
     pub fn camera_to_display(&self, temperature_k: f32) -> Matrix3 {
+        if let Some(forward) = self.forward_matrix(temperature_k) {
+            // The forward matrix already maps *balanced* camera values to XYZ
+            // D50, and its rows sum to the D50 white point by construction, so
+            // a balanced neutral arrives neutral with no normalisation of our
+            // own. All that remains is the connection space.
+            return multiply(&SRGB_FROM_XYZ_D50, &forward);
+        }
         let xyz_to_camera = self.xyz_to_camera(temperature_k);
         // Compose to get sRGB-primaries -> camera, then normalise each row so a
         // neutral input gives a neutral output, then invert.
@@ -234,6 +338,31 @@ impl CameraProfile {
 }
 
 pub const IDENTITY: Matrix3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+/// How far `cct` sits between two calibration temperatures, in mireds, where 1
+/// is fully the lower temperature.
+///
+/// Shared by the colour and forward matrices so the two cannot interpolate
+/// differently — which would produce a profile that is self-consistent at each
+/// calibration point and wrong everywhere between them.
+fn mired_blend(low_cct: f32, high_cct: f32, cct: f32) -> f32 {
+    let (a, b) = (1e6 / low_cct, 1e6 / high_cct);
+    let m = 1e6 / cct.clamp(MIN_TEMPERATURE, MAX_TEMPERATURE);
+    if (a - b).abs() < 1e-6 {
+        return 0.0;
+    }
+    ((m - b) / (a - b)).clamp(0.0, 1.0)
+}
+
+fn multiply(a: &Matrix3, b: &Matrix3) -> Matrix3 {
+    let mut out = [[0.0f32; 3]; 3];
+    for (r, row) in out.iter_mut().enumerate() {
+        for (c, cell) in row.iter_mut().enumerate() {
+            *cell = (0..3).map(|k| a[r][k] * b[k][c]).sum();
+        }
+    }
+    out
+}
 
 /// The XYZ of the illuminant named by a temperature and tint.
 ///
@@ -385,12 +514,16 @@ mod tests {
     /// Roughly a Sony APS-C sensor: the decoder's table for an ILCE-6400,
     /// XYZ to camera. Real numbers rather than an identity, so the tests
     /// exercise a matrix that actually mixes channels.
-    fn sony_profile() -> CameraProfile {
-        CameraProfile::from_color_matrix([
+    fn sony_matrix() -> Matrix3 {
+        [
             [0.6941, -0.2164, -0.0644],
             [-0.3850, 1.1349, 0.2779],
             [-0.0031, 0.1055, 0.6511],
-        ])
+        ]
+    }
+
+    fn sony_profile() -> CameraProfile {
+        CameraProfile::from_color_matrix(sony_matrix())
     }
 
     #[test]
@@ -482,6 +615,69 @@ mod tests {
             "tint sign is inverted: magenta {magenta:?}, neutral {neutral:?}, green {green:?}"
         );
         assert!(magenta[2] < neutral[2] && neutral[2] < green[2]);
+    }
+
+    /// Rows sum to the D50 white point, which is what the DNG specification
+    /// requires of a forward matrix and what makes neutral survive it.
+    const FORWARD_D50: Matrix3 = [
+        [0.6000, 0.2500, 0.1142],
+        [0.2500, 0.7000, 0.0500],
+        [0.0100, 0.0400, 0.7749],
+    ];
+
+    #[test]
+    fn a_forward_matrix_carries_neutral_through_to_neutral() {
+        // The property that makes the forward-matrix path usable without any
+        // normalisation of our own: its rows sum to D50 white, so balanced
+        // camera (1,1,1) lands on the D50 white point, and the connection
+        // matrix takes that to sRGB (1,1,1).
+        //
+        // If this drifts, every image gets a cast that looks like a
+        // white-balance error — the same failure the row normalisation exists
+        // to prevent on the other path, arriving by a different route.
+        let mut profile = CameraProfile::from_color_matrix(sony_matrix());
+        profile.set_forward_matrix(6504.0, FORWARD_D50);
+        assert!(profile.has_forward_matrix());
+
+        let display = apply(&profile.camera_to_display(5000.0), [1.0, 1.0, 1.0]);
+        for (c, v) in display.iter().enumerate() {
+            assert!(
+                (v - 1.0).abs() < 0.01,
+                "balanced neutral rendered {display:?}; channel {c} is not neutral"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_matrices_stay_paired_with_their_illuminant() {
+        // The trap this guards: construction sorts calibrations by temperature,
+        // so a caller passing matrices in file order can end up with the
+        // tungsten forward matrix paired to the daylight colour matrix. The
+        // result is colour that is subtly wrong everywhere and correct nowhere,
+        // with nothing to point at.
+        let tungsten = [[0.9, 0.0, 0.0642], [0.0, 1.0, 0.0], [0.0, 0.0, 0.8249]];
+        let daylight = FORWARD_D50;
+
+        // Built with the illuminants the "wrong" way round, so the constructor
+        // sorts them and any positional pairing would be inverted.
+        let mut profile =
+            CameraProfile::from_dual_illuminant((6504.0, sony_matrix()), (2856.0, sony_matrix()));
+        profile.set_forward_matrix(6504.0, daylight);
+        profile.set_forward_matrix(2856.0, tungsten);
+
+        // At the daylight end the daylight matrix must dominate.
+        let at_daylight = profile.camera_to_display(6504.0);
+        let mut expected = CameraProfile::from_color_matrix(sony_matrix());
+        expected.set_forward_matrix(6504.0, daylight);
+        let reference = expected.camera_to_display(6504.0);
+        for r in 0..3 {
+            for c in 0..3 {
+                assert!(
+                    (at_daylight[r][c] - reference[r][c]).abs() < 1e-3,
+                    "forward matrices are paired with the wrong illuminants"
+                );
+            }
+        }
     }
 
     #[test]

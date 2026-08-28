@@ -26,7 +26,13 @@ use rawkit_editstate::EditState;
 use rawkit_engine::{normalise, BayerPhase, CameraProfile, Frame, Gpu, Output, Renderer};
 use std::path::Path;
 
-pub fn render(input: &Path, output: &Path, max_dim: u32, tile: u32) -> Result<()> {
+pub fn render(
+    input: &Path,
+    output: &Path,
+    max_dim: u32,
+    tile: u32,
+    profile_path: Option<&Path>,
+) -> Result<()> {
     let raw = rawkit_decode::decode_file(input)
         .with_context(|| format!("decoding {}", input.display()))?;
     eprintln!(
@@ -56,18 +62,41 @@ pub fn render(input: &Path, output: &Path, max_dim: u32, tile: u32) -> Result<()
         );
     }
 
-    let profile = match single_illuminant_profile(&raw.cam_to_xyz) {
-        Some(p) => {
-            eprintln!("colour     : decoder camera matrix, single illuminant (no DCP)");
-            p
-        }
-        None => {
+    let profile = match profile_path {
+        Some(path) => {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("reading profile {}", path.display()))?;
+            let profile = rawkit_engine::profile::dcp::parse(&bytes)
+                .with_context(|| format!("parsing profile {}", path.display()))?;
             eprintln!(
-                "colour     : NONE — no camera matrix for this body; \
-                 the image will be strongly cast"
+                "colour     : {} ({}, {})",
+                profile.name.as_deref().unwrap_or("unnamed profile"),
+                if profile.is_dual_illuminant() {
+                    "two illuminants"
+                } else {
+                    "one illuminant"
+                },
+                if profile.has_forward_matrix() {
+                    "forward matrix"
+                } else {
+                    "colour matrix only"
+                },
             );
-            CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY)
+            profile
         }
+        None => match single_illuminant_profile(&raw.cam_to_xyz) {
+            Some(p) => {
+                eprintln!("colour     : decoder camera matrix, single illuminant (no DCP)");
+                p
+            }
+            None => {
+                eprintln!(
+                    "colour     : NONE — no camera matrix for this body; \
+                     the image will be strongly cast"
+                );
+                CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY)
+            }
+        },
     };
 
     let gpu = Gpu::new()?;
