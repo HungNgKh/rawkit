@@ -104,7 +104,12 @@ fn packed_index(x: i32, y: i32) -> u32 {
     // Column parity holding the red/blue sites in this row.
     let site_parity = (cy + i32(params.cfa_y_offset) + i32(params.cfa_x_offset)) & 1;
     let adjust = 1 - site_parity;
-    return u32(cy) * params.packed_width + u32((cx + adjust) / 2);
+    // The `+ adjust` rounds up to the next pair, which on the last column of an
+    // even-width image lands one slot past the end of the row — and since these
+    // buffers are flat, that silently reads the *next row's* first value rather
+    // than going out of bounds where anything would notice. Clamp to the row.
+    let slot = min(u32((cx + adjust) / 2), params.packed_width - 1u);
+    return u32(cy) * params.packed_width + slot;
 }
 
 fn pq_at(x: i32, y: i32) -> f32 { return pq[packed_index(x, y)]; }

@@ -4,9 +4,23 @@
 //! that file carries the provenance and the two assumptions the port makes.
 //! This module is the plumbing: buffers in, five dispatches, pixels out.
 //!
-//! Everything here allocates per call. That is correct for a spike and wrong for
-//! an editor — the interactive path will keep the buffers alive across renders
-//! and reuse them per tile. The stage boundary is what matters now.
+//! # Tiling
+//!
+//! Every render is tiled, including one that would fit in a single tile. Buffers
+//! are sized by the tile and never by the image, which is what lets the engine
+//! run on WebGPU's *default* limits — a 24 MP frame as RGBA f32 is 388 MB and
+//! the portable floor is a 256 MB buffer and a 128 MB storage binding. An
+//! untiled path would work on a large desktop GPU and fail on a smaller one,
+//! which is the divergence the engine exists to prevent.
+//!
+//! It is also the same structure the interactive canvas needs, where only the
+//! visible tiles get rendered. Getting it now rather than later is the whole
+//! point: a pipeline written against whole frames does not become tiled by
+//! refactoring, it becomes tiled by rewriting.
+//!
+//! Buffers are allocated once per `run` and reused across tiles. A render must
+//! not allocate; the remaining per-call allocation is the next thing to lift out
+//! when there is a canvas to keep state for.
 
 use crate::{EngineError, Gpu};
 use wgpu::util::DeviceExt;
@@ -80,15 +94,50 @@ struct Params {
 
 const STAGES: [&str; 5] = ["conv", "green_at_rb", "rb_at_br", "rb_at_g", "pack"];
 
+/// How far outside a tile the kernel reaches, in pixels.
+///
+/// Derived by following the dependency chain rather than guessed, because the
+/// cost of guessing low is a faint seam that only shows on some images:
+///
+/// | Stage | Reads | Cumulative reach |
+/// |---|---|---|
+/// | `conv` | CFA ±3 | 3 |
+/// | `green_at_rb` | CFA ±4, `lp` ±2 (itself CFA ±3) | 5 |
+/// | `rb_at_br` | `pq` ±1, green ±3 (itself reach 5) | 8 |
+/// | `rb_at_g` | chroma ±3 (itself reach 8) | 11 |
+///
+/// Rounded up to 12 to keep it **even**, which is not cosmetic: an odd halo
+/// shifts the CFA phase inside the tile, and every pixel would come out the
+/// wrong colour.
+pub const HALO: u32 = 12;
+
+/// Tile edge in pixels, excluding halo. 512 keeps every buffer far inside
+/// WebGPU's default limits while leaving the halo a small fraction of the work
+/// (a 512 tile carries 536² samples, so ~9% overhead).
+pub const DEFAULT_TILE: u32 = 512;
+
 /// Compiled RCD pipelines. Build once, reuse — shader compilation is far too
 /// slow to sit on a render path.
 pub struct Demosaic {
     layout: wgpu::BindGroupLayout,
     pipelines: Vec<wgpu::ComputePipeline>,
+    tile: u32,
 }
 
 impl Demosaic {
     pub fn new(gpu: &Gpu) -> Self {
+        Self::with_tile_size(gpu, DEFAULT_TILE)
+    }
+
+    /// Mostly for tests: a small tile forces many seams over a small image,
+    /// which is how the halo gets proven.
+    ///
+    /// # Panics
+    ///
+    /// If `tile` is odd. Tile origins must land on the same CFA phase as the
+    /// image, and an odd tile size guarantees they do not.
+    pub fn with_tile_size(gpu: &Gpu, tile: u32) -> Self {
+        assert!(tile > 0 && tile % 2 == 0, "tile size must be even");
         let module = gpu
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -153,14 +202,25 @@ impl Demosaic {
             })
             .collect();
 
-        Self { layout, pipelines }
+        Self {
+            layout,
+            pipelines,
+            tile,
+        }
     }
 
     /// Demosaic one image, returning interleaved RGBA in the caller's units.
     ///
-    /// The outermost few pixels are wrong by construction — RCD reaches four
-    /// pixels out and the kernel clamps at the edge rather than mirroring, which
-    /// would flip CFA parity. Crop before showing the result.
+    /// Always tiled, including when the image fits in a single tile. One code
+    /// path means the tiled result cannot drift from an untiled one, because
+    /// there is no untiled one — the same rule that keeps preview and export
+    /// sharing kernels.
+    ///
+    /// The outermost few pixels of the *image* are still wrong by construction:
+    /// RCD reaches four pixels out and the kernel clamps at the edge rather than
+    /// mirroring, which would flip CFA parity. Crop before showing the result.
+    /// Tile seams are not in that category — they are exact, and a test asserts
+    /// it.
     pub fn run(&self, gpu: &Gpu, image: &Mosaic<'_>) -> Result<Vec<f32>, EngineError> {
         let (w, h) = (image.width as usize, image.height as usize);
         if image.data.len() != w * h {
@@ -172,16 +232,21 @@ impl Demosaic {
             )));
         }
 
-        let packed_width = image.width.div_ceil(2);
+        // Every tile is processed at the same padded size, so the shader's view
+        // of the world — dimensions, packed stride, CFA phase — is identical for
+        // all of them and the uniform never changes. Edge tiles are padded with
+        // clamped pixels rather than shrunk, which costs a little work at the
+        // border and removes a whole class of index bug.
+        let padded = self.tile + 2 * HALO;
         let (dx, dy) = image.phase.offset();
         // Green normalised to 1.0. The kernel estimates green at red and blue
         // sites from unscaled CFA values, so any other normalisation would mix
         // scaled and unscaled greens in the same subtraction.
         let g = image.wb[1];
         let params = Params {
-            width: image.width,
-            height: image.height,
-            packed_width,
+            width: padded,
+            height: padded,
+            packed_width: padded.div_ceil(2),
             cfa_x_offset: dx,
             cfa_y_offset: dy,
             _pad: [0; 3],
@@ -189,39 +254,34 @@ impl Demosaic {
         };
 
         let device = &gpu.device;
+        let px = padded as usize * padded as usize;
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("rcd params"),
             contents: bytemuck::bytes_of(&params),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let cfa_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("cfa"),
-            contents: bytemuck::cast_slice(image.data),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
 
-        let plane = |label: &str, len: usize| {
+        let plane = |label: &str, len: usize, extra: wgpu::BufferUsages| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size: (len * std::mem::size_of::<f32>()) as u64,
-                usage: wgpu::BufferUsages::STORAGE,
+                usage: wgpu::BufferUsages::STORAGE | extra,
                 mapped_at_creation: false,
             })
         };
-        let vh = plane("vh", w * h);
-        let pq = plane("pq", packed_width as usize * h);
-        let lp = plane("lp", packed_width as usize * h);
-        let ch_r = plane("r", w * h);
-        let ch_g = plane("g", w * h);
-        let ch_b = plane("b", w * h);
+        // Allocated once and reused for every tile. This is the shape the
+        // interactive path needs: a render must not allocate.
+        let cfa_buf = plane("cfa", px, wgpu::BufferUsages::COPY_DST);
+        let vh = plane("vh", px, wgpu::BufferUsages::empty());
+        let packed = params.packed_width as usize * padded as usize;
+        let pq = plane("pq", packed, wgpu::BufferUsages::empty());
+        let lp = plane("lp", packed, wgpu::BufferUsages::empty());
+        let ch_r = plane("r", px, wgpu::BufferUsages::empty());
+        let ch_g = plane("g", px, wgpu::BufferUsages::empty());
+        let ch_b = plane("b", px, wgpu::BufferUsages::empty());
+        let out = plane("rgba", px * 4, wgpu::BufferUsages::COPY_SRC);
 
-        let out_size = (w * h * 4 * std::mem::size_of::<f32>()) as u64;
-        let out = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rgba"),
-            size: out_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        let out_size = (px * 4 * std::mem::size_of::<f32>()) as u64;
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: out_size,
@@ -249,42 +309,85 @@ impl Demosaic {
             entries: &bindings,
         });
 
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rcd") });
-        {
-            // One pass per stage. The stage boundaries are vkdt's barriers: each
-            // reads what the previous one wrote, so they cannot be merged
-            // without reintroducing the workgroup-memory version.
-            for (pipeline, stage) in self.pipelines.iter().zip(STAGES) {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some(stage),
-                    timestamp_writes: None,
+        let mut result = vec![0.0f32; w * h * 4];
+        let mut scratch = vec![0.0f32; px];
+
+        for oy in (0..image.height).step_by(self.tile as usize) {
+            for ox in (0..image.width).step_by(self.tile as usize) {
+                gather_padded(image, ox, oy, padded, &mut scratch);
+                gpu.queue
+                    .write_buffer(&cfa_buf, 0, bytemuck::cast_slice(&scratch));
+
+                let mut encoder = device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rcd") });
+                {
+                    // One pass per stage. The stage boundaries are vkdt's
+                    // barriers: each reads what the previous one wrote, so they
+                    // cannot be merged without reintroducing the
+                    // workgroup-memory version.
+                    for (pipeline, stage) in self.pipelines.iter().zip(STAGES) {
+                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some(stage),
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, &bind_group, &[]);
+                        pass.dispatch_workgroups(padded.div_ceil(8), padded.div_ceil(8), 1);
+                    }
+                }
+                encoder.copy_buffer_to_buffer(&out, 0, &staging, 0, out_size);
+                gpu.queue.submit([encoder.finish()]);
+
+                let (tx, rx) = std::sync::mpsc::channel();
+                staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = tx.send(r);
                 });
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(image.width.div_ceil(8), image.height.div_ceil(8), 1);
+                device
+                    .poll(wgpu::PollType::wait_indefinitely())
+                    .map_err(|e| EngineError::DeviceRequest(e.to_string()))?;
+                rx.recv()
+                    .map_err(|_| EngineError::DeviceRequest("readback never completed".into()))?
+                    .map_err(|e| EngineError::DeviceRequest(e.to_string()))?;
+
+                {
+                    let view = staging.slice(..).get_mapped_range();
+                    let tile_px: &[f32] = bytemuck::cast_slice(&view);
+                    // Copy the interior only. The halo exists to make the
+                    // interior correct and is discarded.
+                    let valid_w = self.tile.min(image.width - ox) as usize;
+                    let valid_h = self.tile.min(image.height - oy) as usize;
+                    for y in 0..valid_h {
+                        let src = ((y + HALO as usize) * padded as usize + HALO as usize) * 4;
+                        let dst = ((oy as usize + y) * w + ox as usize) * 4;
+                        result[dst..dst + valid_w * 4]
+                            .copy_from_slice(&tile_px[src..src + valid_w * 4]);
+                    }
+                }
+                staging.unmap();
             }
         }
-        encoder.copy_buffer_to_buffer(&out, 0, &staging, 0, out_size);
-        gpu.queue.submit([encoder.finish()]);
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| EngineError::DeviceRequest(e.to_string()))?;
-        rx.recv()
-            .map_err(|_| EngineError::DeviceRequest("readback never completed".into()))?
-            .map_err(|e| EngineError::DeviceRequest(e.to_string()))?;
+        Ok(result)
+    }
+}
 
-        let pixels = {
-            let view = staging.slice(..).get_mapped_range();
-            bytemuck::cast_slice::<u8, f32>(&view).to_vec()
-        };
-        staging.unmap();
-        Ok(pixels)
+/// Fill `out` with the tile at `(ox, oy)` plus its halo, clamping at the image
+/// edge.
+///
+/// Clamping here has to match what the shader does when it reads out of bounds,
+/// or the tiled result would differ from an untiled one along the image border.
+/// Both clamp to the nearest edge pixel.
+fn gather_padded(image: &Mosaic<'_>, ox: u32, oy: u32, padded: u32, out: &mut [f32]) {
+    let w = image.width as i64;
+    let h = image.height as i64;
+    for py in 0..padded as i64 {
+        let gy = (oy as i64 - HALO as i64 + py).clamp(0, h - 1);
+        let row = (gy * w) as usize;
+        let dst = (py * padded as i64) as usize;
+        for px in 0..padded as i64 {
+            let gx = (ox as i64 - HALO as i64 + px).clamp(0, w - 1);
+            out[dst + px as usize] = image.data[row + gx as usize];
+        }
     }
 }
 

@@ -48,6 +48,10 @@ enum Command {
         /// 0 writes full resolution, which for a 24 MP sensor is a 72 MB file.
         #[arg(long, default_value_t = 2000)]
         max_dim: u32,
+        /// Tile edge in pixels. Exposed for benchmarking and for proving that
+        /// the choice does not change the output.
+        #[arg(long, default_value_t = rawkit_engine::demosaic::DEFAULT_TILE)]
+        tile: u32,
     },
 
     /// Report the GPU adapter this machine would render on.
@@ -85,7 +89,8 @@ fn main() -> Result<()> {
             input,
             output,
             max_dim,
-        } => render::render(&input, &output, max_dim)?,
+            tile,
+        } => render::render(&input, &output, max_dim, tile)?,
         Command::Gpu => {
             let gpu = rawkit_engine::Gpu::new()?;
             let info = &gpu.adapter_info;

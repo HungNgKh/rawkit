@@ -32,7 +32,7 @@ const XYZ_RGB: [[f32; 3]; 3] = [
     [0.019334, 0.119193, 0.950227],
 ];
 
-pub fn render(input: &Path, output: &Path, max_dim: u32) -> Result<()> {
+pub fn render(input: &Path, output: &Path, max_dim: u32, tile: u32) -> Result<()> {
     let raw = rawkit_decode::decode_file(input)
         .with_context(|| format!("decoding {}", input.display()))?;
     eprintln!(
@@ -68,7 +68,7 @@ pub fn render(input: &Path, output: &Path, max_dim: u32) -> Result<()> {
     );
 
     let mosaic = normalise(&raw);
-    let demosaic = Demosaic::new(&gpu);
+    let demosaic = Demosaic::with_tile_size(&gpu, tile);
     let rgba = demosaic.run(
         &gpu,
         &Mosaic {

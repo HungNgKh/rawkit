@@ -261,3 +261,103 @@ fn every_bayer_phase_reconstructs_equally_well() {
         best - worst
     );
 }
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn tiling_does_not_change_a_single_pixel() {
+    // The whole argument for tiling is that it is free: a tile boundary must not
+    // be visible in the output. "Nearly identical" would not do — a faint seam
+    // is exactly the artefact that survives review and shows up in a print. So
+    // this asserts bit-equality between a 96-pixel tiling and one tile covering
+    // the lot.
+    //
+    // 96 is chosen because it does *not* divide 256: the last tile in each
+    // direction is partial, which is the case a neat power-of-two tiling never
+    // exercises and where the interesting index bugs live.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let truth = ground_truth();
+    let cfa = mosaic(&truth, BayerPhase::Rggb);
+    let image = || Mosaic {
+        data: &cfa,
+        width: W,
+        height: H,
+        phase: BayerPhase::Rggb,
+        wb: [1.0, 1.0, 1.0],
+    };
+
+    let whole = Demosaic::with_tile_size(&gpu, 512)
+        .run(&gpu, &image())
+        .expect("single-tile demosaic failed");
+    let tiled = Demosaic::with_tile_size(&gpu, 96)
+        .run(&gpu, &image())
+        .expect("tiled demosaic failed");
+
+    assert_eq!(whole.len(), tiled.len());
+    let mut worst = 0.0f32;
+    let mut worst_at = (0u32, 0u32);
+    for y in 0..H {
+        for x in 0..W {
+            let i = ((y * W + x) * 4) as usize;
+            for c in 0..3 {
+                let d = (whole[i + c] - tiled[i + c]).abs();
+                if d > worst {
+                    worst = d;
+                    worst_at = (x, y);
+                }
+            }
+        }
+    }
+    println!("worst tile-seam difference: {worst:e} at {worst_at:?}");
+    assert_eq!(
+        worst, 0.0,
+        "tiling changed the image by {worst:e} at {worst_at:?}; \
+         the halo is too small or the padded phase is wrong"
+    );
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_full_frame_renders_within_webgpu_default_limits() {
+    // The portability floor. A 24 MP frame as RGBA f32 is 388 MB, past WebGPU's
+    // default 256 MB buffer cap — so before tiling, rendering one required
+    // raising the device limits, which means a render that succeeds on one
+    // machine and fails on another. Tiled, the buffers depend on tile size and
+    // not on image size at all, and this proves it by rendering a
+    // deliberately large frame on a device that asked for nothing special.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let limits = gpu.device.limits();
+    let defaults = wgpu::Limits::default();
+    assert!(
+        limits.max_buffer_size <= defaults.max_buffer_size,
+        "this test is meaningless unless the device is on default limits"
+    );
+
+    // 4000x3000 = 12 MP: 192 MB as RGBA f32, comfortably past the 128 MB
+    // storage-binding cap that an untiled render would need.
+    let (w, h) = (4000u32, 3000u32);
+    let cfa = vec![0.25f32; (w * h) as usize];
+    let out = Demosaic::new(&gpu)
+        .run(
+            &gpu,
+            &Mosaic {
+                data: &cfa,
+                width: w,
+                height: h,
+                phase: BayerPhase::Rggb,
+                wb: [1.0, 1.0, 1.0],
+            },
+        )
+        .expect("a full frame must render on default limits");
+
+    assert_eq!(out.len(), (w * h * 4) as usize);
+    // A flat mosaic must demosaic to a flat image; anything else means the
+    // interpolation invented structure that was not there.
+    let mid = ((h / 2 * w + w / 2) * 4) as usize;
+    for c in 0..3 {
+        assert!(
+            (out[mid + c] - 0.25).abs() < 1e-4,
+            "flat input produced {} in channel {c}",
+            out[mid + c]
+        );
+    }
+}

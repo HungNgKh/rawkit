@@ -71,21 +71,19 @@ impl Gpu {
             .await
             .map_err(|_| EngineError::NoAdapter)?;
 
-        // Ask for what this adapter can actually do rather than WebGPU's
-        // defaults, which cap a buffer at 256 MB and a storage binding at
-        // 128 MB. A 24 MP frame as RGBA f32 is 388 MB, so the defaults cannot
-        // hold one whole image — on any GPU, however large.
+        // WebGPU's **default** limits, deliberately, even though this adapter
+        // would grant more. They cap a buffer at 256 MB and a storage binding at
+        // 128 MB, which a 24 MP frame (388 MB as RGBA f32) cannot fit — so
+        // asking for defaults is a standing assertion that nothing in the engine
+        // sizes a buffer by the image.
         //
-        // Raising the limits makes the whole-frame path work today; it does not
-        // make it right. Desktop GPUs differ in what they allow, so a render
-        // that fits on this machine and not on someone else's would break the
-        // one invariant the engine exists to hold. **The frame has to be tiled,
-        // and this is the reason** — it is an architectural requirement that
-        // happens to also be the 60fps requirement, not a memory optimisation.
+        // Requesting the adapter's limits instead would work on this machine and
+        // silently produce a build that fails on a smaller one, which is the
+        // divergence the whole engine exists to prevent. Everything is tiled;
+        // tiling is what makes the floor sufficient.
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("rawkit engine"),
-                required_limits: adapter.limits(),
                 ..Default::default()
             })
             .await
