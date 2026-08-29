@@ -28,9 +28,10 @@ use serde::{Deserialize, Serialize};
 
 /// The schema version this build expects. `0` means "no tables yet": the
 /// migration list is empty and the first real migration in P1 will be version 1.
+pub mod db;
 pub mod path;
 
-pub const SCHEMA_VERSION: u32 = 0;
+pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -40,6 +41,8 @@ pub enum CatalogError {
     CatalogIsNewer { found: u32, expected: u32 },
     #[error("migration set is not contiguous: v{expected} is missing")]
     MigrationGap { expected: u32 },
+    #[error("sqlite: {0}")]
+    Sqlite(String),
 }
 
 /// One forward-only schema change.
@@ -57,9 +60,17 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
-/// Every migration, in order. Empty until the P1 schema lands — the runner is
-/// what P0 needs, not the tables.
-pub const MIGRATIONS: &[Migration] = &[];
+/// Every migration, in order.
+///
+/// The SQL lives in files rather than in string literals so it can be read and
+/// diffed as SQL. Once a migration has shipped its text is frozen: editing it
+/// changes what a catalog already carrying that version *thinks* it has, and the
+/// only safe correction is another migration.
+pub const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: "spine",
+    sql: include_str!("../migrations/001-spine.sql"),
+}];
 
 /// Migrations that a catalog at `current_version` still needs.
 ///
@@ -89,6 +100,11 @@ pub fn validate_migrations() -> Result<(), CatalogError> {
         if m.version != expected {
             return Err(CatalogError::MigrationGap { expected });
         }
+    }
+    if MIGRATIONS.len() as u32 != SCHEMA_VERSION {
+        return Err(CatalogError::MigrationGap {
+            expected: MIGRATIONS.len() as u32 + 1,
+        });
     }
     Ok(())
 }

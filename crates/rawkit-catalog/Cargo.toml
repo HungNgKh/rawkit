@@ -13,3 +13,4 @@ rawkit-editstate.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 unicode-normalization.workspace = true
+rusqlite.workspace = true

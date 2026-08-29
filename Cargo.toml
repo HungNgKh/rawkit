@@ -40,6 +40,10 @@ schemars = "0.8"
 # NFC normalisation for catalog paths. macOS filenames can arrive decomposed,
 # and the same file spelled two ways is how a library grows duplicates.
 unicode-normalization = "0.1"
+# SQLite, statically linked. `bundled` on purpose: a catalog must open the same
+# way on all three platforms, and depending on whatever libsqlite the host
+# happens to ship is how one of them ends up with different pragma defaults.
+rusqlite = { version = "0.40", features = ["bundled"] }
 blake3 = "1"
 thiserror = "2"
 anyhow = "1"
