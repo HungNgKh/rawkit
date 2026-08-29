@@ -79,6 +79,9 @@ Two habits worth copying from that slice, because neither needs a Mac or a PC:
   three types it imports stubbed out — it is still the file you are shipping.
 - Forcing `PathConvention::host()` to the other two values and running the suite
   exercises the case-folding half of Windows and macOS locally.
+- `TMPDIR=/path/to/a/symlink cargo test` reproduces macOS's `/var` →
+  `/private/var` on Linux, which is what makes "canonicalising changes the path"
+  visible here. Verified by reverting the fix and watching it fail.
 
 So: **every `cfg`-gated piece of behaviour gets a counterpart for the other
 platforms**, even if the counterpart only prints what is missing and returns
@@ -104,7 +107,13 @@ Three CI failures, all this shape, none of them reproducible on the dev box:
 - a scan test needed the machine to have a **filesystem UUID**, and the runners
   do not have one;
 - a culling test derived capture times from the order `read_dir` returned
-  entries, which is filename order on ext4 and something else elsewhere.
+  entries, which is filename order on ext4 and something else elsewhere;
+- two scan tests compared a path they had built against the path the scan
+  actually opened. `scan_on` canonicalises its root, and what that *changes*
+  differs per platform: macOS resolves the temp directory's `/var` to
+  `/private/var`, Windows returns the extended-length `\\?\C:\...` form, and
+  Linux usually changes nothing at all — so the bug is invisible on the dev box
+  by construction.
 
 A test that depends on the filesystem passes locally and fails on the two
 platforms you cannot see. So: **derive test data from names and arguments, never

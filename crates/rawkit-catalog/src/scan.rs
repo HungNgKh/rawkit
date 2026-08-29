@@ -478,6 +478,18 @@ mod tests {
         .unwrap()
     }
 
+    /// The path the scan will hand the reader for a file the test just wrote.
+    ///
+    /// Not the same string the test built: `scan_on` canonicalises its root, and
+    /// what that changes differs per platform — macOS resolves the temp
+    /// directory's `/var` to `/private/var`, and Windows returns the
+    /// extended-length `\\?\C:\...` form. Comparing against the raw spelling
+    /// passed on Linux and failed on both of the others, which is the failure
+    /// mode AGENTS.md is about.
+    fn as_opened(path: PathBuf) -> PathBuf {
+        path.canonicalize().expect("the test just wrote this file")
+    }
+
     /// A reader standing in for the decoder, recording what it was asked for.
     ///
     /// It answers for `.ARW` files whose contents begin with `raw` and refuses
@@ -905,7 +917,7 @@ mod tests {
             fake_reader(&mut third),
         )
         .unwrap();
-        assert_eq!(third, [photos.join("b.ARW")]);
+        assert_eq!(third, [as_opened(photos.join("b.ARW"))]);
     }
 
     #[test]
@@ -928,7 +940,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.unchanged, 1, "the file itself did not move");
-        assert_eq!(seen, [photos.join("a.ARW")], "but it was still described");
+        assert_eq!(
+            seen,
+            [as_opened(photos.join("a.ARW"))],
+            "but it was still described"
+        );
         assert_eq!(
             described(&catalog),
             [(
