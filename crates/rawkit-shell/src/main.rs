@@ -208,7 +208,7 @@ fn main() -> Result<()> {
         .setup(move |app| {
             // The surface is created on the main thread because the raw window
             // handle comes from GTK on this platform and GTK is not thread-safe.
-            let (gpu, surface, size) = build_window(app, route)?;
+            let (gpu, surface, size, window_handle) = build_window(app, route)?;
             eprintln!(
                 "gpu        : {} ({:?})",
                 gpu.adapter_info.name, gpu.adapter_info.backend
@@ -248,23 +248,37 @@ fn main() -> Result<()> {
             let shared = Arc::new(Mutex::new(session));
             app.manage(Shared(shared.clone()));
 
+            #[cfg(target_os = "linux")]
+            if route == Route::NativeChild {
+                canvas::attach_input(&window_handle, PANEL_HEIGHT, shared.clone())?;
+            }
+
             let mut canvas_renderer =
                 session_canvas::CanvasRenderer::new(&gpu, &frame, [size.width, size.height]);
             canvas_renderer.target(&gpu, config.format);
 
             // One frame: let the session decide, draw what it asked for, blit.
+            //
+            // The counters are here because the next optimisation — caching a
+            // texture per tile so a pan redraws only what it exposes — should be
+            // decided by what a pan actually costs rather than by the fact that
+            // it obviously costs something.
             let surface_size = [size.width, size.height];
+            let mut stats = FrameStats::default();
             let mut tick = move || -> Result<()> {
-                {
+                let started = std::time::Instant::now();
+                let drawn = {
                     let mut session = shared.lock().expect("session lock");
-                    canvas_renderer.advance(&gpu, &mut session, &frame, &pyramid, surface_size)?;
-                }
+                    canvas_renderer.advance(&gpu, &mut session, &frame, &pyramid, surface_size)?
+                };
                 paint(
                     &gpu,
                     &surface,
                     canvas_renderer.presenter(),
                     canvas_renderer.canvas(),
-                )
+                )?;
+                stats.record(drawn, started.elapsed());
+                Ok(())
             };
 
             // On Linux the frame runs on the main thread, driven by GTK's own
@@ -307,7 +321,12 @@ fn main() -> Result<()> {
 fn build_window(
     app: &tauri::App,
     route: Route,
-) -> Result<(Gpu, wgpu::Surface<'static>, tauri::PhysicalSize<u32>)> {
+) -> Result<(
+    Gpu,
+    wgpu::Surface<'static>,
+    tauri::PhysicalSize<u32>,
+    tauri::Window,
+)> {
     match route {
         Route::Cutout => {
             let builder =
@@ -324,7 +343,8 @@ fn build_window(
             let window = builder.build()?;
             let size = window.inner_size()?;
             let (gpu, surface) = Gpu::with_surface(window.clone())?;
-            Ok((gpu, surface, size))
+            let handle = window.as_ref().window();
+            Ok((gpu, surface, size, handle))
         }
         Route::ChildWebview => {
             let window = WindowBuilder::new(app, "main")
@@ -345,7 +365,7 @@ fn build_window(
             );
             let size = window.inner_size()?;
             let (gpu, surface) = Gpu::with_surface(window.clone())?;
-            Ok((gpu, surface, size))
+            Ok((gpu, surface, size, window))
         }
         #[cfg(target_os = "linux")]
         Route::NativeChild => {
@@ -362,7 +382,8 @@ fn build_window(
             let size =
                 tauri::PhysicalSize::new(outer.width, outer.height.saturating_sub(panel).max(1));
             let (gpu, surface) = Gpu::with_surface(canvas)?;
-            Ok((gpu, surface, size))
+            let handle = window.as_ref().window();
+            Ok((gpu, surface, size, handle))
         }
         #[cfg(not(target_os = "linux"))]
         Route::NativeChild => Err(anyhow!(
@@ -415,6 +436,52 @@ fn load_image(
     ];
     let size = [raw.width, raw.height];
     Ok((rawkit_engine::normalise(&raw), size, phase, wb, profile))
+}
+
+/// What frames are costing, reported only while something is happening.
+///
+/// An idle window redraws nothing and would otherwise fill the log with zeros.
+struct FrameStats {
+    frames: u32,
+    tiles: usize,
+    busy: std::time::Duration,
+    slowest: std::time::Duration,
+    since: Option<std::time::Instant>,
+}
+
+impl Default for FrameStats {
+    fn default() -> Self {
+        Self {
+            frames: 0,
+            tiles: 0,
+            busy: std::time::Duration::ZERO,
+            slowest: std::time::Duration::ZERO,
+            since: None,
+        }
+    }
+}
+
+impl FrameStats {
+    fn record(&mut self, tiles: usize, elapsed: std::time::Duration) {
+        if tiles == 0 {
+            return;
+        }
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        self.frames += 1;
+        self.tiles += tiles;
+        self.busy += elapsed;
+        self.slowest = self.slowest.max(elapsed);
+        if since.elapsed() >= std::time::Duration::from_secs(1) {
+            eprintln!(
+                "frames     : {} drawing, {} tiles, mean {:.1} ms, worst {:.1} ms",
+                self.frames,
+                self.tiles,
+                self.busy.as_secs_f64() * 1000.0 / self.frames as f64,
+                self.slowest.as_secs_f64() * 1000.0,
+            );
+            *self = Self::default();
+        }
+    }
 }
 
 /// Blit the canvas to the surface and present. Repeated at ~30Hz rather than

@@ -179,3 +179,101 @@ pub fn attach(window: &tauri::Window, panel_height: i32) -> Result<CanvasWindow>
         screen: x11_screen.screen_number(),
     })
 }
+
+/// Route pointer input over the canvas into the session.
+///
+/// # Why this hangs off the toplevel and not the canvas window
+///
+/// The canvas has no GTK widget — that is the whole point of creating it
+/// directly — so GTK has nothing to deliver its events to. Rather than
+/// associating it with a widget after the fact, the canvas simply selects no
+/// events at all, and X does the rest: an event a window has not asked for
+/// propagates to its ancestor, which here is the toplevel, which does have a
+/// widget.
+///
+/// So the handlers below see pointer events over the canvas as if they happened
+/// on the window, in the window's coordinates, and the only thing to do is
+/// notice which side of the panel they fall on.
+pub fn attach_input(
+    window: &tauri::Window,
+    panel_height: i32,
+    session: std::sync::Arc<std::sync::Mutex<rawkit_session::Session>>,
+) -> Result<()> {
+    use gtk::gdk::EventMask;
+    use rawkit_session::Command;
+
+    let gtk_window = window.gtk_window()?;
+    gtk_window.add_events(
+        EventMask::BUTTON_PRESS_MASK
+            | EventMask::BUTTON_RELEASE_MASK
+            | EventMask::POINTER_MOTION_MASK
+            | EventMask::SCROLL_MASK,
+    );
+
+    let scale = gtk_window.scale_factor() as f64;
+    // Logical coordinates from GTK, physical everywhere in the session and the
+    // surface. Converting here means the rest of the shell never has to know
+    // which it is holding.
+    let to_canvas = move |(x, y): (f64, f64)| -> Option<[f64; 2]> {
+        let y = y - panel_height as f64;
+        (y >= 0.0).then_some([x * scale, y * scale])
+    };
+
+    let dragging: std::rc::Rc<std::cell::Cell<Option<(f64, f64)>>> =
+        std::rc::Rc::new(std::cell::Cell::new(None));
+
+    let held = dragging.clone();
+    gtk_window.connect_button_press_event(move |_, event| {
+        if to_canvas(event.position()).is_some() {
+            held.set(Some(event.position()));
+        }
+        gtk::glib::Propagation::Proceed
+    });
+
+    let held = dragging.clone();
+    gtk_window.connect_button_release_event(move |_, _| {
+        held.set(None);
+        gtk::glib::Propagation::Proceed
+    });
+
+    let held = dragging.clone();
+    let dragged = session.clone();
+    gtk_window.connect_motion_notify_event(move |_, event| {
+        if let Some((lx, ly)) = held.get() {
+            let (x, y) = event.position();
+            held.set(Some((x, y)));
+            // A drag emits one of these per motion event, far faster than the
+            // GPU draws. The session has no queue, so the extra ones cost a
+            // lock and two floats each and only the last is ever rendered —
+            // this is the arrangement that claim was written for.
+            dragged.lock().expect("session lock").apply(Command::Pan {
+                dx: (x - lx) * scale,
+                dy: (y - ly) * scale,
+            });
+        }
+        gtk::glib::Propagation::Proceed
+    });
+
+    let zoomed = session;
+    gtk_window.connect_scroll_event(move |_, event| {
+        let Some(anchor) = to_canvas(event.position()) else {
+            return gtk::glib::Propagation::Proceed;
+        };
+        let step = match event.direction() {
+            gtk::gdk::ScrollDirection::Up => 1.15,
+            gtk::gdk::ScrollDirection::Down => 1.0 / 1.15,
+            // Trackpads send Smooth with a delta rather than a direction.
+            gtk::gdk::ScrollDirection::Smooth => (-event.delta().1 * 0.15).exp2(),
+            _ => return gtk::glib::Propagation::Proceed,
+        };
+        let mut session = zoomed.lock().expect("session lock");
+        let scale = session.viewport().scale * step;
+        // Hold the image point under the cursor still, which is what makes
+        // scroll-to-zoom feel like examining a print rather than driving a
+        // camera.
+        session.apply(Command::ZoomTo { scale, anchor });
+        gtk::glib::Propagation::Proceed
+    });
+
+    Ok(())
+}
