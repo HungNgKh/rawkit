@@ -73,6 +73,25 @@ enum Command {
         /// at -1.2 EV has that much room before anything blows.
         #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
         exposure: f32,
+        /// Contrast, about middle grey. -1 to 1.
+        ///
+        /// This and the four below are display-referred: they shape what the
+        /// tone map produced, rather than how much light there was. Whites and
+        /// blacks are the two that clip.
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        contrast: f32,
+        /// Highlights. Negative recovers, -1 to 1.
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        highlights: f32,
+        /// Shadows. Positive opens them, -1 to 1.
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        shadows: f32,
+        /// White point. Positive blows the brightest values to white, -1 to 1.
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        whites: f32,
+        /// Black point. Negative crushes the darkest values to black, -1 to 1.
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        blacks: f32,
     },
 
     /// Render the edits you made, into files you can send someone.
@@ -197,7 +216,26 @@ fn main() -> Result<()> {
             tile,
             profile,
             exposure,
-        } => render::render(&input, &output, max_dim, tile, profile.as_deref(), exposure)?,
+            contrast,
+            highlights,
+            shadows,
+            whites,
+            blacks,
+        } => render::render(
+            &input,
+            &output,
+            max_dim,
+            tile,
+            profile.as_deref(),
+            rawkit_editstate::Tone {
+                exposure_ev: exposure,
+                contrast,
+                highlights,
+                shadows,
+                whites,
+                blacks,
+            },
+        )?,
         Command::Catalog {
             path,
             scan,

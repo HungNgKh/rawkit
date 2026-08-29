@@ -7,6 +7,13 @@
                font: 13px/1.4 system-ui, sans-serif; }
   main { padding: 14px 18px; display: flex; gap: 28px; align-items: flex-start; }
   section { min-width: 260px; }
+  /* Six tone controls in one column would need a taller panel, and the panel is
+     chrome sitting on top of the photograph. Two columns instead: same height,
+     same single "Tone" heading, no canvas surrendered. */
+  section.split { display: grid; grid-template-columns: repeat(2, minmax(250px, 1fr));
+                  grid-template-rows: repeat(4, auto); grid-auto-flow: column;
+                  column-gap: 28px; }
+  section.split h1 { grid-column: 1 / -1; grid-row: 1; }
   h1 { font-size: 13px; font-weight: 600; margin: 0 0 10px; letter-spacing: .02em; }
   label { display: flex; align-items: center; gap: 10px; margin: 7px 0; }
   label span:first-child { width: 74px; color: #9a9aa2; }
@@ -44,7 +51,7 @@
 </div>
 
 <main>
-  <section>
+  <section class="split">
     <h1>Tone</h1>
     <label><span>Exposure</span>
       <input id="exposure" type="range" min="-4" max="4" step="0.01" value="0">
@@ -52,6 +59,18 @@
     <label><span>Contrast</span>
       <input id="contrast" type="range" min="-1" max="1" step="0.01" value="0">
       <output id="contrast-value">0.00</output></label>
+    <label><span>Highlights</span>
+      <input id="highlights" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="highlights-value">0.00</output></label>
+    <label><span>Shadows</span>
+      <input id="shadows" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="shadows-value">0.00</output></label>
+    <label><span>Whites</span>
+      <input id="whites" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="whites-value">0.00</output></label>
+    <label><span>Blacks</span>
+      <input id="blacks" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="blacks-value">0.00</output></label>
   </section>
 
   <section>
@@ -119,6 +138,10 @@
 
   slider("exposure", v => ({ command: "set_exposure", params: v }), v => v.toFixed(2));
   slider("contrast", v => ({ command: "set_contrast", params: v }), v => v.toFixed(2));
+  slider("highlights", v => ({ command: "set_highlights", params: v }), v => v.toFixed(2));
+  slider("shadows", v => ({ command: "set_shadows", params: v }), v => v.toFixed(2));
+  slider("whites", v => ({ command: "set_whites", params: v }), v => v.toFixed(2));
+  slider("blacks", v => ({ command: "set_blacks", params: v }), v => v.toFixed(2));
   slider("temperature", v => ({ command: "set_temperature", params: v }), v => `${v | 0} K`);
   slider("tint", v => ({ command: "set_tint", params: v }), v => `${v | 0}`);
 
@@ -173,7 +196,8 @@
   // would update on navigation while the thumb stayed where it was — the two
   // halves of one control disagreeing, which is worse than either being wrong.
   let dragging = null;
-  for (const id of ["exposure", "contrast", "temperature", "tint"]) {
+  const TONE = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"];
+  for (const id of [...TONE, "temperature", "tint"]) {
     document.getElementById(id).addEventListener("pointerdown", () => (dragging = id));
   }
   document.addEventListener("pointerup", () => (dragging = null));
@@ -185,7 +209,9 @@
 
   const sync = state => {
     setSlider("exposure", state.tone.exposure_ev, v => Number(v).toFixed(2));
-    setSlider("contrast", state.tone.contrast, v => Number(v).toFixed(2));
+    for (const id of TONE.slice(1)) {
+      setSlider(id, state.tone[id], v => Number(v).toFixed(2));
+    }
     setSlider("tint", state.white_balance.tint, v => `${v | 0}`);
     const temp = state.white_balance.temperature_k;
     setSlider("temperature", temp ?? 5500, () => (temp === null ? "as shot" : `${temp | 0} K`));
@@ -261,6 +287,13 @@
   document.addEventListener("keydown", event => {
     if (event.metaKey || event.ctrlKey || event.altKey) return;
     const key = event.key;
+    // A focused control owns its own keys. Without this, arrows move the slider
+    // *and* the selection, and a digit rates the photograph while you are
+    // trying to type into something — which was survivable with two sliders and
+    // is not with six. Escape is the way back out, so it stays ours.
+    const editing = event.target.closest("input, button, select, textarea");
+    if (editing && key !== "Escape") return;
+    if (editing) event.target.blur();
     if (key >= "0" && key <= "5") return act("rate", Number(key)), event.preventDefault();
     // Lightroom's colour keys, and pressing the same one again clears it.
     const labels = { "6": "red", "7": "yellow", "8": "green", "9": "blue" };

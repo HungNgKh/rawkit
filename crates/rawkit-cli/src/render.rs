@@ -33,10 +33,24 @@ pub fn render(
     max_dim: u32,
     tile: u32,
     profile_path: Option<&Path>,
-    exposure_ev: f32,
+    tone: rawkit_editstate::Tone,
 ) -> Result<()> {
-    if !exposure_ev.is_finite() {
+    if !tone.exposure_ev.is_finite() {
         bail!("exposure must be a finite number of stops");
+    }
+    // The renderer clamps these anyway, at the boundary where it has to. Saying
+    // so here is the difference between a slider that silently did something
+    // else and one that told you what you asked for was out of range.
+    for (name, value) in [
+        ("contrast", tone.contrast),
+        ("highlights", tone.highlights),
+        ("shadows", tone.shadows),
+        ("whites", tone.whites),
+        ("blacks", tone.blacks),
+    ] {
+        if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
+            bail!("{name} runs from -1 to 1; got {value}");
+        }
     }
     let raw = rawkit_decode::decode_file(input)
         .with_context(|| format!("decoding {}", input.display()))?;
@@ -138,10 +152,7 @@ pub fn render(
     // Everything else the renderer does comes from the frame itself, which is
     // what makes the default a baseline worth looking at.
     let state = EditState {
-        tone: rawkit_editstate::Tone {
-            exposure_ev,
-            ..Default::default()
-        },
+        tone,
         ..Default::default()
     };
     let renderer = Renderer::with_tile_size(&gpu, tile);

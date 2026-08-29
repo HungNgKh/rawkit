@@ -28,6 +28,7 @@ pub mod present;
 pub mod preview;
 pub mod profile;
 pub mod render;
+mod tone;
 
 pub use pipeline::{Domain, Stage};
 pub use present::Presenter;

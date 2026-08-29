@@ -213,6 +213,10 @@ struct Params {
     working_to_display: [[f32; 4]; 3],
     develop: [f32; 4],
     hsm_dims: [u32; 4],
+    /// `[contrast exponent, highlights, shadows, active]` — see [`crate::tone`].
+    tone: [f32; 4],
+    /// `[black point, white point, unused, unused]`.
+    levels: [f32; 4],
     /// `[dest_x, dest_y, tile, halo]`. Rewritten per tile; everything above it
     /// moves only when the edit does, which is why this sits last and is
     /// patched in place rather than re-uploading the whole uniform.
@@ -225,7 +229,12 @@ struct Params {
 }
 
 /// Byte offset of `Params::present`, for the per-tile partial write.
-const PRESENT_OFFSET: u64 = 176;
+///
+/// Computed rather than written down. It was 176 until the tone controls added
+/// two `vec4`s above it, and a hand-maintained offset that silently drifts
+/// writes a tile's position over somebody else's uniform — which shows up as a
+/// wrong-looking picture, not as an error.
+const PRESENT_OFFSET: u64 = std::mem::offset_of!(Params, present) as u64;
 
 /// What the caller wants back.
 ///
@@ -860,6 +869,7 @@ impl Renderer {
         // and blue sites from unscaled CFA values, so any other normalisation
         // would mix scaled and unscaled greens in the same subtraction.
         let colour = image.colour(state)?;
+        let tone = crate::tone::ToneCurve::new(&state.tone);
         let (wb, m) = (colour.multipliers, colour.cam_to_display);
         let working = colour.working_to_display;
         let hsm = colour.hue_sat.as_ref();
@@ -887,6 +897,8 @@ impl Renderer {
                 image.clip_level,
                 0.0,
             ],
+            tone: tone.shape(),
+            levels: tone.levels(),
             hsm_dims: match hsm {
                 Some(m) => [m.hue_divisions, m.sat_divisions, m.value_divisions, 0],
                 None => [1, 1, 1, 0],

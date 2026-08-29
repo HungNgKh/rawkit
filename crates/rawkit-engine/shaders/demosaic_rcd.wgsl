@@ -67,6 +67,12 @@ struct Params {
     develop: vec4<f32>,
     // Hue, saturation and value divisions of the table. `.w` unused.
     hsm_dims: vec4<u32>,
+    // The display-referred tone controls, already reduced to curve parameters
+    // on the CPU: `.x` is the contrast exponent, `.y` highlights, `.z` shadows,
+    // and `.w` is 1 when any of the five is off its default. See `tone_curve`.
+    tone: vec4<f32>,
+    // `.xy` are the black and white points. `.zw` unused.
+    levels: vec4<f32>,
     // Where this tile lands in the canvas and how to trim it: `.xy` is the
     // destination pixel, `.z` the tile edge, `.w` the halo width. Rewritten per
     // tile, unlike everything above it, which moves only when the edit does.
@@ -505,7 +511,85 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
 
     let exposed = shown * params.develop.x;
-    rgba_out[p] = vec4<f32>(tone_map(exposed), 1.0);
+    let mapped = tone_map(exposed);
+
+    // Stage I -- display-referred ops. The five tone controls live here and not
+    // beside exposure, because the sigmoid is the boundary: exposure decides how
+    // much light there was, these decide what it should look like.
+    rgba_out[p] = vec4<f32>(
+        vec3<f32>(
+            tone_curve(mapped.r),
+            tone_curve(mapped.g),
+            tone_curve(mapped.b),
+        ),
+        1.0,
+    );
+}
+
+/// Mid-grey in the perceptual coordinate: `0.18^(1/2.2)`.
+const TONE_PIVOT: f32 = 0.45865646;
+/// The exponent that coordinate uses.
+const TONE_GAMMA: f32 = 2.2;
+/// How far the shadow and highlight exponents may travel from 1. Bounded by
+/// monotonicity at 0.8807 -- see the `tone` module in Rust for the derivation,
+/// and the test there that checks these three numbers against this file.
+const TONE_TAPER: f32 = 0.75;
+
+/// Contrast, highlights, shadows, whites and blacks, as one curve.
+///
+/// Per channel, deliberately. Working on luminance and re-applying the ratio
+/// preserves hue exactly, and also makes an S-curve leave saturation flat --
+/// which is not what a photographer means by contrast. Per-channel is what an
+/// RGB curve does, and what the eye expects from one.
+///
+/// Every step is monotonic by construction. That is not a nicety: a tone curve
+/// that folds back inverts local contrast, and the result reads as a contour in
+/// a smooth sky rather than as a bug in this function.
+fn tone_curve(y: f32) -> f32 {
+    // Bit-identical passthrough when nothing is set, so an identity edit is
+    // untouched by all of this rather than merely close to untouched.
+    if (params.tone.w < 0.5) {
+        return y;
+    }
+
+    // The tone map is asymptotic, so `y` is already inside [0, 1) -- but a
+    // non-finite exposure would put it outside, and `1.0 - p` going negative
+    // would make every `pow` below a NaN. Clamping is one instruction.
+    let p0 = clamp(pow(max(y, 0.0), 1.0 / TONE_GAMMA), 0.0, 1.0);
+
+    // Contrast: a power about the pivot, each side of it separately. Both
+    // segments carry slope k at the pivot, so this is smooth there and not
+    // merely continuous; 0, mid-grey and 1 are all fixed points.
+    let k = params.tone.x;
+    var p1: f32;
+    if (p0 <= TONE_PIVOT) {
+        p1 = TONE_PIVOT * pow(p0 / TONE_PIVOT, k);
+    } else {
+        p1 = 1.0 - (1.0 - TONE_PIVOT) * pow((1.0 - p0) / (1.0 - TONE_PIVOT), k);
+    }
+
+    // Shadows and highlights: powers whose exponent tapers to exactly 1 at the
+    // pivot. Without the taper each control puts a slope discontinuity in the
+    // middle of the frame, and a "highlights" slider visibly moves mid-grey.
+    var p2: f32;
+    if (p1 <= TONE_PIVOT) {
+        let v = p1 / TONE_PIVOT;
+        p2 = TONE_PIVOT * pow(v, 1.0 - params.tone.z * TONE_TAPER * (1.0 - v));
+    } else {
+        let u = (1.0 - p1) / (1.0 - TONE_PIVOT);
+        p2 = 1.0 - (1.0 - TONE_PIVOT) * pow(u, 1.0 + params.tone.y * TONE_TAPER * (1.0 - u));
+    }
+
+    // The black and white points, and the only place in the whole pipeline that
+    // clips. Deliberate: the endpoints are where a photographer asks for
+    // clipping, and an editor whose black slider only compresses reads as
+    // broken. The points can never cross -- see LEVELS_REACH in Rust.
+    let levelled = clamp(
+        (p2 - params.levels.x) / (params.levels.y - params.levels.x),
+        0.0,
+        1.0,
+    );
+    return pow(levelled, TONE_GAMMA);
 }
 
 /// RGB to hue/saturation/value, with hue in degrees.

@@ -85,6 +85,35 @@ const CASES: &[Case] = &[
             s
         },
     },
+    // The rescue pair, and the reason the display-referred controls exist: pull
+    // a blown highlight back, open a blocked shadow. Both are tapered powers
+    // rather than plain ones, so this is also the reference that would notice
+    // if the taper were dropped and mid-grey started moving.
+    Case {
+        name: "chirp_rggb_recovered",
+        phase: BayerPhase::Rggb,
+        state: || {
+            let mut s = EditState::default();
+            s.tone.highlights = -1.0;
+            s.tone.shadows = 1.0;
+            s
+        },
+    },
+    // The three that reshape rather than rescue, including the only two in the
+    // whole pipeline that clip. A reference with hard black and hard white in it
+    // is worth having on all three platforms: clamping is exactly the kind of
+    // thing a backend can disagree about at the edges.
+    Case {
+        name: "chirp_rggb_contrast_and_endpoints",
+        phase: BayerPhase::Rggb,
+        state: || {
+            let mut s = EditState::default();
+            s.tone.contrast = 1.0;
+            s.tone.whites = 1.0;
+            s.tone.blacks = -1.0;
+            s
+        },
+    },
 ];
 
 /// A deterministic mosaic: a radial chirp whose frequency rises towards the
