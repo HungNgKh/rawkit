@@ -12,3 +12,4 @@ authors.workspace = true
 rawkit-editstate.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+unicode-normalization.workspace = true
