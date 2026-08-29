@@ -17,5 +17,6 @@ bytemuck.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+bytemuck.workspace = true
 blake3.workspace = true
 png.workspace = true

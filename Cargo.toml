@@ -67,6 +67,9 @@ tauri-build = "2"
 # the GPU surface on its own X window — see crates/rawkit-shell/src/canvas.rs.
 gtk = "0.18"
 gdkx11 = "0.18"
+# Already in the tree under gdkx11; declared directly so its build script emits
+# the -lX11 link flag. Needed for exactly one call: XInitThreads.
+x11 = { version = "2", features = ["xlib"] }
 
 # Rendering work is unusably slow in a debug build; keep dev fast but not naive.
 [profile.dev]

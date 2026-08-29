@@ -24,10 +24,12 @@
 use rawkit_editstate::EditState;
 
 pub mod pipeline;
+pub mod present;
 pub mod profile;
 pub mod render;
 
 pub use pipeline::{Domain, Stage};
+pub use present::Presenter;
 pub use profile::CameraProfile;
 pub use render::{
     normalise, BayerPhase, Canvas, Frame, Output, Pyramid, Renderer, TileBuffers, CANVAS_FORMAT,

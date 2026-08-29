@@ -91,7 +91,7 @@
 //! # Reading it yourself
 //!
 //! ```text
-//! cargo run -p rawkit-shell &
+//! RAWKIT_PROBE_CLEAR=1 RAWKIT_PROBE_ROUTE=1 cargo run -p rawkit-shell &
 //! xwd -name rawkit -out probe.xwd
 //! python3 crates/rawkit-shell/probe/check-composite.py probe.xwd
 //! ```
@@ -103,7 +103,8 @@
 mod canvas;
 
 use anyhow::{anyhow, Result};
-use rawkit_engine::Gpu;
+use rawkit_editstate::EditState;
+use rawkit_engine::{BayerPhase, CameraProfile, Frame, Gpu, Output, Presenter, Pyramid, Renderer};
 use tauri::{
     webview::WebviewBuilder, window::WindowBuilder, LogicalPosition, LogicalSize, WebviewUrl,
     WebviewWindowBuilder,
@@ -144,6 +145,10 @@ const WINDOW: (f64, f64) = (1200.0, 800.0);
 
 /// Deliberately a colour no UI would ever use, so a screenshot can be checked by
 /// value rather than by eye.
+///
+/// Still here because the compositing check documented above has to be runnable
+/// on macOS and Windows, where the routes have not been tested. Set
+/// `RAWKIT_PROBE_CLEAR=1` and the window fills with this instead of a render.
 const PROBE_GREEN: wgpu::Color = wgpu::Color {
     r: 0.0,
     g: 1.0,
@@ -152,6 +157,10 @@ const PROBE_GREEN: wgpu::Color = wgpu::Color {
 };
 
 fn main() -> Result<()> {
+    // Before GTK, before Tauri, before anything opens a display.
+    #[cfg(target_os = "linux")]
+    canvas::init_threads();
+
     let route = match std::env::var("RAWKIT_PROBE_ROUTE").as_deref() {
         Ok("1") => Route::Cutout,
         Ok("2") => Route::ChildWebview,
@@ -233,7 +242,7 @@ fn main() -> Result<()> {
                     .title("rawkit")
                     .inner_size(WINDOW.0, WINDOW.1)
                     .build()?;
-                    let canvas = canvas::attach(&window.default_vbox()?, PANEL_HEIGHT)?;
+                    let canvas = canvas::attach(&window.as_ref().window(), PANEL_HEIGHT)?;
                     eprintln!("canvas     : X window {canvas:?}");
                     // The widget reports 2x2 at this point: it has an X window
                     // but GTK has not laid the window out yet. Size the surface
@@ -280,12 +289,92 @@ fn main() -> Result<()> {
                 eprintln!("paint      : disabled (RAWKIT_PROBE_NO_GPU)");
                 return Ok(());
             }
+            // Everything from here down is the real path: a frame is rendered
+            // into a Canvas by the engine and blitted to the surface. The clear
+            // colour that the compositing probe used is gone — set
+            // RAWKIT_PROBE_ROUTE and RAWKIT_PROBE_NO_GPU still select the window
+            // arrangement, but what lands in the window is now a picture.
+            let presenter = Presenter::new(&gpu, config.format);
+            let renderer = Renderer::new(&gpu);
+            let canvas = renderer.create_canvas(&gpu, size.width, size.height);
+
+            // A synthetic frame until the shell learns to open a file. It is a
+            // real render through every stage — decode is the only thing missing.
+            let mosaic = test_mosaic(size.width, size.height);
+            let frame = Frame {
+                data: &mosaic.samples,
+                width: mosaic.width,
+                height: mosaic.height,
+                phase: BayerPhase::Rggb,
+                as_shot_wb: [1.0, 1.0, 1.0],
+                clip_level: 1.0,
+                profile: CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
+            };
+            let state = EditState::default();
+            let buffers = renderer.allocate(&gpu, &frame);
+            renderer.set_edit(&gpu, &buffers, &frame, &state)?;
+            let pyramid = Pyramid::build(&frame, rawkit_engine::render::DEFAULT_TILE);
+
+            // One pass over every visible tile at 1:1. Progressive refinement,
+            // level selection and the rest of the loop belong with the command
+            // bus; this proves the chain reaches the screen.
+            let level = 0;
+            let (_, level_w, level_h) = pyramid.level(level).expect("level 0 always exists");
+            let tile = rawkit_engine::render::DEFAULT_TILE;
+            let mut tiles = 0;
+            for ty in 0..level_h.div_ceil(tile) {
+                for tx in 0..level_w.div_ceil(tile) {
+                    tiles += 1;
+                    renderer.draw_tile(
+                        &gpu,
+                        &buffers,
+                        &canvas,
+                        &pyramid,
+                        level,
+                        tx,
+                        ty,
+                        [tx * tile, ty * tile],
+                        Output::Display,
+                    )?;
+                }
+            }
+            eprintln!("canvas     : {tiles} tiles at level {level} ({level_w}x{level_h})");
+
+            // Painting happens on the main thread, driven by GTK's own loop.
+            //
+            // Not a style preference. Presenting from a spawned thread means two
+            // threads on one Xlib connection, and the failure is not a race that
+            // corrupts an occasional frame — it is `xcb_xlib_threads_sequence_lost`,
+            // an abort inside libxcb. `XInitThreads` would license it, but the
+            // symbol is not linked here and the arrangement would still be the
+            // wrong one: a canvas wants to draw on the compositor's schedule, not
+            // on a sleep. This timer is a step towards GTK's frame clock rather
+            // than the destination.
+            //
+            // The race was always there. Earlier probes presented from a thread
+            // and never aborted, because a static page generates almost no X
+            // traffic; it surfaced the moment the window had a real page and a
+            // real render in it.
+            #[cfg(target_os = "linux")]
+            gtk::glib::timeout_add_local(
+                std::time::Duration::from_millis(16),
+                move || match paint(&gpu, &surface, &presenter, &canvas) {
+                    Ok(()) => gtk::glib::ControlFlow::Continue,
+                    Err(e) => {
+                        eprintln!("paint: {e}");
+                        gtk::glib::ControlFlow::Break
+                    }
+                },
+            );
+            // macOS and Windows have no equivalent constraint, and the routes
+            // they are here to probe do not use a native child widget anyway.
+            #[cfg(not(target_os = "linux"))]
             std::thread::spawn(move || loop {
-                if let Err(e) = paint(&gpu, &surface) {
+                if let Err(e) = paint(&gpu, &surface, &presenter, &canvas) {
                     eprintln!("paint: {e}");
                     return;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(33));
+                std::thread::sleep(std::time::Duration::from_millis(16));
             });
             Ok(())
         })
@@ -293,10 +382,15 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Clear the whole surface and present. Repeated at ~30Hz rather than drawn
-/// once: flicker is the reported failure mode on this platform, and a single
-/// frame cannot show it.
-fn paint(gpu: &Gpu, surface: &wgpu::Surface<'static>) -> Result<()> {
+/// Blit the canvas to the surface and present. Repeated at ~30Hz rather than
+/// drawn once: flicker was the failure mode two of the three arrangements had,
+/// and a single frame cannot show it.
+fn paint(
+    gpu: &Gpu,
+    surface: &wgpu::Surface<'static>,
+    presenter: &Presenter,
+    canvas: &rawkit_engine::Canvas,
+) -> Result<()> {
     use wgpu::CurrentSurfaceTexture as Current;
     let frame = match surface.get_current_texture() {
         Current::Success(f) | Current::Suboptimal(f) => f,
@@ -309,28 +403,71 @@ fn paint(gpu: &Gpu, surface: &wgpu::Surface<'static>) -> Result<()> {
     let view = frame
         .texture
         .create_view(&wgpu::TextureViewDescriptor::default());
-    let mut encoder = gpu
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("probe"),
+    if std::env::var_os("RAWKIT_PROBE_CLEAR").is_some() {
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("probe clear"),
+            });
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("probe clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(PROBE_GREEN),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
         });
-    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("probe clear"),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view: &view,
-            depth_slice: None,
-            resolve_target: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(PROBE_GREEN),
-                store: wgpu::StoreOp::Store,
-            },
-        })],
-        depth_stencil_attachment: None,
-        timestamp_writes: None,
-        occlusion_query_set: None,
-        multiview_mask: None,
-    });
-    gpu.queue.submit([encoder.finish()]);
+        gpu.queue.submit([encoder.finish()]);
+    } else {
+        presenter.draw(gpu, canvas, &view)?;
+    }
     frame.present();
     Ok(())
+}
+
+/// A Bayer mosaic of a scene with structure at every scale.
+///
+/// Stands in for a decoded RAW until the shell learns to open one. Everything
+/// downstream of it is the real pipeline, so what appears in the window is a
+/// genuine render rather than a picture of one.
+struct TestMosaic {
+    samples: Vec<f32>,
+    width: u32,
+    height: u32,
+}
+
+fn test_mosaic(width: u32, height: u32) -> TestMosaic {
+    // Even dimensions: an odd one would put the last row or column on the wrong
+    // half of a CFA block.
+    let (width, height) = (width & !1, height & !1);
+    let mut samples = Vec::with_capacity((width * height) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let fx = x as f32 / width as f32;
+            let fy = y as f32 / height as f32;
+            let luma = 0.5 + 0.35 * (fx * 12.0).sin() * (fy * 9.0).cos();
+            let rgb = [luma * 1.15, luma, luma * 0.8];
+            let channel = if (x + y) % 2 == 1 {
+                1
+            } else if y % 2 == 0 {
+                0
+            } else {
+                2
+            };
+            samples.push(rgb[channel]);
+        }
+    }
+    TestMosaic {
+        samples,
+        width,
+        height,
+    }
 }

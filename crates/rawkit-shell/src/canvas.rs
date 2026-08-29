@@ -28,6 +28,7 @@
 //! EditState -> same pixels" is untouched.
 
 use anyhow::{anyhow, Result};
+use gtk::gdk;
 use gtk::glib::translate::ToGlibPtr;
 use gtk::prelude::*;
 use std::ffi::c_void;
@@ -86,55 +87,93 @@ impl rwh::HasDisplayHandle for CanvasWindow {
 /// The caller sizes the surface from the layout it intends. X clips the surface
 /// to the widget regardless, which is the whole reason this arrangement works —
 /// a surface configured too large spills nowhere.
-pub fn attach(vbox: &gtk::Box, panel_height: i32) -> Result<CanvasWindow> {
-    let area = gtk::DrawingArea::new();
-    area.set_size_request(-1, -1);
-    area.set_vexpand(true);
-    area.set_hexpand(true);
-    vbox.pack_start(&area, true, true, 0);
-
-    // The webview keeps a fixed strip; the canvas takes the rest. Whichever of
-    // them wry packed first, both now have their own rectangle.
-    for child in vbox.children() {
-        if child != area {
-            child.set_size_request(-1, panel_height);
-            child.set_vexpand(false);
-        }
+/// Make Xlib safe to use from more than one thread.
+///
+/// **Must run before anything opens an X connection** — before Tauri starts GTK,
+/// hence the first line of `main`.
+///
+/// Painting happens on the main thread, so this looks unnecessary and is not.
+/// Mesa's X11 present path runs its own thread on the connection GTK is using,
+/// and without this the failures are `xcb_xlib_threads_sequence_lost` (an abort
+/// inside libxcb) and `RenderBadPicture` from GTK's own drawing — the second
+/// arriving tens of seconds after the frame that caused it, naming nothing
+/// useful. Moving painting to the main thread made them rarer, which is worse
+/// than leaving them frequent, because rare looks like fixed.
+pub fn init_threads() {
+    // SAFETY: called before any X connection exists, which is the documented
+    // requirement and the only one.
+    unsafe {
+        x11::xlib::XInitThreads();
     }
-    vbox.show_all();
+}
 
-    // A widget has no GdkWindow until it is realized, and realizing is what
-    // creates the X window this whole approach depends on.
-    area.realize();
-    let gdk_window = area
+/// Create the canvas's X window as a child of the toplevel, and return handles
+/// to it.
+///
+/// # Why not a GtkDrawingArea
+///
+/// That was the first attempt and it does not survive. A widget's `GdkWindow`
+/// stays GTK's: every frame GTK opens a paint cycle on it, creating and freeing
+/// an XRender `Picture`, while Vulkan presents to the same window. The two
+/// collide as `RenderBadPicture` — reported asynchronously, ten seconds later,
+/// naming nothing that caused it. Neither `set_app_paintable`, a `draw` handler
+/// that does nothing, nor the deprecated `set_double_buffered(false)` stops it;
+/// the last made it happen sooner.
+///
+/// So the window is created directly instead. GTK has no widget for it, never
+/// lays it out and never paints it, and X clips the toplevel's own drawing to
+/// exclude it. The cost is that nothing moves or resizes it for us — which for a
+/// canvas is control rather than a chore.
+pub fn attach(window: &tauri::Window, panel_height: i32) -> Result<CanvasWindow> {
+    let gtk_window = window.gtk_window()?;
+    let parent = gtk_window
         .window()
-        .ok_or_else(|| anyhow!("the canvas widget realized without an X window"))?;
+        .ok_or_else(|| anyhow!("the toplevel has no X window yet"))?;
 
-    // Ask the plain GdkWindow for its display and screen *before* downcasting:
-    // the X11 subclasses inherit the accessors but not the trait bounds that
-    // make them callable.
-    let x11_display: gdkx11::X11Display = gdk_window
+    let (width, height) = (gtk_window.allocated_width(), gtk_window.allocated_height());
+    let attributes = gdk::WindowAttr {
+        x: Some(0),
+        y: Some(panel_height),
+        width: width.max(1),
+        height: (height - panel_height).max(1),
+        window_type: gdk::WindowType::Child,
+        wclass: gdk::WindowWindowClass::InputOutput,
+        // The parent's visual, so the child is the same depth as the surface
+        // wgpu will build for it.
+        visual: Some(parent.visual()),
+        ..Default::default()
+    };
+    let child = gdk::Window::new(Some(&parent), &attributes);
+    child.show();
+
+    let x11_display: gdkx11::X11Display = child
         .display()
         .downcast()
         .map_err(|_| anyhow!("the canvas is not on an X11 display"))?;
-    let x11_screen: gdkx11::X11Screen = gdk_window
+    let x11_screen: gdkx11::X11Screen = child
         .screen()
         .downcast()
         .map_err(|_| anyhow!("the canvas is not on an X11 screen"))?;
-    let x11_window: gdkx11::X11Window = gdk_window
+    let x11_window: gdkx11::X11Window = child
+        .clone()
         .downcast()
         .map_err(|_| anyhow!("the canvas is not on an X11 window"))?;
 
-    // SAFETY: `x11_display` is a live GdkX11Display; the call returns the
-    // connection GTK is already using rather than opening a new one, which is
-    // precisely what makes this different from asking Tauri for a display
-    // handle (that hands back a fresh pointer every time).
+    // SAFETY: `x11_display` is a live GdkX11Display; this returns the connection
+    // GTK already uses rather than opening one, which is what separates it from
+    // asking Tauri for a display handle — that hands back a fresh pointer every
+    // call.
     let display =
         unsafe { gdkx11::ffi::gdk_x11_display_get_xdisplay(x11_display.to_glib_none().0) };
 
+    // The window must outlive every surface built on it, and nothing else here
+    // has a lifetime long enough to own it. One window, once, for as long as the
+    // process runs.
+    std::mem::forget(child);
+
     Ok(CanvasWindow {
         window: NonZeroU32::new(x11_window.xid() as u32)
-            .ok_or_else(|| anyhow!("the canvas widget has no X window id"))?,
+            .ok_or_else(|| anyhow!("the canvas window has no X window id"))?,
         display: NonNull::new(display.cast())
             .ok_or_else(|| anyhow!("GTK reported a null X display"))?,
         screen: x11_screen.screen_number(),
