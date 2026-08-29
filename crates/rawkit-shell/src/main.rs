@@ -109,7 +109,7 @@ use rawkit_engine::{
     render::DEFAULT_TILE, BayerPhase, CameraProfile, Frame, Gpu, Presenter, Pyramid,
 };
 use rawkit_session::{Command, Event, Session};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{
     webview::WebviewBuilder, window::WindowBuilder, LogicalPosition, LogicalSize, Manager,
@@ -201,7 +201,10 @@ fn main() -> Result<()> {
         Ok("2") => Route::ChildWebview,
         _ => Route::NativeChild,
     };
-    let raw = std::env::args().nth(1).map(PathBuf::from);
+    // One positional argument. A `.rawkit` file opens a library and its first
+    // image; anything else is a raw opened directly, which is how the shell has
+    // always worked and stays useful when there is no catalog to hand.
+    let target = std::env::args().nth(1).map(PathBuf::from);
     eprintln!("route      : {route:?}");
 
     tauri::Builder::default()
@@ -228,7 +231,17 @@ fn main() -> Result<()> {
             // exactly one per process. Leaking it is honest about that; the
             // alternative is a self-referential struct to hold a Vec and a Frame
             // that points into it.
+            // A library, if that is what was passed. The catalog is what makes
+            // an edit outlive the process, so it is opened before the image it
+            // describes rather than bolted on after.
+            let mut library = open_library(target.as_deref())?;
+            let raw = library
+                .as_ref()
+                .map(|(_, path)| PathBuf::from(path))
+                .or_else(|| target.clone().filter(|p| !is_catalog(p)));
+
             let (mosaic, image, phase, wb, profile) = load_image(raw.as_deref())?;
+            let library_image_id = LIBRARY_IMAGE.load(std::sync::atomic::Ordering::Relaxed);
             let mosaic: &'static [f32] = Box::leak(mosaic.into_boxed_slice());
             let frame = Frame {
                 data: mosaic,
@@ -247,8 +260,60 @@ fn main() -> Result<()> {
                 height: size.height,
             });
             session.apply(Command::FitToView);
+            // Whatever was last decided about this photograph, if anything was.
+            if let Some((catalog, _)) = &library {
+                if let Some((version, saved)) =
+                    rawkit_catalog::edits::latest(catalog, library_image_id)?
+                {
+                    eprintln!("edit       : restored v{version}");
+                    session.apply(Command::SetEditState(Box::new(saved)));
+                }
+            }
+
             let shared = Arc::new(Mutex::new(session));
             app.manage(Shared(shared.clone()));
+
+            // Persist when the edit has stopped moving. A drag emits commands
+            // far faster than anyone decides anything, so writing per command
+            // would fill the history with one gesture — the catalog deduplicates
+            // identical states, but the honest fix is not to ask it to.
+            let persisting = shared.clone();
+            let mut settled = None::<(u64, std::time::Instant)>;
+            // Where the session stood before anyone touched it. Opening a
+            // photograph and not changing it must not write a version: it would
+            // mark every browsed image as edited and fill the history with
+            // decisions nobody made.
+            let opened_at = shared.lock().expect("session lock").generation();
+            let mut saver = move || {
+                let Some((catalog, _)) = &library else { return };
+                let (generation, state) = {
+                    let session = persisting.lock().expect("session lock");
+                    (session.generation(), session.state().clone())
+                };
+                if generation == opened_at {
+                    return;
+                }
+                match settled {
+                    Some((seen, since))
+                        if seen == generation
+                            && since.elapsed() >= std::time::Duration::from_millis(800) =>
+                    {
+                        settled = Some((generation, std::time::Instant::now()));
+                        match rawkit_catalog::edits::save(
+                            catalog,
+                            library_image_id,
+                            &state,
+                            rawkit_editstate::EditSource::User,
+                        ) {
+                            Ok(Some(version)) => eprintln!("edit       : saved v{version}"),
+                            Ok(None) => {}
+                            Err(e) => eprintln!("edit       : could not save: {e}"),
+                        }
+                    }
+                    Some((seen, _)) if seen == generation => {}
+                    _ => settled = Some((generation, std::time::Instant::now())),
+                }
+            };
 
             // Routes 1 and 2 put the canvas over the whole window; route 3
             // reserves a strip for the chrome.
@@ -304,6 +369,7 @@ fn main() -> Result<()> {
             let mut stats = FrameStats::default();
             let mut tick = move || -> Result<()> {
                 let started = std::time::Instant::now();
+                saver();
                 let drawn = {
                     let mut session = shared.lock().expect("session lock");
                     canvas_renderer.advance(&gpu, &mut session, &frame, &pyramid, surface_size)?
@@ -477,6 +543,40 @@ fn build_window(
         )),
     }
 }
+
+/// Whether a path names a catalog rather than a photograph.
+fn is_catalog(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("rawkit"))
+}
+
+/// Open a catalog and pick its first image, when a catalog is what was given.
+///
+/// Returns the catalog alongside the path of the photograph to open, because
+/// the two are only useful together — and holding the catalog is what keeps the
+/// backup-on-close guarantee alive for the whole session.
+#[allow(clippy::type_complexity)]
+fn open_library(target: Option<&Path>) -> Result<Option<(rawkit_catalog::db::Catalog, String)>> {
+    let Some(path) = target.filter(|p| is_catalog(p)) else {
+        return Ok(None);
+    };
+    let catalog = rawkit_catalog::db::Catalog::open(path)?;
+    let Some((image_id, raw)) = rawkit_catalog::edits::first_image(&catalog)? else {
+        return Err(anyhow!(
+            "{} has no images; run `rawkit catalog <path> --scan <folder>` first",
+            path.display()
+        ));
+    };
+    eprintln!("library    : {} · image {image_id}", path.display());
+    LIBRARY_IMAGE.store(image_id, std::sync::atomic::Ordering::Relaxed);
+    Ok(Some((catalog, raw)))
+}
+
+/// Which image the open library is showing.
+///
+/// A single global because the shell shows exactly one image and has no picker
+/// yet; it becomes a field the moment there is more than one to choose between.
+static LIBRARY_IMAGE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// Decode a RAW, or synthesise one when no file was given.
 #[allow(clippy::type_complexity)]

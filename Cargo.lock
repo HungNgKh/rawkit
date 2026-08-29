@@ -3073,6 +3073,7 @@ dependencies = [
  "anyhow",
  "gdkx11",
  "gtk",
+ "rawkit-catalog",
  "rawkit-decode",
  "rawkit-editstate",
  "rawkit-engine",

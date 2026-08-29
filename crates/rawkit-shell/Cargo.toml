@@ -14,6 +14,7 @@ rawkit-engine.workspace = true
 rawkit-session.workspace = true
 rawkit-decode.workspace = true
 rawkit-export.workspace = true
+rawkit-catalog.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
 anyhow.workspace = true
