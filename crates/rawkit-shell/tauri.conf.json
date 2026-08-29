@@ -6,16 +6,7 @@
     "frontendDist": "ui"
   },
   "app": {
-    "windows": [
-      {
-        "label": "main",
-        "title": "rawkit",
-        "width": 1200,
-        "height": 800,
-        "transparent": true,
-        "decorations": true
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null
     }

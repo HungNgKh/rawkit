@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>rawkit panel</title>
+<style>
+  /* Fills its own rectangle. Route 2 needs no transparency anywhere: the panel
+     and the canvas never overlap, which is the whole idea being tested. */
+  html, body { margin: 0; height: 100%; background: rgb(255, 0, 0); }
+  /* Same repaint forcing as index.html: a static page paints once, loses, and
+     stays lost, which reads as a stable z-order. */
+  @keyframes nudge { from { opacity: 0.996; } to { opacity: 1; } }
+  body { animation: nudge 0.05s infinite alternate; }
+  main { color: white; font: 14px system-ui, sans-serif; padding: 16px; }
+</style>
+<main>
+  <strong>webview child</strong>
+  <p>Opaque red, in its own window rather than over the whole one.</p>
+  <p>If this survives while the rest is green, X is clipping the parent's
+     drawing to exclude this child and the two layers never contend.</p>
+</main>

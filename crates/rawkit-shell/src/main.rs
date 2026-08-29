@@ -9,14 +9,16 @@
 //! request (tauri#8246) is closed, and the wgpu-plus-transparency flicker on
 //! Linux/WebKitGTK (tauri#9220) is closed as *not planned*.
 //!
-//! Two routes existed. This binary tested the first before any UI was built on
-//! it, because discovering it afterwards is a rewrite:
+//! Two routes existed, and **both are closed on Linux.** They were tested before
+//! any UI was built on either, because discovering it afterwards is a rewrite.
 //!
 //! 1. **Transparent cutout** — the webview paints chrome and leaves a hole; wgpu
 //!    draws behind it. What RapidRAW ships, having first tried and abandoned
-//!    JPEG-over-IPC as too slow. Known good on macOS and Windows.
+//!    JPEG-over-IPC as too slow. Known good on macOS and Windows. **Fails here:
+//!    the layers fight, see below.**
 //! 2. **Disjoint child webviews** — panels and canvas never overlap, so nothing
-//!    needs transparency at all. Costs an unstable Tauri API.
+//!    needs transparency at all. Costs an unstable Tauri API. **Fails here for a
+//!    different reason: the API does not position the child.**
 //!
 //! # The result, on X11 / WebKitGTK / Vulkan (Radeon 780M, RADV)
 //!
@@ -40,7 +42,23 @@
 //! continuously; a static page paints once, loses, and stays lost, which a
 //! single screenshot would have reported as a clean stable z-order.
 //!
-//! Scope of the finding: X11. Wayland composites differently and is untested —
+//! # Route 2: the child webview cannot be placed
+//!
+//! `Window::add_child` takes a position and a size, and on Linux/GTK the child
+//! ignores both and fills the window. `bounds()` reports `0x0` immediately after
+//! creation and `1200x800` — the whole window — once the page has loaded, after
+//! `set_auto_resize(false)`, `set_position` and `set_size` have each been called
+//! twice. With the GPU disabled the entire window is the panel's red, which is
+//! the visual form of the same fact.
+//!
+//! So route 2 fails before compositing is even reached. Whether X would have
+//! clipped the parent's present out of a correctly-placed child's rectangle is
+//! still unknown, and it is the question worth carrying forward: the mechanism
+//! is sound, the API that would arrange it is not.
+//!
+//! # Scope
+//!
+//! X11. Wayland composites differently and is untested —
 //! GTK uses subsurfaces there — and macOS and Windows are where route 1 is
 //! reported to work. This says nothing about them, which is the point of
 //! writing down what was actually measured.
@@ -58,7 +76,32 @@
 
 use anyhow::{anyhow, Result};
 use rawkit_engine::Gpu;
-use tauri::Manager;
+use tauri::{
+    webview::WebviewBuilder, window::WindowBuilder, LogicalPosition, LogicalSize, WebviewUrl,
+    WebviewWindowBuilder,
+};
+
+/// Which arrangement to test. `RAWKIT_PROBE_ROUTE=1` for the cutout, anything
+/// else for child webviews.
+///
+/// Route 1 stays in the code after being ruled out on Linux, because it is
+/// reported to work on macOS and Windows and this is how that gets checked
+/// there. A probe that only tests the arrangement you settled on cannot tell
+/// you when the other one starts working.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Route {
+    /// One full-window webview with a transparent hole, wgpu behind it.
+    Cutout,
+    /// A window with no webview of its own, wgpu across it, and the chrome as a
+    /// child webview occupying its own rectangle. Nothing overlaps, so nothing
+    /// needs to be transparent.
+    ChildWebview,
+}
+
+/// Width of the chrome, in logical pixels. The canvas is everything to the
+/// right of it.
+const PANEL_WIDTH: f64 = 400.0;
+const WINDOW: (f64, f64) = (1200.0, 800.0);
 
 /// Deliberately a colour no UI would ever use, so a screenshot can be checked by
 /// value rather than by eye.
@@ -70,21 +113,73 @@ const PROBE_GREEN: wgpu::Color = wgpu::Color {
 };
 
 fn main() -> Result<()> {
+    let route = match std::env::var("RAWKIT_PROBE_ROUTE").as_deref() {
+        Ok("1") => Route::Cutout,
+        _ => Route::ChildWebview,
+    };
+    eprintln!("route      : {route:?}");
+
     tauri::Builder::default()
-        .setup(|app| {
-            let window = app
-                .get_webview_window("main")
-                .ok_or_else(|| anyhow!("the config declares a window labelled 'main'"))?;
+        .setup(move |app| {
             // The surface is created here, on the main thread, because the raw
             // window handle comes from GTK on this platform and GTK is not
             // thread-safe. Drawing afterwards is fine from anywhere.
-            let (gpu, surface) = Gpu::with_surface(window.clone())?;
+            let (gpu, surface, size) = match route {
+                Route::Cutout => {
+                    let window = WebviewWindowBuilder::new(
+                        app,
+                        "main",
+                        WebviewUrl::App("index.html".into()),
+                    )
+                    .title("rawkit")
+                    .inner_size(WINDOW.0, WINDOW.1)
+                    .transparent(true)
+                    .build()?;
+                    let size = window.inner_size()?;
+                    let (gpu, surface) = Gpu::with_surface(window.clone())?;
+                    (gpu, surface, size)
+                }
+                Route::ChildWebview => {
+                    // A window with no webview of its own. The chrome becomes a
+                    // child occupying the left strip, and the GPU gets the rest
+                    // — or rather, gets the whole window and is expected to be
+                    // clipped out of the child's rectangle by X.
+                    let window = WindowBuilder::new(app, "main")
+                        .title("rawkit")
+                        .inner_size(WINDOW.0, WINDOW.1)
+                        .build()?;
+                    let panel = window.add_child(
+                        WebviewBuilder::new("panel", WebviewUrl::App("panel.html".into())),
+                        LogicalPosition::new(0.0, 0.0),
+                        LogicalSize::new(PANEL_WIDTH, WINDOW.1),
+                    )?;
+                    // Restating the bounds is not belt and braces: the size
+                    // given to `add_child` alone left the child filling the
+                    // whole window, which would have made the probe answer a
+                    // question nobody asked.
+                    panel.set_auto_resize(false)?;
+                    panel.set_position(LogicalPosition::new(0.0, 0.0))?;
+                    panel.set_size(LogicalSize::new(PANEL_WIDTH, WINDOW.1))?;
+                    eprintln!("panel      : {:?} (at creation)", panel.bounds()?);
+                    // Try again once the page has loaded, in case the bounds
+                    // are only honoured after the webview exists in earnest.
+                    let later = panel.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                        let _ = later.set_auto_resize(false);
+                        let _ = later.set_position(LogicalPosition::new(0.0, 0.0));
+                        let _ = later.set_size(LogicalSize::new(PANEL_WIDTH, WINDOW.1));
+                        eprintln!("panel      : {:?} (after load)", later.bounds());
+                    });
+                    let size = window.inner_size()?;
+                    let (gpu, surface) = Gpu::with_surface(window.clone())?;
+                    (gpu, surface, size)
+                }
+            };
             eprintln!(
                 "gpu        : {} ({:?})",
                 gpu.adapter_info.name, gpu.adapter_info.backend
             );
-
-            let size = window.inner_size()?;
             let config = surface
                 .get_default_config(&gpu.adapter, size.width, size.height)
                 .ok_or_else(|| anyhow!("this surface supports no configuration we can use"))?;
