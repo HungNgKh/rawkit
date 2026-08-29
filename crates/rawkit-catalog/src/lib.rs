@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 pub mod backup;
 pub mod db;
 pub mod path;
+pub mod relink;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
