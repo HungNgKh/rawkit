@@ -36,8 +36,8 @@ pub use present::Presenter;
 pub use preview::{Cell, PreviewBlit, PreviewImage};
 pub use profile::CameraProfile;
 pub use render::{
-    normalise, BayerPhase, Canvas, Frame, Output, Pyramid, Rendered, Renderer, TileBuffers,
-    CANVAS_FORMAT,
+    normalise, BayerPhase, Canvas, Frame, Output, Pyramid, Rendered, Renderer, StraightenView,
+    TileBuffers, CANVAS_FORMAT,
 };
 
 /// Failures the engine can produce that are not programmer error.

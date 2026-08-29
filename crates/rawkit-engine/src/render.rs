@@ -240,6 +240,34 @@ struct Params {
 /// wrong-looking picture, not as an error.
 const PRESENT_OFFSET: u64 = std::mem::offset_of!(Params, present) as u64;
 
+/// Where the two buffers are looking, for [`Renderer::straighten`].
+///
+/// Three values that are only meaningful together: the level they are measured
+/// in, and the point each buffer's top-left pixel stands for. Passed as one
+/// because a caller holding a straight origin and a flat buffer sized for a
+/// different level draws a photograph that is subtly in the wrong place.
+#[derive(Debug, Clone, Copy)]
+pub struct StraightenView {
+    /// The mosaic's size at the level being drawn.
+    pub level_image: [u32; 2],
+    /// The straight-space point of the canvas's top-left pixel.
+    pub straight_origin: [f32; 2],
+    /// The flat-space point of the flat buffer's top-left pixel.
+    pub flat_origin: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct StraightenParams {
+    straight_origin: [f32; 2],
+    flat_origin: [f32; 2],
+    origin: [f32; 2],
+    dx: [f32; 2],
+    dy: [f32; 2],
+    extent: [u32; 2],
+    photograph: [f32; 2],
+}
+
 /// A developed photograph: the pixels, and how wide they are.
 ///
 /// The two travel together because they are only correct together. Before crop
@@ -311,6 +339,8 @@ pub struct Renderer {
     canvas_layout: wgpu::BindGroupLayout,
     pipelines: Vec<wgpu::ComputePipeline>,
     present: wgpu::ComputePipeline,
+    straighten_layout: wgpu::BindGroupLayout,
+    straighten_pipeline: wgpu::ComputePipeline,
     tile: u32,
 }
 
@@ -428,11 +458,76 @@ impl Renderer {
                 cache: None,
             });
 
+        // Straighten stands apart from the six-stage chain: it reads a texture
+        // rather than the tile buffers, so it needs its own layout rather than
+        // three unused bindings in the shared one.
+        let straighten_layout =
+            gpu.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("straighten layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::StorageTexture {
+                                access: wgpu::StorageTextureAccess::WriteOnly,
+                                format: CANVAS_FORMAT,
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+        let straighten_module = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("straighten"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/straighten.wgsl").into()),
+            });
+        let straighten_pipeline =
+            gpu.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("straighten"),
+                    layout: Some(&gpu.device.create_pipeline_layout(
+                        &wgpu::PipelineLayoutDescriptor {
+                            label: Some("straighten layout"),
+                            bind_group_layouts: &[Some(&straighten_layout)],
+                            immediate_size: 0,
+                        },
+                    )),
+                    module: &straighten_module,
+                    entry_point: Some("straighten"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
         Self {
             layout,
             canvas_layout,
             pipelines,
             present,
+            straighten_layout,
+            straighten_pipeline,
             tile,
         }
     }
@@ -744,6 +839,93 @@ impl Renderer {
 
     /// A canvas to draw tiles into. Sized in screen pixels and rebuilt on
     /// resize; the per-image buffers beside it are untouched by that.
+    /// Resample a flat canvas into a straightened one.
+    ///
+    /// The flat canvas holds tiles as they were scattered — rearranged and
+    /// exact. This is where the fraction of a degree happens, and it is a
+    /// separate pass because it has to be a *gather*: scattering a rotated tile
+    /// leaves holes between the pixels it lands on.
+    ///
+    /// `straight_origin` and `flat_origin` are the straight- and flat-space
+    /// points of each buffer's top-left pixel, in level pixels.
+    pub fn straighten(
+        &self,
+        gpu: &Gpu,
+        flat: &Canvas,
+        canvas: &Canvas,
+        geometry: &Geometry,
+        view: StraightenView,
+    ) {
+        let StraightenView {
+            level_image,
+            straight_origin,
+            flat_origin,
+        } = view;
+        let [origin, dx, dy] = geometry.flat_transform(level_image);
+        let extent = canvas.size();
+        let params = StraightenParams {
+            straight_origin,
+            flat_origin,
+            origin,
+            dx,
+            dy,
+            extent,
+            photograph: {
+                let [pw, ph] = geometry.output_size(level_image);
+                [pw as f32, ph as f32]
+            },
+        };
+        let uniform = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("straighten params"),
+            size: std::mem::size_of::<StraightenParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        gpu.queue
+            .write_buffer(&uniform, 0, bytemuck::bytes_of(&params));
+
+        let source = flat
+            .texture()
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let target = canvas
+            .texture()
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("straighten"),
+            layout: &self.straighten_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&source),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&target),
+                },
+            ],
+        });
+
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("straighten"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("straighten"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.straighten_pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(extent[0].div_ceil(8), extent[1].div_ceil(8), 1);
+        }
+        gpu.queue.submit(Some(encoder.finish()));
+    }
+
     pub fn create_canvas(&self, gpu: &Gpu, width: u32, height: u32) -> Canvas {
         let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("canvas"),
@@ -1032,6 +1214,45 @@ impl Canvas {
     /// For tests and for anything offline. Deliberately *not* part of drawing a
     /// frame: this is the synchronising, stalling operation that
     /// [`Renderer::draw_tile`] exists to keep off the hot path.
+    /// Fill the canvas from interleaved RGBA floats.
+    ///
+    /// The counterpart of [`read_back`](Self::read_back), and the reason it
+    /// exists: a test that only reads can compare two GPU paths to each other
+    /// but never to an answer worked out on the CPU.
+    ///
+    /// # Panics
+    ///
+    /// If `pixels` is not `width * height * 4` long.
+    pub fn write(&self, gpu: &Gpu, pixels: &[f32]) {
+        let [w, h] = self.size;
+        assert_eq!(
+            pixels.len(),
+            (w * h * 4) as usize,
+            "a {w}x{h} canvas wants {} samples",
+            w * h * 4
+        );
+        let halves: Vec<u16> = pixels.iter().map(|v| f32_to_f16(*v)).collect();
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&halves),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 8),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     pub fn read_back(&self, gpu: &Gpu) -> Result<Vec<f32>, EngineError> {
         const BYTES_PER_PIXEL: u32 = 8;
         let [w, h] = self.size;
@@ -1105,6 +1326,38 @@ impl Canvas {
 /// Written out rather than pulled from a crate: it is fifteen lines, it is used
 /// only off the hot path, and every dependency in this workspace costs a licence
 /// review (see `docs/licence-policy.md`).
+#[cfg(test)]
+mod half_tests {
+    use super::{f32_to_f16, half_to_f32};
+
+    #[test]
+    fn every_half_survives_a_round_trip() {
+        // Exhaustive: there are only 65536 of them, and the encoder has four
+        // branches — subnormal, normal, overflow and NaN — that are otherwise
+        // exercised by whichever values a test image happens to contain.
+        for bits in 0..=u16::MAX {
+            let exponent = (bits >> 10) & 0x1f;
+            let mantissa = bits & 0x3ff;
+            if exponent == 0x1f && mantissa != 0 {
+                continue; // NaN payloads are not preserved and need not be.
+            }
+            let value = half_to_f32(bits);
+            assert_eq!(f32_to_f16(value), bits, "{bits:#06x} became {value}");
+        }
+    }
+
+    #[test]
+    fn rounding_goes_to_nearest_even_like_the_hardware() {
+        // A test that uploaded with a different rounding rule would measure the
+        // rounding rather than the thing it meant to compare.
+        let above = half_to_f32(0x3c00) + (half_to_f32(0x3c01) - half_to_f32(0x3c00)) / 2.0;
+        assert_eq!(f32_to_f16(above), 0x3c00, "a tie rounds to the even one");
+        assert_eq!(f32_to_f16(1.0e30), 0x7c00, "past the range is infinity");
+        assert_eq!(f32_to_f16(-1.0e30), 0xfc00);
+        assert_eq!(f32_to_f16(1.0e-12), 0x0000, "too small to survive");
+    }
+}
+
 fn half_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) as u32) << 31;
     let exponent = ((h >> 10) & 0x1f) as u32;
@@ -1406,4 +1659,45 @@ mod tests {
         assert!(half_to_f32(0x7c00).is_infinite());
         assert!(half_to_f32(0x7e00).is_nan());
     }
+}
+
+/// The other direction, for [`Canvas::write`].
+///
+/// Round-to-nearest-even, matching what the hardware does on a store — a test
+/// that uploaded with a different rounding rule would measure the rounding
+/// rather than the thing it meant to compare. Values past the half-float range
+/// saturate to infinity, which is what a store does too.
+fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    let mantissa = bits & 0x7f_ffff;
+
+    if exponent == 0xff {
+        // Infinity, or a NaN kept as one rather than turned into infinity.
+        let payload = if mantissa != 0 { 0x200 } else { 0 };
+        return sign | 0x7c00 | payload;
+    }
+    let unbiased = exponent - 127 + 15;
+    if unbiased >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if unbiased <= 0 {
+        // Subnormal, or too small to survive at all.
+        if unbiased < -10 {
+            return sign;
+        }
+        let with_leading = mantissa | 0x80_0000;
+        let shift = (14 - unbiased) as u32;
+        let value = with_leading >> shift;
+        let round = (with_leading >> (shift - 1)) & 1;
+        let sticky = u32::from(with_leading & ((1 << (shift - 1)) - 1) != 0);
+        let up = round & (sticky | (value & 1));
+        return sign | (value + up) as u16;
+    }
+    let value = ((unbiased as u32) << 10) | (mantissa >> 13);
+    let round = (mantissa >> 12) & 1;
+    let sticky = u32::from(mantissa & 0xfff != 0);
+    let up = round & (sticky | (value & 1));
+    sign | (value + up) as u16
 }

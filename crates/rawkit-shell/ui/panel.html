@@ -5,20 +5,25 @@
   :root { color-scheme: dark; }
   html, body { margin: 0; height: 100%; background: #1e1e22; color: #e8e8ea;
                font: 13px/1.4 system-ui, sans-serif; }
-  main { padding: 14px 18px; display: flex; gap: 28px; align-items: flex-start; }
-  section { min-width: 260px; }
+  main { padding: 14px 18px; display: flex; gap: 24px; align-items: flex-start; }
+  section { min-width: 200px; }
   /* Six tone controls in one column would need a taller panel, and the panel is
      chrome sitting on top of the photograph. Two columns instead: same height,
      same single "Tone" heading, no canvas surrendered. */
-  section.split { display: grid; grid-template-columns: repeat(2, minmax(250px, 1fr));
+  /* Fixed columns, and a width that matches them: with `1fr` the grid sized
+     itself past the section's box and drew over the section beside it. */
+  section.split { display: grid; grid-template-columns: repeat(2, 200px);
                   grid-template-rows: repeat(4, auto); grid-auto-flow: column;
-                  column-gap: 28px; }
+                  column-gap: 28px; min-width: 428px; }
   section.split h1 { grid-column: 1 / -1; grid-row: 1; }
   h1 { font-size: 13px; font-weight: 600; margin: 0 0 10px; letter-spacing: .02em; }
   label { display: flex; align-items: center; gap: 10px; margin: 7px 0; }
-  label span:first-child { width: 74px; color: #9a9aa2; }
-  input[type=range] { flex: 1; }
-  output { width: 56px; text-align: right; font-variant-numeric: tabular-nums; }
+  label span:first-child { width: 66px; color: #9a9aa2; }
+  /* `min-width: 0` because a range input has an intrinsic minimum of its own,
+     and without it flex refuses to shrink one — which pushed the readout out of
+     its column and over the label beside it. */
+  input[type=range] { flex: 1; min-width: 0; }
+  output { width: 48px; text-align: right; font-variant-numeric: tabular-nums; }
   button { background: #303038; color: inherit; border: 1px solid #45454f;
            border-radius: 5px; padding: 4px 11px; font: inherit; cursor: pointer; }
   button:hover { background: #3a3a44; }
@@ -71,6 +76,17 @@
     <label><span>Blacks</span>
       <input id="blacks" type="range" min="-1" max="1" step="0.01" value="0">
       <output id="blacks-value">0.00</output></label>
+  </section>
+
+  <section>
+    <h1>Geometry</h1>
+    <label><span>Straighten</span>
+      <input id="straighten" type="range" min="-15" max="15" step="0.1" value="0">
+      <output id="straighten-value">0.0°</output></label>
+    <div class="row">
+      <button data-rotate="-1">↺</button>
+      <button data-rotate="1">↻</button>
+    </div>
   </section>
 
   <section>
@@ -142,6 +158,12 @@
   slider("shadows", v => ({ command: "set_shadows", params: v }), v => v.toFixed(2));
   slider("whites", v => ({ command: "set_whites", params: v }), v => v.toFixed(2));
   slider("blacks", v => ({ command: "set_blacks", params: v }), v => v.toFixed(2));
+  slider("straighten", v => ({ command: "set_straighten", params: v }), v => `${v.toFixed(1)}°`);
+
+  for (const button of document.querySelectorAll("[data-rotate]")) {
+    button.addEventListener("click", () =>
+      send({ command: "rotate_by", params: Number(button.dataset.rotate) }));
+  }
   slider("temperature", v => ({ command: "set_temperature", params: v }), v => `${v | 0} K`);
   slider("tint", v => ({ command: "set_tint", params: v }), v => `${v | 0}`);
 
@@ -197,7 +219,7 @@
   // halves of one control disagreeing, which is worse than either being wrong.
   let dragging = null;
   const TONE = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"];
-  for (const id of [...TONE, "temperature", "tint"]) {
+  for (const id of [...TONE, "straighten", "temperature", "tint"]) {
     document.getElementById(id).addEventListener("pointerdown", () => (dragging = id));
   }
   document.addEventListener("pointerup", () => (dragging = null));
@@ -212,6 +234,7 @@
     for (const id of TONE.slice(1)) {
       setSlider(id, state.tone[id], v => Number(v).toFixed(2));
     }
+    setSlider("straighten", state.crop.angle_deg, v => `${Number(v).toFixed(1)}°`);
     setSlider("tint", state.white_balance.tint, v => `${v | 0}`);
     const temp = state.white_balance.temperature_k;
     setSlider("temperature", temp ?? 5500, () => (temp === null ? "as shot" : `${temp | 0} K`));

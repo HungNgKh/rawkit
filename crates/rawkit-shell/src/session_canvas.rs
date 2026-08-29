@@ -47,6 +47,13 @@ pub struct CanvasRenderer {
     /// The geometry the canvas was last drawn under, so a change to it can clear
     /// what the previous framing left behind.
     geometry: Option<rawkit_editstate::Geometry>,
+    /// Where tiles land when the photograph is straightened.
+    ///
+    /// Tiles are scattered, which stays exact only while every output pixel
+    /// falls on exactly one source pixel — so they go here, flat, and a second
+    /// pass gathers from it at the angle. Absent while there is no angle, which
+    /// is the common case and costs nothing.
+    flat: Option<rawkit_engine::Canvas>,
 }
 
 impl CanvasRenderer {
@@ -62,6 +69,7 @@ impl CanvasRenderer {
             shown: None,
             uploaded: None,
             geometry: None,
+            flat: None,
         }
     }
 
@@ -256,18 +264,55 @@ impl CanvasRenderer {
             .map(|(_, w, h)| [w, h])
             .unwrap_or(session.image_size());
 
+        // Straightening moves where tiles have to land. They go into a flat
+        // buffer covering the *preimage* of the view — which a rotation swings
+        // wider than the view itself — and a gather turns that into the canvas.
+        let straight_origin = [origin[0].floor(), origin[1].floor()];
+        let [canvas_w, canvas_h] = self.canvas.size();
+        let (target, flat_origin) = if geometry.resamples() {
+            let seen = [
+                straight_origin[0],
+                straight_origin[1],
+                straight_origin[0] + canvas_w as f64,
+                straight_origin[1] + canvas_h as f64,
+            ];
+            let flat = geometry.flat_rect(seen, level_size);
+            // Room for the filter's own taps at every edge, for the same reason
+            // the crop reserves it: a gather at the boundary would otherwise
+            // read a clamped row instead of the photograph.
+            let margin = 3.0;
+            let corner = [(flat[0] - margin).floor(), (flat[1] - margin).floor()];
+            let wanted = [
+                ((flat[2] + margin - corner[0]).ceil() as u32).max(1),
+                ((flat[3] + margin - corner[1]).ceil() as u32).max(1),
+            ];
+            if self.flat.as_ref().map(|c| c.size()) != Some(wanted) {
+                self.flat = Some(self.renderer.create_canvas(gpu, wanted[0], wanted[1]));
+            }
+            (
+                self.flat.as_ref().expect("just created"),
+                [corner[0] as f32, corner[1] as f32],
+            )
+        } else {
+            self.flat = None;
+            (
+                &self.canvas,
+                [straight_origin[0] as f32, straight_origin[1] as f32],
+            )
+        };
+
         let mut drawn = 0;
         for tile in &tiles {
             let corner =
-                geometry.developed_of([tile.x * DEFAULT_TILE, tile.y * DEFAULT_TILE], level_size);
+                geometry.flat_of([tile.x * DEFAULT_TILE, tile.y * DEFAULT_TILE], level_size);
             let dest = [
-                (corner[0] - origin[0].floor() as i64) as i32,
-                (corner[1] - origin[1].floor() as i64) as i32,
+                (corner[0] - flat_origin[0] as i64) as i32,
+                (corner[1] - flat_origin[1] as i64) as i32,
             ];
             self.renderer.draw_tile(
                 gpu,
                 &self.buffers,
-                &self.canvas,
+                target,
                 pyramid,
                 level,
                 tile.x,
@@ -278,6 +323,21 @@ impl CanvasRenderer {
             )?;
             session.tile_rendered(*tile, job.generation);
             drawn += 1;
+        }
+        if geometry.resamples() {
+            if let Some(flat) = &self.flat {
+                self.renderer.straighten(
+                    gpu,
+                    flat,
+                    &self.canvas,
+                    &geometry,
+                    rawkit_engine::StraightenView {
+                        level_image: level_size,
+                        straight_origin: [straight_origin[0] as f32, straight_origin[1] as f32],
+                        flat_origin,
+                    },
+                );
+            }
         }
         self.shown = Some(viewport);
         Ok(drawn)

@@ -103,6 +103,8 @@ pub enum Command {
     SetOrientation(Orientation),
     /// The visible rectangle, as fractions of the oriented frame.
     SetCrop(Crop),
+    /// Level a horizon, in degrees clockwise. Refused past the straighten range.
+    SetStraighten(f32),
     /// Turn by this many quarter-turns clockwise, from wherever it is now.
     ///
     /// A relative command rather than an absolute one because that is what a
@@ -152,6 +154,7 @@ impl Command {
             Command::SetTint(_) => "set_tint",
             Command::SetOrientation(_) => "set_orientation",
             Command::SetCrop(_) => "set_crop",
+            Command::SetStraighten(_) => "set_straighten",
             Command::RotateBy(_) => "rotate_by",
             Command::SetEditState(_) => "set_edit_state",
             Command::Pan { .. } => "pan",
@@ -407,6 +410,18 @@ impl Session {
 
             Command::SetOrientation(o) => {
                 self.state.orientation = o;
+                self.edit_changed()
+            }
+
+            Command::SetStraighten(degrees) => {
+                // Through `Crop`, so the range and the refusal are stated in one
+                // place rather than once per caller.
+                let mut crop = self.state.crop;
+                crop.angle_deg = degrees;
+                if let Err(e) = crop.validate() {
+                    return refused(name, e.to_string());
+                }
+                self.state.crop = crop;
                 self.edit_changed()
             }
 
@@ -1173,5 +1188,24 @@ mod tests {
         s.apply(Command::RotateBy(5));
         assert_eq!(s.state().orientation, Orientation::AsShot);
         assert_eq!(s.developed_size(), IMAGE);
+    }
+
+    #[test]
+    fn straightening_refits_and_refuses_more_than_a_straighten() {
+        // The photograph gets smaller, because the crop pulls in to keep the
+        // empty corners out — so the view has to refit or it would show the new
+        // frame at the old scale, cropped by the canvas.
+        let mut s = session();
+        let before = s.developed_size();
+        s.apply(Command::SetStraighten(6.0));
+        let after = s.developed_size();
+        assert!(
+            after[0] < before[0] && after[1] < before[1],
+            "{after:?} is not smaller than {before:?}"
+        );
+
+        let event = s.apply(Command::SetStraighten(30.0));
+        assert!(matches!(event, Event::Refused { .. }), "{event:?}");
+        assert_eq!(s.developed_size(), after, "a refusal changes nothing");
     }
 }

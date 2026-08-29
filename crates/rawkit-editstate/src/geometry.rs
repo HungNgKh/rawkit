@@ -196,12 +196,13 @@ impl Geometry {
         ]
     }
 
-    /// Where an output pixel reads from, to sub-pixel precision.
+    /// A point of the straightened photograph, in *flat* coordinates.
     ///
-    /// In sensor coordinates, and fractional — which is the whole difference a
-    /// straighten makes: without one every output pixel lands exactly on a
-    /// source pixel and [`source_of`](Self::source_of) answers exactly.
-    pub fn source_at(&self, out: [f32; 2], image: [u32; 2]) -> [f32; 2] {
+    /// Flat is the frame after the quarter turn and the crop's translation but
+    /// before the straighten: the space the canvas draws tiles into, because
+    /// tiles land there by permutation and stay exact. The straighten is the one
+    /// step that has to be a gather, and this is the map it gathers along.
+    pub fn flat_of_straight(&self, straight: [f32; 2], image: [u32; 2]) -> [f32; 2] {
         let [fw, fh] = self.oriented_size(image);
         let (fw, fh) = (fw as f32, fh as f32);
         let [x0, y0, x1, y1] = self.window(image);
@@ -213,20 +214,76 @@ impl Geometry {
         );
         let [ow, oh] = self.output_size(image);
 
-        // Sample at pixel centres, so the first output pixel reads half a pixel
-        // in and the last reads half a pixel from the far edge.
-        let px = cx - hx + (out[0] + 0.5) * (2.0 * hx / ow as f32);
-        let py = cy - hy + (out[1] + 0.5) * (2.0 * hy / oh as f32);
+        // Into the shrunk rectangle, in oriented pixels.
+        let px = cx - hx + straight[0] * (2.0 * hx / ow as f32);
+        let py = cy - hy + straight[1] * (2.0 * hy / oh as f32);
 
         // Rotate back about the *frame* centre, not the crop's: a straighten
         // levels the photograph, and moving the crop afterwards must not tilt
         // it again.
         let (sin, cos) = self.angle().sin_cos();
         let (dx, dy) = (px - fw / 2.0, py - fh / 2.0);
-        let oriented = [
-            fw / 2.0 + dx * cos + dy * sin,
-            fh / 2.0 - dx * sin + dy * cos,
+        [
+            fw / 2.0 + dx * cos + dy * sin - x0 as f32,
+            fh / 2.0 - dx * sin + dy * cos - y0 as f32,
+        ]
+    }
+
+    /// The straight-to-flat map as an affine transform: `[origin, dx, dy]`.
+    ///
+    /// A point becomes `origin + dx · straight.x + dy · straight.y`. The map is
+    /// affine — a scale, a rotation and a translation — so three evaluations
+    /// determine it exactly, and **it is measured from
+    /// [`flat_of_straight`](Self::flat_of_straight) rather than derived
+    /// alongside it**. That matters: the GPU needs the transform and the CPU
+    /// needs the map, and re-deriving the same algebra in two places is how a
+    /// canvas ends up framing a photograph differently from the file it exports.
+    pub fn flat_transform(&self, image: [u32; 2]) -> [[f32; 2]; 3] {
+        let origin = self.flat_of_straight([0.0, 0.0], image);
+        let along_x = self.flat_of_straight([1.0, 0.0], image);
+        let along_y = self.flat_of_straight([0.0, 1.0], image);
+        [
+            origin,
+            [along_x[0] - origin[0], along_x[1] - origin[1]],
+            [along_y[0] - origin[0], along_y[1] - origin[1]],
+        ]
+    }
+
+    /// The flat-space rectangle covering a straight one, as `[x0, y0, x1, y1]`.
+    ///
+    /// The corners' bounding box. Used to size the buffer the canvas draws tiles
+    /// into: too small and the straighten reads past its edge, which shows as a
+    /// wedge of black along whichever side the rotation swung out.
+    pub fn flat_rect(&self, straight: [f64; 4], image: [u32; 2]) -> [f64; 4] {
+        let corners = [
+            [straight[0], straight[1]],
+            [straight[2], straight[1]],
+            [straight[0], straight[3]],
+            [straight[2], straight[3]],
         ];
+        let mut out = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+        for corner in corners {
+            let flat = self.flat_of_straight([corner[0] as f32, corner[1] as f32], image);
+            out[0] = out[0].min(flat[0] as f64);
+            out[1] = out[1].min(flat[1] as f64);
+            out[2] = out[2].max(flat[0] as f64);
+            out[3] = out[3].max(flat[1] as f64);
+        }
+        out
+    }
+
+    /// Where an output pixel reads from, to sub-pixel precision.
+    ///
+    /// In sensor coordinates, and fractional — which is the whole difference a
+    /// straighten makes: without one every output pixel lands exactly on a
+    /// source pixel and [`source_of`](Self::source_of) answers exactly.
+    pub fn source_at(&self, out: [f32; 2], image: [u32; 2]) -> [f32; 2] {
+        // Sample at pixel centres, so the first output pixel reads half a pixel
+        // in and the last reads half a pixel from the far edge.
+        let flat = self.flat_of_straight([out[0] + 0.5, out[1] + 0.5], image);
+        let [x0, y0, _, _] = self.window(image);
+        // Flat is measured from the crop's corner; the quarter turn is not.
+        let oriented = [flat[0] + x0 as f32, flat[1] + y0 as f32];
         self.orient_to_sensor(oriented, image)
     }
 
@@ -258,12 +315,17 @@ impl Geometry {
         }
     }
 
-    /// Where a sensor pixel lands in the developed frame.
+    /// Where a sensor pixel lands in *flat* space — after the quarter turn and
+    /// the crop's translation, before the straighten.
     ///
     /// Signed, because a pixel the crop removed lands outside it — and the
     /// canvas needs that answer rather than a clamp, since a tile can straddle
     /// the crop edge and only part of it belongs on screen.
-    pub fn developed_of(&self, sensor: [u32; 2], image: [u32; 2]) -> [i64; 2] {
+    ///
+    /// Named for flat rather than developed because a straightened photograph is
+    /// developed and this is not where it ends up: tiles land here by
+    /// permutation, and the angle is a separate gather afterwards.
+    pub fn flat_of(&self, sensor: [u32; 2], image: [u32; 2]) -> [i64; 2] {
         let [x0, y0, _, _] = self.window(image);
         let (sx, sy) = (sensor[0] as i64, sensor[1] as i64);
         let (w, h) = (image[0] as i64, image[1] as i64);
@@ -292,31 +354,33 @@ impl Geometry {
         }
     }
 
-    /// The sensor rectangle covering a developed one, as `[x0, y0, x1, y1]`.
+    /// The sensor rectangle covering a straightened one, as `[x0, y0, x1, y1]`.
     ///
-    /// Exact rather than conservative: the map is a signed permutation plus a
-    /// translation, so the corners' bounding box *is* the image of the
-    /// rectangle. Used to turn "what is on screen" into "which tiles".
-    pub fn sensor_rect(&self, developed: [f64; 4], image: [u32; 2]) -> [f64; 4] {
+    /// The corners' bounding box, mapped through the same chain a pixel takes —
+    /// so it stays right once an angle is involved, where the old
+    /// permutation-only version would have named a rectangle the rotation had
+    /// swung out of. Used to turn "what is on screen" into "which tiles", and
+    /// too small a rectangle means missing tiles and holes in the canvas.
+    pub fn sensor_rect(&self, straight: [f64; 4], image: [u32; 2]) -> [f64; 4] {
         let [x0, y0, _, _] = self.window(image);
-        let (w, h) = (image[0] as f64, image[1] as f64);
-        let corner = |dx: f64, dy: f64| -> [f64; 2] {
-            let (ox, oy) = (dx + x0 as f64, dy + y0 as f64);
-            match self.turns() {
-                1 => [oy, h - ox],
-                2 => [w - ox, h - oy],
-                3 => [w - oy, ox],
-                _ => [ox, oy],
-            }
+        let corner = |sx: f64, sy: f64| -> [f32; 2] {
+            let flat = self.flat_of_straight([sx as f32, sy as f32], image);
+            self.orient_to_sensor([flat[0] + x0 as f32, flat[1] + y0 as f32], image)
         };
-        let a = corner(developed[0], developed[1]);
-        let b = corner(developed[2], developed[3]);
-        [
-            a[0].min(b[0]),
-            a[1].min(b[1]),
-            a[0].max(b[0]),
-            a[1].max(b[1]),
-        ]
+        let mut out = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+        for (sx, sy) in [
+            (straight[0], straight[1]),
+            (straight[2], straight[1]),
+            (straight[0], straight[3]),
+            (straight[2], straight[3]),
+        ] {
+            let [x, y] = corner(sx, sy);
+            out[0] = out[0].min(x as f64);
+            out[1] = out[1].min(y as f64);
+            out[2] = out[2].max(x as f64);
+            out[3] = out[3].max(y as f64);
+        }
+        out
     }
 }
 
@@ -350,7 +414,7 @@ mod tests {
 
     #[test]
     fn the_two_directions_agree_with_each_other() {
-        // `source_of` is what a still render uses and `developed_of` is what the
+        // `source_of` is what a still render uses and `flat_of` is what the
         // canvas uses. They are separate code, and the failure if they disagree
         // is the worst kind: the canvas shows one framing and the export writes
         // another, so the user only finds out after the file is on disk.
@@ -376,7 +440,7 @@ mod tests {
                 for x in 0..ow {
                     let sensor = g.source_of([x, y], image);
                     assert_eq!(
-                        g.developed_of(sensor, image),
+                        g.flat_of(sensor, image),
                         [x as i64, y as i64],
                         "{orientation:?} round trip at ({x}, {y})"
                     );
@@ -388,7 +452,7 @@ mod tests {
     #[test]
     fn the_axes_match_the_rotation_they_describe() {
         // `axes` is handed to the GPU and applied per pixel; if it disagreed
-        // with `developed_of` the canvas would draw each tile rotated the wrong
+        // with `flat_of` the canvas would draw each tile rotated the wrong
         // way inside a correctly-placed rectangle, which looks like corruption
         // rather than like a rotation bug.
         let image = [9u32, 6];
@@ -400,9 +464,9 @@ mod tests {
         ] {
             let g = with(orientation, Crop::default());
             let [ax, ay] = g.axes();
-            let base = g.developed_of([2, 1], image);
+            let base = g.flat_of([2, 1], image);
             for (dx, dy) in [(1u32, 0u32), (0, 1), (3, 2)] {
-                let moved = g.developed_of([2 + dx, 1 + dy], image);
+                let moved = g.flat_of([2 + dx, 1 + dy], image);
                 let predicted = [
                     base[0] + (ax[0] * dx as i32 + ay[0] * dy as i32) as i64,
                     base[1] + (ax[1] * dx as i32 + ay[1] * dy as i32) as i64,
@@ -568,6 +632,67 @@ mod tests {
                 (0.0..=image[0] as f32).contains(&sx) && (0.0..=image[1] as f32).contains(&sy),
                 "corner ({x}, {y}) reads ({sx}, {sy})"
             );
+        }
+    }
+
+    #[test]
+    fn the_affine_transform_is_the_map_it_was_measured_from() {
+        // The GPU gets the transform and the CPU walks the map. If they parted
+        // company the canvas would frame the photograph differently from the
+        // file it exports, and only a side-by-side comparison would show it.
+        let image = [140u32, 90];
+        for degrees in [-12.0, -3.0, 0.5, 8.0, 15.0] {
+            let g = with(
+                Orientation::Rotate90Cw,
+                Crop {
+                    left: 0.05,
+                    top: 0.15,
+                    right: 0.85,
+                    bottom: 0.95,
+                    angle_deg: degrees,
+                },
+            );
+            let [origin, dx, dy] = g.flat_transform(image);
+            for (sx, sy) in [(0.0, 0.0), (13.0, 7.0), (60.5, 41.25), (-4.0, 120.0)] {
+                let walked = g.flat_of_straight([sx, sy], image);
+                let mapped = [
+                    origin[0] + dx[0] * sx + dy[0] * sy,
+                    origin[1] + dx[1] * sx + dy[1] * sy,
+                ];
+                for axis in 0..2 {
+                    assert!(
+                        (walked[axis] - mapped[axis]).abs() < 2e-3,
+                        "{degrees}° at ({sx}, {sy}): {walked:?} against {mapped:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_tiles_asked_for_still_cover_a_straightened_view() {
+        // `sensor_rect` used to be a permutation, which is right until an angle
+        // swings a corner out of the rectangle it named. Too small a rectangle
+        // means tiles nobody asked for and holes in the canvas.
+        let image = [200u32, 120];
+        let g = with(
+            Orientation::AsShot,
+            Crop {
+                angle_deg: 12.0,
+                ..Crop::default()
+            },
+        );
+        let [ow, oh] = g.output_size(image);
+        let seen = [0.0, 0.0, ow as f64, oh as f64];
+        let [rx0, ry0, rx1, ry1] = g.sensor_rect(seen, image);
+        for y in 0..oh {
+            for x in 0..ow {
+                let [sx, sy] = g.source_at([x as f32, y as f32], image);
+                assert!(
+                    (rx0..=rx1).contains(&(sx as f64)) && (ry0..=ry1).contains(&(sy as f64)),
+                    "({x}, {y}) reads ({sx}, {sy}), outside [{rx0}, {ry0}, {rx1}, {ry1}]"
+                );
+            }
         }
     }
 }

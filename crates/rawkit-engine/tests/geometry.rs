@@ -151,3 +151,80 @@ fn rotating_rearranges_the_pixels_and_changes_none_of_them() {
         "rotation invented or lost a value"
     );
 }
+
+/// Half-float storage: the canvas keeps what the resampler produced at
+/// `rgba16float`, so the two paths agree to the format's precision, not exactly.
+const F16_TOLERANCE: f32 = 1e-3;
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn the_canvas_straightens_the_same_way_the_export_does() {
+    // The claim the whole design rests on. The export walks the map on the CPU;
+    // the canvas hands a six-float transform to a compute kernel and gathers.
+    // They are separate code, and if they disagree the photograph on screen is
+    // framed differently from the file that gets written — which nobody would
+    // catch without putting the two side by side.
+    //
+    // No orientation and a full-frame crop, so flat space *is* sensor space and
+    // `apply` computes exactly what the kernel should.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let renderer = Renderer::new(&gpu);
+    let (w, h) = (96u32, 64u32);
+
+    // Structure at every scale, so a mis-set tap shows as a mismatch rather
+    // than averaging into agreement.
+    let mut pixels = vec![0.0f32; (w * h) as usize * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let at = ((y * w + x) * 4) as usize;
+            let fx = x as f32 / w as f32;
+            let fy = y as f32 / h as f32;
+            pixels[at] = 0.5 + 0.4 * (fx * 17.0).sin();
+            pixels[at + 1] = 0.5 + 0.4 * (fy * 13.0).cos();
+            pixels[at + 2] = 0.5 + 0.3 * ((fx + fy) * 9.0).sin();
+            pixels[at + 3] = 1.0;
+        }
+    }
+
+    let flat = renderer.create_canvas(&gpu, w, h);
+    flat.write(&gpu, &pixels);
+    // Read it back, so the CPU side starts from the same half-float values the
+    // kernel will: comparing against the f32 originals would measure the
+    // storage format rather than the two implementations.
+    let stored = flat.read_back(&gpu).expect("flat readback");
+
+    let geometry = Geometry::from_parts(
+        Orientation::AsShot,
+        Crop {
+            angle_deg: 7.5,
+            ..Crop::default()
+        },
+    );
+    let [ow, oh] = geometry.output_size([w, h]);
+    let canvas = renderer.create_canvas(&gpu, ow, oh);
+    renderer.straighten(
+        &gpu,
+        &flat,
+        &canvas,
+        &geometry,
+        rawkit_engine::StraightenView {
+            level_image: [w, h],
+            straight_origin: [0.0, 0.0],
+            flat_origin: [0.0, 0.0],
+        },
+    );
+    let drawn = canvas.read_back(&gpu).expect("canvas readback");
+
+    let (expected, size) = rawkit_engine::geometry::apply(&geometry, &stored, [w, h]);
+    assert_eq!(size, [ow, oh]);
+
+    let mut worst = 0.0f32;
+    for (a, b) in drawn.iter().zip(&expected) {
+        worst = worst.max((a - b).abs());
+    }
+    println!("worst difference between canvas and export straighten: {worst:e}");
+    assert!(
+        worst < F16_TOLERANCE,
+        "the canvas and the export disagree by {worst:e}"
+    );
+}
