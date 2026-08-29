@@ -1099,10 +1099,15 @@ fn half_to_f32(h: u16) -> f32 {
 /// reconstruction does not fire there. Large blown areas are unaffected, because
 /// their interior averages clipped with clipped. At level 0 — a 1:1 view, and
 /// every export — there is no averaging and no difference at all.
+/// A level of reduction: the mosaic, and what size it came out.
+pub type Level = (Vec<f32>, u32, u32);
+
 pub struct Pyramid<'a> {
     base: &'a [f32],
     base_size: (u32, u32),
-    reduced: Vec<(Vec<f32>, u32, u32)>,
+    /// Owned when [`Pyramid::build`] made them, borrowed when a caller is
+    /// keeping them across images — see [`Pyramid::from_levels`].
+    reduced: std::borrow::Cow<'a, [Level]>,
 }
 
 impl<'a> Pyramid<'a> {
@@ -1127,7 +1132,29 @@ impl<'a> Pyramid<'a> {
         Self {
             base: image.data,
             base_size: (image.width, image.height),
-            reduced,
+            reduced: std::borrow::Cow::Owned(reduced),
+        }
+    }
+
+    /// Give up the reductions, to be kept and pointed at again.
+    pub fn into_levels(self) -> Vec<Level> {
+        self.reduced.into_owned()
+    }
+
+    /// A pyramid over reductions someone else is holding.
+    ///
+    /// The pair with [`Pyramid::into_levels`], and it exists for a shell that
+    /// changes which photograph it is showing. A `Pyramid` borrows its base, so
+    /// an owner that holds both the mosaic and a pyramid over it is a
+    /// self-referential struct; keeping the mosaic and the *levels* instead, and
+    /// making the pyramid a view built per frame, is the same thing without the
+    /// reference into itself. Building the view costs nothing — reducing a 24 MP
+    /// mosaic does not, which is why the levels are kept rather than rebuilt.
+    pub fn from_levels(base: &'a [f32], size: (u32, u32), levels: &'a [Level]) -> Self {
+        Self {
+            base,
+            base_size: size,
+            reduced: std::borrow::Cow::Borrowed(levels),
         }
     }
 

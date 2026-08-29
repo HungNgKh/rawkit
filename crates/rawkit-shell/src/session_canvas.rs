@@ -76,6 +76,20 @@ impl CanvasRenderer {
         self.presenter = Presenter::with_display_lut(gpu, format, lut.entries(), lut.grid());
     }
 
+    /// Point the renderer at a different photograph.
+    ///
+    /// The buffers are reallocated rather than reused because their size follows
+    /// the *profile* — a hue/saturation table's dimensions are a property of the
+    /// file — so a second image can need a different shape even though tiles are
+    /// always the same. Both caches are dropped: `shown` because the canvas now
+    /// holds the previous photograph at the right coordinates, which is the worst
+    /// kind of stale, and `uploaded` because the buffer it described is gone.
+    pub fn reload(&mut self, gpu: &Gpu, frame: &Frame<'_>) {
+        self.buffers = self.renderer.allocate(gpu, frame);
+        self.shown = None;
+        self.uploaded = None;
+    }
+
     pub fn canvas(&self) -> &Canvas {
         &self.canvas
     }

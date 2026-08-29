@@ -1,0 +1,669 @@
+//! Culling: moving through a shoot and deciding what survives.
+//!
+//! # Where the work happens, and why it is split in two
+//!
+//! A keypress does two very different things. Recording a judgement is a row
+//! update and takes microseconds, so it happens on the spot, in the thread the
+//! page called from. *Changing which photograph is on screen* means decoding a
+//! RAW and reducing a pyramid — a fifth of a second — and it has to happen where
+//! the GPU handles live, which on Linux is the main thread.
+//!
+//! So a navigation keypress does not load anything. It leaves a request, and the
+//! render loop picks it up on its next frame. That keeps the IPC call quick,
+//! keeps decoding off a thread that must not block the compositor, and means a
+//! held-down arrow key coalesces into one load rather than queueing forty — the
+//! same reason the session has no command queue.
+//!
+//! # Pinned zoom comes free
+//!
+//! The session holds a viewport and an image *size*, and knows nothing about
+//! pixels. Two frames from the same body are the same size, so moving between
+//! them does not have to touch the viewport at all: a 1:1 look at the eye of a
+//! bird stays a 1:1 look at the same place in the next frame. That is the
+//! sharpness-check workflow the design calls out Lightroom for handling badly,
+//! and here it is the absence of code rather than the presence of it.
+
+use anyhow::{anyhow, Context, Result};
+use rawkit_catalog::cull::{self, Flag, Judgement, LibraryImage};
+use rawkit_catalog::db::Catalog;
+use rawkit_engine::render::Level;
+use rawkit_engine::{BayerPhase, CameraProfile, Frame, Pyramid};
+use rawkit_session::{Command, Session};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+/// One photograph, decoded, with its reductions — everything the renderer needs
+/// and nothing it does not.
+///
+/// The mosaic and the levels are owned here and the `Frame` and `Pyramid` are
+/// built per use. That is the point of the type: a `Pyramid` borrows its base, so
+/// a struct holding both the mosaic and a pyramid over it would refer to itself.
+/// Keeping the *levels* instead makes both cheap views, and — the reason this
+/// matters — makes an image replaceable. The previous version leaked its mosaic
+/// deliberately, which is fine for one photograph and is 96 MB per keypress for a
+/// cull.
+pub struct Loaded {
+    mosaic: Vec<f32>,
+    levels: Vec<Level>,
+    pub size: [u32; 2],
+    phase: BayerPhase,
+    wb: [f32; 3],
+    profile: CameraProfile,
+}
+
+impl Loaded {
+    /// Decode a RAW, or synthesise one when there is no file to open.
+    pub fn open(path: Option<&Path>, tile: u32) -> Result<Self> {
+        let (mosaic, size, phase, wb, profile) = match path {
+            None => {
+                eprintln!("image      : no file given, using a synthetic mosaic");
+                let (width, height) = (2048u32, 1365u32);
+                (
+                    crate::test_mosaic(width, height),
+                    [width & !1, height & !1],
+                    BayerPhase::Rggb,
+                    [1.0, 1.0, 1.0],
+                    CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
+                )
+            }
+            Some(path) => {
+                let raw = rawkit_decode::decode_file(path)
+                    .with_context(|| format!("decoding {}", path.display()))?;
+                let phase = BayerPhase::from_cfa(raw.cfa).ok_or_else(|| {
+                    anyhow!(
+                        "{:?} is not a Bayer sensor; RCD cannot demosaic it",
+                        raw.cfa
+                    )
+                })?;
+                // The decoder's own matrix, treated as a single D65 illuminant.
+                // Defensible and not accurate; a .dcp is what makes it accurate,
+                // and the shell has nowhere to ask for one yet.
+                let profile = if raw.cam_to_xyz.iter().flatten().all(|&v| v == 0.0) {
+                    CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY)
+                } else {
+                    CameraProfile::from_color_matrix([
+                        raw.cam_to_xyz[0],
+                        raw.cam_to_xyz[1],
+                        raw.cam_to_xyz[2],
+                    ])
+                };
+                let wb = [
+                    raw.as_shot_neutral[0],
+                    raw.as_shot_neutral[1],
+                    raw.as_shot_neutral[2],
+                ];
+                let size = [raw.width, raw.height];
+                (rawkit_engine::normalise(&raw), size, phase, wb, profile)
+            }
+        };
+
+        // Built here and taken apart, so that what this struct holds is the two
+        // owned pieces rather than a view into itself.
+        let mut loaded = Self {
+            mosaic,
+            levels: Vec::new(),
+            size,
+            phase,
+            wb,
+            profile,
+        };
+        loaded.levels = Pyramid::build(&loaded.frame(), tile).into_levels();
+        Ok(loaded)
+    }
+
+    pub fn frame(&self) -> Frame<'_> {
+        Frame {
+            data: &self.mosaic,
+            width: self.size[0],
+            height: self.size[1],
+            phase: self.phase,
+            as_shot_wb: self.wb,
+            clip_level: 1.0,
+            profile: self.profile.clone(),
+        }
+    }
+
+    pub fn pyramid(&self) -> Pyramid<'_> {
+        Pyramid::from_levels(&self.mosaic, (self.size[0], self.size[1]), &self.levels)
+    }
+}
+
+/// What the page can ask for. Adjacently tagged for the reason `Command` is: a
+/// newtype variant holding a bare number has no other representation serde can
+/// round-trip.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "action", content = "value", rename_all = "snake_case")]
+pub enum CullAction {
+    Next,
+    Previous,
+    /// Stars, `0` meaning none. Does **not** advance: a digit is a considered
+    /// judgement and changing your mind about it should not mean navigating back.
+    Rate(u8),
+    /// Keep, and move on. Advancing is the point — this is the fast pass.
+    Pick,
+    /// Discard, and move on.
+    Reject,
+    /// Undecide. Stays put, because it is a correction like a rating.
+    ClearFlag,
+    Colour(String),
+    ClearColour,
+    /// Put back what the last judgement replaced, and go to that frame.
+    Undo,
+}
+
+/// What the page draws after a keypress.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CullView {
+    pub filename: String,
+    /// One-based, because it is shown to a person.
+    pub position: usize,
+    pub total: usize,
+    pub rating: Option<u8>,
+    pub flag: Option<&'static str>,
+    pub colour: Option<String>,
+    pub picks: usize,
+    pub rejects: usize,
+    pub undoable: bool,
+}
+
+/// An open catalog and where we are in it.
+pub struct Library {
+    catalog: Catalog,
+    images: Vec<LibraryImage>,
+    index: usize,
+    /// What each judgement replaced, most recent last.
+    ///
+    /// Bounded because it is a convenience, not a history: the versioned record
+    /// is what `edit_states` is for, and a rating deliberately has none.
+    undo: Vec<(usize, Judgement)>,
+    /// A navigation the render loop has not acted on yet.
+    request: Option<usize>,
+}
+
+/// How many judgements can be taken back. Enough to cover a mis-keyed run
+/// through a burst, short enough to stay a keypress rather than a browser.
+const UNDO_DEPTH: usize = 64;
+
+impl Library {
+    /// Open a catalog and stand at the first photograph in it.
+    pub fn open(path: &Path) -> Result<Self> {
+        let catalog = Catalog::open(path)?;
+        let images = cull::sequence(&catalog)?;
+        if images.is_empty() {
+            return Err(anyhow!(
+                "{} has no images; run `rawkit catalog <path> --scan <folder>` first",
+                path.display()
+            ));
+        }
+        eprintln!(
+            "library    : {} · {} image(s)",
+            path.display(),
+            images.len()
+        );
+        Ok(Self {
+            catalog,
+            images,
+            index: 0,
+            undo: Vec::new(),
+            request: None,
+        })
+    }
+
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
+    pub fn current(&self) -> &LibraryImage {
+        &self.images[self.index]
+    }
+
+    /// Carry out an action and report the new state.
+    pub fn act(&mut self, action: CullAction) -> Result<CullView> {
+        match action {
+            CullAction::Next => self.go(self.index + 1),
+            // Saturating, not wrapping: backing off the front of a shoot must
+            // stay at the first frame, and `wrapping_sub` would clamp to the
+            // *last* one — a silent jump to the far end of the library.
+            CullAction::Previous => self.go(self.index.saturating_sub(1)),
+            CullAction::Rate(stars) => {
+                let rating = (stars > 0).then_some(stars);
+                self.judge(|j| Judgement { rating, ..j })?;
+            }
+            CullAction::Pick => {
+                self.judge(|j| Judgement {
+                    flag: Some(Flag::Pick),
+                    ..j
+                })?;
+                self.go(self.index + 1);
+            }
+            CullAction::Reject => {
+                self.judge(|j| Judgement {
+                    flag: Some(Flag::Reject),
+                    ..j
+                })?;
+                self.go(self.index + 1);
+            }
+            CullAction::ClearFlag => {
+                self.judge(|j| Judgement { flag: None, ..j })?;
+            }
+            CullAction::Colour(name) => {
+                self.judge(|j| Judgement {
+                    colour: Some(name.clone()),
+                    ..j
+                })?;
+            }
+            CullAction::ClearColour => {
+                self.judge(|j| Judgement { colour: None, ..j })?;
+            }
+            CullAction::Undo => {
+                if let Some((index, previous)) = self.undo.pop() {
+                    cull::set(&self.catalog, self.images[index].id, &previous)?;
+                    self.go(index);
+                }
+            }
+        }
+        self.view()
+    }
+
+    /// Apply a change to the current image's judgement, remembering what it
+    /// replaced.
+    fn judge(&mut self, change: impl FnOnce(Judgement) -> Judgement) -> Result<()> {
+        let id = self.current().id;
+        let before = cull::judgement(&self.catalog, id)?;
+        let after = change(before.clone());
+        if after == before {
+            return Ok(());
+        }
+        cull::set(&self.catalog, id, &after)?;
+        self.undo.push((self.index, before));
+        if self.undo.len() > UNDO_DEPTH {
+            self.undo.remove(0);
+        }
+        Ok(())
+    }
+
+    /// Move to an image, clamped to the ends.
+    ///
+    /// Stopping at the last frame rather than wrapping: a cull is a pass through
+    /// a shoot, and silently starting again is how a frame gets judged twice
+    /// while its neighbour is missed.
+    fn go(&mut self, index: usize) {
+        let index = index.min(self.images.len() - 1);
+        if index == self.index {
+            return;
+        }
+        self.index = index;
+        self.request = Some(index);
+    }
+
+    /// The photograph the render loop should now be showing, if it changed.
+    pub fn take_request(&mut self) -> Option<String> {
+        let index = self.request.take()?;
+        Some(self.images[index].path.clone())
+    }
+
+    pub fn view(&self) -> Result<CullView> {
+        let image = self.current();
+        let judgement = cull::judgement(&self.catalog, image.id)?;
+        let (_, picks, rejects) = cull::tally(&self.catalog)?;
+        Ok(CullView {
+            filename: image.filename.clone(),
+            position: self.index + 1,
+            total: self.images.len(),
+            rating: judgement.rating,
+            flag: judgement.flag.map(Flag::column),
+            colour: judgement.colour,
+            picks,
+            rejects,
+            undoable: !self.undo.is_empty(),
+        })
+    }
+}
+
+/// Writes an edit back to the catalog once it has stopped moving.
+///
+/// A drag emits commands far faster than anyone decides anything, so writing per
+/// command would fill the history with one gesture. The catalog deduplicates
+/// identical states, but the honest fix is not to ask it to.
+pub struct Saver {
+    library: Option<Arc<Mutex<Library>>>,
+    session: Arc<Mutex<Session>>,
+    /// Which photograph the session is holding an edit *for*.
+    ///
+    /// Captured when the edit was restored, and deliberately not looked up from
+    /// the library at write time. The cursor moves the instant a key is pressed,
+    /// while the flush that precedes a load happens a frame later — so asking the
+    /// library "which image is this?" gives the answer for the frame being
+    /// navigated *to*, and the edit lands on the wrong photograph. That is not
+    /// hypothetical: it wrote one image's white balance onto the next one, and
+    /// the only visible symptom was the second frame opening with the first
+    /// frame's edit already applied, which looks like the feature working.
+    image: Option<i64>,
+    settled: Option<(u64, std::time::Instant)>,
+    /// Where the session stood when this photograph opened. Opening one and not
+    /// changing it must not write a version: that would mark every browsed image
+    /// as edited and fill the history with decisions nobody made.
+    opened_at: u64,
+}
+
+/// How long an edit has to stand still before it is written.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(800);
+
+impl Saver {
+    pub fn new(library: Option<Arc<Mutex<Library>>>, session: Arc<Mutex<Session>>) -> Self {
+        let opened_at = session.lock().expect("session lock").generation();
+        Self {
+            library,
+            session,
+            image: None,
+            settled: None,
+            opened_at,
+        }
+    }
+
+    /// Called every frame. Writes only once the edit has been still for
+    /// [`SETTLE`].
+    pub fn tick(&mut self) {
+        let generation = self.session.lock().expect("session lock").generation();
+        if generation == self.opened_at {
+            return;
+        }
+        match self.settled {
+            Some((seen, since)) if seen == generation && since.elapsed() >= SETTLE => {
+                self.settled = Some((generation, std::time::Instant::now()));
+                self.write();
+            }
+            Some((seen, _)) if seen == generation => {}
+            _ => self.settled = Some((generation, std::time::Instant::now())),
+        }
+    }
+
+    /// Write now, whatever the timer says.
+    ///
+    /// Called before the photograph changes. Without it, tweaking exposure and
+    /// pressing the arrow key within the settle window loses the edit silently —
+    /// which is the worst way to lose one, because nothing looked wrong at the
+    /// time.
+    pub fn flush(&mut self) {
+        if self.session.lock().expect("session lock").generation() != self.opened_at {
+            self.write();
+        }
+    }
+
+    fn write(&self) {
+        let (Some(library), Some(image)) = (&self.library, self.image) else {
+            return;
+        };
+        let state = self.session.lock().expect("session lock").state().clone();
+        let library = library.lock().expect("library lock");
+        match rawkit_catalog::edits::save(
+            library.catalog(),
+            image,
+            &state,
+            rawkit_editstate::EditSource::User,
+        ) {
+            Ok(Some(version)) => eprintln!("edit       : saved v{version} for image {image}"),
+            Ok(None) => {}
+            Err(e) => eprintln!("edit       : could not save: {e}"),
+        }
+    }
+
+    /// Put the current photograph's stored edit into the session, and treat that
+    /// as the state it opened in.
+    pub fn restore(&mut self, session: &mut Session) {
+        let Some(library) = &self.library else {
+            self.opened_at = session.generation();
+            return;
+        };
+        let (catalog_result, id) = {
+            let library = library.lock().expect("library lock");
+            (
+                rawkit_catalog::edits::latest(library.catalog(), library.current().id),
+                library.current().id,
+            )
+        };
+        self.image = Some(id);
+        match catalog_result {
+            Ok(Some((version, saved))) => {
+                eprintln!("edit       : restored v{version} for image {id}");
+                session.apply(Command::SetEditState(Box::new(saved)));
+            }
+            Ok(None) => {
+                // A photograph nobody has edited opens as shot. Applying the
+                // default explicitly rather than assuming the session already
+                // holds it, because the previous image's edit is what it holds.
+                session.apply(Command::SetEditState(Box::default()));
+            }
+            Err(e) => eprintln!("edit       : could not read: {e}"),
+        }
+        self.settled = None;
+        self.opened_at = session.generation();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use rawkit_catalog::scan::FileMetadata;
+
+    /// A catalog of `n` raws, taken in the order their names sort.
+    ///
+    /// Real files on disk, because a scan walks a directory — but never decoded:
+    /// everything here is about which image is *selected*, and selecting one
+    /// costs nothing. Loading it is the render loop's job and needs a GPU.
+    pub(super) fn library_at(dir: &Path, n: usize) -> Library {
+        let photos = dir.join("photos");
+        std::fs::create_dir_all(&photos).unwrap();
+        for i in 0..n {
+            std::fs::write(photos.join(format!("DSC{i:05}.ARW")), b"raw").unwrap();
+        }
+        let mut catalog = Catalog::open(&dir.join("library.rawkit")).unwrap();
+        let mut taken = 1_000i64;
+        rawkit_catalog::scan::scan_on(
+            &mut catalog,
+            &photos,
+            rawkit_catalog::VolumeId::Uuid("test-volume".into()),
+            move |_: &Path| {
+                taken += 1;
+                Some(FileMetadata {
+                    captured_at: Some(taken),
+                    ..FileMetadata::default()
+                })
+            },
+        )
+        .unwrap();
+        drop(catalog);
+        Library::open(&dir.join("library.rawkit")).unwrap()
+    }
+
+    /// A directory that cleans itself up, the same shape the catalog's own tests
+    /// use — duplicated rather than shared because a `#[cfg(test)]` helper in
+    /// another crate is not something this one can reach.
+    pub(super) struct Scratch(pub std::path::PathBuf);
+
+    impl Scratch {
+        pub(super) fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("rawkit-shell-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_flag_advances_and_a_rating_does_not() {
+        // The decision the interface is built around: P and X are the fast pass
+        // through a shoot, digits are a considered judgement on the frame you
+        // are already looking at.
+        let dir = Scratch::new("advance");
+        let mut library = library_at(&dir.0, 3);
+        assert_eq!(library.view().unwrap().position, 1);
+
+        let after_rating = library.act(CullAction::Rate(4)).unwrap();
+        assert_eq!(after_rating.position, 1, "a rating stays put");
+        assert_eq!(after_rating.rating, Some(4));
+
+        let after_pick = library.act(CullAction::Pick).unwrap();
+        assert_eq!(after_pick.position, 2, "a flag moves on");
+        assert_eq!(after_pick.flag, None, "and the new frame is undecided");
+    }
+
+    #[test]
+    fn a_cull_stops_at_both_ends_rather_than_wrapping() {
+        // Wrapping is how a frame gets judged twice while its neighbour is
+        // missed, and `wrapping_sub` at the front would jump to the far end.
+        let dir = Scratch::new("ends");
+        let mut library = library_at(&dir.0, 2);
+        assert_eq!(library.act(CullAction::Previous).unwrap().position, 1);
+        assert_eq!(library.act(CullAction::Next).unwrap().position, 2);
+        assert_eq!(library.act(CullAction::Next).unwrap().position, 2);
+        assert_eq!(library.act(CullAction::Pick).unwrap().position, 2);
+    }
+
+    #[test]
+    fn undo_puts_back_the_judgement_and_returns_to_the_frame() {
+        // The keypress this exists for is X on a keeper, which both marks the
+        // wrong thing *and* moves you off it. Undo has to fix both halves.
+        let dir = Scratch::new("undo");
+        let mut library = library_at(&dir.0, 3);
+        library.act(CullAction::Rate(5)).unwrap();
+        let after_reject = library.act(CullAction::Reject).unwrap();
+        assert_eq!(after_reject.position, 2);
+
+        let undone = library.act(CullAction::Undo).unwrap();
+        assert_eq!(undone.position, 1, "back to the frame that was mis-keyed");
+        assert_eq!(undone.flag, None, "and it is unflagged again");
+        assert_eq!(undone.rating, Some(5), "without losing the rating");
+
+        // One more step back reaches the state before the rating.
+        assert_eq!(library.act(CullAction::Undo).unwrap().rating, None);
+        assert!(!library.view().unwrap().undoable);
+    }
+
+    #[test]
+    fn a_judgement_that_changes_nothing_is_not_undoable() {
+        // Otherwise pressing 3 twice costs two undos to get back, and the second
+        // one silently does nothing.
+        let dir = Scratch::new("noop");
+        let mut library = library_at(&dir.0, 2);
+        library.act(CullAction::Rate(3)).unwrap();
+        library.act(CullAction::Rate(3)).unwrap();
+        assert_eq!(library.act(CullAction::Undo).unwrap().rating, None);
+        assert!(!library.view().unwrap().undoable);
+    }
+
+    #[test]
+    fn only_the_latest_navigation_is_left_for_the_render_loop() {
+        // A held arrow key repeats far faster than a RAW decodes. Six presses
+        // must cost one load, not six — the same coalescing the session gets by
+        // having no command queue.
+        let dir = Scratch::new("coalesce");
+        let mut library = library_at(&dir.0, 6);
+        for _ in 0..5 {
+            library.act(CullAction::Next).unwrap();
+        }
+        let requested = library.take_request().expect("a load is pending");
+        assert!(requested.ends_with("DSC00005.ARW"), "{requested}");
+        assert_eq!(library.take_request(), None, "and it is consumed once");
+    }
+
+    #[test]
+    fn standing_still_asks_for_no_load_at_all() {
+        // Rating the current frame must not make the render loop decode it
+        // again, which would turn every digit into a fifth of a second.
+        let dir = Scratch::new("still");
+        let mut library = library_at(&dir.0, 2);
+        library.act(CullAction::Rate(2)).unwrap();
+        library.act(CullAction::ClearFlag).unwrap();
+        assert_eq!(library.take_request(), None);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod saver_tests {
+    use super::tests::{library_at, Scratch};
+    use super::*;
+    use rawkit_editstate::EditState;
+
+    /// An edit made on one frame must not land on the next one.
+    ///
+    /// Found by running the thing: after navigating, the second photograph's
+    /// first saved version was the first photograph's white balance, exactly.
+    /// The cursor moves the instant a key is pressed and the flush happens a
+    /// frame later, so a saver that asks the library "which image is this?"
+    /// gets the answer for the frame being navigated *to*.
+    ///
+    /// The symptom is nearly invisible: the next frame opens with the previous
+    /// frame's edit applied, which looks like an edit being carried forward
+    /// rather than like data going to the wrong row.
+    #[test]
+    fn an_edit_is_written_to_the_photograph_it_was_made_on() {
+        let dir = Scratch::new("saver");
+        let library = Arc::new(Mutex::new(library_at(&dir.0, 2)));
+        let first = library.lock().unwrap().current().id;
+
+        let session = Arc::new(Mutex::new(Session::new(
+            [100, 100],
+            64,
+            EditState::default(),
+        )));
+        let mut saver = Saver::new(Some(library.clone()), session.clone());
+        saver.restore(&mut session.lock().unwrap());
+
+        // Change the edit, then navigate before the settle timer could fire.
+        session.lock().unwrap().apply(Command::SetExposure(1.5));
+        library.lock().unwrap().act(CullAction::Next).unwrap();
+        let second = library.lock().unwrap().current().id;
+        assert_ne!(first, second);
+        library.lock().unwrap().take_request();
+        saver.flush();
+
+        let catalog = library.lock().unwrap();
+        let on_first = rawkit_catalog::edits::latest(catalog.catalog(), first).unwrap();
+        let on_second = rawkit_catalog::edits::latest(catalog.catalog(), second).unwrap();
+        assert_eq!(
+            on_first.map(|(_, s)| s.tone.exposure_ev),
+            Some(1.5),
+            "the edit belongs to the frame it was made on"
+        );
+        assert!(
+            on_second.is_none(),
+            "and the frame that was never touched has no version at all"
+        );
+    }
+
+    /// Opening a photograph and moving on must write nothing.
+    #[test]
+    fn browsing_writes_no_versions() {
+        let dir = Scratch::new("browse");
+        let library = Arc::new(Mutex::new(library_at(&dir.0, 3)));
+        let session = Arc::new(Mutex::new(Session::new(
+            [100, 100],
+            64,
+            EditState::default(),
+        )));
+        let mut saver = Saver::new(Some(library.clone()), session.clone());
+
+        for _ in 0..3 {
+            saver.restore(&mut session.lock().unwrap());
+            library.lock().unwrap().act(CullAction::Next).unwrap();
+            library.lock().unwrap().take_request();
+            saver.flush();
+        }
+        let versions: i64 = library
+            .lock()
+            .unwrap()
+            .catalog()
+            .connection()
+            .query_row("SELECT count(*) FROM edit_states", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(versions, 0);
+    }
+}

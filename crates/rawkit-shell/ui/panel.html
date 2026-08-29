@@ -18,7 +18,26 @@
   .row { display: flex; gap: 7px; margin-top: 10px; }
   #log { color: #7d7d87; margin-top: 12px; font-variant-numeric: tabular-nums; }
   #log.refused { color: #e0705f; }
+
+  #cull { display: flex; align-items: baseline; gap: 18px; padding: 8px 18px;
+          border-bottom: 1px solid #2c2c34; font-variant-numeric: tabular-nums; }
+  #cull.hidden { display: none; }
+  #frame { font-weight: 600; }
+  #position, #counts, #keys { color: #7d7d87; }
+  #keys { margin-left: auto; font-size: 11px; }
+  #stars { letter-spacing: 2px; color: #d8bf63; min-width: 62px; }
+  #flag.pick { color: #6fc27a; }
+  #flag.reject { color: #e0705f; }
 </style>
+
+<div id="cull" class="hidden">
+  <span id="frame"></span>
+  <span id="position"></span>
+  <span id="stars"></span>
+  <span id="flag"></span>
+  <span id="counts"></span>
+  <span id="keys">← → move · P pick · X reject · U unflag · 1–5 rate · 0 clear · Z undo</span>
+</div>
 
 <main>
   <section>
@@ -136,4 +155,100 @@
     scale = s.viewport.scale;
     log.textContent = `${s.image[0]}x${s.image[1]}`;
   });
+
+  // Put the controls where the *session* says they are.
+  //
+  // The page is not the source of truth and never was — it just used to be the
+  // only thing that changed the edit, so nobody noticed. Moving between
+  // photographs restores each one's stored edit underneath the page, and a
+  // slider left showing the last frame's exposure is worse than a wrong readout:
+  // the next drag sends that stale value as if it were a decision.
+  // Which slider the pointer is currently holding, so a sync does not yank the
+  // thumb out from under a drag. Focus is the wrong test and was the first
+  // attempt: a slider keeps focus after the click that moved it, so the readout
+  // would update on navigation while the thumb stayed where it was — the two
+  // halves of one control disagreeing, which is worse than either being wrong.
+  let dragging = null;
+  for (const id of ["exposure", "contrast", "temperature", "tint"]) {
+    document.getElementById(id).addEventListener("pointerdown", () => (dragging = id));
+  }
+  document.addEventListener("pointerup", () => (dragging = null));
+
+  const setSlider = (id, value, format) => {
+    if (dragging !== id) document.getElementById(id).value = value;
+    document.getElementById(id + "-value").textContent = format(value);
+  };
+
+  const sync = state => {
+    setSlider("exposure", state.tone.exposure_ev, v => Number(v).toFixed(2));
+    setSlider("contrast", state.tone.contrast, v => Number(v).toFixed(2));
+    setSlider("tint", state.white_balance.tint, v => `${v | 0}`);
+    const temp = state.white_balance.temperature_k;
+    setSlider("temperature", temp ?? 5500, () => (temp === null ? "as shot" : `${temp | 0} K`));
+  };
+
+  // Polled rather than pushed, because the edit changes on the render loop's
+  // schedule: a keypress leaves a request and the photograph is not loaded until
+  // a frame or two later. Four times a second is far below anything a person
+  // notices and costs a lock and a serialise.
+  let seen = -1;
+  setInterval(async () => {
+    const s = await invoke("snapshot");
+    if (s.generation === seen) return;
+    seen = s.generation;
+    sync(s.state);
+  }, 250);
+
+  // ---- Culling -------------------------------------------------------------
+  //
+  // Keys are handled here rather than natively because a keyboard is the one
+  // input that does *not* need the canvas window: the webview holds focus, and
+  // this works identically on all three platforms without a line of per-OS code.
+  // Pointer input over the canvas is the opposite case, and is why `canvas.rs`
+  // exists.
+
+  const strip = document.getElementById("cull");
+  const show = view => {
+    if (!view) return;
+    strip.classList.remove("hidden");
+    document.getElementById("frame").textContent = view.filename;
+    document.getElementById("position").textContent = `${view.position} / ${view.total}`;
+    document.getElementById("stars").textContent =
+      "★".repeat(view.rating ?? 0) + "☆".repeat(5 - (view.rating ?? 0));
+    const flag = document.getElementById("flag");
+    flag.textContent = view.flag === "pick" ? "PICK" : view.flag === "reject" ? "REJECT" : "";
+    flag.className = view.flag ?? "";
+    document.getElementById("counts").textContent =
+      `${view.picks} picked · ${view.rejects} rejected`;
+  };
+
+  const act = async (action, value) => {
+    try {
+      show(await invoke("cull", { action: value === undefined ? { action } : { action, value } }));
+    } catch (e) {
+      log.className = "refused";
+      log.textContent = String(e);
+    }
+  };
+
+  // A held arrow key repeats far faster than a RAW decodes. Every press is still
+  // sent — the library keeps only the latest request and the render loop reads
+  // it once per frame, so this coalesces for the same reason a slider drag does.
+  document.addEventListener("keydown", event => {
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    const key = event.key;
+    if (key >= "0" && key <= "5") return act("rate", Number(key)), event.preventDefault();
+    switch (key.toLowerCase()) {
+      case "arrowright": case " ": act("next"); break;
+      case "arrowleft": act("previous"); break;
+      case "p": act("pick"); break;
+      case "x": act("reject"); break;
+      case "u": act("clear_flag"); break;
+      case "z": act("undo"); break;
+      default: return;
+    }
+    event.preventDefault();
+  });
+
+  invoke("cull_view").then(show);
 </script>

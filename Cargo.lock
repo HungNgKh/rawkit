@@ -3079,6 +3079,7 @@ dependencies = [
  "rawkit-engine",
  "rawkit-export",
  "rawkit-session",
+ "serde",
  "serde_json",
  "tauri",
  "tauri-build",

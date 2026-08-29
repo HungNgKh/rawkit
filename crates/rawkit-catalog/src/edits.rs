@@ -129,24 +129,6 @@ pub fn history(
         .collect()
 }
 
-/// The first image in the catalog, for a shell that has no picker yet.
-pub fn first_image(catalog: &Catalog) -> Result<Option<(i64, String)>, CatalogError> {
-    Ok(catalog
-        .connection()
-        .query_row(
-            "SELECT i.id, v.last_mount_path || '/' || d.relative_path || '/' || f.filename
-               FROM images i
-               JOIN files f ON f.id = i.file_id
-               JOIN folders d ON d.id = f.folder_id
-               JOIN volumes v ON v.id = d.volume_id
-              WHERE f.missing = 0
-              ORDER BY i.id LIMIT 1",
-            [],
-            |r| Ok((r.get(0)?, r.get::<_, String>(1)?.replace("//", "/"))),
-        )
-        .ok())
-}
-
 fn seconds_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -291,15 +273,5 @@ mod tests {
             )
             .unwrap();
         assert!(latest(&catalog, image).is_err());
-    }
-
-    #[test]
-    fn the_first_image_resolves_to_a_path_that_exists() {
-        let (dir, catalog, _) = library_with_one_image();
-        let (_id, path) = first_image(&catalog).unwrap().expect("one image");
-        assert_eq!(
-            std::path::Path::new(&path).canonicalize().unwrap(),
-            dir.join("photos/a.ARW").canonicalize().unwrap()
-        );
     }
 }

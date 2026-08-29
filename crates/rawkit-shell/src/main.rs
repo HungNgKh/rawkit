@@ -101,13 +101,13 @@
 
 #[cfg(target_os = "linux")]
 mod canvas;
+mod library;
 mod session_canvas;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
+use library::{CullAction, CullView, Library, Loaded, Saver};
 use rawkit_editstate::EditState;
-use rawkit_engine::{
-    render::DEFAULT_TILE, BayerPhase, CameraProfile, Frame, Gpu, Presenter, Pyramid,
-};
+use rawkit_engine::{render::DEFAULT_TILE, Gpu, Presenter};
 use rawkit_session::{Command, Event, Session};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -191,6 +191,38 @@ fn snapshot(state: tauri::State<'_, Shared>) -> serde_json::Value {
     })
 }
 
+/// The open library, when a catalog was what was opened.
+///
+/// Separate state from [`Shared`] because the two answer to different things: a
+/// slider changes the session, an arrow key changes the library, and only the
+/// render loop ever needs both at once. Keeping them apart also keeps the lock
+/// a keypress takes away from the lock a drag is holding sixty times a second.
+struct Shelf(Option<Arc<Mutex<Library>>>);
+
+/// Move through the shoot, or record what this frame is worth.
+///
+/// Returns what to draw in the status line. Errors come back as strings rather
+/// than panicking the command thread: a failed write is something the page
+/// should say, not something that should take the window down.
+#[tauri::command]
+fn cull(state: tauri::State<'_, Shelf>, action: CullAction) -> Result<CullView, String> {
+    let Some(library) = &state.0 else {
+        return Err("no library is open; pass a .rawkit catalog".into());
+    };
+    library
+        .lock()
+        .expect("library lock")
+        .act(action)
+        .map_err(|e| e.to_string())
+}
+
+/// The status line as it stands, for a page that has just loaded.
+#[tauri::command]
+fn cull_view(state: tauri::State<'_, Shelf>) -> Option<CullView> {
+    let library = state.0.as_ref()?;
+    library.lock().expect("library lock").view().ok()
+}
+
 fn main() -> Result<()> {
     // Before GTK, before Tauri, before anything opens a display.
     #[cfg(target_os = "linux")]
@@ -208,7 +240,7 @@ fn main() -> Result<()> {
     eprintln!("route      : {route:?}");
 
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![apply, snapshot])
+        .invoke_handler(tauri::generate_handler![apply, snapshot, cull, cull_view])
         .setup(move |app| {
             // The surface is created on the main thread because the raw window
             // handle comes from GTK on this platform and GTK is not thread-safe.
@@ -227,93 +259,35 @@ fn main() -> Result<()> {
             surface.configure(&gpu.device, &config);
             let mut config = config;
 
-            // The mosaic outlives everything that borrows it, and there is
-            // exactly one per process. Leaking it is honest about that; the
-            // alternative is a self-referential struct to hold a Vec and a Frame
-            // that points into it.
             // A library, if that is what was passed. The catalog is what makes
             // an edit outlive the process, so it is opened before the image it
             // describes rather than bolted on after.
-            let library = open_library(target.as_deref())?;
-            let raw = library
-                .as_ref()
-                .map(|(_, path)| PathBuf::from(path))
-                .or_else(|| target.clone().filter(|p| !is_catalog(p)));
-
-            let (mosaic, image, phase, wb, profile) = load_image(raw.as_deref())?;
-            let library_image_id = LIBRARY_IMAGE.load(std::sync::atomic::Ordering::Relaxed);
-            let mosaic: &'static [f32] = Box::leak(mosaic.into_boxed_slice());
-            let frame = Frame {
-                data: mosaic,
-                width: image[0],
-                height: image[1],
-                phase,
-                as_shot_wb: wb,
-                clip_level: 1.0,
-                profile,
+            let library = match target.as_deref().filter(|p| is_catalog(p)) {
+                Some(path) => Some(Arc::new(Mutex::new(Library::open(path)?))),
+                None => None,
             };
-            let pyramid = Pyramid::build(&frame, DEFAULT_TILE);
+            let raw = match &library {
+                Some(library) => Some(PathBuf::from(
+                    &library.lock().expect("library lock").current().path,
+                )),
+                None => target.clone().filter(|p| !is_catalog(p)),
+            };
+            app.manage(Shelf(library.clone()));
 
-            let mut session = Session::new(image, DEFAULT_TILE, EditState::default());
+            let mut loaded = Loaded::open(raw.as_deref(), DEFAULT_TILE)?;
+            let mut session = Session::new(loaded.size, DEFAULT_TILE, EditState::default());
             session.apply(Command::Resize {
                 width: size.width,
                 height: size.height,
             });
             session.apply(Command::FitToView);
-            // Whatever was last decided about this photograph, if anything was.
-            if let Some((catalog, _)) = &library {
-                if let Some((version, saved)) =
-                    rawkit_catalog::edits::latest(catalog, library_image_id)?
-                {
-                    eprintln!("edit       : restored v{version}");
-                    session.apply(Command::SetEditState(Box::new(saved)));
-                }
-            }
 
             let shared = Arc::new(Mutex::new(session));
             app.manage(Shared(shared.clone()));
 
-            // Persist when the edit has stopped moving. A drag emits commands
-            // far faster than anyone decides anything, so writing per command
-            // would fill the history with one gesture — the catalog deduplicates
-            // identical states, but the honest fix is not to ask it to.
-            let persisting = shared.clone();
-            let mut settled = None::<(u64, std::time::Instant)>;
-            // Where the session stood before anyone touched it. Opening a
-            // photograph and not changing it must not write a version: it would
-            // mark every browsed image as edited and fill the history with
-            // decisions nobody made.
-            let opened_at = shared.lock().expect("session lock").generation();
-            let mut saver = move || {
-                let Some((catalog, _)) = &library else { return };
-                let (generation, state) = {
-                    let session = persisting.lock().expect("session lock");
-                    (session.generation(), session.state().clone())
-                };
-                if generation == opened_at {
-                    return;
-                }
-                match settled {
-                    Some((seen, since))
-                        if seen == generation
-                            && since.elapsed() >= std::time::Duration::from_millis(800) =>
-                    {
-                        settled = Some((generation, std::time::Instant::now()));
-                        match rawkit_catalog::edits::save(
-                            catalog,
-                            library_image_id,
-                            &state,
-                            rawkit_editstate::EditSource::User,
-                        ) {
-                            Ok(Some(version)) => eprintln!("edit       : saved v{version}"),
-                            Ok(None) => {}
-                            Err(e) => eprintln!("edit       : could not save: {e}"),
-                        }
-                    }
-                    Some((seen, _)) if seen == generation => {}
-                    _ => settled = Some((generation, std::time::Instant::now())),
-                }
-            };
+            let mut saver = Saver::new(library.clone(), shared.clone());
+            // Whatever was last decided about this photograph, if anything was.
+            saver.restore(&mut shared.lock().expect("session lock"));
 
             // Routes 1 and 2 put the canvas over the whole window; route 3
             // reserves a strip for the chrome.
@@ -324,8 +298,11 @@ fn main() -> Result<()> {
             };
             attach_input(&window_handle, panel, shared.clone())?;
 
-            let mut canvas_renderer =
-                session_canvas::CanvasRenderer::new(&gpu, &frame, [size.width, size.height]);
+            let mut canvas_renderer = session_canvas::CanvasRenderer::new(
+                &gpu,
+                &loaded.frame(),
+                [size.width, size.height],
+            );
 
             // Correct for the monitor when the desktop says what it is. The
             // table already encodes, so the surface has to stop doing it —
@@ -367,12 +344,50 @@ fn main() -> Result<()> {
             // it obviously costs something.
             let surface_size = [size.width, size.height];
             let mut stats = FrameStats::default();
+            let navigating = library.clone();
             let mut tick = move || -> Result<()> {
                 let started = std::time::Instant::now();
-                saver();
+
+                // A keypress left a request; this is where it costs anything.
+                // Decoding here rather than in the command handler keeps the IPC
+                // call immediate and keeps a fifth of a second of CPU off the
+                // thread the compositor is waiting on.
+                let requested = navigating
+                    .as_ref()
+                    .and_then(|l| l.lock().expect("library lock").take_request());
+                if let Some(path) = requested {
+                    // Before the photograph changes, not after: the edit being
+                    // written belongs to the one on screen now.
+                    saver.flush();
+                    let next = Loaded::open(Some(Path::new(&path)), DEFAULT_TILE)?;
+                    let mut session = shared.lock().expect("session lock");
+                    if next.size != loaded.size {
+                        // A different body, or a different orientation. Nothing
+                        // about the old view means anything, so start again.
+                        *session = Session::new(next.size, DEFAULT_TILE, EditState::default());
+                        session.apply(Command::Resize {
+                            width: surface_size[0],
+                            height: surface_size[1],
+                        });
+                        session.apply(Command::FitToView);
+                    }
+                    // Same size: the viewport is left exactly as it was, which
+                    // is what carries a 1:1 sharpness check from frame to frame.
+                    loaded = next;
+                    canvas_renderer.reload(&gpu, &loaded.frame());
+                    saver.restore(&mut session);
+                }
+
+                saver.tick();
                 let drawn = {
                     let mut session = shared.lock().expect("session lock");
-                    canvas_renderer.advance(&gpu, &mut session, &frame, &pyramid, surface_size)?
+                    canvas_renderer.advance(
+                        &gpu,
+                        &mut session,
+                        &loaded.frame(),
+                        &loaded.pyramid(),
+                        surface_size,
+                    )?
                 };
                 paint(
                     &gpu,
@@ -550,80 +565,6 @@ fn is_catalog(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("rawkit"))
 }
 
-/// Open a catalog and pick its first image, when a catalog is what was given.
-///
-/// Returns the catalog alongside the path of the photograph to open, because
-/// the two are only useful together — and holding the catalog is what keeps the
-/// backup-on-close guarantee alive for the whole session.
-#[allow(clippy::type_complexity)]
-fn open_library(target: Option<&Path>) -> Result<Option<(rawkit_catalog::db::Catalog, String)>> {
-    let Some(path) = target.filter(|p| is_catalog(p)) else {
-        return Ok(None);
-    };
-    let catalog = rawkit_catalog::db::Catalog::open(path)?;
-    let Some((image_id, raw)) = rawkit_catalog::edits::first_image(&catalog)? else {
-        return Err(anyhow!(
-            "{} has no images; run `rawkit catalog <path> --scan <folder>` first",
-            path.display()
-        ));
-    };
-    eprintln!("library    : {} · image {image_id}", path.display());
-    LIBRARY_IMAGE.store(image_id, std::sync::atomic::Ordering::Relaxed);
-    Ok(Some((catalog, raw)))
-}
-
-/// Which image the open library is showing.
-///
-/// A single global because the shell shows exactly one image and has no picker
-/// yet; it becomes a field the moment there is more than one to choose between.
-static LIBRARY_IMAGE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-
-/// Decode a RAW, or synthesise one when no file was given.
-#[allow(clippy::type_complexity)]
-fn load_image(
-    path: Option<&std::path::Path>,
-) -> Result<(Vec<f32>, [u32; 2], BayerPhase, [f32; 3], CameraProfile)> {
-    let Some(path) = path else {
-        eprintln!("image      : no file given, using a synthetic mosaic");
-        let (width, height) = (2048u32, 1365u32);
-        return Ok((
-            test_mosaic(width, height),
-            [width & !1, height & !1],
-            BayerPhase::Rggb,
-            [1.0, 1.0, 1.0],
-            CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
-        ));
-    };
-
-    let raw =
-        rawkit_decode::decode_file(path).with_context(|| format!("decoding {}", path.display()))?;
-    let phase = BayerPhase::from_cfa(raw.cfa).ok_or_else(|| {
-        anyhow!(
-            "{:?} is not a Bayer sensor; RCD cannot demosaic it",
-            raw.cfa
-        )
-    })?;
-    eprintln!(
-        "image      : {} {} · {}x{} · {:?}",
-        raw.camera.make, raw.camera.model, raw.width, raw.height, raw.cfa
-    );
-    // The decoder's own matrix, treated as a single D65 illuminant. Defensible
-    // and not accurate; a .dcp is what makes it accurate, and the shell has
-    // nowhere to ask for one yet.
-    let profile = if raw.cam_to_xyz.iter().flatten().all(|&v| v == 0.0) {
-        CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY)
-    } else {
-        CameraProfile::from_color_matrix([raw.cam_to_xyz[0], raw.cam_to_xyz[1], raw.cam_to_xyz[2]])
-    };
-    let wb = [
-        raw.as_shot_neutral[0],
-        raw.as_shot_neutral[1],
-        raw.as_shot_neutral[2],
-    ];
-    let size = [raw.width, raw.height];
-    Ok((rawkit_engine::normalise(&raw), size, phase, wb, profile))
-}
-
 /// What frames are costing, reported only while something is happening.
 ///
 /// An idle window redraws nothing and would otherwise fill the log with zeros.
@@ -726,7 +667,7 @@ fn paint(
 /// For running the shell with no file to hand. Everything downstream of it is
 /// the real pipeline, so what appears in the window is a genuine render either
 /// way — only the sensor is imaginary.
-fn test_mosaic(width: u32, height: u32) -> Vec<f32> {
+pub(crate) fn test_mosaic(width: u32, height: u32) -> Vec<f32> {
     // Even dimensions: an odd one would put the last row or column on the wrong
     // half of a CFA block.
     let (width, height) = (width & !1, height & !1);

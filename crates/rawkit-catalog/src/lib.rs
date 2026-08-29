@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 /// The schema version this build expects. `0` means "no tables yet": the
 /// migration list is empty and the first real migration in P1 will be version 1.
 pub mod backup;
+pub mod cull;
 pub mod db;
 pub mod edits;
 pub mod path;
