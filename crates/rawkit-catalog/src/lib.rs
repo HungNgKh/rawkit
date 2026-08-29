@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 /// migration list is empty and the first real migration in P1 will be version 1.
 pub mod backup;
 pub mod db;
+pub mod edits;
 pub mod path;
 pub mod relink;
 pub mod scan;
@@ -51,6 +52,9 @@ pub enum CatalogError {
     Io(String),
     #[error("{0}")]
     Unsupported(&'static str),
+    /// A stored edit this build cannot faithfully render.
+    #[error(transparent)]
+    EditState(#[from] rawkit_editstate::EditStateError),
     /// The catalog failed SQLite's own integrity check.
     ///
     /// Opening it anyway and then writing to it makes the damage worse, so this

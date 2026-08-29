@@ -50,10 +50,28 @@ pub struct ScanReport {
 /// unscanned one, and SQLite is far faster batching inserts this way than
 /// committing per row.
 pub fn scan(catalog: &mut Catalog, root: &Path) -> Result<ScanReport, CatalogError> {
+    let resolved = root
+        .canonicalize()
+        .map_err(|e| CatalogError::Io(format!("{}: {e}", root.display())))?;
+    let volume = VolumeId::resolve(&resolved)?;
+    scan_on(catalog, root, volume)
+}
+
+/// The same, against a volume the caller has already identified.
+///
+/// Split out because resolving a volume and walking a folder are different
+/// concerns with different failure modes — and because tests should not need
+/// the machine they run on to have a filesystem UUID. CI found that the hard
+/// way: its runners are on a filesystem without one, so every scan test failed
+/// on a refusal that was entirely correct.
+pub fn scan_on(
+    catalog: &mut Catalog,
+    root: &Path,
+    volume: VolumeId,
+) -> Result<ScanReport, CatalogError> {
     let root = root
         .canonicalize()
         .map_err(|e| CatalogError::Io(format!("{}: {e}", root.display())))?;
-    let volume = VolumeId::resolve(&root)?;
     let convention = PathConvention::host();
 
     let mut report = ScanReport::default();
@@ -343,6 +361,12 @@ mod tests {
     use super::*;
     use crate::db::tests::{tempdir, Scratch};
 
+    /// A scan against a fixed volume, so these tests do not require the machine
+    /// running them to have a filesystem UUID — CI's does not.
+    fn test_scan(catalog: &mut Catalog, root: &Path) -> ScanReport {
+        scan_on(catalog, root, VolumeId::Uuid("test-volume".into())).unwrap()
+    }
+
     fn library(dir: &Scratch) -> Catalog {
         Catalog::open(&dir.join("library.rawkit")).unwrap()
     }
@@ -381,7 +405,7 @@ mod tests {
             write(&photos.join(name), b"x");
         }
         let mut catalog = library(&dir);
-        let report = scan(&mut catalog, &photos).unwrap();
+        let report = test_scan(&mut catalog, &photos);
 
         assert_eq!(report.added, 3, "only the raws, whatever their case");
         let names: Vec<String> = filenames(&catalog).into_iter().map(|(n, _)| n).collect();
@@ -397,7 +421,7 @@ mod tests {
         let photos = dir.join("photos");
         write(&photos.join("a.ARW"), b"x");
         let mut catalog = library(&dir);
-        scan(&mut catalog, &photos).unwrap();
+        test_scan(&mut catalog, &photos);
 
         let unhashed: i64 = catalog
             .connection()
@@ -418,10 +442,10 @@ mod tests {
         write(&photos.join("2026/b.ARW"), b"y");
         let mut catalog = library(&dir);
 
-        let first = scan(&mut catalog, &photos).unwrap();
+        let first = test_scan(&mut catalog, &photos);
         assert_eq!((first.added, first.unchanged), (2, 0));
 
-        let second = scan(&mut catalog, &photos).unwrap();
+        let second = test_scan(&mut catalog, &photos);
         assert_eq!(
             (second.added, second.unchanged, second.missing),
             (0, 2, 0),
@@ -443,10 +467,10 @@ mod tests {
         write(&photos.join("a.ARW"), b"x");
         write(&photos.join("b.ARW"), b"y");
         let mut catalog = library(&dir);
-        scan(&mut catalog, &photos).unwrap();
+        test_scan(&mut catalog, &photos);
 
         std::fs::remove_file(photos.join("b.ARW")).unwrap();
-        let report = scan(&mut catalog, &photos).unwrap();
+        let report = test_scan(&mut catalog, &photos);
         assert_eq!(report.missing, 1);
         assert_eq!(
             filenames(&catalog),
@@ -465,7 +489,7 @@ mod tests {
 
         // Put it back: a reconnected drive clears the flag.
         write(&photos.join("b.ARW"), b"y");
-        scan(&mut catalog, &photos).unwrap();
+        test_scan(&mut catalog, &photos);
         assert_eq!(
             filenames(&catalog),
             [("a.ARW".into(), 0), ("b.ARW".into(), 0)]
@@ -480,7 +504,7 @@ mod tests {
         let photos = dir.join("photos");
         write(&photos.join("a.ARW"), b"first");
         let mut catalog = library(&dir);
-        scan(&mut catalog, &photos).unwrap();
+        test_scan(&mut catalog, &photos);
         catalog
             .connection()
             .execute("UPDATE files SET content_hash = 'stale'", [])
@@ -489,7 +513,7 @@ mod tests {
         // Different length, so the change is visible without waiting for the
         // clock's resolution on mtime.
         write(&photos.join("a.ARW"), b"second and longer");
-        let report = scan(&mut catalog, &photos).unwrap();
+        let report = test_scan(&mut catalog, &photos);
         assert_eq!(report.updated, 1);
 
         let hash: Option<String> = catalog
@@ -505,7 +529,7 @@ mod tests {
         let photos = dir.join("photos");
         write(&photos.join("2026/january/a.ARW"), b"x");
         let mut catalog = library(&dir);
-        scan(&mut catalog, &photos).unwrap();
+        test_scan(&mut catalog, &photos);
 
         let mut statement = catalog
             .connection()
@@ -538,7 +562,7 @@ mod tests {
         .unwrap();
 
         let mut catalog = library(&dir);
-        let report = scan(&mut catalog, &photos).unwrap();
+        let report = test_scan(&mut catalog, &photos);
 
         // Restore before the assertions, or a failure leaves an undeletable dir.
         std::fs::set_permissions(
@@ -561,7 +585,7 @@ mod tests {
         std::os::unix::fs::symlink(&photos, photos.join("loop")).unwrap();
 
         let mut catalog = library(&dir);
-        let report = scan(&mut catalog, &photos).unwrap();
+        let report = test_scan(&mut catalog, &photos);
         assert_eq!(report.added, 1);
         assert_eq!(report.symlinks, 1);
     }
@@ -572,7 +596,7 @@ mod tests {
         let photos = dir.join("photos");
         write(&photos.join("a.ARW"), b"contents");
         let mut catalog = library(&dir);
-        scan(&mut catalog, &photos).unwrap();
+        test_scan(&mut catalog, &photos);
 
         let (hashed, failed) = hash_missing(&mut catalog, |_, _| {}).unwrap();
         assert_eq!((hashed, failed), (1, 0));
