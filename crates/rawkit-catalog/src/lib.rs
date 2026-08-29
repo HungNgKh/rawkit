@@ -32,6 +32,8 @@ pub mod backup;
 pub mod db;
 pub mod path;
 pub mod relink;
+pub mod scan;
+pub mod volume;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -47,6 +49,8 @@ pub enum CatalogError {
     Sqlite(String),
     #[error("filesystem: {0}")]
     Io(String),
+    #[error("{0}")]
+    Unsupported(&'static str),
     /// The catalog failed SQLite's own integrity check.
     ///
     /// Opening it anyway and then writing to it makes the damage worse, so this

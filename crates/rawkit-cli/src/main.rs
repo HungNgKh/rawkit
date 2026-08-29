@@ -88,6 +88,21 @@ enum Command {
     Catalog {
         /// The catalog file. Created if it does not exist.
         path: PathBuf,
+        /// Index every supported file under this folder, and flag anything
+        /// previously catalogued there that has gone.
+        ///
+        /// Records size and modification time; it does not hash, which is what
+        /// keeps an import bounded by directory listing rather than by reading
+        /// the whole library. See `--hash`.
+        #[arg(long)]
+        scan: Option<PathBuf>,
+        /// Fill in the content hashes a scan left empty.
+        ///
+        /// This is the deferred cost, made explicit: it reads every catalogued
+        /// file once. Minutes on an internal disk, considerably longer on an
+        /// external one.
+        #[arg(long)]
+        hash: bool,
     },
 }
 
@@ -121,8 +136,8 @@ fn main() -> Result<()> {
             profile,
             exposure,
         } => render::render(&input, &output, max_dim, tile, profile.as_deref(), exposure)?,
-        Command::Catalog { path } => {
-            let catalog = rawkit_catalog::db::Catalog::open(&path)?;
+        Command::Catalog { path, scan, hash } => {
+            let mut catalog = rawkit_catalog::db::Catalog::open(&path)?;
             println!("path       : {}", path.display());
             println!(
                 "schema     : v{} of v{}",
@@ -141,6 +156,44 @@ fn main() -> Result<()> {
                 }
                 None => println!("backups    : none"),
             }
+            if let Some(root) = scan {
+                let report = rawkit_catalog::scan::scan(&mut catalog, &root)?;
+                println!(
+                    "scanned    : {} added, {} updated, {} unchanged, {} now missing",
+                    report.added, report.updated, report.unchanged, report.missing
+                );
+                if report.symlinks > 0 {
+                    println!("symlinks   : {} not followed", report.symlinks);
+                }
+                for dir in &report.unreadable {
+                    println!("unreadable : {}", dir.display());
+                }
+            }
+
+            if hash {
+                let mut last = usize::MAX;
+                let (hashed, failed) =
+                    rawkit_catalog::scan::hash_missing(&mut catalog, |done, total| {
+                        // One line per ten percent: enough to show progress on a
+                        // long run, quiet enough not to bury the result.
+                        let step = (total / 10).max(1);
+                        if total > 0 && done / step != last {
+                            last = done / step;
+                            eprint!("\rhashing    : {done}/{total}");
+                        }
+                    })?;
+                if hashed + failed > 0 {
+                    eprintln!();
+                }
+                println!(
+                    "hashed     : {hashed} files{}",
+                    match failed {
+                        0 => String::new(),
+                        n => format!(", {n} unreadable"),
+                    }
+                );
+            }
+
             // Dropping the catalog is what writes the backup, so say so after.
             drop(catalog);
             println!("closed     : backup written");

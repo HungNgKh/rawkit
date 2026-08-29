@@ -239,10 +239,14 @@ impl Catalog {
         Ok(())
     }
 
-    /// The underlying connection, for the queries that will live in this crate
-    /// once there is something to store.
+    /// The underlying connection, for the queries that live in this crate.
     pub fn connection(&self) -> &Connection {
         &self.connection
+    }
+
+    /// Mutable access, for the transactions a scan runs in.
+    pub fn connection_mut(&mut self) -> &mut Connection {
+        &mut self.connection
     }
 }
 
