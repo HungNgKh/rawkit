@@ -91,9 +91,10 @@ enum Command {
         /// Index every supported file under this folder, and flag anything
         /// previously catalogued there that has gone.
         ///
-        /// Records size and modification time; it does not hash, which is what
-        /// keeps an import bounded by directory listing rather than by reading
-        /// the whole library. See `--hash`.
+        /// Records size, modification time, and the camera, lens and capture
+        /// time from each file's header. It does not hash, which is what keeps
+        /// an import bounded by reading headers rather than whole files — a
+        /// two-hundredfold difference per photograph. See `--hash`.
         #[arg(long)]
         scan: Option<PathBuf>,
         /// Fill in the content hashes a scan left empty.
@@ -157,11 +158,17 @@ fn main() -> Result<()> {
                 None => println!("backups    : none"),
             }
             if let Some(root) = scan {
-                let report = rawkit_catalog::scan::scan(&mut catalog, &root)?;
+                let report = rawkit_catalog::scan::scan(&mut catalog, &root, file_metadata)?;
                 println!(
                     "scanned    : {} added, {} updated, {} unchanged, {} now missing",
                     report.added, report.updated, report.unchanged, report.missing
                 );
+                if report.without_metadata > 0 {
+                    println!(
+                        "unreadable : {} file(s) gave no camera metadata",
+                        report.without_metadata
+                    );
+                }
                 if report.symlinks > 0 {
                     println!("symlinks   : {} not followed", report.symlinks);
                 }
@@ -208,4 +215,26 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The seam between the catalog and the decoder.
+///
+/// `rawkit-catalog` deliberately does not depend on `rawkit-decode`, so that the
+/// library layer stays free of LibRaw and its CDDL obligations. It takes a
+/// reader instead, and this is the one place the two are joined — a translation
+/// small enough to read in full, which is the point of putting it here rather
+/// than giving the catalog a dependency it would only use for six columns.
+///
+/// A failure is `None`, not an error: an `.ARW` that will not parse is a row
+/// with empty camera columns, never a scan that stops halfway through a library.
+fn file_metadata(path: &std::path::Path) -> Option<rawkit_catalog::scan::FileMetadata> {
+    let found = rawkit_decode::read_metadata(path).ok()?;
+    Some(rawkit_catalog::scan::FileMetadata {
+        captured_at: found.captured_at,
+        camera_make: Some(found.camera.make).filter(|s| !s.is_empty()),
+        camera_model: Some(found.camera.model).filter(|s| !s.is_empty()),
+        camera_serial: found.camera.serial,
+        shutter_count: found.shutter_count.map(i64::from),
+        lens: found.lens,
+    })
 }

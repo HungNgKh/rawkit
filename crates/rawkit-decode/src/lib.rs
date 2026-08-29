@@ -26,7 +26,7 @@
 
 pub mod libraw;
 
-pub use libraw::decode_file;
+pub use libraw::{decode_file, read_metadata};
 
 /// Failures that decoding can produce. Every variant is something a user can
 /// hit with a real file, which is why "unsupported camera" is a first-class
@@ -89,6 +89,39 @@ pub struct CameraId {
     pub make: String,
     pub model: String,
     pub serial: Option<String>,
+}
+
+/// What a catalog needs from a file, without decoding a single pixel.
+///
+/// Reading this costs a header parse rather than a decompression — milliseconds
+/// against roughly a second — which is why a scan can afford it per file and
+/// hashing cannot.
+///
+/// Every field but the camera is optional, because every one of them is
+/// something a particular body may simply not record. A missing value is stored
+/// as missing; nothing here is guessed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawMetadata {
+    pub camera: CameraId,
+    /// When the photograph was taken, as the camera's own clock read it.
+    ///
+    /// **This is a wall clock, not an instant.** EXIF capture times carry no
+    /// timezone, so the value here is the camera's local date and time
+    /// *interpreted as if it were UTC* — the same convention every photo
+    /// catalogue uses, and the only one that gives the same number on a laptop
+    /// that has flown somewhere.
+    ///
+    /// LibRaw's own `timestamp` field is deliberately **not** used: it runs the
+    /// EXIF string through `mktime`, so its value depends on the timezone of the
+    /// machine that read the file. On this dev box, in JST, that is nine hours
+    /// of silent error in a column that sorts a library.
+    pub captured_at: Option<i64>,
+    /// Frames the shutter has fired, where the maker note records it. Part of
+    /// the catalog's duplicate-detection triple with `captured_at` and the
+    /// camera serial: together they identify a frame that has been renamed,
+    /// which a content hash cannot do once the file has been re-saved.
+    pub shutter_count: Option<u32>,
+    pub lens: Option<String>,
 }
 
 /// One decoded RAW: the sensor mosaic plus everything needed to interpret it.

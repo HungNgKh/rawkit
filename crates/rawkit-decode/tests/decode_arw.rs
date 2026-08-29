@@ -8,7 +8,7 @@
 //!
 //! `cargo test -p rawkit-decode -- --ignored`
 
-use rawkit_decode::{decode_file, CfaPattern};
+use rawkit_decode::{decode_file, read_metadata, CfaPattern};
 use std::path::PathBuf;
 
 fn fixture_dir() -> PathBuf {
@@ -94,6 +94,40 @@ fn decodes_a_sony_arw_to_a_plausible_mosaic() {
         "this file has different black levels for the two greens; \
          the single-green assumption downstream no longer holds"
     );
+}
+
+#[test]
+#[ignore = "requires a RAW fixture"]
+fn reads_metadata_without_decoding_and_agrees_with_the_decode() {
+    let path = any_arw();
+    let meta = read_metadata(&path).expect("metadata read failed");
+
+    println!("camera  : {} {}", meta.camera.make, meta.camera.model);
+    println!("serial  : {:?}", meta.camera.serial);
+    println!("taken   : {:?}", meta.captured_at);
+    println!("shutter : {:?}", meta.shutter_count);
+    println!("lens    : {:?}", meta.lens);
+
+    // The catalog's duplicate-detection triple. Every part of it is a field a
+    // body may not record, so this is what proves the supported one does.
+    assert!(meta.captured_at.is_some(), "no capture time");
+    assert!(meta.camera.serial.is_some(), "no body serial");
+    assert!(meta.shutter_count.is_some(), "no shutter count");
+
+    // 2010-01-01 to 2100-01-01. A wall clock misparsed by a digit lands outside
+    // this; one shifted by a timezone does not, which is why the exact
+    // conversion is pinned by a unit test against a known string instead.
+    let taken = meta.captured_at.unwrap();
+    assert!(
+        (1_262_304_000..4_102_444_800).contains(&taken),
+        "capture time {taken} is not a plausible date"
+    );
+
+    // Two code paths read the same struct, and only one of them unpacks. If
+    // they ever disagree about which camera took the picture, the cheap path is
+    // reading a field the expensive path does not.
+    let decoded = decode_file(&path).expect("decode failed");
+    assert_eq!(meta.camera, decoded.camera);
 }
 
 #[test]

@@ -17,13 +17,47 @@
 //! removed. An unplugged drive must not erase a library, and this is the vault's
 //! "flagged on scan, not on access".
 //!
-//! **It does not read metadata.** `captured_at` and the camera columns stay
-//! NULL; they come from the decoder, and wiring that in has its own failure
-//! modes on files that are not really raws.
+//! **It does read metadata, and that is not a contradiction.** Capture time,
+//! camera and lens come from a header parse — 0.6 ms per file against 120 ms for
+//! a decode and considerably more for a hash — so a twenty-thousand-file library
+//! costs about twelve seconds, not forty minutes. The cost that was deferred is
+//! reading whole files; reading their first few kilobytes was never the same
+//! expense, and a library you cannot sort by date is barely a library.
+//!
+//! **It does not depend on the decoder.** The reader arrives as a parameter, for
+//! the reason `PathConvention` does: the catalog stays free of LibRaw and its
+//! CDDL, and the failure path — a file with an `.ARW` name that is not a RAW —
+//! is testable without one.
 
 use crate::path::{CatalogPath, PathConvention};
 use crate::{db::Catalog, CatalogError, VolumeId};
 use std::path::{Path, PathBuf};
+
+/// What a scan records about a file beyond its name and size.
+///
+/// Every field is optional because every field is something a particular camera
+/// may not write. `rawkit_decode::read_metadata` is what fills this in; the
+/// catalog only knows the shape.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileMetadata {
+    /// The camera's wall clock at capture, read as if UTC. Never a converted
+    /// instant: an EXIF capture time has no timezone, and applying the reading
+    /// machine's is how one file gets two times in one library.
+    pub captured_at: Option<i64>,
+    pub camera_make: Option<String>,
+    pub camera_model: Option<String>,
+    pub camera_serial: Option<String>,
+    pub shutter_count: Option<i64>,
+    pub lens: Option<String>,
+}
+
+/// A reader that reads nothing, for a caller that wants only the filesystem.
+///
+/// Spelled out rather than left as a closure so that skipping metadata is
+/// visible at the call site as a decision.
+pub fn no_metadata(_: &Path) -> Option<FileMetadata> {
+    None
+}
 
 /// What a scan indexes. One constant, because the editor renders exactly one
 /// thing: rows it cannot open would do nothing when clicked.
@@ -42,6 +76,10 @@ pub struct ScanReport {
     pub unreadable: Vec<PathBuf>,
     /// Symlinks not followed, to avoid cycles and double-indexing.
     pub symlinks: usize,
+    /// Files whose metadata could not be read — an `.ARW` that is not a RAW, a
+    /// truncated download, a body this build does not know. The row is still
+    /// catalogued; only its camera columns stay NULL.
+    pub without_metadata: usize,
 }
 
 /// Index every supported file under `root`.
@@ -49,12 +87,16 @@ pub struct ScanReport {
 /// One transaction for the whole scan: a half-scanned catalog is worse than an
 /// unscanned one, and SQLite is far faster batching inserts this way than
 /// committing per row.
-pub fn scan(catalog: &mut Catalog, root: &Path) -> Result<ScanReport, CatalogError> {
+pub fn scan(
+    catalog: &mut Catalog,
+    root: &Path,
+    metadata: impl FnMut(&Path) -> Option<FileMetadata>,
+) -> Result<ScanReport, CatalogError> {
     let resolved = root
         .canonicalize()
         .map_err(|e| CatalogError::Io(format!("{}: {e}", root.display())))?;
     let volume = VolumeId::resolve(&resolved)?;
-    scan_on(catalog, root, volume)
+    scan_on(catalog, root, volume, metadata)
 }
 
 /// The same, against a volume the caller has already identified.
@@ -68,6 +110,7 @@ pub fn scan_on(
     catalog: &mut Catalog,
     root: &Path,
     volume: VolumeId,
+    mut metadata: impl FnMut(&Path) -> Option<FileMetadata>,
 ) -> Result<ScanReport, CatalogError> {
     let root = root
         .canonicalize()
@@ -98,34 +141,46 @@ pub fn scan_on(
         let key = CatalogPath::new(Path::new(&name), convention)
             .map_err(|e| CatalogError::Io(e.to_string()))?;
 
-        let existing: Option<(i64, i64, i64)> = transaction
+        let existing: Option<(i64, i64, i64, bool)> = transaction
             .query_row(
-                "SELECT id, size, mtime FROM files WHERE folder_id = ?1 AND filename_key = ?2",
+                "SELECT id, size, mtime, captured_at IS NULL
+                   FROM files WHERE folder_id = ?1 AND filename_key = ?2",
                 rusqlite::params![folder_id, key.key()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .ok();
 
-        match existing {
-            Some((id, size, mtime)) => {
+        // Read metadata for a file whose bytes we have not seen before, and for
+        // one catalogued by an older build that never read any. Never for a file
+        // that is unchanged and already described: that is what keeps a rescan
+        // proportional to what moved rather than to the size of the library.
+        let (id, wants_metadata) = match existing {
+            Some((id, size, mtime, undescribed)) => {
                 if size == file.size && mtime == file.mtime {
                     // Unchanged, but possibly previously flagged missing — a
                     // reconnected drive should clear that.
                     transaction.execute("UPDATE files SET missing = 0 WHERE id = ?1", [id])?;
                     report.unchanged += 1;
+                    (id, undescribed)
                 } else {
                     // Different bytes, so any hash we hold describes a file that
                     // no longer exists. Keeping it would be worse than having
-                    // none, because relink trusts it.
+                    // none, because relink trusts it — and everything the camera
+                    // columns say is stale for exactly the same reason, so they
+                    // are cleared here rather than merely overwritten below. If
+                    // the new contents will not parse, the row must end up
+                    // saying nothing, not saying what the old contents said.
                     transaction.execute(
                         "UPDATE files
-                            SET size = ?2, mtime = ?3, content_hash = NULL, missing = 0
+                            SET size = ?2, mtime = ?3, content_hash = NULL, missing = 0,
+                                captured_at = NULL, camera_make = NULL, camera_model = NULL,
+                                camera_serial = NULL, shutter_count = NULL, lens = NULL
                           WHERE id = ?1",
                         rusqlite::params![id, file.size, file.mtime],
                     )?;
                     report.updated += 1;
+                    (id, true)
                 }
-                seen.push(id);
             }
             None => {
                 transaction.execute(
@@ -141,14 +196,53 @@ pub fn scan_on(
                     rusqlite::params![id, now],
                 )?;
                 report.added += 1;
-                seen.push(id);
+                (id, true)
+            }
+        };
+
+        if wants_metadata {
+            match metadata(&file.path) {
+                Some(found) => write_metadata(&transaction, id, &found)?,
+                // Left NULL rather than marked tried: the next scan retries,
+                // which costs a header read and is the right answer when the
+                // failure was a flaky drive rather than a file that is not a RAW.
+                None => report.without_metadata += 1,
             }
         }
+        seen.push(id);
     }
 
     report.missing = mark_missing(&transaction, volume_id, &seen)?;
     transaction.commit()?;
     Ok(report)
+}
+
+/// Record what the reader found, overwriting whatever was there.
+///
+/// Overwriting rather than merging is deliberate: this runs when the file is new
+/// or its bytes have changed, and in the second case the old values describe a
+/// photograph that is no longer in that file.
+fn write_metadata(
+    transaction: &rusqlite::Transaction<'_>,
+    id: i64,
+    found: &FileMetadata,
+) -> Result<(), CatalogError> {
+    transaction.execute(
+        "UPDATE files
+            SET captured_at = ?2, camera_make = ?3, camera_model = ?4,
+                camera_serial = ?5, shutter_count = ?6, lens = ?7
+          WHERE id = ?1",
+        rusqlite::params![
+            id,
+            found.captured_at,
+            found.camera_make,
+            found.camera_model,
+            found.camera_serial,
+            found.shutter_count,
+            found.lens,
+        ],
+    )?;
+    Ok(())
 }
 
 /// Flag rows on this volume that the walk did not reach.
@@ -364,7 +458,49 @@ mod tests {
     /// A scan against a fixed volume, so these tests do not require the machine
     /// running them to have a filesystem UUID — CI's does not.
     fn test_scan(catalog: &mut Catalog, root: &Path) -> ScanReport {
-        scan_on(catalog, root, VolumeId::Uuid("test-volume".into())).unwrap()
+        scan_on(
+            catalog,
+            root,
+            VolumeId::Uuid("test-volume".into()),
+            no_metadata,
+        )
+        .unwrap()
+    }
+
+    /// A reader standing in for the decoder, recording what it was asked for.
+    ///
+    /// It answers for `.ARW` files whose contents begin with `raw` and refuses
+    /// everything else, which is the shape of the real failure: a file named
+    /// like a photograph that is not one.
+    fn fake_reader(seen: &mut Vec<PathBuf>) -> impl FnMut(&Path) -> Option<FileMetadata> + '_ {
+        move |path: &Path| {
+            seen.push(path.to_path_buf());
+            let contents = std::fs::read(path).ok()?;
+            if !contents.starts_with(b"raw") {
+                return None;
+            }
+            Some(FileMetadata {
+                captured_at: Some(1_786_382_890),
+                camera_make: Some("Sony".into()),
+                camera_model: Some("ILCE-6400".into()),
+                camera_serial: Some("14ff0000260d".into()),
+                shutter_count: Some(14_562),
+                lens: Some("E 70-350mm F4.5-6.3 G OSS".into()),
+            })
+        }
+    }
+
+    fn described(catalog: &Catalog) -> Vec<(String, Option<i64>, Option<String>)> {
+        let mut statement = catalog
+            .connection()
+            .prepare("SELECT filename, captured_at, camera_model FROM files ORDER BY filename")
+            .unwrap();
+        let rows = statement
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
     }
 
     fn library(dir: &Scratch) -> Catalog {
@@ -588,6 +724,203 @@ mod tests {
         let report = test_scan(&mut catalog, &photos);
         assert_eq!(report.added, 1);
         assert_eq!(report.symlinks, 1);
+    }
+
+    #[test]
+    fn a_scan_records_the_camera_and_when_the_shutter_fired() {
+        let dir = tempdir();
+        let photos = dir.join("photos");
+        write(&photos.join("a.ARW"), b"raw bytes");
+        let mut catalog = library(&dir);
+
+        let mut seen = Vec::new();
+        scan_on(
+            &mut catalog,
+            &photos,
+            VolumeId::Uuid("test-volume".into()),
+            fake_reader(&mut seen),
+        )
+        .unwrap();
+
+        let row = catalog
+            .connection()
+            .query_row(
+                "SELECT captured_at, camera_make, camera_model, camera_serial,
+                        shutter_count, lens
+                   FROM files",
+                [],
+                |r| {
+                    Ok(FileMetadata {
+                        captured_at: r.get(0)?,
+                        camera_make: r.get(1)?,
+                        camera_model: r.get(2)?,
+                        camera_serial: r.get(3)?,
+                        shutter_count: r.get(4)?,
+                        lens: r.get(5)?,
+                    })
+                },
+            )
+            .unwrap();
+        // Read back as the same struct that went in, so a column written into
+        // the wrong place fails here rather than showing up as a lens called
+        // "Sony" in a UI six months from now.
+        assert_eq!(
+            row,
+            FileMetadata {
+                captured_at: Some(1_786_382_890),
+                camera_make: Some("Sony".into()),
+                camera_model: Some("ILCE-6400".into()),
+                camera_serial: Some("14ff0000260d".into()),
+                shutter_count: Some(14_562),
+                lens: Some("E 70-350mm F4.5-6.3 G OSS".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_really_a_raw_is_still_catalogued() {
+        // The failure mode that made this a parameter rather than a dependency.
+        // A `.ARW` that will not parse must not abort the scan, must not be
+        // skipped, and must not acquire invented metadata.
+        let dir = tempdir();
+        let photos = dir.join("photos");
+        write(&photos.join("good.ARW"), b"raw bytes");
+        write(&photos.join("truncated.ARW"), b"not a raw at all");
+        let mut catalog = library(&dir);
+
+        let mut seen = Vec::new();
+        let report = scan_on(
+            &mut catalog,
+            &photos,
+            VolumeId::Uuid("test-volume".into()),
+            fake_reader(&mut seen),
+        )
+        .unwrap();
+
+        assert_eq!(report.added, 2, "both rows exist");
+        assert_eq!(report.without_metadata, 1);
+        assert_eq!(
+            described(&catalog),
+            [
+                (
+                    "good.ARW".to_string(),
+                    Some(1_786_382_890),
+                    Some("ILCE-6400".to_string())
+                ),
+                ("truncated.ARW".to_string(), None, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rescan_does_not_reread_a_file_it_has_already_described() {
+        // The cost argument. Reading a header is cheap per file and ruinous per
+        // library if it happens on every scan of every unchanged photograph.
+        let dir = tempdir();
+        let photos = dir.join("photos");
+        write(&photos.join("a.ARW"), b"raw bytes");
+        write(&photos.join("b.ARW"), b"raw bytes too");
+        let mut catalog = library(&dir);
+
+        let mut first = Vec::new();
+        scan_on(
+            &mut catalog,
+            &photos,
+            VolumeId::Uuid("test-volume".into()),
+            fake_reader(&mut first),
+        )
+        .unwrap();
+        assert_eq!(first.len(), 2, "both were new");
+
+        let mut second = Vec::new();
+        scan_on(
+            &mut catalog,
+            &photos,
+            VolumeId::Uuid("test-volume".into()),
+            fake_reader(&mut second),
+        )
+        .unwrap();
+        assert!(
+            second.is_empty(),
+            "nothing changed, so nothing was reopened"
+        );
+
+        // Change one, and only that one is read again.
+        write(&photos.join("b.ARW"), b"raw bytes, rather more of them");
+        let mut third = Vec::new();
+        scan_on(
+            &mut catalog,
+            &photos,
+            VolumeId::Uuid("test-volume".into()),
+            fake_reader(&mut third),
+        )
+        .unwrap();
+        assert_eq!(third, [photos.join("b.ARW")]);
+    }
+
+    #[test]
+    fn a_row_left_undescribed_is_filled_in_by_the_next_scan() {
+        // Two cases at once: a library catalogued before this code existed, and
+        // a file whose read failed for a reason that has since gone away.
+        let dir = tempdir();
+        let photos = dir.join("photos");
+        write(&photos.join("a.ARW"), b"raw bytes");
+        let mut catalog = library(&dir);
+        test_scan(&mut catalog, &photos); // no reader at all
+        assert_eq!(described(&catalog), [("a.ARW".to_string(), None, None)]);
+
+        let mut seen = Vec::new();
+        let report = scan_on(
+            &mut catalog,
+            &photos,
+            VolumeId::Uuid("test-volume".into()),
+            fake_reader(&mut seen),
+        )
+        .unwrap();
+        assert_eq!(report.unchanged, 1, "the file itself did not move");
+        assert_eq!(seen, [photos.join("a.ARW")], "but it was still described");
+        assert_eq!(
+            described(&catalog),
+            [(
+                "a.ARW".to_string(),
+                Some(1_786_382_890),
+                Some("ILCE-6400".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn changed_bytes_replace_the_capture_time_rather_than_keeping_it() {
+        // The same reasoning as the hash: metadata that describes bytes which
+        // are gone is worse than none, because a duplicate check trusts it.
+        let dir = tempdir();
+        let photos = dir.join("photos");
+        write(&photos.join("a.ARW"), b"raw bytes");
+        let mut catalog = library(&dir);
+        let mut seen = Vec::new();
+        scan_on(
+            &mut catalog,
+            &photos,
+            VolumeId::Uuid("test-volume".into()),
+            fake_reader(&mut seen),
+        )
+        .unwrap();
+
+        // Overwritten with something that is no longer a RAW.
+        write(&photos.join("a.ARW"), b"a jpeg someone renamed by mistake");
+        let mut seen = Vec::new();
+        scan_on(
+            &mut catalog,
+            &photos,
+            VolumeId::Uuid("test-volume".into()),
+            fake_reader(&mut seen),
+        )
+        .unwrap();
+        assert_eq!(
+            described(&catalog),
+            [("a.ARW".to_string(), None, None)],
+            "the old camera and capture time described the previous contents"
+        );
     }
 
     #[test]

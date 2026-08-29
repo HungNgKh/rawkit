@@ -169,6 +169,7 @@ mod tests {
             &mut catalog,
             &photos,
             crate::VolumeId::Uuid("test-volume".into()),
+            crate::scan::no_metadata,
         )
         .unwrap();
         let image: i64 = catalog
