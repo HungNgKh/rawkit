@@ -103,6 +103,12 @@ pub struct CameraId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawMetadata {
     pub camera: CameraId,
+    /// The visible sensor area, the same numbers [`RawImage`] reports.
+    ///
+    /// Here so a catalogue can set up a viewport for a photograph it has not
+    /// decoded — which is the whole point of showing a cached preview.
+    pub width: u32,
+    pub height: u32,
     /// When the photograph was taken, as the camera's own clock read it.
     ///
     /// **This is a wall clock, not an instant.** EXIF capture times carry no

@@ -21,7 +21,8 @@
 use anyhow::Result;
 use rawkit_editstate::EditState;
 use rawkit_engine::{
-    render::DEFAULT_TILE, Canvas, Frame, Gpu, Output, Presenter, Pyramid, Renderer, TileBuffers,
+    render::DEFAULT_TILE, Canvas, Frame, Gpu, Output, Presenter, PreviewBlit, PreviewImage,
+    Pyramid, Renderer, TileBuffers,
 };
 use rawkit_session::{Session, TileId, Viewport};
 
@@ -98,16 +99,13 @@ impl CanvasRenderer {
         &self.presenter
     }
 
-    /// Draw whatever the session says is missing. Returns how many tiles were
-    /// drawn, which is the honest measure of what a frame cost.
-    pub fn advance(
-        &mut self,
-        gpu: &Gpu,
-        session: &mut Session,
-        frame: &Frame<'_>,
-        pyramid: &Pyramid<'_>,
-        surface: [u32; 2],
-    ) -> Result<usize> {
+    /// Size the canvas for the current view, and say which resolution level it
+    /// is expressed in.
+    ///
+    /// Shared by both paths on purpose: a cached preview and a tile render put
+    /// pixels in the *same* canvas at the *same* scale, so crossing between them
+    /// does not rebuild it and does not change what the presenter sees.
+    fn fit_canvas(&mut self, gpu: &Gpu, session: &Session, surface: [u32; 2]) -> u8 {
         let viewport = session.viewport();
         let level = viewport.level(session.max_level());
         let scale = viewport.scale * (1u32 << level) as f64;
@@ -122,6 +120,64 @@ impl CanvasRenderer {
             self.canvas = self.renderer.create_canvas(gpu, wanted[0], wanted[1]);
             self.shown = None;
         }
+        level
+    }
+
+    /// Fill the canvas from a preview that was rendered earlier, instead of
+    /// rendering tiles now.
+    ///
+    /// `image_size` is the photograph's full resolution, not the preview's: the
+    /// viewport is expressed in image pixels, and the preview is a scaled copy of
+    /// the same coordinate space. Using the preview's own size here would place
+    /// the view by a factor of the reduction, which looks like a photograph that
+    /// jumps when it finishes loading.
+    pub fn show_preview(
+        &mut self,
+        gpu: &Gpu,
+        blit: &PreviewBlit,
+        image: &PreviewImage,
+        session: &Session,
+        image_size: [u32; 2],
+        surface: [u32; 2],
+    ) {
+        let level = self.fit_canvas(gpu, session, surface);
+        let viewport = session.viewport();
+        let origin = viewport.image_at([0.0, 0.0]);
+        let canvas = self.canvas.size();
+        // One canvas pixel is 2^level image pixels, which is what makes the
+        // canvas the same shape for both paths.
+        let step = (1u32 << level) as f64;
+        let (width, height) = (image_size[0] as f64, image_size[1] as f64);
+
+        blit.draw(
+            gpu,
+            image,
+            &self.canvas,
+            [(origin[0] / width) as f32, (origin[1] / height) as f32],
+            [
+                (canvas[0] as f64 * step / width) as f32,
+                (canvas[1] as f64 * step / height) as f32,
+            ],
+        );
+
+        // The canvas now holds a preview, so nothing in it is a rendered tile.
+        // Zooming past what the preview covers has to redraw everything.
+        self.shown = None;
+        self.uploaded = None;
+    }
+
+    /// Draw whatever the session says is missing. Returns how many tiles were
+    /// drawn, which is the honest measure of what a frame cost.
+    pub fn advance(
+        &mut self,
+        gpu: &Gpu,
+        session: &mut Session,
+        frame: &Frame<'_>,
+        pyramid: &Pyramid<'_>,
+        surface: [u32; 2],
+    ) -> Result<usize> {
+        let viewport = session.viewport();
+        let level = self.fit_canvas(gpu, session, surface);
 
         let moved = self.shown != Some(viewport);
         let job = session.pending_work();

@@ -719,9 +719,12 @@ impl Renderer {
             dimension: wgpu::TextureDimension::D2,
             format: CANVAS_FORMAT,
             // STORAGE to be written by `present`, TEXTURE_BINDING so a surface
-            // blit can sample it, COPY_SRC so a test can check what landed.
+            // blit can sample it, COPY_SRC so a test can check what landed, and
+            // RENDER_ATTACHMENT so a cached preview can be drawn into it before
+            // any tile has been rendered.
             usage: wgpu::TextureUsages::STORAGE_BINDING
                 | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],

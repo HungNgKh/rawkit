@@ -134,6 +134,64 @@ pub fn encode(
     }
 }
 
+/// Read back a JPEG this crate wrote, as eight-bit sRGB.
+///
+/// # Why eight-bit sRGB and not linear floats
+///
+/// Because the caller is a GPU. Handing back the encoded bytes lets the texture
+/// be declared `Rgba8UnormSrgb`, and the hardware does the transfer function for
+/// free on every sample. Converting to linear here would mean running lcms over
+/// every pixel — 154 ns each, measured — which for a 1024-pixel preview is over
+/// a hundred milliseconds, and the whole point of a preview is that it appears
+/// immediately.
+///
+/// # Scope
+///
+/// This is the inverse of [`encode`] and **not a general image importer**. It
+/// assumes the sRGB output that function writes; it does not read the embedded
+/// profile and convert from it, because the only files it is pointed at are ones
+/// we wrote ten lines away. Pointing it at a stranger's Adobe RGB JPEG would
+/// silently misinterpret the colour, so do not.
+pub fn decode(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), ExportError> {
+    let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
+    let pixels = decoder
+        .decode()
+        .map_err(|e| ExportError::Colour(format!("decoding a preview: {e}")))?;
+    let info = decoder
+        .info()
+        .ok_or_else(|| ExportError::Colour("a decoded jpeg with no header".into()))?;
+
+    let (width, height) = (info.width as u32, info.height as u32);
+    let count = width as usize * height as usize;
+    // Widened to four channels because that is what a GPU texture wants; three
+    // is not a format wgpu offers.
+    let mut rgba = vec![255u8; count * 4];
+    match info.pixel_format {
+        jpeg_decoder::PixelFormat::RGB24 => {
+            if pixels.len() != count * 3 {
+                return Err(ExportError::Colour("truncated jpeg".into()));
+            }
+            for (out, inp) in rgba.chunks_exact_mut(4).zip(pixels.chunks_exact(3)) {
+                out[..3].copy_from_slice(inp);
+            }
+        }
+        jpeg_decoder::PixelFormat::L8 => {
+            if pixels.len() != count {
+                return Err(ExportError::Colour("truncated jpeg".into()));
+            }
+            for (out, &grey) in rgba.chunks_exact_mut(4).zip(pixels.iter()) {
+                out[..3].copy_from_slice(&[grey, grey, grey]);
+            }
+        }
+        other => {
+            return Err(ExportError::Colour(format!(
+                "a preview in {other:?}, which this build does not read"
+            )))
+        }
+    }
+    Ok((rgba, width, height))
+}
+
 /// The space the engine renders in: sRGB primaries with a linear transfer
 /// function.
 ///
@@ -259,6 +317,40 @@ mod tests {
             pixels.extend_from_slice(&[v, v, v, 1.0]);
         }
         (pixels, values.len() as u32, 1)
+    }
+
+    #[test]
+    fn a_preview_reads_back_as_the_encoded_values_that_were_written() {
+        // `decode` is the inverse of `encode` and this is the claim: the eight-
+        // bit sRGB it hands a GPU is the same eight-bit sRGB that went into the
+        // file. Mid-grey is the number to pin, because linear 0.18 must come
+        // back as 118 — if `decode` ever converted to linear on the way out, or
+        // `encode` stopped applying the transfer function, this lands on 46.
+        let (pixels, width, height) = sample();
+        // Quality 100 so JPEG's own losses do not blur the thing being tested.
+        let bytes = encode(&pixels, width, height, Format::Jpeg { quality: 100 }).expect("encode");
+        let (rgba, w, h) = decode(&bytes).expect("decode");
+
+        assert_eq!((w, h), (width, height));
+        assert_eq!(rgba.len(), (width * height * 4) as usize);
+        let greys: Vec<u8> = rgba.chunks_exact(4).map(|p| p[0]).collect();
+        for (got, expected) in greys.iter().zip([0u8, 118, 188, 255]) {
+            assert!(
+                got.abs_diff(expected) <= 2,
+                "expected about {expected}, got {greys:?}"
+            );
+        }
+        // Opaque throughout: a photograph has no alpha, and a GPU sampling a
+        // zero there would show nothing at all.
+        assert!(rgba.chunks_exact(4).all(|p| p[3] == 255));
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_jpeg_is_an_error_not_a_panic() {
+        // It reads files from a directory beside a user's catalog, which anything
+        // could have put something into.
+        assert!(decode(b"certainly not a jpeg").is_err());
+        assert!(decode(&[]).is_err());
     }
 
     #[test]

@@ -274,7 +274,7 @@ fn main() -> Result<()> {
             };
             app.manage(Shelf(library.clone()));
 
-            let mut loaded = Loaded::open(raw.as_deref(), DEFAULT_TILE)?;
+            let loaded = Loaded::open(raw.as_deref(), DEFAULT_TILE)?;
             let mut session = Session::new(loaded.size, DEFAULT_TILE, EditState::default());
             session.apply(Command::Resize {
                 width: size.width,
@@ -303,6 +303,13 @@ fn main() -> Result<()> {
                 &loaded.frame(),
                 [size.width, size.height],
             );
+            let blit = rawkit_engine::PreviewBlit::new(&gpu);
+            let mut showing = Showing {
+                path: raw.clone(),
+                size: loaded.size,
+                preview: None,
+                raw: Some(loaded),
+            };
 
             // Correct for the monitor when the desktop says what it is. The
             // table already encodes, so the surface has to stop doing it —
@@ -356,15 +363,21 @@ fn main() -> Result<()> {
                     .as_ref()
                     .and_then(|l| l.lock().expect("library lock").take_request());
                 if let Some(path) = requested {
+                    let opening = std::time::Instant::now();
                     // Before the photograph changes, not after: the edit being
                     // written belongs to the one on screen now.
                     saver.flush();
-                    let next = Loaded::open(Some(Path::new(&path)), DEFAULT_TILE)?;
+
+                    let library = navigating.as_ref().expect("a request implies a library");
+                    // A header parse, so the viewport can be set up for a
+                    // photograph nothing has decoded.
+                    let size = library.lock().expect("library lock").size_of_current()?;
+
                     let mut session = shared.lock().expect("session lock");
-                    if next.size != loaded.size {
+                    if size != showing.size {
                         // A different body, or a different orientation. Nothing
                         // about the old view means anything, so start again.
-                        *session = Session::new(next.size, DEFAULT_TILE, EditState::default());
+                        *session = Session::new(size, DEFAULT_TILE, EditState::default());
                         session.apply(Command::Resize {
                             width: surface_size[0],
                             height: surface_size[1],
@@ -373,21 +386,92 @@ fn main() -> Result<()> {
                     }
                     // Same size: the viewport is left exactly as it was, which
                     // is what carries a 1:1 sharpness check from frame to frame.
-                    loaded = next;
-                    canvas_renderer.reload(&gpu, &loaded.frame());
+                    showing.size = size;
+                    showing.path = Some(PathBuf::from(&path));
+                    showing.raw = None;
+                    // The edit first, because which preview is current depends on
+                    // it — a preview of an edit that has since changed is not a
+                    // preview of this photograph.
                     saver.restore(&mut session);
+
+                    let needed = needed_pixels(&session, size);
+                    let hash = session.state().content_hash();
+                    let found = library
+                        .lock()
+                        .expect("library lock")
+                        .preview_for(needed, &hash)?;
+                    showing.preview = match found {
+                        Some(decoded) => {
+                            Some(blit.upload(&gpu, &decoded.rgba, decoded.width, decoded.height)?)
+                        }
+                        None => None,
+                    };
+                    eprintln!(
+                        "open       : {} in {:.0} ms",
+                        if showing.preview.is_some() {
+                            "preview"
+                        } else {
+                            "no preview, decoding"
+                        },
+                        opening.elapsed().as_secs_f64() * 1000.0
+                    );
                 }
 
                 saver.tick();
-                let drawn = {
-                    let mut session = shared.lock().expect("session lock");
-                    canvas_renderer.advance(
-                        &gpu,
-                        &mut session,
-                        &loaded.frame(),
-                        &loaded.pyramid(),
-                        surface_size,
-                    )?
+
+                // Does what is on disk still have enough pixels for what the view
+                // is showing? Zooming in past it is the one thing that makes a
+                // decode necessary, and it is also the one time it is worth it.
+                let covered = {
+                    let session = shared.lock().expect("session lock");
+                    let needed = needed_pixels(&session, showing.size);
+                    showing
+                        .preview
+                        .as_ref()
+                        .is_some_and(|p| p.width.max(p.height) >= needed)
+                };
+                if !covered && showing.raw.is_none() {
+                    let decoding = std::time::Instant::now();
+                    let next = Loaded::open(showing.path.as_deref(), DEFAULT_TILE)?;
+                    canvas_renderer.reload(&gpu, &next.frame());
+                    showing.size = next.size;
+                    showing.raw = Some(next);
+                    // From here on this photograph renders. Holding the preview
+                    // as well would mean two answers to what is on screen.
+                    showing.preview = None;
+                    eprintln!(
+                        "decode     : {:.0} ms",
+                        decoding.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+
+                let drawn = match (&showing.raw, &showing.preview) {
+                    (Some(loaded), _) => {
+                        let mut session = shared.lock().expect("session lock");
+                        canvas_renderer.advance(
+                            &gpu,
+                            &mut session,
+                            &loaded.frame(),
+                            &loaded.pyramid(),
+                            surface_size,
+                        )?
+                    }
+                    (None, Some(preview)) => {
+                        let session = shared.lock().expect("session lock");
+                        canvas_renderer.show_preview(
+                            &gpu,
+                            &blit,
+                            preview,
+                            &session,
+                            showing.size,
+                            surface_size,
+                        );
+                        0
+                    }
+                    // Unreachable: the branch above decodes whenever no preview
+                    // covers the view. Drawing nothing is the safe answer if that
+                    // ever stops being true.
+                    (None, None) => 0,
                 };
                 paint(
                     &gpu,
@@ -557,6 +641,36 @@ fn build_window(
             "the native-child canvas is implemented for X11 only so far"
         )),
     }
+}
+
+/// What the canvas can currently draw for the photograph on screen.
+///
+/// A cached preview if there is one with enough pixels, and the decoded RAW only
+/// once something actually needs more detail than the preview has. During a cull
+/// that second thing never happens, which is the whole point: moving to the next
+/// frame costs a file read and a texture upload rather than a decode and a
+/// pyramid.
+struct Showing {
+    /// The RAW, for when it does have to be decoded. `None` only for the
+    /// synthetic mosaic the shell falls back to with no file at all.
+    path: Option<PathBuf>,
+    /// The photograph's full resolution — from a header parse, not a decode. The
+    /// viewport is expressed in these coordinates whichever source is drawing.
+    size: [u32; 2],
+    preview: Option<rawkit_engine::PreviewImage>,
+    raw: Option<Loaded>,
+}
+
+/// How many pixels along its longest edge the photograph currently occupies on
+/// screen.
+///
+/// The bar a preview has to clear: at least one preview pixel per screen pixel.
+/// Below that it would be upscaled, which is exactly what makes a preview look
+/// like a preview. At 1:1 nothing on disk clears it and the renderer takes over,
+/// which is the right answer — a sharpness check is not a job for a JPEG.
+fn needed_pixels(session: &Session, image: [u32; 2]) -> u32 {
+    let longest = image[0].max(image[1]) as f64;
+    (longest * session.viewport().scale).ceil().max(1.0) as u32
 }
 
 /// Whether a path names a catalog rather than a photograph.

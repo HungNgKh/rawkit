@@ -11,8 +11,7 @@ authors.workspace = true
 [dependencies]
 lcms2.workspace = true
 jpeg-encoder.workspace = true
+jpeg-decoder.workspace = true
 png.workspace = true
 thiserror.workspace = true
 
-[dev-dependencies]
-jpeg-decoder.workspace = true

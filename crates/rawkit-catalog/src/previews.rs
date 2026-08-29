@@ -178,6 +178,55 @@ pub fn lookup(
     }))
 }
 
+/// The cheapest preview that still has enough pixels for what is being asked.
+///
+/// `needed` is the longest edge, in image pixels, that the view can actually
+/// show. Anything larger is bytes read for nothing; anything smaller would be
+/// upscaled, which is what makes a preview look like a preview.
+///
+/// The hash has to match. A preview of an edit that has since been changed is
+/// not a preview of this photograph — showing it would put the previous version
+/// of someone's decisions on screen, which is worse than a pause.
+pub fn covering(
+    catalog: &Catalog,
+    image_id: i64,
+    needed: u32,
+    edit_state_hash: &str,
+) -> Result<Option<Preview>, CatalogError> {
+    let row = catalog
+        .connection()
+        .query_row(
+            "SELECT level, path, edit_state_hash, width, height, bytes
+               FROM previews
+              WHERE image_id = ?1 AND edit_state_hash = ?2 AND max(width, height) >= ?3
+              ORDER BY max(width, height) ASC
+              LIMIT 1",
+            rusqlite::params![image_id, edit_state_hash, needed],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .ok();
+    let Some((level, path, hash, width, height, bytes)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(Preview {
+        level: Level::parse(&level)?,
+        path,
+        edit_state_hash: hash,
+        width: width as u32,
+        height: height as u32,
+        bytes: bytes as u64,
+    }))
+}
+
 /// An image that needs previews built, and what it needs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Wanted {
@@ -399,6 +448,73 @@ mod tests {
         assert!(work.iter().all(|w| w.missing.len() == 3));
         // As shot, because none of them has been edited.
         assert!(work.iter().all(|w| w.state == EditState::default()));
+    }
+
+    #[test]
+    fn the_cheapest_preview_that_is_big_enough_is_the_one_chosen() {
+        let dir = tempdir();
+        let catalog = library(&dir, &["a.ARW"]);
+        let id = crate::cull::sequence(&catalog).unwrap()[0].id;
+        let hash = EditState::default().content_hash();
+        for (level, width, height) in [
+            (Level::Thumb, 256, 171),
+            (Level::Small, 1024, 684),
+            (Level::Standard, 2560, 1710),
+        ] {
+            record(
+                &catalog,
+                id,
+                &Preview {
+                    level,
+                    width,
+                    height,
+                    edit_state_hash: hash.clone(),
+                    ..sample("")
+                },
+            )
+            .unwrap();
+        }
+
+        let pick = |needed| {
+            covering(&catalog, id, needed, &hash)
+                .unwrap()
+                .map(|p| p.level)
+        };
+        assert_eq!(pick(100), Some(Level::Thumb));
+        assert_eq!(pick(256), Some(Level::Thumb), "exactly enough is enough");
+        assert_eq!(pick(257), Some(Level::Small));
+        assert_eq!(pick(2000), Some(Level::Standard));
+        assert_eq!(
+            pick(4000),
+            None,
+            "zoomed past every preview, so the RAW has to be decoded"
+        );
+    }
+
+    #[test]
+    fn a_preview_of_a_different_edit_is_not_offered() {
+        // Showing it would put the previous version of someone's decisions on
+        // screen, which is worse than waiting for a decode.
+        let dir = tempdir();
+        let catalog = library(&dir, &["a.ARW"]);
+        let id = crate::cull::sequence(&catalog).unwrap()[0].id;
+        record(
+            &catalog,
+            id,
+            &Preview {
+                level: Level::Small,
+                width: 1024,
+                height: 684,
+                edit_state_hash: "an older edit".into(),
+                ..sample("")
+            },
+        )
+        .unwrap();
+        let now = EditState::default().content_hash();
+        assert!(covering(&catalog, id, 100, &now).unwrap().is_none());
+        assert!(covering(&catalog, id, 100, "an older edit")
+            .unwrap()
+            .is_some());
     }
 
     #[test]

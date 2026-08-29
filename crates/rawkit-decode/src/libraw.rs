@@ -158,6 +158,11 @@ fn metadata(data: &libraw_sys::libraw_data_t) -> RawMetadata {
     let sony = camera.make.eq_ignore_ascii_case("sony");
 
     RawMetadata {
+        // The visible area, not the full sensor readout — the same crop
+        // `decode_file` applies, so a viewport built from these numbers matches
+        // the pixels that arrive later.
+        width: data.sizes.width as u32,
+        height: data.sizes.height as u32,
         // The maker note carries the capture time as the characters the camera
         // wrote, which is the only form with no timezone applied to it. LibRaw
         // exposes that string per vendor and only ever exposes the timezone-

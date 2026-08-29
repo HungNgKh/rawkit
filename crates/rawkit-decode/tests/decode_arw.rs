@@ -128,6 +128,14 @@ fn reads_metadata_without_decoding_and_agrees_with_the_decode() {
     // reading a field the expensive path does not.
     let decoded = decode_file(&path).expect("decode failed");
     assert_eq!(meta.camera, decoded.camera);
+    // And about how big it is. The shell builds a viewport from these numbers
+    // before the file is decoded, so a mismatch would place a photograph
+    // slightly wrong and only for the moment before its pixels arrive.
+    assert_eq!(
+        (meta.width, meta.height),
+        (decoded.width, decoded.height),
+        "the cheap path and the expensive one disagree about the geometry"
+    );
 }
 
 #[test]

@@ -26,6 +26,7 @@
 use anyhow::{anyhow, Context, Result};
 use rawkit_catalog::cull::{self, Flag, Judgement, LibraryImage};
 use rawkit_catalog::db::Catalog;
+use rawkit_catalog::previews;
 use rawkit_engine::render::Level;
 use rawkit_engine::{BayerPhase, CameraProfile, Frame, Pyramid};
 use rawkit_session::{Command, Session};
@@ -128,6 +129,17 @@ impl Loaded {
     }
 }
 
+/// A preview read off disk and decoded, ready for the GPU.
+///
+/// Eight-bit **sRGB**, exactly as `rawkit_export::decode` hands it back and
+/// exactly what `PreviewBlit::upload` wants. Nothing in between converts it, and
+/// nothing should: the texture format is what does the colour management.
+pub struct Decoded {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// What the page can ask for. Adjacently tagged for the reason `Command` is: a
 /// newtype variant holding a bare number has no other representation serde can
 /// round-trip.
@@ -211,6 +223,49 @@ impl Library {
 
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// How big the current photograph is, without decoding it.
+    ///
+    /// A header parse — under a millisecond — which is what lets a viewport be
+    /// set up for a frame whose pixels are going to come from a preview.
+    pub fn size_of_current(&self) -> Result<[u32; 2]> {
+        let path = &self.current().path;
+        let meta = rawkit_decode::read_metadata(Path::new(path))
+            .with_context(|| format!("reading {path}"))?;
+        Ok([meta.width, meta.height])
+    }
+
+    /// A rendered copy big enough for what the view is about to show, if there
+    /// is one and it is current.
+    ///
+    /// `needed` is the longest edge in image pixels the view can resolve. Returns
+    /// `None` when nothing on disk is large enough — the caller then decodes,
+    /// which is the slow path this exists to avoid but is still the right answer
+    /// when someone zooms in.
+    pub fn preview_for(&self, needed: u32, edit_state_hash: &str) -> Result<Option<Decoded>> {
+        let Some(dir) = previews::directory(&self.catalog) else {
+            return Ok(None);
+        };
+        let Some(found) =
+            previews::covering(&self.catalog, self.current().id, needed, edit_state_hash)?
+        else {
+            return Ok(None);
+        };
+        let file = dir.join(&found.path);
+        // A preview the catalog knows about and the disk does not is an ordinary
+        // situation — someone tidied the directory — and the answer is to render
+        // rather than to fail.
+        let Ok(bytes) = std::fs::read(&file) else {
+            return Ok(None);
+        };
+        let (rgba, width, height) = rawkit_export::decode(&bytes)
+            .with_context(|| format!("reading the preview at {}", file.display()))?;
+        Ok(Some(Decoded {
+            rgba,
+            width,
+            height,
+        }))
     }
 
     pub fn current(&self) -> &LibraryImage {

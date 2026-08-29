@@ -25,11 +25,13 @@ use rawkit_editstate::EditState;
 
 pub mod pipeline;
 pub mod present;
+pub mod preview;
 pub mod profile;
 pub mod render;
 
 pub use pipeline::{Domain, Stage};
 pub use present::Presenter;
+pub use preview::{PreviewBlit, PreviewImage};
 pub use profile::CameraProfile;
 pub use render::{
     normalise, BayerPhase, Canvas, Frame, Output, Pyramid, Renderer, TileBuffers, CANVAS_FORMAT,
@@ -46,6 +48,10 @@ pub enum EngineError {
     /// malformed edit: the parameters are valid, the code is missing.
     #[error("not implemented: {0}")]
     Unsupported(&'static str),
+    /// A buffer whose length does not match the geometry it claims to have.
+    /// Caught at the boundary rather than as a garbled texture.
+    #[error("{0}")]
+    WrongSize(String),
     #[error(transparent)]
     EditState(#[from] rawkit_editstate::EditStateError),
 }
