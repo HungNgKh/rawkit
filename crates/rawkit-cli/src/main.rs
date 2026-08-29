@@ -114,6 +114,13 @@ enum Command {
         /// photograph stale, which is what keeps a grid honest.
         #[arg(long)]
         previews: bool,
+        /// How many photographs to build previews for at once.
+        ///
+        /// Bounded by memory rather than by cores: one photograph in flight
+        /// holds about 300 MB for a 24 MP frame. Above four this stops helping
+        /// anyway, because the GPU share of the work does not divide.
+        #[arg(long, default_value_t = previews::default_jobs())]
+        jobs: usize,
         /// Delete preview files the catalog no longer refers to.
         ///
         /// Regenerating after an edit writes a new file and leaves the old one,
@@ -158,6 +165,7 @@ fn main() -> Result<()> {
             scan,
             hash,
             previews,
+            jobs,
             sweep,
         } => {
             let mut catalog = rawkit_catalog::db::Catalog::open(&path)?;
@@ -225,14 +233,15 @@ fn main() -> Result<()> {
 
             if previews {
                 let mut last = usize::MAX;
-                let report = previews::build(&catalog, PreviewLevel::BULK, |done, total, name| {
-                    // One line per image, rewritten in place: a build is long
-                    // enough that silence reads as a hang.
-                    if done != last {
-                        last = done;
-                        eprint!("\rpreviews   : {done}/{total} {name:<40}");
-                    }
-                })?;
+                let report =
+                    previews::build(&catalog, PreviewLevel::BULK, jobs, |done, total, name| {
+                        // One line per image, rewritten in place: a build is long
+                        // enough that silence reads as a hang.
+                        if done != last {
+                            last = done;
+                            eprint!("\rpreviews   : {done}/{total} {name:<40}");
+                        }
+                    })?;
                 if report.images > 0 {
                     eprintln!();
                 }

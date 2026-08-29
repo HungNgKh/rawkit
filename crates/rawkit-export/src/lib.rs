@@ -584,6 +584,42 @@ mod tests {
     }
 
     #[test]
+    fn two_encodes_of_the_same_pixels_differ_only_in_the_profiles_timestamp() {
+        // Worth pinning because it wastes an afternoon otherwise. Comparing two
+        // of our own files byte-for-byte says they differ, which reads as a
+        // non-deterministic renderer — and the renderer is not the problem. An
+        // ICC profile carries a creation date and Little CMS stamps it when it
+        // serialises one, so two bytes of the header move between runs.
+        //
+        // The lesson, and the reason this is a test rather than a comment:
+        // **never compare our output by file bytes.** Compare pixels.
+        let (pixels, width, height) = sample();
+        let format = Format::Jpeg { quality: 90 };
+        let first = encode(&pixels, width, height, format).expect("encode");
+        let second = encode(&pixels, width, height, format).expect("encode");
+
+        assert_eq!(first.len(), second.len(), "same content, same length");
+        let differing: Vec<usize> = first
+            .iter()
+            .zip(&second)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            differing.len() <= 4,
+            "expected only the profile's timestamp to move, got {} differing bytes",
+            differing.len()
+        );
+
+        // And the pixels really are identical, which is the claim that matters.
+        assert_eq!(
+            decode(&first).expect("decode").0,
+            decode(&second).expect("decode").0
+        );
+    }
+
+    #[test]
     fn a_file_that_is_not_a_jpeg_is_an_error_not_a_panic() {
         // It reads files from a directory beside a user's catalog, which anything
         // could have put something into.

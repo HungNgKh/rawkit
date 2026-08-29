@@ -45,10 +45,37 @@ pub struct BuildReport {
     pub failed: Vec<(String, String)>,
 }
 
+/// How many photographs to work on at once when the caller does not say.
+///
+/// Low on purpose, and the constraint is memory rather than cores. One
+/// photograph in flight holds its mosaic, its pyramid, the render and the
+/// largest resample — roughly 300 MB for a 24 MP frame — so a machine with
+/// sixteen cores and sixteen gigabytes would spend all of them on buffers. Four
+/// is also close to where this stops helping: about 100 ms of each 630 is on the
+/// GPU, which does not divide.
+pub fn default_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(4))
+        .unwrap_or(1)
+}
+
 /// Render every preview the catalog is missing or holds a stale copy of.
+///
+/// # Where the concurrency is, and where it deliberately is not
+///
+/// Photographs are independent, so each one is decoded, rendered, resampled and
+/// encoded on its own thread. **The catalog is not touched from any of them.**
+/// Results come back down a channel and this thread writes them, one image at a
+/// time, as they arrive — which keeps SQLite single-threaded and keeps a build
+/// resumable: interrupt it and everything already finished is already recorded.
+///
+/// The GPU is shared. `Renderer::run` takes `&self` and allocates its own
+/// buffers per call, so concurrent renders do not collide; the device serialises
+/// them, which is why more threads stop helping once the GPU is the slowest part.
 pub fn build(
     catalog: &Catalog,
     levels: &[Level],
+    jobs: usize,
     mut progress: impl FnMut(usize, usize, &str),
 ) -> Result<BuildReport> {
     let dir =
@@ -67,28 +94,60 @@ pub fn build(
     let gpu = Gpu::new()?;
     let renderer = Renderer::with_tile_size(&gpu, DEFAULT_TILE);
 
-    for (index, wanted) in outstanding.iter().enumerate() {
-        progress(index, report.images, &wanted.filename);
-        match one(
-            &gpu,
-            &renderer,
-            &dir,
-            Path::new(&wanted.path),
-            wanted.image_id,
-            &wanted.state,
-            &wanted.edit_state_hash,
-            &wanted.missing,
-        ) {
-            Ok(built) => {
-                for preview in &built {
-                    previews::record(catalog, wanted.image_id, preview)?;
-                    report.bytes += preview.bytes;
+    // Interleaved per-stage timings from several threads are unreadable and
+    // would be worse than none, so asking for them asks for one worker.
+    let timing = std::env::var_os("RAWKIT_TIME_PREVIEWS").is_some();
+    let workers = if timing { 1 } else { jobs.max(1) }.min(outstanding.len());
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (sender, receiver) = std::sync::mpsc::channel();
+
+    std::thread::scope(|scope| -> Result<()> {
+        for _ in 0..workers {
+            let sender = sender.clone();
+            let (next, outstanding, gpu, renderer, dir) =
+                (&next, &outstanding, &gpu, &renderer, &dir);
+            scope.spawn(move || loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(wanted) = outstanding.get(index) else {
+                    break;
+                };
+                let built = one(
+                    gpu,
+                    renderer,
+                    dir,
+                    Path::new(&wanted.path),
+                    wanted.image_id,
+                    &wanted.state,
+                    &wanted.edit_state_hash,
+                    &wanted.missing,
+                );
+                // A closed channel means this thread's work is no longer wanted.
+                if sender.send((index, built)).is_err() {
+                    break;
                 }
-                report.written += built.len();
-            }
-            Err(e) => report.failed.push((wanted.filename.clone(), e.to_string())),
+            });
         }
-    }
+        // Dropped so the loop below ends when the last worker finishes.
+        drop(sender);
+
+        for (done, (index, built)) in receiver.into_iter().enumerate() {
+            let wanted = &outstanding[index];
+            progress(done, report.images, &wanted.filename);
+            match built {
+                Ok(built) => {
+                    for preview in &built {
+                        previews::record(catalog, wanted.image_id, preview)?;
+                        report.bytes += preview.bytes;
+                    }
+                    report.written += built.len();
+                }
+                Err(e) => report.failed.push((wanted.filename.clone(), e.to_string())),
+            }
+        }
+        Ok(())
+    })?;
+
     progress(report.images, report.images, "");
     Ok(report)
 }
