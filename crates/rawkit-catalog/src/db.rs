@@ -196,7 +196,33 @@ impl Catalog {
 
     fn migrate(&mut self) -> Result<(), CatalogError> {
         let current = self.version()?;
-        for migration in pending(current)? {
+        self.apply_all(current, pending(current)?)
+    }
+
+    /// The body of [`Catalog::migrate`], with the list passed in.
+    ///
+    /// Split out so the pre-migration backup can be tested. With a single
+    /// migration shipped, `current > 0` and "there is work to do" are never true
+    /// together in production, so the guarantee that matters most here would
+    /// otherwise be the one thing with no test behind it — and it would stay
+    /// that way until the day migration 2 ran on somebody's library.
+    fn apply_all(&mut self, current: u32, pending: &[Migration]) -> Result<(), CatalogError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        // A copy before the riskiest write a catalog takes, and the one backup
+        // that always happens — unlike the one on close, which a killed process
+        // skips. Skipped when `current` is 0, because a catalog that has never
+        // had a schema has nothing yet to lose and the copy would be noise.
+        if current > 0 {
+            if let Some(path) = crate::backup::snapshot(self)? {
+                eprintln!(
+                    "catalog    : backed up to {} before migrating",
+                    path.display()
+                );
+            }
+        }
+        for migration in pending {
             self.apply(migration)?;
         }
         Ok(())
@@ -220,8 +246,24 @@ impl Catalog {
     }
 }
 
+impl Drop for Catalog {
+    /// A rolling copy on the way out.
+    ///
+    /// Best effort by necessity: `Drop` cannot fail usefully and does not run at
+    /// all when a process is killed. That is why the backup before a migration
+    /// exists — this one is the convenience, that one is the guarantee.
+    fn drop(&mut self) {
+        if self.path.is_none() {
+            return;
+        }
+        if let Err(e) = crate::backup::snapshot(self) {
+            eprintln!("catalog    : could not back up on close: {e}");
+        }
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::SCHEMA_VERSION;
 
@@ -229,7 +271,7 @@ mod tests {
     ///
     /// Hand-rolled rather than `tempfile`: it is nine lines, it is only needed
     /// by tests, and every dependency in this workspace costs a licence review.
-    struct Scratch(PathBuf);
+    pub(crate) struct Scratch(PathBuf);
 
     impl std::ops::Deref for Scratch {
         type Target = Path;
@@ -244,7 +286,7 @@ mod tests {
         }
     }
 
-    fn tempdir() -> Scratch {
+    pub(crate) fn tempdir() -> Scratch {
         // The address of a local is unique among live allocations, which is
         // enough to keep concurrent tests apart without a counter.
         let unique = &0u8 as *const u8 as usize;
@@ -360,6 +402,59 @@ mod tests {
         let path = dir.join("library.rawkit");
         let catalog = Catalog::open(&path).unwrap();
         assert_eq!(catalog.backup_dir().unwrap(), dir.join("library-backups"));
+    }
+
+    #[test]
+    fn a_catalog_with_a_schema_is_backed_up_before_it_is_migrated() {
+        let dir = tempdir();
+        let path = dir.join("library.rawkit");
+        let backups = dir.join("library-backups");
+        let mut catalog = Catalog::open(&path).unwrap();
+        // A fresh catalog is not backed up: it has never had a schema, so there
+        // is nothing a copy would protect.
+        assert!(!backups.exists(), "an empty catalog needs no backup");
+
+        catalog
+            .connection()
+            .execute(
+                "INSERT INTO volumes (kind, uuid, path_convention) VALUES ('uuid', 'v', 'exact')",
+                [],
+            )
+            .unwrap();
+
+        // A migration that would be catastrophic if it ran without a copy first.
+        let destructive = [Migration {
+            version: 2,
+            name: "test-only",
+            sql: "DROP TABLE volumes;",
+        }];
+        catalog.apply_all(1, &destructive).unwrap();
+
+        let saved: Vec<_> = std::fs::read_dir(&backups).unwrap().collect();
+        assert_eq!(
+            saved.len(),
+            1,
+            "the pre-migration copy is the one guarantee"
+        );
+
+        let restored = Catalog::open(&saved[0].as_ref().unwrap().path()).unwrap();
+        let volumes: i64 = restored
+            .connection()
+            .query_row("SELECT count(*) FROM volumes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(volumes, 1, "the backup predates the destructive migration");
+    }
+
+    #[test]
+    fn closing_a_catalog_leaves_a_copy() {
+        let dir = tempdir();
+        let path = dir.join("library.rawkit");
+        let backups = dir.join("library-backups");
+        drop(Catalog::open(&path).unwrap());
+        assert!(
+            backups.read_dir().unwrap().next().is_some(),
+            "a clean close should leave a backup behind"
+        );
     }
 
     #[test]
