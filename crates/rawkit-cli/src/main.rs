@@ -5,6 +5,7 @@
 //! here first: it makes the behaviour scriptable and, more usefully, testable on
 //! three operating systems without a display attached.
 
+mod export;
 mod previews;
 mod render;
 
@@ -72,6 +73,43 @@ enum Command {
         /// at -1.2 EV has that much room before anything blows.
         #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
         exposure: f32,
+    },
+
+    /// Render the edits you made, into files you can send someone.
+    ///
+    /// The loop `render` never closed: that one takes a RAW and renders it as
+    /// shot, because it has never heard of a catalog. This reads each image's
+    /// stored `EditState` and renders with it, always at full resolution.
+    Export {
+        /// The catalog to read.
+        catalog: PathBuf,
+        /// Where to write. Created if it does not exist, and never inside the
+        /// catalog's own previews or backups — those get swept.
+        #[arg(long)]
+        to: PathBuf,
+        /// Only what survived the cull.
+        #[arg(long, conflicts_with_all = ["rated", "image", "all"])]
+        picks: bool,
+        /// Only images with at least this many stars.
+        #[arg(long, conflicts_with_all = ["picks", "image", "all"])]
+        rated: Option<u8>,
+        /// One image, by its catalog id.
+        #[arg(long, conflicts_with_all = ["picks", "rated", "all"])]
+        image: Option<i64>,
+        /// Everything in the library.
+        #[arg(long, conflicts_with_all = ["picks", "rated", "image"])]
+        all: bool,
+        /// Longest edge in pixels. 0 writes full resolution, which is what an
+        /// export usually wants.
+        #[arg(long, default_value_t = 0)]
+        max_dim: u32,
+        /// Replace files that are already there. Off by default: an export is
+        /// the one thing here that writes outside the catalog's own directory.
+        #[arg(long)]
+        overwrite: bool,
+        /// How many to render at once.
+        #[arg(long, default_value_t = previews::default_jobs())]
+        jobs: usize,
     },
 
     /// Report the GPU adapter this machine would render on.
@@ -277,6 +315,63 @@ fn main() -> Result<()> {
             // Dropping the catalog is what writes the backup, so say so after.
             drop(catalog);
             println!("closed     : backup written");
+        }
+        Command::Export {
+            catalog,
+            to,
+            picks,
+            rated,
+            image,
+            all,
+            max_dim,
+            overwrite,
+            jobs,
+        } => {
+            let selection = match (picks, rated, image, all) {
+                (true, _, _, _) => export::Selection::Picks,
+                (_, Some(stars), _, _) => export::Selection::Rated(stars),
+                (_, _, Some(id), _) => export::Selection::Image(id),
+                (_, _, _, true) => export::Selection::All,
+                _ => {
+                    anyhow::bail!("say what to export: --picks, --rated <n>, --image <id> or --all")
+                }
+            };
+            let catalog = rawkit_catalog::db::Catalog::open(&catalog)?;
+            export::check_destination(&catalog, &to)?;
+
+            let mut last = usize::MAX;
+            let report = export::export(
+                &catalog,
+                selection,
+                &to,
+                max_dim,
+                overwrite,
+                jobs,
+                |done, total, name| {
+                    if done != last {
+                        last = done;
+                        eprint!("\rexporting  : {done}/{total} {name:<40}");
+                    }
+                },
+            )?;
+            if report.written + report.skipped > 0 {
+                eprintln!();
+            }
+            println!(
+                "exported   : {} file(s), {} to {}",
+                report.written,
+                human_bytes(report.bytes),
+                to.display()
+            );
+            if report.skipped > 0 {
+                println!(
+                    "skipped    : {} already there (use --overwrite)",
+                    report.skipped
+                );
+            }
+            for (name, why) in &report.failed {
+                println!("            {name}: {why}");
+            }
         }
         Command::Gpu => {
             let gpu = rawkit_engine::Gpu::new()?;
