@@ -32,16 +32,20 @@ enum Command {
     /// it so a human can check it against the design without reading Rust.
     Stages,
 
-    /// Decode, demosaic and write a viewable image.
+    /// Decode, demosaic, develop and write a colour-managed image.
     ///
-    /// The whole chain on real sensor data, and the first answer to "does this
-    /// look like the photo". Not colour management: no DCP profile, no tone
-    /// map, no output transform — see the module docs before judging the
-    /// result.
+    /// The whole chain on real sensor data: decode, RCD demosaic, white
+    /// balance, highlight reconstruction, camera profile, exposure, tone map,
+    /// output transform. A `.jpg` or `.png` carries an ICC profile; a `.ppm`
+    /// cannot, and is for looking at intermediate results rather than for
+    /// anything that leaves the machine.
+    ///
+    /// Colour is only as good as the profile: without `--profile` it uses the
+    /// decoder's single-illuminant matrix, which is defensible and not accurate.
     Render {
         /// RAW file to read.
         input: PathBuf,
-        /// Where to write the PPM.
+        /// Where to write the image. The extension picks the format.
         #[arg(short, long, default_value = "render.ppm")]
         output: PathBuf,
         /// Box-downsample so the longest edge is at most this many pixels.
@@ -59,6 +63,13 @@ enum Command {
         /// can be — Adobe's are not redistributable.
         #[arg(long)]
         profile: Option<PathBuf>,
+        /// Exposure in stops, applied in scene-linear light before the tone map.
+        ///
+        /// The `signal` line this command prints says how far the frame sits
+        /// from clipping, which is the number to set this from: a file peaking
+        /// at -1.2 EV has that much room before anything blows.
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        exposure: f32,
     },
 
     /// Report the GPU adapter this machine would render on.
@@ -98,7 +109,8 @@ fn main() -> Result<()> {
             max_dim,
             tile,
             profile,
-        } => render::render(&input, &output, max_dim, tile, profile.as_deref())?,
+            exposure,
+        } => render::render(&input, &output, max_dim, tile, profile.as_deref(), exposure)?,
         Command::Gpu => {
             let gpu = rawkit_engine::Gpu::new()?;
             let info = &gpu.adapter_info;

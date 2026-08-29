@@ -33,7 +33,11 @@ pub fn render(
     max_dim: u32,
     tile: u32,
     profile_path: Option<&Path>,
+    exposure_ev: f32,
 ) -> Result<()> {
+    if !exposure_ev.is_finite() {
+        bail!("exposure must be a finite number of stops");
+    }
     let raw = rawkit_decode::decode_file(input)
         .with_context(|| format!("decoding {}", input.display()))?;
     eprintln!(
@@ -114,10 +118,32 @@ pub fn render(
     );
 
     let mosaic = normalise(&raw);
-    // The identity edit: no exposure change, as-shot white balance. Everything
-    // the renderer does to this frame comes from the frame itself, which is what
-    // makes it a baseline worth looking at.
-    let state = EditState::default();
+    // How much of the sensor's range this exposure actually used. Worth
+    // printing because a dark render has two very different causes — a dark
+    // scene, or a scaling bug in decode — and they look identical in the image.
+    // 1.0 means a channel reached the white level.
+    {
+        let mut sorted: Vec<f32> = mosaic.iter().copied().collect();
+        sorted.sort_by(f32::total_cmp);
+        let at = |q: f64| sorted[((sorted.len() - 1) as f64 * q) as usize];
+        eprintln!(
+            "signal     : median {:.3}, p99 {:.3}, max {:.3} of white level ({:+.1} EV from clipping)",
+            at(0.5),
+            at(0.99),
+            at(1.0),
+            at(1.0).max(1e-6).log2(),
+        );
+    }
+    // As-shot white balance and whatever exposure the caller asked for.
+    // Everything else the renderer does comes from the frame itself, which is
+    // what makes the default a baseline worth looking at.
+    let state = EditState {
+        tone: rawkit_editstate::Tone {
+            exposure_ev,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let renderer = Renderer::with_tile_size(&gpu, tile);
     let frame = Frame {
         data: &mosaic,
