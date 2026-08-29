@@ -24,6 +24,7 @@
 //! The binding lives in [`libraw`]; everything below is the shape it produces,
 //! which is the part other crates depend on.
 
+pub mod exif;
 pub mod libraw;
 
 pub use libraw::{decode_file, read_metadata};

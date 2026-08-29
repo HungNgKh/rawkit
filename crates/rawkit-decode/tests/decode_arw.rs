@@ -108,6 +108,17 @@ fn reads_metadata_without_decoding_and_agrees_with_the_decode() {
     println!("shutter : {:?}", meta.shutter_count);
     println!("lens    : {:?}", meta.lens);
 
+    // The general reader and the vendor's maker note must agree. They are two
+    // independent answers to the same question, and the whole reason the
+    // general one exists is that the vendor's is absent on most cameras — so
+    // the day they disagree, the one that is always available is wrong.
+    let from_exif = rawkit_decode::exif::capture_time(&path);
+    assert!(
+        from_exif.is_some(),
+        "no EXIF DateTimeOriginal in a file that has one"
+    );
+    println!("exif    : {from_exif:?}");
+
     // The catalog's duplicate-detection triple. Every part of it is a field a
     // body may not record, so this is what proves the supported one does.
     assert!(meta.captured_at.is_some(), "no capture time");

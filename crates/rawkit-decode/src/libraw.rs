@@ -44,7 +44,17 @@ pub fn read_metadata(path: &Path) -> Result<RawMetadata, DecodeError> {
     // SAFETY: `open` returns only on a successful parse, and we read fields
     // LibRaw populates before unpacking.
     let data = unsafe { &*handle.0 };
-    Ok(metadata(data))
+    let mut found = metadata(data);
+    // The standard tag first, the vendor's maker note only if there is none.
+    // EXIF `DateTimeOriginal` is what every camera writes; the maker note is
+    // what one of them writes, and relying on it left the column empty for
+    // everything else.
+    if let Some(text) = crate::exif::capture_time(path) {
+        if let Some(seconds) = wall_clock(&text) {
+            found.captured_at = Some(seconds);
+        }
+    }
+    Ok(found)
 }
 
 /// Decode a RAW file to its sensor mosaic.
