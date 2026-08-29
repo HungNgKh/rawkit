@@ -252,47 +252,50 @@ fn main() -> Result<()> {
                 session_canvas::CanvasRenderer::new(&gpu, &frame, [size.width, size.height]);
             canvas_renderer.target(&gpu, config.format);
 
-            // Painting happens on the main thread, driven by GTK's own loop.
-            //
-            // Not a style preference. Presenting from a spawned thread means two
-            // threads on one Xlib connection; `XInitThreads` licenses that, but
-            // the arrangement would still be wrong — a canvas wants to draw on
-            // the compositor's schedule, not on a sleep. This timer is a step
-            // towards GTK's frame clock rather than the destination.
+            // One frame: let the session decide, draw what it asked for, blit.
             let surface_size = [size.width, size.height];
+            let mut tick = move || -> Result<()> {
+                {
+                    let mut session = shared.lock().expect("session lock");
+                    canvas_renderer.advance(&gpu, &mut session, &frame, &pyramid, surface_size)?;
+                }
+                paint(
+                    &gpu,
+                    &surface,
+                    canvas_renderer.presenter(),
+                    canvas_renderer.canvas(),
+                )
+            };
+
+            // On Linux the frame runs on the main thread, driven by GTK's own
+            // loop. Not a style preference: presenting from a spawned thread
+            // means two threads on one Xlib connection, and while XInitThreads
+            // licenses that, a canvas should draw on the compositor's schedule
+            // rather than on a sleep. This timer is a step towards GTK's frame
+            // clock, not the destination.
             #[cfg(target_os = "linux")]
-            gtk::glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-                let result = (|| -> Result<()> {
-                    {
-                        let mut session = shared.lock().expect("session lock");
-                        canvas_renderer.advance(
-                            &gpu,
-                            &mut session,
-                            &frame,
-                            &pyramid,
-                            surface_size,
-                        )?;
-                    }
-                    paint(
-                        &gpu,
-                        &surface,
-                        canvas_renderer.presenter(),
-                        canvas_renderer.canvas(),
-                    )
-                })();
-                match result {
+            gtk::glib::timeout_add_local(
+                std::time::Duration::from_millis(16),
+                move || match tick() {
                     Ok(()) => gtk::glib::ControlFlow::Continue,
                     Err(e) => {
                         eprintln!("paint: {e}");
                         gtk::glib::ControlFlow::Break
                     }
-                }
-            });
+                },
+            );
+            // Elsewhere there is no equivalent constraint and no GTK loop to
+            // hook, so a thread it is — until each platform's canvas arrives
+            // with its own idea of when a frame should happen.
             #[cfg(not(target_os = "linux"))]
-            {
-                let _ = (canvas_renderer, frame, pyramid, surface_size, gpu, surface);
-                eprintln!("paint      : the render loop is implemented for X11 only so far");
-            }
+            std::thread::spawn(move || loop {
+                if let Err(e) = tick() {
+                    eprintln!("paint: {e}");
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            });
+
             Ok(())
         })
         .run(tauri::generate_context!())?;
