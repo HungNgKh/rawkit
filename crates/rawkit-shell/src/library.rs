@@ -458,15 +458,20 @@ mod tests {
             std::fs::write(photos.join(format!("DSC{i:05}.ARW")), b"raw").unwrap();
         }
         let mut catalog = Catalog::open(&dir.join("library.rawkit")).unwrap();
-        let mut taken = 1_000i64;
         rawkit_catalog::scan::scan_on(
             &mut catalog,
             &photos,
             rawkit_catalog::VolumeId::Uuid("test-volume".into()),
-            move |_: &Path| {
-                taken += 1;
+            // Capture time from the *name*, never from the order the reader is
+            // called in. `read_dir` returns entries in whatever order the
+            // filesystem likes, so a counter here makes the sequence depend on
+            // the machine — which passed on ext4 and failed on CI, the third
+            // time this project has been caught assuming a host filesystem.
+            |path: &Path| {
+                let name = path.file_stem()?.to_string_lossy().into_owned();
+                let index: i64 = name.trim_start_matches("DSC").parse().ok()?;
                 Some(FileMetadata {
-                    captured_at: Some(taken),
+                    captured_at: Some(1_000 + index),
                     ..FileMetadata::default()
                 })
             },

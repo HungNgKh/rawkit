@@ -68,6 +68,22 @@ you want to know.
 
 The engine has never broken the matrix. Keep the platform knowledge here.
 
+## Tests must not assume the host filesystem
+
+Three CI failures, all this shape, none of them reproducible on the dev box:
+
+- a scan test needed the machine to have a **filesystem UUID**, and the runners
+  do not have one;
+- a culling test derived capture times from the order `read_dir` returned
+  entries, which is filename order on ext4 and something else elsewhere.
+
+A test that depends on the filesystem passes locally and fails on the two
+platforms you cannot see. So: **derive test data from names and arguments, never
+from enumeration order, mount identity, timestamps or case-folding behaviour.**
+Where the real code genuinely depends on one of those, take it as a parameter —
+`PathConvention` and `scan_on`'s `VolumeId` are both that pattern — so the
+behaviour can be exercised on any machine rather than only on the one that has it.
+
 ## Dependencies
 
 Every dependency is declared in the root `Cargo.toml` `[workspace.dependencies]`
