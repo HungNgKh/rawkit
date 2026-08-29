@@ -135,6 +135,10 @@ enum Route {
 const PANEL_WIDTH: f64 = 400.0;
 /// Height the chrome keeps in route 3. `default_vbox` is a vertical box, and the
 /// probe needs two disjoint rectangles rather than the final layout.
+///
+/// Linux-only, like route 3 itself: the equivalent on macOS and Windows will be
+/// a child NSView and a child HWND, and those will bring their own geometry.
+#[cfg(target_os = "linux")]
 const PANEL_HEIGHT: i32 = 200;
 const WINDOW: (f64, f64) = (1200.0, 800.0);
 
