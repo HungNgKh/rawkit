@@ -239,7 +239,25 @@ impl PreviewBlit {
     /// row shows part of a photograph rather than a squashed whole one. That is
     /// the failure worth avoiding here: a squashed edge row looks like a layout
     /// choice rather than a bug.
+    /// Lay out cells over the whole canvas, clearing what was there.
+    ///
+    /// What a grid wants: every cell is redrawn each frame, and the gaps between
+    /// them are background rather than whatever the last view left.
     pub fn draw_grid(&self, gpu: &Gpu, canvas: &Canvas, cells: &[Cell<'_>]) {
+        self.render(gpu, canvas, cells, true);
+    }
+
+    /// Draw cells *onto* what is already on the canvas.
+    ///
+    /// What an overlay wants — a crop rectangle drawn over the photograph. The
+    /// only difference from [`draw_grid`](Self::draw_grid) is the load: clearing
+    /// first would leave four white lines on an empty canvas, which is what
+    /// happened before this existed.
+    pub fn draw_over(&self, gpu: &Gpu, canvas: &Canvas, cells: &[Cell<'_>]) {
+        self.render(gpu, canvas, cells, false);
+    }
+
+    fn render(&self, gpu: &Gpu, canvas: &Canvas, cells: &[Cell<'_>], clear: bool) {
         let [canvas_w, canvas_h] = canvas.size();
         let mut regions = vec![0.0f32; cells.len() * (REGION_STRIDE as usize / 4)];
         let mut placed: Vec<([u32; 4], usize)> = Vec::with_capacity(cells.len());
@@ -361,12 +379,16 @@ impl PreviewBlit {
                     ops: wgpu::Operations {
                         // The background between cells. Dark rather than black so
                         // a black photograph still has an edge.
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.012,
-                            g: 0.012,
-                            b: 0.014,
-                            a: 1.0,
-                        }),
+                        load: if clear {
+                            wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.012,
+                                g: 0.012,
+                                b: 0.014,
+                                a: 1.0,
+                            })
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                 })],

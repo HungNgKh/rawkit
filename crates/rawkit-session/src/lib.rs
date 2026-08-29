@@ -64,7 +64,7 @@
 //! The bus was deliberately first. It constrains the other two, and it is the
 //! only part that can be fully tested before a window exists.
 
-use rawkit_editstate::{EditState, Orientation};
+use rawkit_editstate::{Crop, EditState, Geometry, Orientation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -101,6 +101,15 @@ pub enum Command {
     SetTemperature(Option<f32>),
     SetTint(f32),
     SetOrientation(Orientation),
+    /// The visible rectangle, as fractions of the oriented frame.
+    SetCrop(Crop),
+    /// Turn by this many quarter-turns clockwise, from wherever it is now.
+    ///
+    /// A relative command rather than an absolute one because that is what a
+    /// rotate key means, and because the alternative — the interface reading the
+    /// current orientation, adding one and sending it back — is a race whenever
+    /// anything else can change the edit.
+    RotateBy(i32),
     /// Replace the edit wholesale — preset application, undo/redo, or loading a
     /// state from the catalog. Boxed to keep [`Command`] small; see
     /// `commands_and_events_stay_small`.
@@ -142,6 +151,8 @@ impl Command {
             Command::SetTemperature(_) => "set_temperature",
             Command::SetTint(_) => "set_tint",
             Command::SetOrientation(_) => "set_orientation",
+            Command::SetCrop(_) => "set_crop",
+            Command::RotateBy(_) => "rotate_by",
             Command::SetEditState(_) => "set_edit_state",
             Command::Pan { .. } => "pan",
             Command::ZoomTo { .. } => "zoom_to",
@@ -269,6 +280,13 @@ impl RenderJob {
 /// state needed to decide what to render.
 pub struct Session {
     image: [u32; 2],
+    /// The frame after orientation and crop — what the viewport is measured in.
+    ///
+    /// Cached rather than derived on every call because it changes only when the
+    /// edit does, and because deriving it in some places and not others is
+    /// exactly how a fit and a pan end up disagreeing about how big the
+    /// photograph is.
+    developed: [u32; 2],
     tile: u32,
     max_level: u8,
     state: EditState,
@@ -298,13 +316,15 @@ impl Session {
             "an image with no pixels has nothing to render"
         );
         let max_level = max_level(image, tile);
+        let developed = Geometry::new(&state).output_size(image);
         let mut session = Self {
             image,
+            developed,
             tile,
             max_level,
             state,
             viewport: Viewport {
-                center: [image[0] as f64 / 2.0, image[1] as f64 / 2.0],
+                center: [developed[0] as f64 / 2.0, developed[1] as f64 / 2.0],
                 scale: 1.0,
                 size: [0, 0],
             },
@@ -333,6 +353,20 @@ impl Session {
     /// The image size this session was opened with.
     pub fn image_size(&self) -> [u32; 2] {
         self.image
+    }
+
+    /// The photograph's size, after orientation and crop.
+    ///
+    /// What the viewport is measured in, and what a caller wanting to know "how
+    /// big is this picture" means — `image_size` is the sensor's answer, which
+    /// is a different question.
+    pub fn developed_size(&self) -> [u32; 2] {
+        self.developed
+    }
+
+    /// The map between the sensor's frame and the photograph's.
+    pub fn geometry(&self) -> Geometry {
+        Geometry::new(&self.state)
     }
 
     /// Apply one command. Never blocks and never renders.
@@ -373,6 +407,29 @@ impl Session {
 
             Command::SetOrientation(o) => {
                 self.state.orientation = o;
+                self.edit_changed()
+            }
+
+            Command::RotateBy(quarters) => {
+                let turns = [
+                    Orientation::AsShot,
+                    Orientation::Rotate90Cw,
+                    Orientation::Rotate180,
+                    Orientation::Rotate270Cw,
+                ];
+                let at = turns
+                    .iter()
+                    .position(|o| *o == self.state.orientation)
+                    .unwrap_or(0) as i32;
+                self.state.orientation = turns[(at + quarters).rem_euclid(4) as usize];
+                self.edit_changed()
+            }
+
+            Command::SetCrop(crop) => {
+                if let Err(e) = crop.validate() {
+                    return refused(name, e.to_string());
+                }
+                self.state.crop = crop;
                 self.edit_changed()
             }
 
@@ -482,10 +539,15 @@ impl Session {
 
     /// Every tile intersecting the visible region at `level`.
     pub fn visible_tiles(&self, level: u8) -> Vec<TileId> {
-        let rect = self.viewport.visible_rect(self.image);
-        if rect[2] <= rect[0] || rect[3] <= rect[1] {
+        let seen = self.viewport.visible_rect(self.developed);
+        if seen[2] <= seen[0] || seen[3] <= seen[1] {
             return Vec::new();
         }
+        // Tiles are addressed in the sensor's frame — the mosaic has not been
+        // rotated and never will be, because rotating it would move the CFA
+        // phase. So the visible rectangle is carried back across the geometry
+        // before it becomes tile indices.
+        let rect = Geometry::new(&self.state).sensor_rect(seen, self.image);
         let span = (self.tile << level) as f64;
         let tiles_x = (self.image[0] as f64 / span).ceil() as u32;
         let tiles_y = (self.image[1] as f64 / span).ceil() as u32;
@@ -529,6 +591,24 @@ impl Session {
 
     fn edit_changed(&mut self) -> Event {
         self.generation += 1;
+        // Orientation and crop change how big the photograph is, and a stale
+        // size would leave the view fitted to the frame before the change.
+        // Recomputed for every edit rather than only the geometric ones: it is
+        // two multiplications, and remembering which commands are geometric is a
+        // rule somebody eventually forgets.
+        let was = self.developed;
+        self.developed = Geometry::new(&self.state).output_size(self.image);
+        if self.developed != was {
+            // The photograph is a different shape, so the old scale and centre
+            // describe a frame that no longer exists — a rotate would leave it
+            // overflowing the canvas and a crop would leave it off to one side.
+            //
+            // The cost is that nudging a crop while zoomed in throws the view
+            // back to fit. That is the right way round: after a geometric change
+            // the useful thing to see is the whole of what you now have.
+            self.fit_to_view();
+        }
+        self.clamp_center();
         // Every tile is stale, at every level. Clearing beats marking: the
         // generation check would already reject these entries, and holding them
         // only costs memory.
@@ -540,18 +620,23 @@ impl Session {
 
     fn fit_to_view(&mut self) {
         let [w, h] = self.viewport.size;
-        self.viewport.center = [self.image[0] as f64 / 2.0, self.image[1] as f64 / 2.0];
+        self.viewport.center = [
+            self.developed[0] as f64 / 2.0,
+            self.developed[1] as f64 / 2.0,
+        ];
         if w == 0 || h == 0 {
             return;
         }
+        // The *developed* frame: fitting the sensor's would leave a cropped
+        // photograph small and off-centre, surrounded by the part it removed.
         self.viewport.scale =
-            (w as f64 / self.image[0] as f64).min(h as f64 / self.image[1] as f64);
+            (w as f64 / self.developed[0] as f64).min(h as f64 / self.developed[1] as f64);
     }
 
     /// Keep the centre on the image, so the photo cannot be flung off screen.
     fn clamp_center(&mut self) {
-        self.viewport.center[0] = self.viewport.center[0].clamp(0.0, self.image[0] as f64);
-        self.viewport.center[1] = self.viewport.center[1].clamp(0.0, self.image[1] as f64);
+        self.viewport.center[0] = self.viewport.center[0].clamp(0.0, self.developed[0] as f64);
+        self.viewport.center[1] = self.viewport.center[1].clamp(0.0, self.developed[1] as f64);
     }
 }
 
@@ -963,5 +1048,126 @@ mod tests {
     #[test]
     fn tile_size_matches_the_engine() {
         assert_eq!(TILE, rawkit_engine::render::DEFAULT_TILE);
+    }
+
+    #[test]
+    fn the_view_is_measured_in_the_photograph_and_not_in_the_sensor() {
+        // The whole point of routing the viewport through the geometry. Fitting
+        // the sensor's frame would leave a cropped photograph small and
+        // off-centre, ringed by the part the user just removed.
+        let mut s = session();
+        s.apply(Command::FitToView);
+        let fitted = s.viewport().scale;
+        s.apply(Command::SetCrop(Crop {
+            left: 0.25,
+            top: 0.25,
+            right: 0.75,
+            bottom: 0.75,
+        }));
+
+        assert_eq!(s.developed_size(), [3000, 2000]);
+        assert_eq!(s.image_size(), IMAGE, "the sensor did not change size");
+        assert!(
+            (s.viewport().scale - fitted * 2.0).abs() < 1e-9,
+            "half the frame should fit at twice the scale"
+        );
+        assert_eq!(s.viewport().center, [1500.0, 1000.0]);
+    }
+
+    #[test]
+    fn rotating_swaps_the_photograph_and_refits_it() {
+        let mut s = session();
+        s.apply(Command::SetOrientation(Orientation::Rotate90Cw));
+        assert_eq!(s.developed_size(), [4000, 6000]);
+        // No explicit fit: a photograph that changed shape is refitted, because
+        // the old scale describes a frame that no longer exists. A 1600x1000
+        // canvas around a 4000x6000 photograph fits on height.
+        assert!((s.viewport().scale - 1000.0 / 6000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_crop_asks_for_the_tiles_under_it_and_no_others() {
+        // The conversion that has to be right: the view is in the photograph's
+        // frame, the mosaic is in the sensor's, and the mosaic is never rotated
+        // because rotating it would move the CFA phase.
+        let mut s = session();
+        s.apply(Command::FitToView);
+        let whole = s.visible_tiles(3).len();
+
+        s.apply(Command::SetCrop(Crop {
+            left: 0.0,
+            top: 0.0,
+            right: 0.25,
+            bottom: 0.25,
+        }));
+        s.apply(Command::FitToView);
+        let corner = s.visible_tiles(3);
+        assert!(
+            corner.len() < whole,
+            "a quarter-frame crop asked for {} of {whole} tiles",
+            corner.len()
+        );
+        // Top-left of the photograph is top-left of the sensor when unrotated.
+        assert!(corner.iter().all(|t| t.x < 3 && t.y < 2), "{corner:?}");
+    }
+
+    #[test]
+    fn a_rotated_crop_reads_the_corner_of_the_sensor_it_actually_covers() {
+        // Under a quarter turn the photograph's top-left corner is the sensor's
+        // bottom-left. Getting this backwards shows the wrong part of the frame
+        // while looking entirely plausible.
+        let mut s = session();
+        s.apply(Command::SetOrientation(Orientation::Rotate90Cw));
+        s.apply(Command::SetCrop(Crop {
+            left: 0.0,
+            top: 0.0,
+            right: 0.25,
+            bottom: 0.25,
+        }));
+        s.apply(Command::FitToView);
+
+        let tiles = s.visible_tiles(3);
+        assert!(!tiles.is_empty());
+        let span = TILE << 3;
+        let rows = IMAGE[1].div_ceil(span);
+        assert!(
+            tiles.iter().all(|t| t.y >= rows / 2),
+            "expected the lower half of the sensor, got {tiles:?}"
+        );
+    }
+
+    #[test]
+    fn a_crop_that_is_not_a_rectangle_is_refused_and_changes_nothing() {
+        let mut s = session();
+        let before = s.state().clone();
+        let event = s.apply(Command::SetCrop(Crop {
+            left: 0.8,
+            top: 0.0,
+            right: 0.2,
+            bottom: 1.0,
+        }));
+        assert!(matches!(event, Event::Refused { .. }), "{event:?}");
+        assert_eq!(s.state(), &before);
+        assert_eq!(s.developed_size(), IMAGE);
+    }
+
+    #[test]
+    fn rotating_wraps_in_both_directions() {
+        // Relative, so it cannot get out of step with an interface that read the
+        // orientation a moment ago — and so a rotate key works the same whether
+        // you press it four times or twice each way.
+        let mut s = session();
+        for _ in 0..4 {
+            s.apply(Command::RotateBy(1));
+        }
+        assert_eq!(s.state().orientation, Orientation::AsShot);
+
+        s.apply(Command::RotateBy(-1));
+        assert_eq!(s.state().orientation, Orientation::Rotate270Cw);
+        assert_eq!(s.developed_size(), [4000, 6000]);
+
+        s.apply(Command::RotateBy(5));
+        assert_eq!(s.state().orientation, Orientation::AsShot);
+        assert_eq!(s.developed_size(), IMAGE);
     }
 }

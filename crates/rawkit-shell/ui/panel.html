@@ -47,7 +47,7 @@
   <span id="label"></span>
   <span id="counts"></span>
   <span id="mode">loupe</span>
-  <span id="keys">G grid · E loupe · M mark · C compare · P pick · X reject · 1–5 rate · 6–9 label · Z undo</span>
+  <span id="keys">G grid · E loupe · R crop · [ ] rotate · M mark · C compare · P pick · X reject · 1–5 rate · Z undo</span>
 </div>
 
 <main>
@@ -301,7 +301,20 @@
     switch (key.toLowerCase()) {
       // G and E, because that is what a Lightroom user's hands already do.
       case "g": act("grid"); break;
-      case "e": case "enter": case "escape": act("loupe"); break;
+      // In crop the same two keys mean take it and throw it away, which is why
+      // crop is a mode rather than a flag.
+      case "enter":
+        if (document.getElementById("mode").textContent === "crop") { act("crop_apply"); break; }
+        act("loupe"); break;
+      case "escape":
+        if (document.getElementById("mode").textContent === "crop") { act("crop_cancel"); break; }
+        act("loupe"); break;
+      case "e": act("loupe"); break;
+      // R for the crop tool, as in Lightroom; the brackets rotate, as in
+      // Lightroom's Ctrl+[ and Ctrl+].
+      case "r": act("crop"); break;
+      case "[": send({ command: "rotate_by", params: -1 }); break;
+      case "]": send({ command: "rotate_by", params: 1 }); break;
       // M sets a frame aside, C compares what you set aside.
       case "m": act("mark"); break;
       case "c": act("survey"); break;

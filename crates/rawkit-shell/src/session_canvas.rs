@@ -44,6 +44,9 @@ pub struct CanvasRenderer {
     /// The edit the uniform currently holds. Uploading it is cheap but not free,
     /// and it changes far less often than tiles are drawn.
     uploaded: Option<EditState>,
+    /// The geometry the canvas was last drawn under, so a change to it can clear
+    /// what the previous framing left behind.
+    geometry: Option<rawkit_editstate::Geometry>,
 }
 
 impl CanvasRenderer {
@@ -58,6 +61,7 @@ impl CanvasRenderer {
             canvas,
             shown: None,
             uploaded: None,
+            geometry: None,
         }
     }
 
@@ -110,6 +114,17 @@ impl CanvasRenderer {
         let level = viewport.level(session.max_level());
         let scale = viewport.scale * (1u32 << level) as f64;
 
+        // A canvas only ever gets written where the photograph is, so when the
+        // photograph gets smaller — a crop, a rotation into a narrower shape —
+        // whatever was underneath stays on screen around it. Recreating clears
+        // it, which is what the size branch below already relies on.
+        let geometry = session.geometry();
+        if self.geometry != Some(geometry) {
+            self.geometry = Some(geometry);
+            self.canvas = self.renderer.create_canvas(gpu, 1, 1);
+            self.shown = None;
+        }
+
         // Canvas in level pixels, so tiles land 1:1 in it and the presenter does
         // the fractional part.
         let wanted = [
@@ -121,6 +136,15 @@ impl CanvasRenderer {
             self.shown = None;
         }
         level
+    }
+
+    /// Forget what is on the canvas, so the next frame redraws all of it.
+    ///
+    /// Wanted by anything drawn *over* the tiles: the canvas is only written
+    /// where a tile lands, so an overlay that moves would otherwise leave its
+    /// previous position behind.
+    pub fn invalidate(&mut self) {
+        self.shown = None;
     }
 
     /// Size the canvas to the surface exactly, for a view that has no zoom.
@@ -220,12 +244,25 @@ impl CanvasRenderer {
         let divisor = (1u32 << level) as f64;
         let origin = [origin[0] / divisor, origin[1] / divisor];
 
-        let span = DEFAULT_TILE as i32;
+        // The viewport is measured in the *photograph*; tiles are addressed in
+        // the sensor's frame, because the mosaic is never rotated — rotating it
+        // would move the CFA phase. So each tile's corner is carried across the
+        // geometry, and the same geometry tells the blit which way its own axes
+        // now point.
+        let geometry = session.geometry();
+        let axes = geometry.axes();
+        let level_size = pyramid
+            .level(level)
+            .map(|(_, w, h)| [w, h])
+            .unwrap_or(session.image_size());
+
         let mut drawn = 0;
         for tile in &tiles {
+            let corner =
+                geometry.developed_of([tile.x * DEFAULT_TILE, tile.y * DEFAULT_TILE], level_size);
             let dest = [
-                (tile.x as i32 * span) - origin[0].floor() as i32,
-                (tile.y as i32 * span) - origin[1].floor() as i32,
+                (corner[0] - origin[0].floor() as i64) as i32,
+                (corner[1] - origin[1].floor() as i64) as i32,
             ];
             self.renderer.draw_tile(
                 gpu,
@@ -236,6 +273,7 @@ impl CanvasRenderer {
                 tile.x,
                 tile.y,
                 dest,
+                axes,
                 Output::Display,
             )?;
             session.tile_rendered(*tile, job.generation);

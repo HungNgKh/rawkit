@@ -54,8 +54,8 @@
 //! handful of tiles rather than ninety-two.
 
 use crate::profile::{CameraProfile, Matrix3};
-use crate::{EngineError, Geometry, Gpu};
-use rawkit_editstate::EditState;
+use crate::{EngineError, Gpu};
+use rawkit_editstate::{EditState, Geometry};
 
 /// Which colour sits at pixel (0,0). Bayer only: RCD is a Bayer algorithm, and
 /// X-Trans needs a different kernel rather than a different phase.
@@ -226,6 +226,10 @@ struct Params {
     present: [i32; 4],
     /// How much of the tile is inside the image, in pixels. See `present`.
     extent: [i32; 4],
+    /// The rotation, as the two columns of a signed permutation: where a step
+    /// along the tile's x and y axes lands on the canvas. Identity when the
+    /// photograph is not turned. Written with `present`, since both are per-tile.
+    axes: [i32; 4],
 }
 
 /// Byte offset of `Params::present`, for the per-tile partial write.
@@ -601,7 +605,7 @@ impl Renderer {
         // each tile — and doing it here is what keeps a cropped export
         // bit-identical to the same region of an uncropped one.
         let (pixels, [width, height]) =
-            Geometry::new(state).apply(&result, [image.width, image.height]);
+            crate::geometry::apply(&Geometry::new(state), &result, [image.width, image.height]);
         Ok(Rendered {
             pixels,
             width,
@@ -801,6 +805,7 @@ impl Renderer {
         tx: u32,
         ty: u32,
         dest: [i32; 2],
+        axes: [[i32; 2]; 2],
         intent: Output,
     ) -> Result<(), EngineError> {
         let (data, lw, lh) = pyramid.level(level).ok_or_else(|| {
@@ -830,7 +835,7 @@ impl Renderer {
         // before the dispatch that reads it.
         // Everything the present pass needs, written as one patch at the tail of
         // the uniform: where the tile goes, and how much of it is real.
-        let tail: [i32; 8] = [
+        let tail: [i32; 12] = [
             dest[0],
             dest[1],
             self.tile as i32,
@@ -839,6 +844,10 @@ impl Renderer {
             (lh - oy).min(self.tile) as i32,
             0,
             0,
+            axes[0][0],
+            axes[0][1],
+            axes[1][0],
+            axes[1][1],
         ];
         gpu.queue
             .write_buffer(&buffers.params, PRESENT_OFFSET, bytemuck::cast_slice(&tail));
@@ -924,6 +933,10 @@ impl Renderer {
             ],
             tone: tone.shape(),
             levels: tone.levels(),
+            // Per-tile, and rewritten before every present. The value here only
+            // has to be something valid for the whole-image path, which never
+            // rotates in the shader — geometry is applied to the finished frame.
+            axes: [1, 0, 0, 1],
             hsm_dims: match hsm {
                 Some(m) => [m.hue_divisions, m.sat_divisions, m.value_divisions, 0],
                 None => [1, 1, 1, 0],

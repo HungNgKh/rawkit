@@ -170,6 +170,11 @@ pub enum CullAction {
     SurveyJudge(bool),
     /// Empty the comparison.
     ClearMarks,
+    /// Draw a rectangle on the loupe. Pressed again, it stops.
+    Crop,
+    /// Take the rectangle that was drawn, or throw it away.
+    CropApply,
+    CropCancel,
     /// Move the selection without loading anything — what a grid does. The
     /// loupe uses `Next`/`Previous`, which ask for the photograph as well.
     SelectNext,
@@ -397,6 +402,11 @@ impl Library {
     /// Carry out an action and report the new state.
     pub fn act(&mut self, action: CullAction) -> Result<CullView> {
         match action {
+            // Resolved before they reach here — they change which view is
+            // showing, not which photograph. Listed rather than caught by a
+            // wildcard so adding a cull action still fails to compile here,
+            // which is what has kept this match honest.
+            CullAction::Crop | CullAction::CropApply | CullAction::CropCancel => {}
             CullAction::Next => self.go(self.index + 1),
             CullAction::SelectNext => self.select(self.index + 1),
             CullAction::SelectPrevious => self.select(self.index.saturating_sub(1)),

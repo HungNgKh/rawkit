@@ -16,8 +16,8 @@
 //!
 //! GPU-gated like the rest: `cargo test -- --ignored`.
 
-use rawkit_editstate::{Crop, EditState, Orientation};
-use rawkit_engine::{BayerPhase, CameraProfile, Frame, Geometry, Gpu, Output, Renderer};
+use rawkit_editstate::{Crop, EditState, Geometry, Orientation};
+use rawkit_engine::{BayerPhase, CameraProfile, Frame, Gpu, Output, Renderer};
 
 const W: u32 = 192;
 const H: u32 = 128;

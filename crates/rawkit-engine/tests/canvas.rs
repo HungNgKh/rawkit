@@ -87,6 +87,7 @@ fn a_tile_drawn_to_the_canvas_is_the_tile_read_back() {
             2,
             1,
             [0, 0],
+            [[1, 0], [0, 1]],
             Output::Display,
         )
         .expect("draw");
@@ -143,6 +144,7 @@ fn tiles_land_where_they_are_told() {
                 tx,
                 ty,
                 [(tx * TILE) as i32, (ty * TILE) as i32],
+                [[1, 0], [0, 1]],
                 Output::Display,
             )
             .expect("draw");
@@ -198,6 +200,7 @@ fn a_tile_overhanging_the_canvas_is_clipped_not_wrapped() {
             0,
             0,
             [64, 64],
+            [[1, 0], [0, 1]],
             Output::Display,
         )
         .expect("an overhanging tile is not an error");
@@ -249,6 +252,7 @@ fn a_tile_starting_before_the_canvas_is_clipped_on_that_side_too() {
             1,
             1,
             [offset, offset],
+            [[1, 0], [0, 1]],
             Output::Display,
         )
         .expect("a tile may start off the canvas");
@@ -316,6 +320,7 @@ fn a_tile_overhanging_the_image_does_not_draw_its_overhang() {
             2,
             0,
             [0, 0],
+            [[1, 0], [0, 1]],
             Output::Display,
         )
         .expect("draw the last tile");
@@ -338,4 +343,70 @@ fn a_tile_overhanging_the_image_does_not_draw_its_overhang() {
     // And the part that is inside the image is real picture.
     let inside = drawn[(((TILE / 2) * TILE + valid / 2) * 4) as usize];
     assert!(inside > 0.0, "the valid part of the tile is blank");
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_turned_tile_lands_transposed_and_carries_the_same_pixels() {
+    // The rotation the canvas applies at blit time, rather than by turning the
+    // mosaic — which would move the CFA phase and make every pixel the wrong
+    // colour. Checked against the unrotated readback of the same tile, so this
+    // cannot pass by agreeing with itself.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let cfa = mosaic();
+    let image = frame(&cfa);
+    let renderer = Renderer::with_tile_size(&gpu, TILE);
+    let pyramid = Pyramid::build(&image, TILE);
+    let buffers = renderer.allocate(&gpu, &image);
+    renderer
+        .set_edit(&gpu, &buffers, &image, &EditState::default())
+        .expect("upload edit");
+
+    let upright = renderer
+        .render_tile(&gpu, &buffers, &pyramid, 0, 1, 1, Output::Display)
+        .expect("readback path");
+
+    // A quarter turn clockwise sends a step along the tile's x axis to +y, and a
+    // step along y to -x — so the tile's own origin has to be placed at the
+    // canvas's top-*right* for the whole tile to land inside it.
+    let canvas = renderer.create_canvas(&gpu, TILE, TILE);
+    renderer
+        .draw_tile(
+            &gpu,
+            &buffers,
+            &canvas,
+            &pyramid,
+            0,
+            1,
+            1,
+            [TILE as i32 - 1, 0],
+            [[0, 1], [-1, 0]],
+            Output::Display,
+        )
+        .expect("draw");
+    let turned = canvas.read_back(&gpu).expect("canvas readback");
+
+    let at = |pixels: &[f32], x: u32, y: u32| {
+        let i = ((y * TILE + x) * 4) as usize;
+        [pixels[i], pixels[i + 1], pixels[i + 2]]
+    };
+    // Half-float quantisation, as in the test above: the canvas stores what the
+    // readback path returns in f32, so the values agree to the format's
+    // precision rather than exactly. What is exact is *where* they land.
+    let mut worst = 0.0f32;
+    for y in 0..TILE {
+        for x in 0..TILE {
+            let landed = at(&turned, TILE - 1 - y, x);
+            let expected = at(&upright, x, y);
+            for c in 0..3 {
+                worst = worst.max((landed[c] - expected[c]).abs());
+            }
+            assert!(
+                worst < F16_TOLERANCE,
+                "({x}, {y}) is not at ({}, {x}): {landed:?} against {expected:?}",
+                TILE - 1 - y
+            );
+        }
+    }
+    println!("worst difference across the turn: {worst:e}");
 }

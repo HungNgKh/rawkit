@@ -31,7 +31,6 @@ pub mod profile;
 pub mod render;
 mod tone;
 
-pub use geometry::Geometry;
 pub use pipeline::{Domain, Stage};
 pub use present::Presenter;
 pub use preview::{Cell, PreviewBlit, PreviewImage};

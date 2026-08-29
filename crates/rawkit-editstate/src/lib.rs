@@ -23,6 +23,10 @@
 //! Fields are added as the renderer learns to honour them — an `EditState` field
 //! that nothing renders is a lie the whole codebase has to keep.
 
+pub mod geometry;
+
+pub use geometry::Geometry;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 

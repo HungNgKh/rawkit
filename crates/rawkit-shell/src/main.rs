@@ -228,6 +228,29 @@ fn cull(state: tauri::State<'_, Shelf>, action: CullAction) -> Result<CullView, 
             MODE.store(MODE_SURVEY, std::sync::atomic::Ordering::Relaxed);
             CullAction::SelectMarked(0)
         }
+        // Crop is a mode of the loupe rather than a view of its own: the same
+        // photograph, at the same zoom, with a rectangle on it.
+        CullAction::Crop => {
+            let next = if mode() == MODE_CROP {
+                MODE_LOUPE
+            } else {
+                MODE_CROP
+            };
+            *CANVAS_MARQUEE.lock().expect("marquee lock") = None;
+            MODE.store(next, std::sync::atomic::Ordering::Relaxed);
+            CullAction::SelectBy(0)
+        }
+        CullAction::CropApply => {
+            // Turning a rectangle into a crop needs the viewport, which lives in
+            // the render loop. This only says that it should happen.
+            CROP_COMMIT.store(true, std::sync::atomic::Ordering::Relaxed);
+            CullAction::SelectBy(0)
+        }
+        CullAction::CropCancel => {
+            *CANVAS_MARQUEE.lock().expect("marquee lock") = None;
+            MODE.store(MODE_LOUPE, std::sync::atomic::Ordering::Relaxed);
+            CullAction::SelectBy(0)
+        }
         CullAction::Loupe => {
             MODE.store(MODE_LOUPE, std::sync::atomic::Ordering::Relaxed);
             // The loupe has been showing something else since it last ran, so
@@ -363,6 +386,11 @@ fn main() -> Result<()> {
                 [size.width, size.height],
             );
             let blit = rawkit_engine::PreviewBlit::new(&gpu);
+            // One white pixel, uploaded once. The crop outline is drawn as four
+            // thin cells whose edge colour covers them entirely, so this is
+            // never sampled — but a cell wants an image, and inventing one per
+            // frame would allocate a texture thirty times a second.
+            let white = blit.upload(&gpu, &[255, 255, 255, 255], 1, 1)?;
             let mut grid = Grid {
                 cells: std::collections::HashMap::new(),
                 scroll: 0.0,
@@ -415,6 +443,9 @@ fn main() -> Result<()> {
             let surface_size = [size.width, size.height];
             let mut stats = FrameStats::default();
             let navigating = library.clone();
+            // The rectangle the canvas currently carries, so a settled one is
+            // not redrawn on every frame. See the crop block below.
+            let mut last_marquee: Option<[f64; 4]> = None;
             let mut tick = move || -> Result<()> {
                 let started = std::time::Instant::now();
 
@@ -564,6 +595,51 @@ fn main() -> Result<()> {
                     // ever stops being true.
                     (None, None) => 0,
                 };
+                // The outline goes on after the tiles, into the same canvas, and
+                // the canvas is only written where a tile landed — so a moving
+                // rectangle would leave its previous position behind. Redrawing
+                // every visible tile each frame is what stops that; at fit zoom
+                // it is about six of them.
+                if in_crop() {
+                    let marquee = *CANVAS_MARQUEE.lock().expect("marquee lock");
+                    if CROP_COMMIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                        if let Some(marquee) = marquee {
+                            let mut session = shared.lock().expect("session lock");
+                            if let Some(crop) = crop_from(&session, &marquee) {
+                                // No explicit fit: the session refits whenever
+                                // the photograph changes shape, so asking again
+                                // here would be a second opinion on the same
+                                // question.
+                                session.apply(Command::SetCrop(crop));
+                            }
+                        }
+                        *CANVAS_MARQUEE.lock().expect("marquee lock") = None;
+                        MODE.store(MODE_LOUPE, std::sync::atomic::Ordering::Relaxed);
+                        canvas_renderer.invalidate();
+                    } else if let Some(marquee) = marquee {
+                        let session = shared.lock().expect("session lock");
+                        draw_marquee(&gpu, &blit, &white, &canvas_renderer, &session, &marquee);
+                        // Only when the rectangle actually moved. The outline is
+                        // drawn into the canvas, so erasing the old one means
+                        // redrawing every visible tile — the cost of a pan. Doing
+                        // that unconditionally is a full redraw every frame
+                        // forever, and since this loop is GTK's main thread, the
+                        // window stops answering: it does not look like a slow
+                        // canvas, it looks like the application has hung.
+                        let rect = marquee.rect();
+                        if last_marquee != Some(rect) {
+                            last_marquee = Some(rect);
+                            canvas_renderer.invalidate();
+                        }
+                    } else {
+                        last_marquee = None;
+                    }
+                } else if last_marquee.take().is_some() {
+                    // Escape left crop mode, and the outline is still painted
+                    // into the canvas. One redraw takes it off; without this it
+                    // stays until something else happens to move the view.
+                    canvas_renderer.invalidate();
+                }
                 paint(
                     &gpu,
                     &surface,
@@ -778,6 +854,12 @@ const MODE_LOUPE: u8 = 0;
 const MODE_GRID: u8 = 1;
 /// A handful of frames side by side, to choose between.
 const MODE_SURVEY: u8 = 2;
+/// The loupe, with a rectangle being drawn on it.
+///
+/// A mode rather than a flag because it changes what the same keys mean: Enter
+/// commits the rectangle instead of returning to the loupe, and Escape discards
+/// it instead of doing nothing.
+const MODE_CROP: u8 = 3;
 
 fn mode() -> u8 {
     MODE.load(std::sync::atomic::Ordering::Relaxed)
@@ -795,8 +877,47 @@ pub(crate) fn in_grid() -> bool {
     matches!(mode(), MODE_GRID | MODE_SURVEY)
 }
 
+/// Whether a drag on the canvas draws a rectangle rather than panning.
+pub(crate) fn in_crop() -> bool {
+    mode() == MODE_CROP
+}
+
+/// The rectangle being drawn on the canvas, in surface pixels, and whether the
+/// pointer has been let go.
+///
+/// Surface pixels because that is what the pointer produces and what the outline
+/// is drawn in; turning it into a crop needs the viewport, which lives in the
+/// render loop. Same division of labour as the grid's click: this widget reports
+/// where, and the loop works out what.
+pub(crate) static CANVAS_MARQUEE: Mutex<Option<Marquee>> = Mutex::new(None);
+/// Set when the page asks for the rectangle to be taken.
+static CROP_COMMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Marquee {
+    pub start: [f64; 2],
+    pub end: [f64; 2],
+    /// Set on button release. Until then the rectangle is still being sized.
+    pub settled: bool,
+}
+
+impl Marquee {
+    /// `[x, y, w, h]`, however the drag was made — up-left is a rectangle too.
+    pub(crate) fn rect(&self) -> [f64; 4] {
+        let x = self.start[0].min(self.end[0]);
+        let y = self.start[1].min(self.end[1]);
+        [
+            x,
+            y,
+            (self.start[0] - self.end[0]).abs(),
+            (self.start[1] - self.end[1]).abs(),
+        ]
+    }
+}
+
 pub(crate) fn mode_name() -> &'static str {
     match mode() {
+        MODE_CROP => "crop",
         MODE_GRID => "grid",
         MODE_SURVEY => "survey",
         _ => "loupe",
@@ -1054,7 +1175,7 @@ fn draw_grid(
     }
 
     let drawn = cells.len();
-    blit.draw_grid(gpu, canvas_renderer.canvas(), &cells);
+    blit.draw_over(gpu, canvas_renderer.canvas(), &cells);
     Ok(drawn)
 }
 
@@ -1206,4 +1327,92 @@ pub(crate) fn test_mosaic(width: u32, height: u32) -> Vec<f32> {
         }
     }
     samples
+}
+
+/// The four sides of the rectangle being drawn, as thin filled cells.
+///
+/// Four cells rather than one outlined one: a cell is opaque everywhere, so a
+/// single rectangle with an edge would paint over the photograph it is meant to
+/// be drawn on. The image handed to each side is never sampled — the edge colour
+/// covers the whole of a cell this thin — but the type wants one.
+fn draw_marquee(
+    gpu: &Gpu,
+    blit: &rawkit_engine::PreviewBlit,
+    white: &rawkit_engine::PreviewImage,
+    canvas_renderer: &session_canvas::CanvasRenderer,
+    session: &Session,
+    marquee: &Marquee,
+) {
+    // Surface pixels to canvas pixels. In the loupe the canvas is sized in level
+    // pixels, so the outline has to shrink by the same factor the presenter
+    // magnifies by, or it would sit somewhere else entirely when zoomed.
+    let viewport = session.viewport();
+    let level = viewport.level(session.max_level());
+    let scale = viewport.scale * (1u32 << level) as f64;
+    if scale <= 0.0 {
+        return;
+    }
+    let [x, y, w, h] = marquee.rect();
+    let to_canvas = |v: f64| (v / scale).round() as i32;
+    let (x, y, w, h) = (to_canvas(x), to_canvas(y), to_canvas(w), to_canvas(h));
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    // Two *screen* pixels, whatever the zoom. In canvas pixels the same line
+    // would thin out as you zoom away — at fit on a 24 MP frame it came to a
+    // single pixel, which on white foam is invisible.
+    let t = (2.0 / scale).ceil().max(1.0) as i32;
+    let colour = [0.98, 0.98, 0.98];
+    let sides = [
+        [x, y, w, t],
+        [x, y + h - t, w, t],
+        [x, y, t, h],
+        [x + w - t, y, t, h],
+    ];
+    let cells: Vec<rawkit_engine::Cell<'_>> = sides
+        .iter()
+        .map(|dest| rawkit_engine::Cell {
+            image: white,
+            dest: *dest,
+            tint: [1.0, 1.0, 1.0],
+            // Thickness is a fraction of the cell's short side, so `t` on a cell
+            // `t` thick covers all of it — which is the point: the image below
+            // is never sampled.
+            edge: (colour, t as f32),
+            inner: ([0.0; 3], 0.0),
+        })
+        .collect();
+    blit.draw_over(gpu, canvas_renderer.canvas(), &cells);
+}
+
+/// The rectangle on screen, as a crop of the photograph.
+///
+/// Composed with the crop already in force rather than replacing it: the drag
+/// happened on what is *currently* visible, so a second crop names a region of
+/// the first. Replacing would make every crop after the first jump somewhere
+/// else, which reads as the rectangle being ignored.
+fn crop_from(session: &Session, marquee: &Marquee) -> Option<rawkit_editstate::Crop> {
+    let [x, y, w, h] = marquee.rect();
+    if w < 8.0 || h < 8.0 {
+        // A click, or a twitch. Cropping to a few pixels is never what was
+        // meant, and the photograph would vanish.
+        return None;
+    }
+    let viewport = session.viewport();
+    let [dw, dh] = session.developed_size();
+    let (dw, dh) = (dw as f64, dh as f64);
+
+    let top_left = viewport.image_at([x, y]);
+    let bottom_right = viewport.image_at([x + w, y + h]);
+    let fraction = |v: f64, extent: f64| (v / extent).clamp(0.0, 1.0) as f32;
+
+    let now = session.state().crop;
+    let (span_x, span_y) = (now.right - now.left, now.bottom - now.top);
+    let crop = rawkit_editstate::Crop {
+        left: now.left + span_x * fraction(top_left[0], dw),
+        top: now.top + span_y * fraction(top_left[1], dh),
+        right: now.left + span_x * fraction(bottom_right[0], dw),
+        bottom: now.top + span_y * fraction(bottom_right[1], dh),
+    };
+    crop.validate().ok().map(|()| crop)
 }

@@ -89,6 +89,10 @@ struct Params {
     // whole-image path drops the overhang when it copies each tile out; the
     // canvas path has to be told.
     extent: vec4<i32>,
+    // The rotation, as the two columns of a signed permutation: `.xy` is where a
+    // step along the tile's x axis lands, `.zw` where a step along y lands.
+    // Identity when the photograph is not turned.
+    axes: vec4<i32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -805,7 +809,15 @@ fn present(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i32(gid.x) >= params.extent.x || i32(gid.y) >= params.extent.y) {
         return;
     }
-    let dest = params.present.xy + vec2<i32>(gid.xy);
+    // The tile's own axes, turned onto the canvas. A quarter turn is applied
+    // here rather than by rotating the mosaic, because rotating the mosaic would
+    // move the CFA phase and every pixel would come out the wrong colour.
+    let step = vec2<i32>(gid.xy);
+    let dest = params.present.xy
+        + vec2<i32>(
+            params.axes.x * step.x + params.axes.z * step.y,
+            params.axes.y * step.x + params.axes.w * step.y,
+        );
     // A tile can overhang the canvas on any side. Dropping those pixels beats
     // clamping them, which would smear an edge column across the view.
     let bounds = vec2<i32>(textureDimensions(canvas));
