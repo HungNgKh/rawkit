@@ -3031,6 +3031,8 @@ name = "rawkit-shell"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "gdkx11",
+ "gtk",
  "rawkit-editstate",
  "rawkit-engine",
  "rawkit-session",

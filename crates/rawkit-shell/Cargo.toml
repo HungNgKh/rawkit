@@ -16,5 +16,11 @@ tauri.workspace = true
 anyhow.workspace = true
 wgpu.workspace = true
 
+# The canvas widget is X11-specific. Nothing above this line is, which is what
+# keeps the engine buildable on a machine with no windowing system at all.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk.workspace = true
+gdkx11.workspace = true
+
 [build-dependencies]
 tauri-build.workspace = true

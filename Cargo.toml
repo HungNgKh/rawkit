@@ -62,6 +62,11 @@ jpeg-decoder = "0.3"
 # usable headless, which is what keeps the golden tests and export honest.
 tauri = { version = "2", features = ["unstable"] }
 tauri-build = "2"
+# Linux only, and pinned to the versions Tauri already links so the GTK types
+# are the same types. Used to pack a native widget beside the webview and hang
+# the GPU surface on its own X window — see crates/rawkit-shell/src/canvas.rs.
+gtk = "0.18"
+gdkx11 = "0.18"
 
 # Rendering work is unusably slow in a debug build; keep dev fast but not naive.
 [profile.dev]

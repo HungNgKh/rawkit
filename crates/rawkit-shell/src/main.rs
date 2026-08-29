@@ -9,8 +9,9 @@
 //! request (tauri#8246) is closed, and the wgpu-plus-transparency flicker on
 //! Linux/WebKitGTK (tauri#9220) is closed as *not planned*.
 //!
-//! Two routes existed, and **both are closed on Linux.** They were tested before
-//! any UI was built on either, because discovering it afterwards is a rewrite.
+//! Three arrangements were tested before any UI was built on one, because
+//! discovering it afterwards is a rewrite. **The third works; the first two do
+//! not.**
 //!
 //! 1. **Transparent cutout** — the webview paints chrome and leaves a hole; wgpu
 //!    draws behind it. What RapidRAW ships, having first tried and abandoned
@@ -19,6 +20,9 @@
 //! 2. **Disjoint child webviews** — panels and canvas never overlap, so nothing
 //!    needs transparency at all. Costs an unstable Tauri API. **Fails here for a
 //!    different reason: the API does not position the child.**
+//! 3. **A native widget for the canvas** — a `GtkDrawingArea` packed beside the
+//!    webview, with the surface on *its* X window rather than the toplevel.
+//!    **Works.** See below, and `canvas.rs` for how.
 //!
 //! # The result, on X11 / WebKitGTK / Vulkan (Radeon 780M, RADV)
 //!
@@ -56,6 +60,27 @@
 //! still unknown, and it is the question worth carrying forward: the mechanism
 //! is sound, the API that would arrange it is not.
 //!
+//! # Route 3: give the canvas its own window
+//!
+//! Stable across every capture, with **one exact boundary and nothing else**:
+//! red above y=1000, green below, no alternation and no bleed.
+//!
+//! The confirming detail is an accident that turned into the proof. The surface
+//! was configured at 2400x1200 while the widget is only 2400x600, and the green
+//! still stops exactly at the widget's edge — **X clipped the overspill rather
+//! than letting it reach the webview.** That is the mechanism this route is
+//! built on, demonstrated rather than assumed: output to a window is clipped to
+//! that window, so two siblings cannot contend.
+//!
+//! Both failures above share one cause, which is why this fixes them: the
+//! surface was attached to the toplevel, and the toplevel is also the webview's
+//! window. It was never a transparency problem.
+//!
+//! The split here is 500 logical pixels of webview above 300 of canvas, rather
+//! than the 200 requested — the size request did not take. That is a layout
+//! detail and an ordinary one; the compositing question it was asked to answer
+//! is settled.
+//!
 //! # Scope
 //!
 //! X11. Wayland composites differently and is untested —
@@ -73,6 +98,9 @@
 //!
 //! wgpu clears the window to a green no interface would ever use, so the check
 //! is by value rather than by eye. Take several captures a second apart.
+
+#[cfg(target_os = "linux")]
+mod canvas;
 
 use anyhow::{anyhow, Result};
 use rawkit_engine::Gpu;
@@ -96,11 +124,18 @@ enum Route {
     /// child webview occupying its own rectangle. Nothing overlaps, so nothing
     /// needs to be transparent.
     ChildWebview,
+    /// A native widget packed beside the webview, with the surface on *its* X
+    /// window rather than the toplevel. Nothing is transparent and nothing
+    /// overlaps, and X clips each window's output to its own rectangle.
+    NativeChild,
 }
 
 /// Width of the chrome, in logical pixels. The canvas is everything to the
 /// right of it.
 const PANEL_WIDTH: f64 = 400.0;
+/// Height the chrome keeps in route 3. `default_vbox` is a vertical box, and the
+/// probe needs two disjoint rectangles rather than the final layout.
+const PANEL_HEIGHT: i32 = 200;
 const WINDOW: (f64, f64) = (1200.0, 800.0);
 
 /// Deliberately a colour no UI would ever use, so a screenshot can be checked by
@@ -115,7 +150,8 @@ const PROBE_GREEN: wgpu::Color = wgpu::Color {
 fn main() -> Result<()> {
     let route = match std::env::var("RAWKIT_PROBE_ROUTE").as_deref() {
         Ok("1") => Route::Cutout,
-        _ => Route::ChildWebview,
+        Ok("2") => Route::ChildWebview,
+        _ => Route::NativeChild,
     };
     eprintln!("route      : {route:?}");
 
@@ -174,6 +210,43 @@ fn main() -> Result<()> {
                     let size = window.inner_size()?;
                     let (gpu, surface) = Gpu::with_surface(window.clone())?;
                     (gpu, surface, size)
+                }
+                #[cfg(target_os = "linux")]
+                Route::NativeChild => {
+                    // A normal Tauri window, webview and all — the difference is
+                    // entirely in where the surface goes.
+                    let window = WebviewWindowBuilder::new(
+                        app,
+                        "main",
+                        WebviewUrl::App("panel.html".into()),
+                    )
+                    .title("rawkit")
+                    .inner_size(WINDOW.0, WINDOW.1)
+                    .build()?;
+                    let canvas = canvas::attach(&window.default_vbox()?, PANEL_HEIGHT)?;
+                    eprintln!("canvas     : X window {canvas:?}");
+                    // The widget reports 2x2 at this point: it has an X window
+                    // but GTK has not laid the window out yet. Size the surface
+                    // from what the layout is *going* to be instead of waiting
+                    // for an allocation — X clips the surface to the widget
+                    // either way, and the probe is asking about clipping, not
+                    // about resize handling.
+                    let outer = window.inner_size()?;
+                    let scale = window.scale_factor()?;
+                    let panel = (PANEL_HEIGHT as f64 * scale) as u32;
+                    let size = tauri::PhysicalSize::new(
+                        outer.width,
+                        outer.height.saturating_sub(panel).max(1),
+                    );
+                    let (gpu, surface) = Gpu::with_surface(canvas)?;
+                    (gpu, surface, size)
+                }
+                #[cfg(not(target_os = "linux"))]
+                Route::NativeChild => {
+                    return Err(anyhow!(
+                        "the native-child canvas is implemented for X11 only so far"
+                    )
+                    .into())
                 }
             };
             eprintln!(

@@ -92,7 +92,22 @@ deny = [
 
 [advisories]
 yanked = "deny"
-ignore = []
+# Two entries, both the same decision made once. rawkit-shell depends on gtk and
+# gdkx11 *directly* — to pack a native canvas widget beside the webview, which is
+# the only arrangement of the three tested that works on Linux — so the rule
+# below correctly fires on them.
+#
+# They are unmaintained rather than vulnerable: gtk-rs has moved to GTK4 and
+# webkit2gtk still requires GTK3, so this is where Tauri's Linux backend lives
+# and there is nowhere else to go until Tauri moves. Pinned to the versions Tauri
+# already links, so this adds no code to the build that was not there — it only
+# makes the dependency honest by naming it.
+#
+# Revisit when Tauri's Linux backend moves to GTK4 or webkitgtk-6.0.
+ignore = [
+    { id = "RUSTSEC-2024-0415", reason = "gtk: GTK3 bindings unmaintained. Required by webkit2gtk; see above." },
+    { id = "RUSTSEC-2024-0417", reason = "gdkx11: same GTK3 family, same reason." },
+]
 # Vulnerabilities always fail, for every crate in the graph. *Unmaintained*
 # notices only fail for crates this workspace depends on directly.
 #
