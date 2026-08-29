@@ -2990,12 +2990,14 @@ name = "rawkit-catalog"
 version = "0.0.1"
 dependencies = [
  "blake3",
+ "libc",
  "rawkit-editstate",
  "rusqlite",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "unicode-normalization",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

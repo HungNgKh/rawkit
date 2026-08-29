@@ -53,12 +53,32 @@ and say so rather than working around it.
 
 ## Platform code
 
-**Priority: this file has broken CI four times, all the same way.**
+**Priority: this has broken CI five times, all the same way.**
 
-`rawkit-shell` is the only crate with `#[cfg(target_os = ...)]` in it, and that
-is deliberate — the engine must stay portable. But a `cfg` block that *uses*
-something means the platforms without that block see dead code, and `-D warnings`
-turns dead code into a build failure on machines you are not developing on.
+Platform code lives in two crates and nowhere else: `rawkit-shell`, for windows
+and canvases, and `rawkit-catalog`, for volume identity and path conventions.
+**The engine has none and must stay that way** — that is what makes "same RAW,
+same pixels" checkable. But a `cfg` block that *uses* something means the
+platforms without that block see dead code, and `-D warnings` turns dead code
+into a build failure on machines you are not developing on.
+
+**Keep the `cfg` around the system call, never around the decision.**
+`volume.rs` is the worked example: `resolve` has a body per platform and each one
+does nothing but ask the kernel two questions, then hands the answers to
+`from_linux_mount` / `from_macos_volume` / `from_windows_root` — ordinary
+functions over ordinary data, compiled and tested everywhere. That is the same
+move `scan_on` makes by taking a `VolumeId` rather than resolving one, and it is
+what lets the Windows and macOS logic be exercised on a Linux dev box.
+
+Two habits worth copying from that slice, because neither needs a Mac or a PC:
+
+- `rustup target add x86_64-pc-windows-msvc aarch64-apple-darwin` and
+  `cargo clippy --target ...` catches every compile error and lint in FFI before
+  CI does. `cargo check` cannot cross-build this workspace (rusqlite's bundled C
+  will not cross-compile), so lift the file into a scratch crate with the two or
+  three types it imports stubbed out — it is still the file you are shipping.
+- Forcing `PathConvention::host()` to the other two values and running the suite
+  exercises the case-folding half of Windows and macOS locally.
 
 So: **every `cfg`-gated piece of behaviour gets a counterpart for the other
 platforms**, even if the counterpart only prints what is missing and returns
@@ -74,7 +94,8 @@ like infrastructure. So either the shared code uses it too, or it should not
 exist — the accessors were deleted and the platform file now touches the statics
 directly, which is one fewer thing that can be unused.
 
-The engine has never broken the matrix. Keep the platform knowledge here.
+The engine has never broken the matrix. Keep the platform knowledge in those
+two crates.
 
 ## Tests must not assume the host filesystem
 
@@ -91,6 +112,15 @@ from enumeration order, mount identity, timestamps or case-folding behaviour.**
 Where the real code genuinely depends on one of those, take it as a parameter —
 `PathConvention` and `scan_on`'s `VolumeId` are both that pattern — so the
 behaviour can be exercised on any machine rather than only on the one that has it.
+
+**One deliberate exception, and the reasoning that earns it.**
+`volume.rs`'s `a_boot_volume_has_a_real_identity` asserts that `/` on a Mac and
+`C:\` on a PC resolve to a *stable* identity. That is a host assumption, and it
+stays because untestable FFI has no other witness: a wrong buffer layout or a bad
+attribute bit does not fail loudly, it falls through to the mount-path fallback
+and looks exactly like success. The rule is against depending on a **quirk**; a
+boot volume having an identity is true of every real machine of that kind. If you
+add another exception, it needs an argument this specific.
 
 ## Dependencies
 

@@ -45,6 +45,13 @@ unicode-normalization = "0.1"
 # happens to ship is how one of them ends up with different pragma defaults.
 rusqlite = { version = "0.40", features = ["bundled"] }
 blake3 = "1"
+# Volume identity, one platform each, and both already in the tree transitively
+# -- declared here because rawkit-catalog now calls them directly and every
+# dependency edge belongs in one file. Windows: GetVolumePathNameW and
+# GetVolumeInformationW. macOS: statfs and getattrlist, whose `attrlist` struct
+# and attribute bits come from libc rather than being spelled out by hand.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+libc = "0.2"
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

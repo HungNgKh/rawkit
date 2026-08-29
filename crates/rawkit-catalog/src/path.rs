@@ -87,6 +87,27 @@ impl PathConvention {
     }
 }
 
+/// Undo Windows' extended-length prefix.
+///
+/// `canonicalize` returns `\\?\C:\...`, and both `scan` and the volume
+/// resolver canonicalise before they store anything — so without this a Windows
+/// catalog would hold paths beginning `//?/`, and `\\?\` **disables** Windows'
+/// path parsing, forward slashes included. The stored path would look plausible
+/// and open nothing. Rust's `std` puts the prefix back on its own when a path is
+/// long enough to need it, so the plain spelling is the one worth keeping.
+///
+/// Idempotent, and a no-op on every path that does not carry the prefix, which
+/// is every path on Linux and macOS.
+pub(crate) fn without_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PathError {
     /// Linux filenames are bytes and need not be UTF-8. Refusing beats mangling:
@@ -109,12 +130,14 @@ impl CatalogPath {
     /// Separators become `/` regardless of platform, so a catalog carried
     /// between machines reads the same and comparison never has to consider
     /// which slash a path was written with. Windows accepts `/` everywhere it
-    /// accepts `\`, so this costs nothing to reverse.
+    /// accepts `\`, so this costs nothing to reverse — everywhere except behind
+    /// an extended-length prefix, which is why that comes off first.
     pub fn new(path: &Path, convention: PathConvention) -> Result<Self, PathError> {
-        let stored = path
-            .to_str()
-            .ok_or_else(|| PathError::NotUtf8(path.to_string_lossy().into_owned()))?
-            .replace('\\', "/");
+        let stored = without_verbatim_prefix(
+            path.to_str()
+                .ok_or_else(|| PathError::NotUtf8(path.to_string_lossy().into_owned()))?,
+        )
+        .replace('\\', "/");
         Ok(Self {
             key: convention.key_for(&stored),
             stored,
@@ -160,6 +183,26 @@ mod tests {
     }
 
     #[test]
+    fn the_extended_length_prefix_comes_off() {
+        // `canonicalize` produces these, and `scan` canonicalises before it
+        // resolves. Left on, every root would start with two backslashes and be
+        // mistaken for a share.
+        assert_eq!(without_verbatim_prefix(r"\\?\C:\"), r"C:\");
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\UNC\nas\photos\"),
+            r"\\nas\photos\"
+        );
+        assert_eq!(without_verbatim_prefix(r"C:\"), r"C:\");
+        assert_eq!(without_verbatim_prefix(r"\\nas\photos\"), r"\\nas\photos\");
+        // Applied twice on the way through `CatalogPath::new` and by `from_windows_root`, so it has to be
+        // idempotent rather than merely correct once.
+        assert_eq!(
+            without_verbatim_prefix(&without_verbatim_prefix(r"\\?\C:\")),
+            r"C:\"
+        );
+    }
+
+    #[test]
     fn separators_are_one_shape_everywhere() {
         let windows = CatalogPath::new(
             &PathBuf::from(r"C:\Photos\2026\DSC00881.ARW"),
@@ -167,6 +210,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(windows.stored(), "C:/Photos/2026/DSC00881.ARW");
+    }
+
+    #[test]
+    fn a_canonicalised_windows_path_is_stored_as_one_that_opens() {
+        // The bug this prevents: `scan` canonicalises its root, Windows returns
+        // the extended-length form, and the catalog ends up holding `//?/C:/...`
+        // — which looks like a path and is not one, because `\\?\` turns off the
+        // parsing that would have accepted those forward slashes.
+        let stored = CatalogPath::new(
+            &PathBuf::from(r"\\?\C:\Photos\2026\DSC00881.ARW"),
+            PathConvention::Exact,
+        )
+        .unwrap();
+        assert_eq!(stored.stored(), "C:/Photos/2026/DSC00881.ARW");
+
+        // A share keeps its two leading slashes; it is the `?\UNC\` in the
+        // middle that has to go.
+        let share = CatalogPath::new(
+            &PathBuf::from(r"\\?\UNC\nas\photos\a.ARW"),
+            PathConvention::Exact,
+        )
+        .unwrap();
+        assert_eq!(share.stored(), "//nas/photos/a.ARW");
     }
 
     #[test]

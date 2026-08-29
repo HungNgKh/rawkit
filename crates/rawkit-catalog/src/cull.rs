@@ -175,7 +175,7 @@ pub fn tally(catalog: &Catalog) -> Result<(usize, usize, usize), CatalogError> {
     )?)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::tests::{tempdir, Scratch};

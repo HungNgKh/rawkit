@@ -16,3 +16,12 @@ thiserror.workspace = true
 unicode-normalization.workspace = true
 rusqlite.workspace = true
 blake3.workspace = true
+
+# Volume identity. Kept per-target so a Linux build never sees them: the shared
+# half of the decision (from_windows_root, from_macos_volume) is plain Rust and
+# is tested everywhere, and only the system calls need these.
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true

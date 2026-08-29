@@ -683,7 +683,7 @@ impl Saver {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use rawkit_catalog::scan::FileMetadata;
@@ -833,7 +833,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod saver_tests {
     use super::tests::{library_at, Scratch};
     use super::*;
@@ -915,7 +915,7 @@ mod saver_tests {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod survey_tests {
     use super::tests::{library_at, Scratch};
     use super::*;

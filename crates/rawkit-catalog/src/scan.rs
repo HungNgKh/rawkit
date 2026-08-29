@@ -274,6 +274,15 @@ fn upsert_volume(
     root: &Path,
     convention: PathConvention,
 ) -> Result<i64, CatalogError> {
+    // The same spelling as `folders.relative_path`, because the two are
+    // concatenated with `/` to rebuild a path — by `hash_missing` below, by
+    // `cull::sequence`, by previews and by export. Stored raw, a Windows root
+    // arrives here as `\\?\C:\Users\...` and the result is a mixed-separator
+    // verbatim path, which is the one shape Windows will not open.
+    let mount = CatalogPath::new(root, convention)
+        .map_err(|e| CatalogError::Io(e.to_string()))?
+        .stored()
+        .to_string();
     let convention = match convention {
         PathConvention::Exact => "exact",
         PathConvention::CaseInsensitive => "case_insensitive",
@@ -292,8 +301,6 @@ fn upsert_volume(
         ),
         VolumeId::MountPath(at) => ("mount_path", None, None, None, None, Some(at.clone())),
     };
-    let mount = root.to_string_lossy().into_owned();
-
     transaction.execute(
         "INSERT INTO volumes
               (kind, uuid, windows_serial, host, share, mount_path, last_mount_path, path_convention)
@@ -454,7 +461,7 @@ fn seconds_now() -> i64 {
         .unwrap_or(0)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::tests::{tempdir, Scratch};
@@ -664,6 +671,34 @@ mod tests {
     }
 
     #[test]
+    fn the_recorded_root_is_spelled_the_way_the_rest_of_the_path_is() {
+        // Every rebuilt path in the catalog is `last_mount_path` + '/' +
+        // `relative_path` + '/' + `filename`, so the root has to follow the same
+        // separator rule as the halves it is glued to. It did not: it went in
+        // via `to_string_lossy`, which on Windows means backslashes and an
+        // extended-length prefix, and the concatenation then produced a path
+        // that looked right and opened nothing.
+        let dir = tempdir();
+        let photos = dir.join("photos");
+        write(&photos.join("a.ARW"), b"x");
+        let mut catalog = library(&dir);
+        test_scan(&mut catalog, &photos);
+
+        let root: String = catalog
+            .connection()
+            .query_row("SELECT last_mount_path FROM volumes", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            !root.contains('\\'),
+            "{root} carries a separator the rebuilt paths do not use"
+        );
+        assert!(
+            !root.starts_with("//?/"),
+            "{root} still carries an extended-length prefix"
+        );
+    }
+
+    #[test]
     fn nested_folders_are_linked_to_their_parents() {
         let dir = tempdir();
         let photos = dir.join("photos");
@@ -688,6 +723,13 @@ mod tests {
         assert_eq!(rows[2], ("2026/january".into(), Some(2)));
     }
 
+    // The behaviour under test is portable — a scan that aborts on one
+    // permission error is useless on any real disk — but the only way to *make*
+    // a directory unreadable differs per platform, and on Windows it means an
+    // ACL rather than a mode. So this runs on Linux and macOS, where the setup
+    // is one call, and the Windows half is a genuine gap rather than a
+    // pretended pass.
+    #[cfg(unix)]
     #[test]
     fn an_unreadable_directory_is_reported_and_the_scan_continues() {
         use std::os::unix::fs::PermissionsExt;
@@ -715,6 +757,10 @@ mod tests {
         assert_eq!(report.unreadable.len(), 1, "and the failure was reported");
     }
 
+    // Windows can make symlinks too, but only with developer mode on or the
+    // privilege granted, so a runner without either would fail on the setup and
+    // not on the thing being tested.
+    #[cfg(unix)]
     #[test]
     fn symlinks_are_counted_and_not_followed() {
         // A link pointing at an ancestor is how a naive walk recurses forever,
