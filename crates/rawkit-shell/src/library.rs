@@ -161,6 +161,17 @@ pub enum CullAction {
     ClearColour,
     /// Put back what the last judgement replaced, and go to that frame.
     Undo,
+    /// Move the selection without loading anything — what a grid does. The
+    /// loupe uses `Next`/`Previous`, which ask for the photograph as well.
+    SelectNext,
+    SelectPrevious,
+    /// By a whole row, resolved against the grid's current column count.
+    SelectBy(i32),
+    /// Which view to show.
+    Grid,
+    Loupe,
+    /// Larger or smaller cells, in steps.
+    Cells(i32),
 }
 
 /// What the page draws after a keypress.
@@ -244,12 +255,91 @@ impl Library {
     /// which is the slow path this exists to avoid but is still the right answer
     /// when someone zooms in.
     pub fn preview_for(&self, needed: u32, edit_state_hash: &str) -> Result<Option<Decoded>> {
+        self.preview_at(self.index, needed, Some(edit_state_hash))
+    }
+
+    pub fn count(&self) -> usize {
+        self.images.len()
+    }
+
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Put the selection somewhere without asking the render loop to load it.
+    ///
+    /// What a grid does: moving across a contact sheet must not decode anything,
+    /// because the cell it lands on is already on screen.
+    pub fn select(&mut self, index: usize) {
+        self.index = index.min(self.images.len() - 1);
+    }
+
+    /// Ask for the current photograph to be loaded even though the selection did
+    /// not move. Leaving the grid needs this: the loupe has been showing
+    /// something else since the last time it ran.
+    pub fn reopen(&mut self) {
+        self.request = Some(self.index);
+    }
+
+    /// The flag on each image in a range of the sequence, for tinting cells.
+    ///
+    /// One query for the whole visible page rather than one per cell, because a
+    /// grid re-reads this every frame — pressing X has to change what the cell
+    /// looks like straight away.
+    pub fn flags_in(&self, from: usize, to: usize) -> Result<Vec<Option<Flag>>> {
+        let from = from.min(self.images.len());
+        let slice = &self.images[from..to.min(self.images.len())];
+        if slice.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<String> = slice.iter().map(|i| i.id.to_string()).collect();
+        let mut statement = self.catalog.connection().prepare(&format!(
+            "SELECT id, flag FROM images WHERE id IN ({})",
+            ids.join(",")
+        ))?;
+        let found: std::collections::HashMap<i64, Option<String>> = statement
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(slice
+            .iter()
+            .map(
+                |image| match found.get(&image.id).and_then(|f| f.as_deref()) {
+                    Some("pick") => Some(Flag::Pick),
+                    Some("reject") => Some(Flag::Reject),
+                    _ => None,
+                },
+            )
+            .collect())
+    }
+
+    /// A preview for any image in the sequence, resolving its edit itself.
+    ///
+    /// The grid cannot be handed a hash the way the loupe can: it draws thirty
+    /// photographs at once and each has its own edit.
+    pub fn preview_at(
+        &self,
+        index: usize,
+        needed: u32,
+        hash: Option<&str>,
+    ) -> Result<Option<Decoded>> {
+        let Some(image) = self.images.get(index) else {
+            return Ok(None);
+        };
+        let resolved;
+        let hash = match hash {
+            Some(hash) => hash,
+            None => {
+                resolved = rawkit_catalog::edits::latest(&self.catalog, image.id)?
+                    .map(|(_, state)| state)
+                    .unwrap_or_default()
+                    .content_hash();
+                &resolved
+            }
+        };
         let Some(dir) = previews::directory(&self.catalog) else {
             return Ok(None);
         };
-        let Some(found) =
-            previews::covering(&self.catalog, self.current().id, needed, edit_state_hash)?
-        else {
+        let Some(found) = previews::covering(&self.catalog, image.id, needed, hash)? else {
             return Ok(None);
         };
         let file = dir.join(&found.path);
@@ -276,6 +366,12 @@ impl Library {
     pub fn act(&mut self, action: CullAction) -> Result<CullView> {
         match action {
             CullAction::Next => self.go(self.index + 1),
+            CullAction::SelectNext => self.select(self.index + 1),
+            CullAction::SelectPrevious => self.select(self.index.saturating_sub(1)),
+            CullAction::SelectBy(step) => {
+                let target = self.index as i64 + step as i64;
+                self.select(target.clamp(0, self.images.len() as i64 - 1) as usize);
+            }
             // Saturating, not wrapping: backing off the front of a shoot must
             // stay at the first frame, and `wrapping_sub` would clamp to the
             // *last* one — a silent jump to the far end of the library.
@@ -310,6 +406,9 @@ impl Library {
             CullAction::ClearColour => {
                 self.judge(|j| Judgement { colour: None, ..j })?;
             }
+            // Handled by the shell, which owns the layout and the render loop.
+            // Listed here so the page has one vocabulary rather than two.
+            CullAction::Grid | CullAction::Loupe | CullAction::Cells(_) => {}
             CullAction::Undo => {
                 if let Some((index, previous)) = self.undo.pop() {
                     cull::set(&self.catalog, self.images[index].id, &previous)?;

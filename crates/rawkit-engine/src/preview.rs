@@ -21,6 +21,28 @@
 
 use crate::{render::Canvas, EngineError, Gpu, CANVAS_FORMAT};
 
+/// One cell's worth of uniform, padded to the alignment a uniform binding needs.
+///
+/// The stride rather than the size, because a grid frame writes every cell into
+/// one buffer and binds a slice of it per draw. 256 is the alignment every
+/// backend accepts.
+const REGION_STRIDE: u64 = 256;
+/// origin(2) + span(2) + tint(4) + edge(4), in floats.
+const REGION_FLOATS: usize = 12;
+
+/// One thumbnail to draw, and how it should look.
+pub struct Cell<'a> {
+    pub image: &'a PreviewImage,
+    /// Where it goes in the canvas, in canvas pixels: x, y, width, height.
+    /// May extend past the edges; the part that is off-canvas is cropped rather
+    /// than squashed.
+    pub dest: [i32; 4],
+    /// Multiplied into the sample, in linear light. `[1.0; 3]` leaves it alone.
+    pub tint: [f32; 3],
+    /// Colour and thickness in canvas pixels. Thickness zero draws no edge.
+    pub edge: ([f32; 3], f32),
+}
+
 /// A preview uploaded to the GPU, ready to be drawn at any zoom.
 ///
 /// Held across frames: panning and zooming re-draw from the same texture, and
@@ -132,7 +154,7 @@ impl PreviewBlit {
 
         let region = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("preview region"),
-            size: 16,
+            size: REGION_STRIDE,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -202,6 +224,156 @@ impl PreviewBlit {
         })
     }
 
+    /// Draw a grid of thumbnails into `canvas`, clearing it first.
+    ///
+    /// One render pass and one draw per cell. The cells share a uniform buffer,
+    /// each binding its own slice of it, so a frame costs one buffer write and
+    /// no allocation beyond the bind groups — which are needed regardless
+    /// because every cell has a different texture.
+    ///
+    /// A cell hanging off the top or bottom of the canvas has its **rectangle**
+    /// clamped and its **sampling window** cropped to match, so a partly visible
+    /// row shows part of a photograph rather than a squashed whole one. That is
+    /// the failure worth avoiding here: a squashed edge row looks like a layout
+    /// choice rather than a bug.
+    pub fn draw_grid(&self, gpu: &Gpu, canvas: &Canvas, cells: &[Cell<'_>]) {
+        let [canvas_w, canvas_h] = canvas.size();
+        let mut regions = vec![0.0f32; cells.len() * (REGION_STRIDE as usize / 4)];
+        let mut placed: Vec<([u32; 4], usize)> = Vec::with_capacity(cells.len());
+
+        for (index, cell) in cells.iter().enumerate() {
+            let [x, y, w, h] = cell.dest;
+            if w <= 0 || h <= 0 {
+                continue;
+            }
+            let (left, top) = (x.max(0), y.max(0));
+            let right = (x + w).min(canvas_w as i32);
+            let bottom = (y + h).min(canvas_h as i32);
+            if right <= left || bottom <= top {
+                continue;
+            }
+            // What fraction of the cell survived the clamp, and where it starts.
+            let origin = [(left - x) as f32 / w as f32, (top - y) as f32 / h as f32];
+            let span = [
+                (right - left) as f32 / w as f32,
+                (bottom - top) as f32 / h as f32,
+            ];
+
+            let at = index * (REGION_STRIDE as usize / 4);
+            regions[at..at + 4].copy_from_slice(&[origin[0], origin[1], span[0], span[1]]);
+            regions[at + 4..at + 8].copy_from_slice(&[
+                cell.tint[0],
+                cell.tint[1],
+                cell.tint[2],
+                1.0,
+            ]);
+            // Thickness as a fraction of the *drawn* rectangle, so an edge stays
+            // the same number of pixels wide on a cell that is half off-screen.
+            let thickness = if cell.edge.1 > 0.0 {
+                cell.edge.1 / (right - left).min(bottom - top).max(1) as f32
+            } else {
+                0.0
+            };
+            regions[at + 8..at + 12].copy_from_slice(&[
+                cell.edge.0[0],
+                cell.edge.0[1],
+                cell.edge.0[2],
+                thickness,
+            ]);
+            placed.push((
+                [
+                    left as u32,
+                    top as u32,
+                    (right - left) as u32,
+                    (bottom - top) as u32,
+                ],
+                index,
+            ));
+        }
+
+        let needed = (cells.len().max(1) as u64) * REGION_STRIDE;
+        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("preview grid regions"),
+            size: needed,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        gpu.queue
+            .write_buffer(&buffer, 0, bytemuck::cast_slice(&regions));
+
+        let groups: Vec<wgpu::BindGroup> = placed
+            .iter()
+            .map(|(_, index)| {
+                gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("preview cell"),
+                    layout: &self.layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&cells[*index].image.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &buffer,
+                                offset: *index as u64 * REGION_STRIDE,
+                                size: std::num::NonZeroU64::new((REGION_FLOATS * 4) as u64),
+                            }),
+                        },
+                    ],
+                })
+            })
+            .collect();
+
+        let target = canvas
+            .texture()
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("preview grid"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("preview grid"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // The background between cells. Dark rather than black so
+                        // a black photograph still has an edge.
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.012,
+                            g: 0.012,
+                            b: 0.014,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            for (group, ([x, y, w, h], _)) in groups.iter().zip(&placed) {
+                // The viewport maps the triangle onto the cell; the scissor stops
+                // the oversized part of it reaching anything else.
+                pass.set_viewport(*x as f32, *y as f32, *w as f32, *h as f32, 0.0, 1.0);
+                pass.set_scissor_rect(*x, *y, *w, *h);
+                pass.set_bind_group(0, group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+        }
+        gpu.queue.submit(Some(encoder.finish()));
+    }
+
     /// Fill `canvas` with the part of `image` the view is looking at.
     ///
     /// `origin` and `span` are in preview coordinates, 0 to 1. A span above 1
@@ -217,11 +389,12 @@ impl PreviewBlit {
         origin: [f32; 2],
         span: [f32; 2],
     ) {
-        gpu.queue.write_buffer(
-            &self.region,
-            0,
-            bytemuck::cast_slice(&[origin[0], origin[1], span[0], span[1]]),
-        );
+        let mut region = [0.0f32; REGION_FLOATS];
+        region[..4].copy_from_slice(&[origin[0], origin[1], span[0], span[1]]);
+        // No tint and no edge: the loupe shows the photograph and nothing else.
+        region[4..8].copy_from_slice(&[1.0, 1.0, 1.0, 1.0]);
+        gpu.queue
+            .write_buffer(&self.region, 0, bytemuck::cast_slice(&region));
 
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("preview"),

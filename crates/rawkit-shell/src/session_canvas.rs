@@ -123,6 +123,21 @@ impl CanvasRenderer {
         level
     }
 
+    /// Size the canvas to the surface exactly, for a view that has no zoom.
+    ///
+    /// The grid is laid out in screen pixels, so the level-based sizing the
+    /// loupe uses would make every cell a fractional scale away from what it
+    /// asked for.
+    pub fn fit_surface(&mut self, gpu: &Gpu, surface: [u32; 2]) {
+        let wanted = [surface[0].max(1), surface[1].max(1)];
+        if self.canvas.size() != wanted {
+            self.canvas = self.renderer.create_canvas(gpu, wanted[0], wanted[1]);
+        }
+        // Whatever is in the canvas belongs to another view entirely.
+        self.shown = None;
+        self.uploaded = None;
+    }
+
     /// Fill the canvas from a preview that was rendered earlier, instead of
     /// rendering tiles now.
     ///

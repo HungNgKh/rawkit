@@ -140,3 +140,92 @@ fn a_buffer_that_does_not_match_its_geometry_is_refused() {
     assert!(blit.upload(&gpu, &flat(0, 4, 4), 8, 8).is_err());
     assert!(blit.upload(&gpu, &[], 0, 0).is_err());
 }
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_grid_puts_each_cell_where_it_was_told_and_tints_it() {
+    // Three things that all look like a layout choice rather than a bug if they
+    // go wrong: a cell in the wrong place, a tint that does not apply, and an
+    // edge drawn on the wrong cell.
+    let Some(gpu) = gpu() else { return };
+    let renderer = Renderer::new(&gpu);
+    let blit = PreviewBlit::new(&gpu);
+    let canvas = renderer.create_canvas(&gpu, 32, 32);
+
+    let white = blit.upload(&gpu, &flat(255, 4, 4), 4, 4).expect("upload");
+    blit.draw_grid(
+        &gpu,
+        &canvas,
+        &[
+            rawkit_engine::Cell {
+                image: &white,
+                dest: [0, 0, 16, 16],
+                tint: [1.0, 1.0, 1.0],
+                edge: ([0.0; 3], 0.0),
+            },
+            // A third the brightness, the way a rejected frame is drawn.
+            rawkit_engine::Cell {
+                image: &white,
+                dest: [16, 16, 16, 16],
+                tint: [0.33, 0.33, 0.33],
+                edge: ([0.0; 3], 0.0),
+            },
+        ],
+    );
+
+    let pixels = canvas.read_back(&gpu).expect("read back");
+    let at = |x: usize, y: usize| pixels[(y * 32 + x) * 4];
+    assert!(at(8, 8) > 0.9, "the first cell is where it was put");
+    assert!(
+        (at(24, 24) - 0.33).abs() < 0.02,
+        "the second is tinted, got {}",
+        at(24, 24)
+    );
+    // The two cells the grid was not given stay background.
+    assert!(at(24, 8) < 0.05, "nothing was drawn top right");
+    assert!(at(8, 24) < 0.05, "nothing was drawn bottom left");
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_cell_hanging_off_the_edge_is_cropped_rather_than_squashed() {
+    // A partly visible row is the normal state of a scrolling grid. Clamping the
+    // rectangle without cropping the sampling window would squash the
+    // photograph, which reads as a deliberate layout and never gets reported.
+    let Some(gpu) = gpu() else { return };
+    let renderer = Renderer::new(&gpu);
+    let blit = PreviewBlit::new(&gpu);
+    let canvas = renderer.create_canvas(&gpu, 16, 16);
+
+    // Top half white, bottom half black.
+    let (w, h) = (8u32, 8u32);
+    let mut rgba = Vec::new();
+    for y in 0..h {
+        for _ in 0..w {
+            let value = if y < h / 2 { 255u8 } else { 0 };
+            rgba.extend_from_slice(&[value, value, value, 255]);
+        }
+    }
+    let image = blit.upload(&gpu, &rgba, w, h).expect("upload");
+
+    // A 16x16 cell whose top half is above the canvas: only the image's bottom
+    // half should be visible, so the canvas should be black throughout.
+    blit.draw_grid(
+        &gpu,
+        &canvas,
+        &[rawkit_engine::Cell {
+            image: &image,
+            dest: [0, -8, 16, 16],
+            tint: [1.0; 3],
+            edge: ([0.0; 3], 0.0),
+        }],
+    );
+    let pixels = canvas.read_back(&gpu).expect("read back");
+    let at = |x: usize, y: usize| pixels[(y * 16 + x) * 4];
+    assert!(
+        at(8, 1) < 0.05 && at(8, 7) < 0.05,
+        "the visible part is the image's lower half; got {} and {}",
+        at(8, 1),
+        at(8, 7)
+    );
+}

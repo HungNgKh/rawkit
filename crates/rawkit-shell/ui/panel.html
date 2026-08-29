@@ -26,6 +26,8 @@
   #position, #counts, #keys { color: #7d7d87; }
   #keys { margin-left: auto; font-size: 11px; }
   #stars { letter-spacing: 2px; color: #d8bf63; min-width: 62px; }
+  #mode { color: #8e8e98; text-transform: uppercase; letter-spacing: .08em; font-size: 11px;
+          border: 1px solid #3a3a44; border-radius: 3px; padding: 1px 6px; }
   #flag.pick { color: #6fc27a; }
   #flag.reject { color: #e0705f; }
 </style>
@@ -36,7 +38,8 @@
   <span id="stars"></span>
   <span id="flag"></span>
   <span id="counts"></span>
-  <span id="keys">← → move · P pick · X reject · U unflag · 1–5 rate · 0 clear · Z undo</span>
+  <span id="mode">loupe</span>
+  <span id="keys">G grid · E loupe · ←→↑↓ move · P pick · X reject · U unflag · 1–5 rate · Z undo</span>
 </div>
 
 <main>
@@ -234,13 +237,30 @@
   // A held arrow key repeats far faster than a RAW decodes. Every press is still
   // sent — the library keeps only the latest request and the render loop reads
   // it once per frame, so this coalesces for the same reason a slider drag does.
+  const setMode = name => {
+    document.getElementById("mode").textContent = name;
+    // The grid is laid out from the canvas, so the view controls beside it are
+    // about a photograph that is not on screen. Dimmed rather than removed, so
+    // the panel does not jump when the mode changes.
+    document.querySelector("main").style.opacity = name === "grid" ? 0.45 : 1;
+  };
+
   document.addEventListener("keydown", event => {
     if (event.metaKey || event.ctrlKey || event.altKey) return;
     const key = event.key;
     if (key >= "0" && key <= "5") return act("rate", Number(key)), event.preventDefault();
     switch (key.toLowerCase()) {
+      // G and E, because that is what a Lightroom user's hands already do.
+      case "g": act("grid"); setMode("grid"); break;
+      case "e": case "enter": case "escape": act("loupe"); setMode("loupe"); break;
       case "arrowright": case " ": act("next"); break;
       case "arrowleft": act("previous"); break;
+      // Rows in the grid; neighbours in the loupe. Which one is resolved by the
+      // shell, because only it knows how many cells fit across.
+      case "arrowdown": act("select_by", 1); break;
+      case "arrowup": act("select_by", -1); break;
+      case "-": act("cells", -1); break;
+      case "=": case "+": act("cells", 1); break;
       case "p": act("pick"); break;
       case "x": act("reject"); break;
       case "u": act("clear_flag"); break;

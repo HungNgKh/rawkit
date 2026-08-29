@@ -17,6 +17,13 @@ struct Region {
     // How much of the preview it spans. Greater than 1 when the view is zoomed
     // out far enough that the whole image does not fill the canvas.
     span: vec2<f32>,
+    // Multiplied into the sample. White for the loupe; a third for a frame that
+    // has been rejected, so the shape of a cull is visible without reading
+    // anything. In linear light, because that is what the canvas holds.
+    tint: vec4<f32>,
+    // Edge colour, and its thickness as a fraction of the cell. Thickness zero
+    // means no edge — which is every cell the loupe ever draws.
+    edge: vec4<f32>,
 }
 
 struct VsOut {
@@ -41,6 +48,17 @@ fn vs(@builtin(vertex_index) index: u32) -> VsOut {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    // The edge is drawn in the cell's own rectangle rather than as extra
+    // geometry, so selection and flags cost no draw calls and no second
+    // pipeline. `in.uv` runs 0 to 1 across whatever rectangle was set.
+    let thickness = region.edge.w;
+    if (thickness > 0.0) {
+        let inset = min(min(in.uv.x, in.uv.y), min(1.0 - in.uv.x, 1.0 - in.uv.y));
+        if (inset < thickness) {
+            return vec4<f32>(region.edge.rgb, 1.0);
+        }
+    }
+
     let uv = region.origin + in.uv * region.span;
     // Outside the photograph is black, not the edge pixel smeared outwards.
     // Clamping would paint a border of stretched sky wherever the image does not
@@ -48,5 +66,5 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
-    return vec4<f32>(textureSample(image, image_sampler, uv).rgb, 1.0);
+    return vec4<f32>(textureSample(image, image_sampler, uv).rgb * region.tint.rgb, 1.0);
 }

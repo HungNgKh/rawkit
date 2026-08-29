@@ -31,7 +31,7 @@ pub mod render;
 
 pub use pipeline::{Domain, Stage};
 pub use present::Presenter;
-pub use preview::{PreviewBlit, PreviewImage};
+pub use preview::{Cell, PreviewBlit, PreviewImage};
 pub use profile::CameraProfile;
 pub use render::{
     normalise, BayerPhase, Canvas, Frame, Output, Pyramid, Renderer, TileBuffers, CANVAS_FORMAT,

@@ -209,6 +209,48 @@ fn cull(state: tauri::State<'_, Shelf>, action: CullAction) -> Result<CullView, 
     let Some(library) = &state.0 else {
         return Err("no library is open; pass a .rawkit catalog".into());
     };
+    // Resolved here rather than in the library, because these are about the
+    // *layout* — which view is showing and how many cells fit across it — and
+    // the library knows about photographs, not pixels.
+    let action = match action {
+        CullAction::Grid => {
+            MODE.store(MODE_GRID, std::sync::atomic::Ordering::Relaxed);
+            CullAction::SelectBy(0)
+        }
+        CullAction::Loupe => {
+            MODE.store(MODE_LOUPE, std::sync::atomic::Ordering::Relaxed);
+            // The loupe has been showing something else since it last ran, so
+            // the selection has to be asked for even though it did not move.
+            library.lock().expect("library lock").reopen();
+            CullAction::SelectBy(0)
+        }
+        CullAction::Cells(steps) => {
+            let cell = GRID_CELL.load(std::sync::atomic::Ordering::Relaxed) as i32;
+            let next = (cell + steps * 80).clamp(120, 900) as u32;
+            GRID_CELL.store(next, std::sync::atomic::Ordering::Relaxed);
+            CullAction::SelectBy(0)
+        }
+        // A row is however many cells fit across right now.
+        CullAction::SelectBy(rows) if mode() == MODE_GRID => CullAction::SelectBy(
+            rows * GRID_COLUMNS.load(std::sync::atomic::Ordering::Relaxed) as i32,
+        ),
+        // In the loupe there are no rows, so up and down are just neighbours.
+        CullAction::SelectBy(rows) => {
+            if rows < 0 {
+                CullAction::Previous
+            } else if rows > 0 {
+                CullAction::Next
+            } else {
+                CullAction::SelectBy(0)
+            }
+        }
+        // Arrows move without loading in the grid and with loading in the loupe,
+        // which is the same key meaning the same thing in both.
+        CullAction::Next if mode() == MODE_GRID => CullAction::SelectNext,
+        CullAction::Previous if mode() == MODE_GRID => CullAction::SelectPrevious,
+        other => other,
+    };
+
     library
         .lock()
         .expect("library lock")
@@ -304,6 +346,10 @@ fn main() -> Result<()> {
                 [size.width, size.height],
             );
             let blit = rawkit_engine::PreviewBlit::new(&gpu);
+            let mut grid = Grid {
+                cells: std::collections::HashMap::new(),
+                scroll: 0.0,
+            };
             let mut showing = Showing {
                 path: raw.clone(),
                 size: loaded.size,
@@ -354,6 +400,34 @@ fn main() -> Result<()> {
             let navigating = library.clone();
             let mut tick = move || -> Result<()> {
                 let started = std::time::Instant::now();
+
+                // The grid draws from the same cache the loupe does and touches
+                // nothing else: no decode, no session, no viewport. Returning
+                // here is what keeps the two views from having to know about
+                // each other.
+                if mode() == MODE_GRID {
+                    if let Some(library) = &navigating {
+                        let drawn = draw_grid(
+                            &gpu,
+                            &blit,
+                            &mut canvas_renderer,
+                            library,
+                            &mut grid,
+                            surface_size,
+                        )?;
+                        paint(
+                            &gpu,
+                            &surface,
+                            canvas_renderer.presenter(),
+                            canvas_renderer.canvas(),
+                        )?;
+                        stats.record(drawn, started.elapsed());
+                        return Ok(());
+                    }
+                    // No library, so nothing to lay out. Fall through to the
+                    // loupe rather than showing an empty grid.
+                    MODE.store(MODE_LOUPE, std::sync::atomic::Ordering::Relaxed);
+                }
 
                 // A keypress left a request; this is where it costs anything.
                 // Decoding here rather than in the command handler keeps the IPC
@@ -643,6 +717,45 @@ fn build_window(
     }
 }
 
+/// Which view the window is showing.
+///
+/// Shared as an atomic rather than held in the render loop, because the page
+/// changes it — a keypress arrives on the IPC thread and the next frame has to
+/// act on it. Two values, so a byte is enough and no lock is needed.
+static MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// How many cells the grid currently fits across, written by the render loop and
+/// read by the page's up/down keys.
+///
+/// The layout belongs to whoever measures the canvas, and that is not the page.
+static GRID_COLUMNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+/// The cell edge in canvas pixels, changed by `-` and `=`.
+static GRID_CELL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(400);
+
+const MODE_LOUPE: u8 = 0;
+const MODE_GRID: u8 = 1;
+
+fn mode() -> u8 {
+    MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The grid's own state: what is on the GPU, and where the view is.
+struct Grid {
+    /// Uploaded thumbnails, keyed by position in the sequence. Not an LRU by
+    /// time but by distance from the view, which for a grid is the same thing
+    /// and needs no bookkeeping.
+    cells: std::collections::HashMap<usize, rawkit_engine::PreviewImage>,
+    /// Vertical offset in canvas pixels.
+    scroll: f64,
+}
+
+/// How many thumbnails to load in one frame.
+///
+/// The profile found the only over-budget frame was the first, filling an empty
+/// grid: at large cells that is thirty fetches at about two milliseconds each.
+/// Spreading them over frames turns a sixty-millisecond stall into cells that
+/// appear over the next half second, which is what a placeholder is for.
+const LOADS_PER_FRAME: usize = 4;
+
 /// What the canvas can currently draw for the photograph on screen.
 ///
 /// A cached preview if there is one with enough pixels, and the decoded RAW only
@@ -671,6 +784,131 @@ struct Showing {
 fn needed_pixels(session: &Session, image: [u32; 2]) -> u32 {
     let longest = image[0].max(image[1]) as f64;
     (longest * session.viewport().scale).ceil().max(1.0) as u32
+}
+
+/// Lay the sequence out, load what is newly visible, and draw it.
+///
+/// Everything here is in canvas pixels, and the canvas is the surface, so a cell
+/// asked for at 400 is 400. Cells keep the photograph's aspect inside a square
+/// slot, which is what makes a mixed-orientation shoot line up in rows.
+fn draw_grid(
+    gpu: &Gpu,
+    blit: &rawkit_engine::PreviewBlit,
+    canvas_renderer: &mut session_canvas::CanvasRenderer,
+    library: &Mutex<Library>,
+    grid: &mut Grid,
+    surface: [u32; 2],
+) -> Result<usize> {
+    canvas_renderer.fit_surface(gpu, surface);
+    // The requested cell size picks the column count; the columns then set the
+    // actual size, so a row always fills the width. Laying out at the requested
+    // size instead leaves a ragged strip down the right — which reads as a
+    // margin nobody asked for, and wastes an eighth of the window.
+    let asked = GRID_CELL.load(std::sync::atomic::Ordering::Relaxed).max(80) as f64;
+    let columns = ((surface[0] as f64 / asked).round() as usize).max(1);
+    GRID_COLUMNS.store(columns, std::sync::atomic::Ordering::Relaxed);
+    let pitch_x = surface[0] as f64 / columns as f64;
+    let gap = (pitch_x * 0.05).round().max(4.0);
+    let cell = pitch_x - gap;
+    // Slots are 3:2 rather than square. A square slot letterboxes every
+    // landscape frame top and bottom, and the empty band it leaves reads as an
+    // enormous gap between rows — the layout looking broken because of the shape
+    // of the photographs in it. A portrait frame fits by its height instead and
+    // simply comes out narrow, which is what it is.
+    let slot_h = (cell / 1.5).round();
+    let pitch_y = slot_h + gap;
+
+    let (count, selected) = {
+        let library = library.lock().expect("library lock");
+        (library.count(), library.index())
+    };
+    let rows = count.div_ceil(columns);
+
+    // Follow the selection rather than making the user chase it. Only ever by
+    // the minimum needed, so a selection already on screen does not move the
+    // view at all.
+    let selected_row = (selected / columns) as f64;
+    let top = selected_row * pitch_y;
+    let bottom = top + pitch_y;
+    if top < grid.scroll {
+        grid.scroll = top;
+    } else if bottom > grid.scroll + surface[1] as f64 {
+        grid.scroll = bottom - surface[1] as f64;
+    }
+    let furthest = (rows as f64 * pitch_y - surface[1] as f64).max(0.0);
+    grid.scroll = grid.scroll.clamp(0.0, furthest);
+
+    let first_row = (grid.scroll / pitch_y).floor() as usize;
+    let last_row = (((grid.scroll + surface[1] as f64) / pitch_y).ceil() as usize).min(rows);
+    let (from, to) = (first_row * columns, (last_row * columns).min(count));
+
+    // Load a bounded number per frame, nearest to the selection first, so what
+    // you are looking at fills in before what you are not.
+    let mut wanted: Vec<usize> = (from..to).filter(|i| !grid.cells.contains_key(i)).collect();
+    wanted.sort_by_key(|i| i.abs_diff(selected));
+    let needed = cell.round() as u32;
+    for index in wanted.into_iter().take(LOADS_PER_FRAME) {
+        let decoded = library
+            .lock()
+            .expect("library lock")
+            .preview_at(index, needed, None)?;
+        if let Some(decoded) = decoded {
+            let image = blit.upload(gpu, &decoded.rgba, decoded.width, decoded.height)?;
+            grid.cells.insert(index, image);
+        }
+    }
+    // Anything far outside the view is not coming back soon.
+    let keep = from.saturating_sub(columns * 4)..to + columns * 4;
+    grid.cells.retain(|index, _| keep.contains(index));
+
+    let flags = library.lock().expect("library lock").flags_in(from, to)?;
+
+    let mut cells = Vec::new();
+    for index in from..to {
+        let Some(image) = grid.cells.get(&index) else {
+            continue;
+        };
+        let row = index / columns;
+        let column = index % columns;
+        // Fit the photograph inside the slot, keeping its shape.
+        let (iw, ih) = (image.width as f64, image.height as f64);
+        let scale = (cell / iw).min(slot_h / ih);
+        let (w, h) = (iw * scale, ih * scale);
+        let slot_x = gap / 2.0 + column as f64 * pitch_x;
+        let slot_y = gap / 2.0 + row as f64 * pitch_y - grid.scroll;
+
+        let flag = flags.get(index - from).copied().flatten();
+        let tint = match flag {
+            // A third the brightness. The shape of a cull becomes visible
+            // without reading anything, which is the whole point of a grid.
+            Some(rawkit_catalog::cull::Flag::Reject) => [0.33, 0.33, 0.33],
+            _ => [1.0, 1.0, 1.0],
+        };
+        let edge = if index == selected {
+            ([0.95, 0.95, 0.98], 3.0)
+        } else {
+            match flag {
+                Some(rawkit_catalog::cull::Flag::Pick) => ([0.30, 0.65, 0.36], 2.0),
+                _ => ([0.0; 3], 0.0),
+            }
+        };
+
+        cells.push(rawkit_engine::Cell {
+            image,
+            dest: [
+                (slot_x + (cell - w) / 2.0).round() as i32,
+                (slot_y + (slot_h - h) / 2.0).round() as i32,
+                w.round() as i32,
+                h.round() as i32,
+            ],
+            tint,
+            edge,
+        });
+    }
+
+    let drawn = cells.len();
+    blit.draw_grid(gpu, canvas_renderer.canvas(), &cells);
+    Ok(drawn)
 }
 
 /// Whether a path names a catalog rather than a photograph.
