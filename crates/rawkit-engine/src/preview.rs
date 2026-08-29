@@ -27,8 +27,8 @@ use crate::{render::Canvas, EngineError, Gpu, CANVAS_FORMAT};
 /// one buffer and binds a slice of it per draw. 256 is the alignment every
 /// backend accepts.
 const REGION_STRIDE: u64 = 256;
-/// origin(2) + span(2) + tint(4) + edge(4), in floats.
-const REGION_FLOATS: usize = 12;
+/// origin(2) + span(2) + tint(4) + edge(4) + inner(4), in floats.
+const REGION_FLOATS: usize = 16;
 
 /// One thumbnail to draw, and how it should look.
 pub struct Cell<'a> {
@@ -41,6 +41,9 @@ pub struct Cell<'a> {
     pub tint: [f32; 3],
     /// Colour and thickness in canvas pixels. Thickness zero draws no edge.
     pub edge: ([f32; 3], f32),
+    /// A second band just inside the first — a colour label, which a frame can
+    /// carry at the same time as a flag.
+    pub inner: ([f32; 3], f32),
 }
 
 /// A preview uploaded to the GPU, ready to be drawn at any zoom.
@@ -279,6 +282,17 @@ impl PreviewBlit {
                 cell.edge.0[1],
                 cell.edge.0[2],
                 thickness,
+            ]);
+            let inner = if cell.inner.1 > 0.0 {
+                cell.inner.1 / (right - left).min(bottom - top).max(1) as f32
+            } else {
+                0.0
+            };
+            regions[at + 12..at + 16].copy_from_slice(&[
+                cell.inner.0[0],
+                cell.inner.0[1],
+                cell.inner.0[2],
+                inner,
             ]);
             placed.push((
                 [

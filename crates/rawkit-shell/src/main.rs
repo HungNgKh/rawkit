@@ -731,11 +731,61 @@ static GRID_COLUMNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 /// The cell edge in canvas pixels, changed by `-` and `=`.
 static GRID_CELL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(400);
 
+/// A click on the canvas the grid has not acted on yet, and whether it was a
+/// double.
+///
+/// The canvas widget records where a click landed and nothing more; **which cell
+/// that is** is worked out by the render loop, which is the only place that knows
+/// the layout. Publishing the column count and pitch instead would put the same
+/// arithmetic in two files and let them disagree.
+static CANVAS_CLICK: Mutex<Option<([f64; 2], bool)>> = Mutex::new(None);
+/// Wheel notches since the last frame, positive downwards.
+static CANVAS_SCROLL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// What a colour label looks like, in linear light.
+///
+/// The names are Lightroom's, because the keys are: 6 to 9 do there what they do
+/// here, and a photographer's hands already know them.
+fn label_colour(name: &str) -> Option<[f32; 3]> {
+    Some(match name {
+        "red" => [0.52, 0.06, 0.06],
+        "yellow" => [0.62, 0.48, 0.04],
+        "green" => [0.09, 0.42, 0.13],
+        "blue" => [0.06, 0.22, 0.55],
+        _ => return None,
+    })
+}
+
 const MODE_LOUPE: u8 = 0;
 const MODE_GRID: u8 = 1;
 
 fn mode() -> u8 {
     MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the canvas is currently showing a grid.
+///
+/// Named rather than a comparison at each call site because the canvas widget
+/// asks it, and that file is the one where platform-specific code is allowed to
+/// live — the less it knows about the rest of the shell, the better.
+pub(crate) fn in_grid() -> bool {
+    mode() == MODE_GRID
+}
+
+pub(crate) fn mode_name() -> &'static str {
+    if in_grid() {
+        "grid"
+    } else {
+        "loupe"
+    }
+}
+
+pub(crate) fn canvas_click() -> std::sync::MutexGuard<'static, Option<([f64; 2], bool)>> {
+    CANVAS_CLICK.lock().expect("click lock")
+}
+
+pub(crate) fn add_canvas_scroll(notches: i32) {
+    CANVAS_SCROLL.fetch_add(notches, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The grid's own state: what is on the GPU, and where the view is.
@@ -818,11 +868,36 @@ fn draw_grid(
     let slot_h = (cell / 1.5).round();
     let pitch_y = slot_h + gap;
 
-    let (count, selected) = {
+    let (count, mut selected) = {
         let library = library.lock().expect("library lock");
         (library.count(), library.index())
     };
     let rows = count.div_ceil(columns);
+
+    // A wheel notch moves half a row, which is small enough to feel like
+    // scrolling and large enough to get somewhere.
+    let notches = CANVAS_SCROLL.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if notches != 0 {
+        grid.scroll += notches as f64 * pitch_y * 0.5;
+    }
+
+    // A click picks the cell under it; a double-click opens that cell.
+    if let Some(([x, y], double)) = CANVAS_CLICK.lock().expect("click lock").take() {
+        let column = (x / pitch_x).floor() as i64;
+        let row = ((y + grid.scroll) / pitch_y).floor() as i64;
+        if (0..columns as i64).contains(&column) && row >= 0 {
+            let index = row as usize * columns + column as usize;
+            if index < count {
+                selected = index;
+                let mut library = library.lock().expect("library lock");
+                library.select(index);
+                if double {
+                    library.reopen();
+                    MODE.store(MODE_LOUPE, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    }
 
     // Follow the selection rather than making the user chase it. Only ever by
     // the minimum needed, so a selection already on screen does not move the
@@ -877,7 +952,7 @@ fn draw_grid(
         let slot_x = gap / 2.0 + column as f64 * pitch_x;
         let slot_y = gap / 2.0 + row as f64 * pitch_y - grid.scroll;
 
-        let flag = flags.get(index - from).copied().flatten();
+        let (flag, label) = flags.get(index - from).cloned().unwrap_or((None, None));
         let tint = match flag {
             // A third the brightness. The shape of a cull becomes visible
             // without reading anything, which is the whole point of a grid.
@@ -888,10 +963,20 @@ fn draw_grid(
             ([0.95, 0.95, 0.98], 3.0)
         } else {
             match flag {
-                Some(rawkit_catalog::cull::Flag::Pick) => ([0.30, 0.65, 0.36], 2.0),
+                // Cyan, and deliberately not green: green is one of the four
+                // colour labels, so a green edge made a picked frame and a
+                // green-labelled one look identical. Selection is white, labels
+                // are red/yellow/green/blue, and a flag needs a hue of its own.
+                Some(rawkit_catalog::cull::Flag::Pick) => ([0.16, 0.58, 0.64], 2.0),
                 _ => ([0.0; 3], 0.0),
             }
         };
+
+        let inner = label
+            .as_deref()
+            .and_then(label_colour)
+            .map(|colour| (colour, 3.0))
+            .unwrap_or(([0.0; 3], 0.0));
 
         cells.push(rawkit_engine::Cell {
             image,
@@ -903,6 +988,7 @@ fn draw_grid(
             ],
             tint,
             edge,
+            inner,
         });
     }
 

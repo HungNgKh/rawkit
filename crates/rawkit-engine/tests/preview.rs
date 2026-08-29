@@ -162,6 +162,7 @@ fn a_grid_puts_each_cell_where_it_was_told_and_tints_it() {
                 dest: [0, 0, 16, 16],
                 tint: [1.0, 1.0, 1.0],
                 edge: ([0.0; 3], 0.0),
+                inner: ([0.0; 3], 0.0),
             },
             // A third the brightness, the way a rejected frame is drawn.
             rawkit_engine::Cell {
@@ -169,6 +170,7 @@ fn a_grid_puts_each_cell_where_it_was_told_and_tints_it() {
                 dest: [16, 16, 16, 16],
                 tint: [0.33, 0.33, 0.33],
                 edge: ([0.0; 3], 0.0),
+                inner: ([0.0; 3], 0.0),
             },
         ],
     );
@@ -218,6 +220,7 @@ fn a_cell_hanging_off_the_edge_is_cropped_rather_than_squashed() {
             dest: [0, -8, 16, 16],
             tint: [1.0; 3],
             edge: ([0.0; 3], 0.0),
+            inner: ([0.0; 3], 0.0),
         }],
     );
     let pixels = canvas.read_back(&gpu).expect("read back");
@@ -227,5 +230,46 @@ fn a_cell_hanging_off_the_edge_is_cropped_rather_than_squashed() {
         "the visible part is the image's lower half; got {} and {}",
         at(8, 1),
         at(8, 7)
+    );
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_flag_and_a_colour_label_can_be_shown_at_once() {
+    // The reason there are two bands rather than one. A frame can be picked
+    // *and* labelled, and a single edge would make the two argue about which is
+    // drawn — so one of them would silently never appear.
+    let Some(gpu) = gpu() else { return };
+    let renderer = Renderer::new(&gpu);
+    let blit = PreviewBlit::new(&gpu);
+    let canvas = renderer.create_canvas(&gpu, 40, 40);
+
+    let black = blit.upload(&gpu, &flat(0, 4, 4), 4, 4).expect("upload");
+    blit.draw_grid(
+        &gpu,
+        &canvas,
+        &[rawkit_engine::Cell {
+            image: &black,
+            dest: [0, 0, 40, 40],
+            tint: [1.0; 3],
+            // Pure green outside, pure red just inside it.
+            edge: ([0.0, 1.0, 0.0], 4.0),
+            inner: ([1.0, 0.0, 0.0], 4.0),
+        }],
+    );
+
+    let pixels = canvas.read_back(&gpu).expect("read back");
+    let at = |x: usize, y: usize| {
+        let i = (y * 40 + x) * 4;
+        [pixels[i], pixels[i + 1], pixels[i + 2]]
+    };
+    let green = at(20, 1);
+    let red = at(20, 6);
+    let middle = at(20, 20);
+    assert!(green[1] > 0.9 && green[0] < 0.1, "outer band: {green:?}");
+    assert!(red[0] > 0.9 && red[1] < 0.1, "inner band: {red:?}");
+    assert!(
+        middle.iter().all(|c| *c < 0.05),
+        "the photograph: {middle:?}"
     );
 }

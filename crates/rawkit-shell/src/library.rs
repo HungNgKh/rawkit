@@ -187,6 +187,10 @@ pub struct CullView {
     pub picks: usize,
     pub rejects: usize,
     pub undoable: bool,
+    /// Which view is showing. Here because the *canvas* can change it — a
+    /// double-click on a cell opens the loupe — and the page would otherwise go
+    /// on claiming the grid was up.
+    pub mode: &'static str,
 }
 
 /// An open catalog and where we are in it.
@@ -286,7 +290,8 @@ impl Library {
     /// One query for the whole visible page rather than one per cell, because a
     /// grid re-reads this every frame — pressing X has to change what the cell
     /// looks like straight away.
-    pub fn flags_in(&self, from: usize, to: usize) -> Result<Vec<Option<Flag>>> {
+    #[allow(clippy::type_complexity)]
+    pub fn flags_in(&self, from: usize, to: usize) -> Result<Vec<(Option<Flag>, Option<String>)>> {
         let from = from.min(self.images.len());
         let slice = &self.images[from..to.min(self.images.len())];
         if slice.is_empty() {
@@ -294,21 +299,24 @@ impl Library {
         }
         let ids: Vec<String> = slice.iter().map(|i| i.id.to_string()).collect();
         let mut statement = self.catalog.connection().prepare(&format!(
-            "SELECT id, flag FROM images WHERE id IN ({})",
+            "SELECT id, flag, colour_label FROM images WHERE id IN ({})",
             ids.join(",")
         ))?;
-        let found: std::collections::HashMap<i64, Option<String>> = statement
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        #[allow(clippy::type_complexity)]
+        let found: std::collections::HashMap<i64, (Option<String>, Option<String>)> = statement
+            .query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
             .collect::<std::result::Result<_, _>>()?;
         Ok(slice
             .iter()
-            .map(
-                |image| match found.get(&image.id).and_then(|f| f.as_deref()) {
+            .map(|image| {
+                let (flag, label) = found.get(&image.id).cloned().unwrap_or((None, None));
+                let flag = match flag.as_deref() {
                     Some("pick") => Some(Flag::Pick),
                     Some("reject") => Some(Flag::Reject),
                     _ => None,
-                },
-            )
+                };
+                (flag, label)
+            })
             .collect())
     }
 
@@ -398,9 +406,16 @@ impl Library {
                 self.judge(|j| Judgement { flag: None, ..j })?;
             }
             CullAction::Colour(name) => {
-                self.judge(|j| Judgement {
-                    colour: Some(name.clone()),
-                    ..j
+                // Pressing the same label again clears it, the way Lightroom's
+                // colour keys behave. Without that there is no key for "I was
+                // wrong about this one" except reaching for another.
+                self.judge(|j| {
+                    let colour = if j.colour.as_deref() == Some(name.as_str()) {
+                        None
+                    } else {
+                        Some(name.clone())
+                    };
+                    Judgement { colour, ..j }
                 })?;
             }
             CullAction::ClearColour => {
@@ -470,6 +485,7 @@ impl Library {
             picks,
             rejects,
             undoable: !self.undo.is_empty(),
+            mode: crate::mode_name(),
         })
     }
 }

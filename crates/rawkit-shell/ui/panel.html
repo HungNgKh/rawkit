@@ -37,9 +37,10 @@
   <span id="position"></span>
   <span id="stars"></span>
   <span id="flag"></span>
+  <span id="label"></span>
   <span id="counts"></span>
   <span id="mode">loupe</span>
-  <span id="keys">G grid · E loupe · ←→↑↓ move · P pick · X reject · U unflag · 1–5 rate · Z undo</span>
+  <span id="keys">G grid · E loupe · P pick · X reject · U unflag · 1–5 rate · 6–9 label · Z undo</span>
 </div>
 
 <main>
@@ -197,9 +198,15 @@
   let seen = -1;
   setInterval(async () => {
     const s = await invoke("snapshot");
-    if (s.generation === seen) return;
-    seen = s.generation;
-    sync(s.state);
+    if (s.generation !== seen) {
+      seen = s.generation;
+      sync(s.state);
+    }
+    // The canvas changes the selection too — clicking a cell, and
+    // double-clicking to open it — and none of that passes through this page.
+    // Without this the strip goes on describing the frame you were on two
+    // clicks ago, which is a readout lying rather than merely lagging.
+    show(await invoke("cull_view"));
   }, 250);
 
   // ---- Culling -------------------------------------------------------------
@@ -221,8 +228,12 @@
     const flag = document.getElementById("flag");
     flag.textContent = view.flag === "pick" ? "PICK" : view.flag === "reject" ? "REJECT" : "";
     flag.className = view.flag ?? "";
+    const label = document.getElementById("label");
+    label.textContent = view.colour ? view.colour.toUpperCase() : "";
+    label.style.color = { red: "#e0705f", yellow: "#d8bf63", green: "#6fc27a", blue: "#6f9ade" }[view.colour] ?? "";
     document.getElementById("counts").textContent =
       `${view.picks} picked · ${view.rejects} rejected`;
+    setMode(view.mode);
   };
 
   const act = async (action, value) => {
@@ -237,18 +248,22 @@
   // A held arrow key repeats far faster than a RAW decodes. Every press is still
   // sent — the library keeps only the latest request and the render loop reads
   // it once per frame, so this coalesces for the same reason a slider drag does.
-  const setMode = name => {
+  function setMode(name) {
+    if (document.getElementById("mode").textContent === name) return;
     document.getElementById("mode").textContent = name;
     // The grid is laid out from the canvas, so the view controls beside it are
     // about a photograph that is not on screen. Dimmed rather than removed, so
     // the panel does not jump when the mode changes.
     document.querySelector("main").style.opacity = name === "grid" ? 0.45 : 1;
-  };
+  }
 
   document.addEventListener("keydown", event => {
     if (event.metaKey || event.ctrlKey || event.altKey) return;
     const key = event.key;
     if (key >= "0" && key <= "5") return act("rate", Number(key)), event.preventDefault();
+    // Lightroom's colour keys, and pressing the same one again clears it.
+    const labels = { "6": "red", "7": "yellow", "8": "green", "9": "blue" };
+    if (labels[key]) return act("colour", labels[key]), event.preventDefault();
     switch (key.toLowerCase()) {
       // G and E, because that is what a Lightroom user's hands already do.
       case "g": act("grid"); setMode("grid"); break;

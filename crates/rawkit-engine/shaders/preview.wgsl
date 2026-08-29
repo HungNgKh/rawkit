@@ -24,6 +24,10 @@ struct Region {
     // Edge colour, and its thickness as a fraction of the cell. Thickness zero
     // means no edge — which is every cell the loupe ever draws.
     edge: vec4<f32>,
+    // A second band just inside the first, for a colour label. Two channels
+    // rather than one because a frame can be picked *and* labelled, and a single
+    // edge would make them argue about which is shown.
+    inner: vec4<f32>,
 }
 
 struct VsOut {
@@ -51,12 +55,12 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     // The edge is drawn in the cell's own rectangle rather than as extra
     // geometry, so selection and flags cost no draw calls and no second
     // pipeline. `in.uv` runs 0 to 1 across whatever rectangle was set.
-    let thickness = region.edge.w;
-    if (thickness > 0.0) {
-        let inset = min(min(in.uv.x, in.uv.y), min(1.0 - in.uv.x, 1.0 - in.uv.y));
-        if (inset < thickness) {
-            return vec4<f32>(region.edge.rgb, 1.0);
-        }
+    let inset = min(min(in.uv.x, in.uv.y), min(1.0 - in.uv.x, 1.0 - in.uv.y));
+    if (region.edge.w > 0.0 && inset < region.edge.w) {
+        return vec4<f32>(region.edge.rgb, 1.0);
+    }
+    if (region.inner.w > 0.0 && inset < region.edge.w + region.inner.w) {
+        return vec4<f32>(region.inner.rgb, 1.0);
     }
 
     let uv = region.origin + in.uv * region.span;

@@ -224,7 +224,16 @@ pub fn attach_input(
 
     let held = dragging.clone();
     gtk_window.connect_button_press_event(move |_, event| {
-        if to_canvas(event.position()).is_some() {
+        let Some(at) = to_canvas(event.position()) else {
+            return gtk::glib::Propagation::Proceed;
+        };
+        if crate::in_grid() {
+            // The grid works out which cell this is, because it is the only
+            // place that knows the layout. This widget's whole job is turning
+            // GTK's logical coordinates into canvas ones.
+            let double = event.event_type() == gtk::gdk::EventType::DoubleButtonPress;
+            *crate::canvas_click() = Some((at, double));
+        } else {
             held.set(Some(event.position()));
         }
         gtk::glib::Propagation::Proceed
@@ -259,6 +268,18 @@ pub fn attach_input(
         let Some(anchor) = to_canvas(event.position()) else {
             return gtk::glib::Propagation::Proceed;
         };
+        if crate::in_grid() {
+            // A grid scrolls; it does not zoom. Accumulated rather than applied,
+            // for the same reason the click is: the layout lives elsewhere.
+            let notches = match event.direction() {
+                gtk::gdk::ScrollDirection::Up => -1,
+                gtk::gdk::ScrollDirection::Down => 1,
+                gtk::gdk::ScrollDirection::Smooth => event.delta().1.round() as i32,
+                _ => 0,
+            };
+            crate::add_canvas_scroll(notches);
+            return gtk::glib::Propagation::Proceed;
+        }
         let step = match event.direction() {
             gtk::gdk::ScrollDirection::Up => 1.15,
             gtk::gdk::ScrollDirection::Down => 1.0 / 1.15,
