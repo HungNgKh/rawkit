@@ -471,6 +471,13 @@ pub struct EditFlags {
     /// right for a full-resolution export and for a thumbnail.
     #[arg(long, value_name = "L,T,R,B")]
     crop: Option<String>,
+    /// Straighten, in degrees clockwise. -15 to 15.
+    ///
+    /// The crop pulls in far enough that no empty corner is left, so a
+    /// straightened frame always comes out smaller than an unstraightened one.
+    /// This is the only operation in the pipeline that resamples.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    straighten: f32,
 }
 
 impl EditFlags {
@@ -504,11 +511,15 @@ impl EditFlags {
             270 => Orientation::Rotate270Cw,
             other => bail!("--rotate takes 0, 90, 180 or 270; got {other}"),
         };
-        let crop = match self.crop.as_deref() {
-            Some(text) => parse_crop(text)?,
-            None => rawkit_editstate::Crop::default(),
+        let crop = rawkit_editstate::Crop {
+            angle_deg: self.straighten,
+            ..match self.crop.as_deref() {
+                Some(text) => parse_crop(text)?,
+                None => rawkit_editstate::Crop::default(),
+            }
         };
-        crop.validate().map_err(|e| anyhow!("{e}; see --crop"))?;
+        crop.validate()
+            .map_err(|e| anyhow!("{e}; see --crop and --straighten"))?;
 
         Ok(EditState {
             tone: Tone {
@@ -541,5 +552,6 @@ fn parse_crop(text: &str) -> anyhow::Result<rawkit_editstate::Crop> {
         top: number("top", top)?,
         right: number("right", right)?,
         bottom: number("bottom", bottom)?,
+        ..rawkit_editstate::Crop::default()
     })
 }

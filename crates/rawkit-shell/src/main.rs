@@ -1448,6 +1448,7 @@ fn crop_from(session: &Session, marquee: &Marquee) -> Option<rawkit_editstate::C
         top: now.top + span_y * fraction(top_left[1], dh),
         right: now.left + span_x * fraction(bottom_right[0], dw),
         bottom: now.top + span_y * fraction(bottom_right[1], dh),
+        ..rawkit_editstate::Crop::default()
     };
     crop.validate().ok().map(|()| crop)
 }

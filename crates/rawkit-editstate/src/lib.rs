@@ -200,7 +200,23 @@ pub struct Crop {
     pub top: f32,
     pub right: f32,
     pub bottom: f32,
+    /// Straighten, in degrees clockwise. Applied *after* [`Orientation`] and
+    /// before the rectangle above is read, so the rectangle is always a
+    /// rectangle in the frame the user is looking at.
+    ///
+    /// It lives here rather than beside `orientation` because the two are one
+    /// decision: rotating by a fraction of a degree leaves empty corners, and
+    /// the only thing that can keep them out of the picture is the crop. They
+    /// are stored together because they are resolved together.
+    ///
+    /// Bounded to ±15°. Past that it is not straightening a horizon, and whole
+    /// quarter turns are [`Orientation`]'s job.
+    #[serde(default)]
+    pub angle_deg: f32,
 }
+
+/// The largest straighten this is, in degrees.
+pub const MAX_STRAIGHTEN_DEG: f32 = 15.0;
 
 impl Default for Crop {
     /// The whole frame.
@@ -210,6 +226,7 @@ impl Default for Crop {
             top: 0.0,
             right: 1.0,
             bottom: 1.0,
+            angle_deg: 0.0,
         }
     }
 }
@@ -237,6 +254,13 @@ impl Crop {
                     "{name} is {value}, and every edge is a fraction from 0 to 1"
                 )));
             }
+        }
+        if !self.angle_deg.is_finite() || self.angle_deg.abs() > MAX_STRAIGHTEN_DEG {
+            return Err(EditStateError::InvalidCrop(format!(
+                "straighten is {} degrees, and runs from -{MAX_STRAIGHTEN_DEG} to \
+                 {MAX_STRAIGHTEN_DEG}; whole quarter turns are the orientation's job",
+                self.angle_deg
+            )));
         }
         if self.left >= self.right || self.top >= self.bottom {
             return Err(EditStateError::InvalidCrop(format!(

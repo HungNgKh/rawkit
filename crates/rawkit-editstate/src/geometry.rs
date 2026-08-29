@@ -71,6 +71,79 @@ impl Geometry {
         self.orientation == Orientation::AsShot && self.crop.is_full_frame()
     }
 
+    /// The straighten, in radians clockwise. Zero when there is none.
+    pub fn angle(&self) -> f32 {
+        self.crop.angle_deg.to_radians()
+    }
+
+    /// Whether anything here needs a pixel to be interpolated.
+    ///
+    /// Quarter turns and crops select and permute; only a straighten resamples.
+    /// Kept separate from [`is_identity`](Self::is_identity) because the exact
+    /// path is worth taking whenever it is available, not only when there is
+    /// nothing to do at all.
+    pub fn resamples(&self) -> bool {
+        self.crop.angle_deg != 0.0
+    }
+
+    /// How far outside a sample the renderer's filter reaches, in pixels.
+    ///
+    /// Catmull-Rom takes four taps per axis, so a sample at the very edge of the
+    /// frame would read two pixels past it. [`fit_scale`](Self::fit_scale) keeps
+    /// that margin clear, which is why the renderer's edge clamp is a guard
+    /// against rounding rather than a thing that happens: without it, the
+    /// outermost pixels of a straightened frame are a smear of the edge row and
+    /// no longer a faithful resample.
+    ///
+    /// A filter with a wider support than this needs this number raised with it.
+    const FILTER_MARGIN: f32 = 2.0;
+
+    /// How far the crop has to pull in so no empty corner is visible.
+    ///
+    /// Between 0 and 1, scaling the rectangle about its own centre. Solved
+    /// rather than searched: each corner sits at `centre + s · offset`, so
+    /// "inside the frame" is linear in `s` and the tightest of the eight bounds
+    /// is the answer. A search would need a tolerance, and a tolerance here is a
+    /// sliver of empty corner in an export.
+    pub fn fit_scale(&self, image: [u32; 2]) -> f32 {
+        if !self.resamples() {
+            return 1.0;
+        }
+        let [fw, fh] = self.oriented_size(image);
+        let (fw, fh) = (fw as f32, fh as f32);
+        let [x0, y0, x1, y1] = self.window(image);
+        let (cx, cy) = ((x0 + x1) as f32 / 2.0, (y0 + y1) as f32 / 2.0);
+        let (hx, hy) = ((x1 - x0) as f32 / 2.0, (y1 - y0) as f32 / 2.0);
+
+        let (sin, cos) = self.angle().sin_cos();
+        // Where the crop's own centre reads from. Everything else is measured
+        // from here.
+        let (dcx, dcy) = (cx - fw / 2.0, cy - fh / 2.0);
+        let centre = [
+            fw / 2.0 + dcx * cos + dcy * sin,
+            fh / 2.0 - dcx * sin + dcy * cos,
+        ];
+
+        let mut scale = 1.0f32;
+        for (ox, oy) in [(-hx, -hy), (hx, -hy), (-hx, hy), (hx, hy)] {
+            // The corner's offset from the centre, rotated the same way.
+            let offset = [ox * cos + oy * sin, -ox * sin + oy * cos];
+            for axis in 0..2 {
+                let extent = if axis == 0 { fw } else { fh };
+                // Inset by the filter's reach, not by nothing: the corner has to
+                // be far enough in that its *taps* are on the frame too.
+                let (low, high) = (Self::FILTER_MARGIN, extent - Self::FILTER_MARGIN);
+                let (at, step) = (centre[axis], offset[axis]);
+                if step > 0.0 {
+                    scale = scale.min((high - at) / step);
+                } else if step < 0.0 {
+                    scale = scale.min((low - at) / step);
+                }
+            }
+        }
+        scale.clamp(0.0, 1.0)
+    }
+
     /// Quarter-turns clockwise.
     pub fn turns(&self) -> u32 {
         match self.orientation {
@@ -109,9 +182,63 @@ impl Geometry {
     }
 
     /// The size of the developed photograph.
+    ///
+    /// Smaller than the rectangle asked for when a straighten is in force: the
+    /// crop pulls in to keep the empty corners out, and the output shrinks with
+    /// it rather than being scaled back up, so one output pixel still stands for
+    /// about one sensor pixel.
     pub fn output_size(&self, image: [u32; 2]) -> [u32; 2] {
         let [x0, y0, x1, y1] = self.window(image);
-        [x1 - x0, y1 - y0]
+        let scale = self.fit_scale(image);
+        [
+            (((x1 - x0) as f32 * scale) as u32).max(1),
+            (((y1 - y0) as f32 * scale) as u32).max(1),
+        ]
+    }
+
+    /// Where an output pixel reads from, to sub-pixel precision.
+    ///
+    /// In sensor coordinates, and fractional — which is the whole difference a
+    /// straighten makes: without one every output pixel lands exactly on a
+    /// source pixel and [`source_of`](Self::source_of) answers exactly.
+    pub fn source_at(&self, out: [f32; 2], image: [u32; 2]) -> [f32; 2] {
+        let [fw, fh] = self.oriented_size(image);
+        let (fw, fh) = (fw as f32, fh as f32);
+        let [x0, y0, x1, y1] = self.window(image);
+        let (cx, cy) = ((x0 + x1) as f32 / 2.0, (y0 + y1) as f32 / 2.0);
+        let scale = self.fit_scale(image);
+        let (hx, hy) = (
+            (x1 - x0) as f32 / 2.0 * scale,
+            (y1 - y0) as f32 / 2.0 * scale,
+        );
+        let [ow, oh] = self.output_size(image);
+
+        // Sample at pixel centres, so the first output pixel reads half a pixel
+        // in and the last reads half a pixel from the far edge.
+        let px = cx - hx + (out[0] + 0.5) * (2.0 * hx / ow as f32);
+        let py = cy - hy + (out[1] + 0.5) * (2.0 * hy / oh as f32);
+
+        // Rotate back about the *frame* centre, not the crop's: a straighten
+        // levels the photograph, and moving the crop afterwards must not tilt
+        // it again.
+        let (sin, cos) = self.angle().sin_cos();
+        let (dx, dy) = (px - fw / 2.0, py - fh / 2.0);
+        let oriented = [
+            fw / 2.0 + dx * cos + dy * sin,
+            fh / 2.0 - dx * sin + dy * cos,
+        ];
+        self.orient_to_sensor(oriented, image)
+    }
+
+    /// The quarter-turn half of the map, in floating point.
+    fn orient_to_sensor(&self, p: [f32; 2], image: [u32; 2]) -> [f32; 2] {
+        let (w, h) = (image[0] as f32, image[1] as f32);
+        match self.turns() {
+            1 => [p[1], h - p[0]],
+            2 => [w - p[0], h - p[1]],
+            3 => [w - p[1], p[0]],
+            _ => p,
+        }
     }
 
     /// Where an output pixel came from, in sensor coordinates.
@@ -211,6 +338,7 @@ mod tests {
             top: 0.5,
             right: 0.75,
             bottom: 1.0,
+            ..Crop::default()
         };
         let g = with(Orientation::AsShot, crop);
         assert_eq!(g.output_size([400, 200]), [200, 100]);
@@ -240,6 +368,7 @@ mod tests {
                     top: 0.2,
                     right: 0.8,
                     bottom: 0.9,
+                    ..Crop::default()
                 },
             );
             let [ow, oh] = g.output_size(image);
@@ -340,6 +469,104 @@ mod tests {
             assert!(
                 seen.iter().all(|&s| s),
                 "{orientation:?} left a pixel behind"
+            );
+        }
+    }
+
+    fn tilted(degrees: f32) -> Geometry {
+        with(
+            Orientation::AsShot,
+            Crop {
+                angle_deg: degrees,
+                ..Crop::default()
+            },
+        )
+    }
+
+    #[test]
+    fn no_angle_means_no_resampling_and_no_shrinking() {
+        // The exact path has to stay available: cropping alone still lands every
+        // output pixel on exactly one source pixel, and that is what keeps a
+        // cropped export bit-identical to the region it kept.
+        let g = tilted(0.0);
+        assert!(!g.resamples());
+        assert_eq!(g.fit_scale([100, 60]), 1.0);
+        assert_eq!(g.output_size([100, 60]), [100, 60]);
+    }
+
+    #[test]
+    fn a_positive_angle_turns_the_photograph_clockwise() {
+        // Stated as a direction rather than as the formula, because the formula
+        // is what is under test — and because a sign error here is invisible
+        // until somebody straightens a horizon the wrong way.
+        let image = [100u32, 100];
+        let g = tilted(10.0);
+        let [ow, oh] = g.output_size(image);
+        let top_middle = g.source_at([ow as f32 / 2.0, 0.0], image);
+        assert!(
+            top_middle[0] < 50.0,
+            "the top of the frame should read from left of centre, got {top_middle:?}"
+        );
+        let left_middle = g.source_at([0.0, oh as f32 / 2.0], image);
+        assert!(
+            left_middle[1] > 50.0,
+            "the left of the frame should read from below centre, got {left_middle:?}"
+        );
+    }
+
+    #[test]
+    fn the_crop_pulls_in_far_enough_that_no_corner_is_empty() {
+        // The reason `fit_scale` exists. An empty corner in an export is a
+        // mistake that is easy to make and hard to notice, so this checks the
+        // property rather than the formula: every pixel of the output, at every
+        // angle, reads from inside the frame.
+        for degrees in [-15.0, -7.5, -1.0, 1.0, 7.5, 15.0] {
+            for image in [[100u32, 60], [60, 100], [80, 80]] {
+                let g = tilted(degrees);
+                assert!(g.fit_scale(image) < 1.0, "{degrees} did not shrink");
+                let [ow, oh] = g.output_size(image);
+                for y in 0..oh {
+                    for x in 0..ow {
+                        let [sx, sy] = g.source_at([x as f32, y as f32], image);
+                        // Two pixels inside, not merely inside: the renderer's
+                        // filter reaches that far, and a sample at the very edge
+                        // would read a clamped row rather than the photograph.
+                        let m = Geometry::FILTER_MARGIN;
+                        assert!(
+                            sx >= m - 1e-3
+                                && sy >= m - 1e-3
+                                && sx <= image[0] as f32 - m + 1e-3
+                                && sy <= image[1] as f32 - m + 1e-3,
+                            "{degrees}° on {image:?}: ({x}, {y}) reads ({sx}, {sy})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn straightening_composes_with_a_quarter_turn_and_a_crop() {
+        // Three geometric operations at once is where an ordering mistake
+        // hides — and the answer still has to be inside the sensor.
+        let image = [120u32, 80];
+        let g = with(
+            Orientation::Rotate270Cw,
+            Crop {
+                left: 0.2,
+                top: 0.1,
+                right: 0.9,
+                bottom: 0.8,
+                angle_deg: -6.0,
+            },
+        );
+        let [ow, oh] = g.output_size(image);
+        assert!(ow > 0 && oh > 0);
+        for (x, y) in [(0, 0), (ow - 1, 0), (0, oh - 1), (ow - 1, oh - 1)] {
+            let [sx, sy] = g.source_at([x as f32, y as f32], image);
+            assert!(
+                (0.0..=image[0] as f32).contains(&sx) && (0.0..=image[1] as f32).contains(&sy),
+                "corner ({x}, {y}) reads ({sx}, {sy})"
             );
         }
     }

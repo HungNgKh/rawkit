@@ -15,6 +15,9 @@ pub fn apply(geometry: &Geometry, rgba: &[f32], image: [u32; 2]) -> (Vec<f32>, [
     if geometry.is_identity() {
         return (rgba.to_vec(), image);
     }
+    if geometry.resamples() {
+        return straighten(geometry, rgba, image);
+    }
     let [ow, oh] = geometry.output_size(image);
     let mut out = vec![0.0f32; (ow as usize) * (oh as usize) * 4];
     for y in 0..oh {
@@ -26,6 +29,92 @@ pub fn apply(geometry: &Geometry, rgba: &[f32], image: [u32; 2]) -> (Vec<f32>, [
         }
     }
     (out, [ow, oh])
+}
+
+/// Rearrange *and* resample, for a frame that has been straightened.
+///
+/// The one place in the pipeline that interpolates. Every other geometric
+/// operation lands each output pixel on exactly one source pixel; a fraction of
+/// a degree does not, so this is where a photograph stops being a rearrangement
+/// of its own samples.
+///
+/// # Why Catmull-Rom
+///
+/// Bilinear would be four taps and no overshoot, and it visibly softens: a
+/// one-degree correction would leave the whole frame slightly less sharp than it
+/// went in, which a photographer notices at 100% and blames on the lens.
+/// Catmull-Rom is the standard photographic choice and keeps the detail. It can
+/// overshoot at a hard edge — a faint halo across a black-to-white boundary —
+/// which is the accepted cost and the reason the weights are written out rather
+/// than hidden in a sampler.
+///
+/// # Why the taps are explicit
+///
+/// A GPU's own filtering uses reduced-precision weights, so anything sampled
+/// through hardware could never match a render done here. Writing the arithmetic
+/// out is what will let the canvas and the export agree when the canvas learns
+/// to straighten.
+fn straighten(geometry: &Geometry, rgba: &[f32], image: [u32; 2]) -> (Vec<f32>, [u32; 2]) {
+    let [ow, oh] = geometry.output_size(image);
+    let mut out = vec![0.0f32; (ow as usize) * (oh as usize) * 4];
+    for y in 0..oh {
+        for x in 0..ow {
+            let at = geometry.source_at([x as f32, y as f32], image);
+            let pixel = sample(rgba, image, at);
+            let to = ((y as usize) * ow as usize + x as usize) * 4;
+            out[to..to + 4].copy_from_slice(&pixel);
+        }
+    }
+    (out, [ow, oh])
+}
+
+/// One Catmull-Rom tap set, 4x4 around `at`.
+///
+/// Alpha is carried through the same filter as the colour rather than being
+/// forced to 1: the develop stage writes a constant there today, and a filter
+/// that quietly disagrees with the other three channels is the kind of thing
+/// that only shows up once something starts using it.
+fn sample(rgba: &[f32], image: [u32; 2], at: [f32; 2]) -> [f32; 4] {
+    let (w, h) = (image[0] as i64, image[1] as i64);
+    // The sample sits at a pixel *centre*, so the nearest texel index is the
+    // floor of the position less half a pixel.
+    let base = [(at[0] - 0.5).floor(), (at[1] - 0.5).floor()];
+    let frac = [at[0] - 0.5 - base[0], at[1] - 0.5 - base[1]];
+    let wx = weights(frac[0]);
+    let wy = weights(frac[1]);
+
+    let mut acc = [0.0f32; 4];
+    for (j, vertical) in wy.iter().enumerate() {
+        // Clamped to the edge. The crop is pulled in far enough that this should
+        // not fire, so it is a guard rather than a behaviour — but a rounding
+        // error at the last row must read a pixel, not panic.
+        let sy = (base[1] as i64 + j as i64 - 1).clamp(0, h - 1);
+        for (i, horizontal) in wx.iter().enumerate() {
+            let sx = (base[0] as i64 + i as i64 - 1).clamp(0, w - 1);
+            let weight = horizontal * vertical;
+            let from = ((sy * w + sx) * 4) as usize;
+            for (c, channel) in acc.iter_mut().enumerate() {
+                *channel += rgba[from + c] * weight;
+            }
+        }
+    }
+    acc
+}
+
+/// Catmull-Rom weights for the four taps around a fraction.
+///
+/// The a = -0.5 form, which is the interpolating cubic that passes through every
+/// source pixel — so a straighten of exactly zero would return the image
+/// unchanged even if it took this path.
+fn weights(t: f32) -> [f32; 4] {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    [
+        -0.5 * t3 + t2 - 0.5 * t,
+        1.5 * t3 - 2.5 * t2 + 1.0,
+        -1.5 * t3 + 2.0 * t2 + 0.5 * t,
+        0.5 * t3 - 0.5 * t2,
+    ]
 }
 
 #[cfg(test)]
@@ -133,6 +222,7 @@ mod tests {
                 top: 0.4,
                 right: 0.5,
                 bottom: 0.9,
+                ..Crop::default()
             },
         );
         let (out, size) = apply(&g, &pixels, [10, 10]);
@@ -159,6 +249,7 @@ mod tests {
                 top: 0.0,
                 right: 0.5,
                 bottom: 0.25,
+                ..Crop::default()
             },
         );
         let (out, size) = apply(&g, &pixels, [8, 4]);
@@ -184,11 +275,122 @@ mod tests {
                 top: 0.5,
                 right: 0.501,
                 bottom: 0.501,
+                ..Crop::default()
             },
         );
         assert_eq!(g.output_size([8, 8]), [1, 1]);
         let (out, size) = apply(&g, &frame(8, 8), [8, 8]);
         assert_eq!(size, [1, 1]);
         assert_eq!(out.len(), 4);
+    }
+
+    fn tilted(degrees: f32) -> Geometry {
+        Geometry::from_parts(
+            Orientation::AsShot,
+            Crop {
+                angle_deg: degrees,
+                ..Crop::default()
+            },
+        )
+    }
+
+    #[test]
+    fn the_weights_always_add_up_to_one() {
+        // A filter whose weights do not sum to 1 changes the brightness of the
+        // photograph, by an amount that varies with the sub-pixel phase — so a
+        // straightened frame would come out very slightly mottled rather than
+        // obviously wrong.
+        for step in 0..=1000 {
+            let t = step as f32 / 1000.0;
+            let w = weights(t);
+            let sum: f32 = w.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-5, "weights at {t} sum to {sum}");
+        }
+        // And at a whole pixel it is the identity, so a sample that happens to
+        // land exactly on a source pixel is that pixel.
+        assert_eq!(weights(0.0), [0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_flat_field_stays_flat() {
+        // Weights summing to one, checked through the whole path rather than in
+        // isolation: mapping, clamping and accumulation all have to agree, and a
+        // constant image is the case where any disagreement shows as texture in
+        // something that has none.
+        let image = [64u32, 48];
+        let pixels: Vec<f32> = vec![0.37; 64 * 48 * 4];
+        let (out, [ow, oh]) = apply(&tilted(7.0), &pixels, image);
+        assert!(ow > 0 && oh > 0);
+        for (i, v) in out.iter().enumerate() {
+            assert!(
+                (v - 0.37).abs() < 1e-5,
+                "sample {i} came out {v} on a flat field"
+            );
+        }
+    }
+
+    #[test]
+    fn a_linear_ramp_is_reproduced_exactly() {
+        // The strongest check available, and the reason it is worth writing the
+        // weights out: Catmull-Rom reproduces linear functions exactly, so every
+        // output pixel has an *expected value* rather than a tolerance — and it
+        // is a value derived from the mapping, so this checks where each pixel
+        // was read from and how it was filtered at the same time.
+        let image = [80u32, 56];
+        let mut pixels = vec![0.0f32; (image[0] * image[1]) as usize * 4];
+        for y in 0..image[1] {
+            for x in 0..image[0] {
+                let at = ((y * image[0] + x) * 4) as usize;
+                // Value at the pixel *centre*, which is what the sampler assumes.
+                pixels[at] = x as f32 + 0.5;
+                pixels[at + 1] = y as f32 + 0.5;
+                pixels[at + 2] = 0.0;
+                pixels[at + 3] = 1.0;
+            }
+        }
+
+        let g = tilted(9.0);
+        let (out, [ow, oh]) = apply(&g, &pixels, image);
+        let mut worst = 0.0f32;
+        for y in 0..oh {
+            for x in 0..ow {
+                let want = g.source_at([x as f32, y as f32], image);
+                let at = ((y * ow + x) * 4) as usize;
+                worst = worst.max((out[at] - want[0]).abs());
+                worst = worst.max((out[at + 1] - want[1]).abs());
+            }
+        }
+        // A thousandth of a pixel: f32 accumulation over sixteen taps, and
+        // nothing else. The first version of this allowed two thousandths and
+        // still failed at 0.073 — the crop was not reserving room for the
+        // filter's own taps, so every straightened frame had a smeared border.
+        assert!(worst < 1e-3, "worst departure from the ramp was {worst}");
+    }
+
+    #[test]
+    fn a_straighten_of_zero_never_reaches_the_resampler() {
+        // Cropping alone must stay exact. If a zero angle took the interpolating
+        // path it would still be correct — Catmull-Rom passes through every
+        // source pixel — but it would no longer be *bit*-identical, and that is
+        // the property the crop tests rest on.
+        let pixels = frame(9, 7);
+        let g = Geometry::from_parts(
+            Orientation::Rotate180,
+            Crop {
+                left: 0.1,
+                top: 0.2,
+                right: 0.8,
+                bottom: 0.9,
+                angle_deg: 0.0,
+            },
+        );
+        assert!(!g.resamples());
+        let (out, size) = apply(&g, &pixels, [9, 7]);
+        for y in 0..size[1] {
+            for x in 0..size[0] {
+                let [sx, sy] = g.source_of([x, y], [9, 7]);
+                assert_eq!(at(&out, size[0], x, y), (sx as f32, sy as f32));
+            }
+        }
     }
 }

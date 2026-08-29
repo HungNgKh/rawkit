@@ -87,6 +87,7 @@ fn a_cropped_render_is_bit_identical_to_the_region_it_kept() {
         top: 0.3,
         right: 0.85,
         bottom: 0.9,
+        ..Crop::default()
     };
     let mut state = edited();
     state.crop = crop;

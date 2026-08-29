@@ -1194,6 +1194,7 @@ mod marked_set_tests {
                 top: 0.1,
                 right: 0.6,
                 bottom: 0.6,
+                ..rawkit_editstate::Crop::default()
             },
             orientation: rawkit_editstate::Orientation::Rotate90Cw,
             ..EditState::default()

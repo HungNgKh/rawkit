@@ -1063,6 +1063,7 @@ mod tests {
             top: 0.25,
             right: 0.75,
             bottom: 0.75,
+            ..Crop::default()
         }));
 
         assert_eq!(s.developed_size(), [3000, 2000]);
@@ -1099,6 +1100,7 @@ mod tests {
             top: 0.0,
             right: 0.25,
             bottom: 0.25,
+            ..Crop::default()
         }));
         s.apply(Command::FitToView);
         let corner = s.visible_tiles(3);
@@ -1123,6 +1125,7 @@ mod tests {
             top: 0.0,
             right: 0.25,
             bottom: 0.25,
+            ..Crop::default()
         }));
         s.apply(Command::FitToView);
 
@@ -1145,6 +1148,7 @@ mod tests {
             top: 0.0,
             right: 0.2,
             bottom: 1.0,
+            ..Crop::default()
         }));
         assert!(matches!(event, Event::Refused { .. }), "{event:?}");
         assert_eq!(s.state(), &before);
