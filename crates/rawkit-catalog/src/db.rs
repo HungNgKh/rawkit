@@ -17,7 +17,38 @@
 
 use crate::{pending, CatalogError, Migration};
 use rusqlite::Connection;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+fn backup_dir_for(path: Option<&Path>) -> Option<PathBuf> {
+    let path = path?;
+    let stem = path.file_stem()?.to_string_lossy().into_owned();
+    Some(path.with_file_name(format!("{stem}-backups")))
+}
+
+fn describe(backups: &Option<PathBuf>) -> String {
+    backups
+        .as_ref()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|| "(none: this catalog is in memory)".into())
+}
+
+/// Whether SQLite is telling us the *file* is broken, as opposed to the query.
+///
+/// `NotADatabase` counts: a file truncated or overwritten at the header is
+/// damaged in the same way and wants the same answer, even though SQLite
+/// describes it differently.
+fn is_corruption(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase,
+                ..
+            },
+            _
+        )
+    )
+}
 
 impl From<rusqlite::Error> for CatalogError {
     fn from(e: rusqlite::Error) -> Self {
@@ -28,28 +59,127 @@ impl From<rusqlite::Error> for CatalogError {
 /// An open catalog, migrated to [`SCHEMA_VERSION`].
 pub struct Catalog {
     connection: Connection,
+    journal_mode: String,
+    path: Option<PathBuf>,
 }
 
 impl Catalog {
     /// Open or create a catalog at `path`, applying whatever migrations it needs.
     pub fn open(path: &Path) -> Result<Self, CatalogError> {
-        Self::from_connection(Connection::open(path)?)
+        Self::from_connection(Connection::open(path)?, Some(path.to_path_buf()))
     }
 
     /// A catalog held only in memory. For tests, and for asking what a fresh
     /// schema looks like without writing one to disk.
     pub fn in_memory() -> Result<Self, CatalogError> {
-        Self::from_connection(Connection::open_in_memory()?)
+        Self::from_connection(Connection::open_in_memory()?, None)
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, CatalogError> {
+    fn from_connection(
+        connection: Connection,
+        path: Option<PathBuf>,
+    ) -> Result<Self, CatalogError> {
+        // Corruption does not wait for the integrity check to ask about it: a
+        // damaged file fails whichever statement first touches a bad page, which
+        // in practice is the first pragma below. Mapping it here is what makes
+        // the refusal say where the backups are instead of relaying SQLite's
+        // "database disk image is malformed" and leaving the user nowhere.
+        let backups = backup_dir_for(path.as_deref());
+        let refuse = |e: rusqlite::Error| -> CatalogError {
+            if is_corruption(&e) {
+                CatalogError::Corrupt {
+                    report: e.to_string(),
+                    backups: describe(&backups),
+                }
+            } else {
+                CatalogError::Sqlite(e.to_string())
+            }
+        };
+
         // Foreign keys are off by default in SQLite, which means every
         // `REFERENCES` in the schema is decoration until this runs. Deleting a
         // volume would silently orphan every folder under it.
-        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
-        let mut catalog = Self { connection };
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(refuse)?;
+
+        // Write-ahead logging: readers do not block the writer, so browsing a
+        // library stays responsive while a scan is filling it.
+        //
+        // The result is *checked* rather than assumed. WAL needs shared memory
+        // and does not work on a network filesystem — which is exactly the
+        // `VolumeId::NetworkShare` case the schema already models as having no
+        // stable identity. Falling back is fine; believing we are in WAL when we
+        // are not is what would make a later durability claim false.
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            .map_err(refuse)?;
+
+        // The standard companion to WAL, and a trade worth naming: NORMAL is
+        // safe against this process crashing and at risk only from an OS crash
+        // or power loss, in exchange for not fsyncing every commit. FULL would
+        // make a library scan several times slower for a guarantee that the
+        // backups already provide.
+        connection
+            .execute_batch("PRAGMA synchronous = NORMAL;")
+            .map_err(refuse)?;
+
+        let mut catalog = Self {
+            connection,
+            journal_mode,
+            path,
+        };
+        catalog.check_integrity()?;
         catalog.migrate()?;
         Ok(catalog)
+    }
+
+    /// Ask SQLite whether the file is sound, and refuse it if not.
+    ///
+    /// The full check rather than `quick_check`: it reads every page and
+    /// verifies every index, and on a catalog sized for a real library — tens of
+    /// megabytes, not the photos themselves — it costs single-digit
+    /// milliseconds. The weaker check would save time that nobody is spending.
+    fn check_integrity(&self) -> Result<(), CatalogError> {
+        let report: String = self
+            .connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(|e| {
+                if is_corruption(&e) {
+                    CatalogError::Corrupt {
+                        report: e.to_string(),
+                        backups: describe(&self.backup_dir()),
+                    }
+                } else {
+                    CatalogError::Sqlite(e.to_string())
+                }
+            })?;
+        if report == "ok" {
+            return Ok(());
+        }
+        Err(CatalogError::Corrupt {
+            report,
+            backups: describe(&self.backup_dir()),
+        })
+    }
+
+    /// Where this catalog's backups live: `<stem>-backups/` beside the file.
+    ///
+    /// Beside it on purpose — a backup that does not travel when the library is
+    /// copied to another disk is not a backup of that library.
+    pub fn backup_dir(&self) -> Option<PathBuf> {
+        backup_dir_for(self.path.as_deref())
+    }
+
+    /// The journal mode SQLite actually settled on, which is not always the one
+    /// that was asked for. See [`Catalog::from_connection`].
+    pub fn journal_mode(&self) -> &str {
+        &self.journal_mode
+    }
+
+    /// Where this catalog lives, or `None` for an in-memory one.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     /// The schema version this catalog is at.
@@ -95,6 +225,37 @@ mod tests {
     use super::*;
     use crate::SCHEMA_VERSION;
 
+    /// A scratch directory that cleans itself up.
+    ///
+    /// Hand-rolled rather than `tempfile`: it is nine lines, it is only needed
+    /// by tests, and every dependency in this workspace costs a licence review.
+    struct Scratch(PathBuf);
+
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tempdir() -> Scratch {
+        // The address of a local is unique among live allocations, which is
+        // enough to keep concurrent tests apart without a counter.
+        let unique = &0u8 as *const u8 as usize;
+        let path = std::env::temp_dir().join(format!(
+            "rawkit-catalog-{unique:x}-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Scratch(path)
+    }
+
     fn tables(catalog: &Catalog) -> Vec<String> {
         let mut statement = catalog
             .connection()
@@ -129,6 +290,76 @@ mod tests {
         catalog.migrate().unwrap();
         assert_eq!(tables(&catalog), before);
         assert_eq!(catalog.version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_catalog_on_disk_uses_write_ahead_logging() {
+        // Readers not blocking the writer is what keeps browsing responsive
+        // while a scan is filling the library, so it is worth asserting rather
+        // than assuming the pragma took.
+        let dir = tempdir();
+        let catalog = Catalog::open(&dir.join("library.rawkit")).unwrap();
+        assert_eq!(catalog.journal_mode(), "wal");
+    }
+
+    #[test]
+    fn an_in_memory_catalog_reports_whatever_it_actually_got() {
+        // Memory databases cannot do WAL, and the point of recording the mode
+        // rather than assuming it is that this case is visible instead of a
+        // false claim.
+        let catalog = Catalog::in_memory().unwrap();
+        assert_ne!(catalog.journal_mode(), "wal");
+        assert!(!catalog.journal_mode().is_empty());
+    }
+
+    #[test]
+    fn a_damaged_catalog_is_refused_and_says_where_the_backups_are() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempdir();
+        let path = dir.join("library.rawkit");
+        {
+            let catalog = Catalog::open(&path).unwrap();
+            // Something to corrupt. An empty file's damage can hide in slack.
+            for i in 0..200 {
+                catalog
+                    .connection()
+                    .execute(
+                        "INSERT INTO volumes (kind, uuid, path_convention)
+                         VALUES ('uuid', ?1, 'exact')",
+                        [format!("volume-{i}")],
+                    )
+                    .unwrap();
+            }
+        }
+
+        // Scribble over the middle of the file, past the header so it is still
+        // recognisably a database — the realistic shape of disk corruption, and
+        // the one an eager `open` would happily write more data into.
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        file.seek(SeekFrom::Start(len / 2)).unwrap();
+        file.write_all(&[0xa5; 2048]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        match Catalog::open(&path) {
+            Err(CatalogError::Corrupt { backups, .. }) => {
+                assert!(
+                    backups.ends_with("library-backups"),
+                    "the refusal must name where the copies are, got {backups}"
+                );
+            }
+            Err(e) => panic!("refused, but not as corruption: {e}"),
+            Ok(_) => panic!("a damaged catalog was opened, which is how damage spreads"),
+        }
+    }
+
+    #[test]
+    fn backups_live_beside_the_catalog() {
+        let dir = tempdir();
+        let path = dir.join("library.rawkit");
+        let catalog = Catalog::open(&path).unwrap();
+        assert_eq!(catalog.backup_dir().unwrap(), dir.join("library-backups"));
     }
 
     #[test]

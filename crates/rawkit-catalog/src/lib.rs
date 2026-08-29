@@ -43,6 +43,15 @@ pub enum CatalogError {
     MigrationGap { expected: u32 },
     #[error("sqlite: {0}")]
     Sqlite(String),
+    /// The catalog failed SQLite's own integrity check.
+    ///
+    /// Opening it anyway and then writing to it makes the damage worse, so this
+    /// is a refusal. The message names the backups directory because a corrupt
+    /// catalog is the one moment a user needs to be told where the copies are.
+    #[error(
+        "this catalog is damaged and was not opened.\n{report}\nRecent backups are in {backups}"
+    )]
+    Corrupt { report: String, backups: String },
 }
 
 /// One forward-only schema change.
