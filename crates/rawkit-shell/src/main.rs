@@ -205,7 +205,11 @@ struct Shelf(Option<Arc<Mutex<Library>>>);
 /// than panicking the command thread: a failed write is something the page
 /// should say, not something that should take the window down.
 #[tauri::command]
-fn cull(state: tauri::State<'_, Shelf>, action: CullAction) -> Result<CullView, String> {
+fn cull(
+    state: tauri::State<'_, Shelf>,
+    session: tauri::State<'_, Shared>,
+    action: CullAction,
+) -> Result<CullView, String> {
     let Some(library) = &state.0 else {
         return Err("no library is open; pass a .rawkit catalog".into());
     };
@@ -227,6 +231,14 @@ fn cull(state: tauri::State<'_, Shelf>, action: CullAction) -> Result<CullView, 
             }
             MODE.store(MODE_SURVEY, std::sync::atomic::Ordering::Relaxed);
             CullAction::SelectMarked(0)
+        }
+        // Copying reads the *session*, not the catalog: what should travel is
+        // what is on screen, including slider movements that have not settled
+        // into a saved version yet.
+        CullAction::CopyEdit => {
+            let state = session.0.lock().expect("session lock").state().clone();
+            library.lock().expect("library lock").copy_edit(state);
+            CullAction::SelectBy(0)
         }
         // Crop is a mode of the loupe rather than a view of its own: the same
         // photograph, at the same zoom, with a rectangle on it.
@@ -481,6 +493,27 @@ fn main() -> Result<()> {
                 // Decoding here rather than in the command handler keeps the IPC
                 // call immediate and keeps a fifth of a second of CPU off the
                 // thread the compositor is waiting on.
+                // Before anything else: a paste writes to the catalog under the
+                // frame on screen, so an unsettled slider movement has to land
+                // first or the pending save would put the old edit straight back
+                // — and the paste would look like it had skipped one frame.
+                let pasting = navigating
+                    .as_ref()
+                    .is_some_and(|l| l.lock().expect("library lock").take_paste());
+                if pasting {
+                    saver.flush();
+                    let library = navigating.as_ref().expect("a paste implies a library");
+                    let outcome = library.lock().expect("library lock").paste_into_marked();
+                    match outcome {
+                        Ok(count) => eprintln!("paste      : {count} frame(s)"),
+                        Err(e) => eprintln!("paste      : {e}"),
+                    }
+                    // The frame on screen may have been one of them, so its edit
+                    // is re-read rather than assumed unchanged.
+                    let mut session = shared.lock().expect("session lock");
+                    saver.restore(&mut session);
+                }
+
                 let requested = navigating
                     .as_ref()
                     .and_then(|l| l.lock().expect("library lock").take_request());

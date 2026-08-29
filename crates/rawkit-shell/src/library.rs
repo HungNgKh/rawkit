@@ -27,6 +27,7 @@ use anyhow::{anyhow, Context, Result};
 use rawkit_catalog::cull::{self, Flag, Judgement, LibraryImage};
 use rawkit_catalog::db::Catalog;
 use rawkit_catalog::previews;
+use rawkit_editstate::EditState;
 use rawkit_engine::render::Level;
 use rawkit_engine::{BayerPhase, CameraProfile, Frame, Pyramid};
 use rawkit_session::{Command, Session};
@@ -143,6 +144,25 @@ pub struct Decoded {
 /// What the page can ask for. Adjacently tagged for the reason `Command` is: a
 /// newtype variant holding a bare number has no other representation serde can
 /// round-trip.
+/// One reversible thing, so `Z` reverses whichever happened last.
+///
+/// A judgement and a paste are different in shape but the same to a user: the
+/// previous action. Two stacks would mean two keys, and the second one would be
+/// pressed by accident.
+#[derive(Debug)]
+enum Undone {
+    Judged {
+        index: usize,
+        before: Judgement,
+    },
+    /// What each frame's edit was before the paste. `None` means it had none —
+    /// restoring that writes the identity edit rather than deleting a version,
+    /// because the history is append-only and an undo is itself a decision.
+    Pasted {
+        frames: Vec<(usize, Option<EditState>)>,
+    },
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "action", content = "value", rename_all = "snake_case")]
 pub enum CullAction {
@@ -170,6 +190,10 @@ pub enum CullAction {
     SurveyJudge(bool),
     /// Empty the comparison.
     ClearMarks,
+    /// Take this frame's look, to give to the marked ones.
+    CopyEdit,
+    /// Give the copied look to every marked frame.
+    PasteEdit,
     /// Draw a rectangle on the loupe. Pressed again, it stops.
     Crop,
     /// Take the rectangle that was drawn, or throw it away.
@@ -202,6 +226,9 @@ pub struct CullView {
     pub picks: usize,
     pub rejects: usize,
     pub undoable: bool,
+    /// Whether a look is on the clipboard. Shown, because a clipboard nobody can
+    /// see is a key that sometimes does nothing for no visible reason.
+    pub copied: bool,
     /// How many frames are set aside to compare.
     pub marked: usize,
     /// Whether this one is among them.
@@ -221,13 +248,26 @@ pub struct Library {
     ///
     /// Bounded because it is a convenience, not a history: the versioned record
     /// is what `edit_states` is for, and a rating deliberately has none.
-    undo: Vec<(usize, Judgement)>,
+    undo: Vec<Undone>,
     /// A navigation the render loop has not acted on yet.
     request: Option<usize>,
     /// Frames set aside to compare against each other, as positions in the
     /// sequence, kept in order so a survey reads left to right the way the shoot
     /// happened.
     marked: Vec<usize>,
+    /// The look taken from a frame, waiting to be applied to the marked ones.
+    ///
+    /// Held rather than re-read from the source frame, so navigating away — or
+    /// editing the source further — does not change what gets pasted. A
+    /// clipboard that quietly follows its source is not a clipboard.
+    copied: Option<EditState>,
+    /// Set by the paste key, drained by the render loop.
+    ///
+    /// Not done here, because the frame on screen may have unsaved slider
+    /// movements: writing to the catalog under it and letting the pending save
+    /// land afterwards would put the old edit back, and the paste would look
+    /// like it had silently skipped one frame.
+    paste_requested: bool,
 }
 
 /// How many judgements can be taken back. Enough to cover a mis-keyed run
@@ -255,6 +295,8 @@ impl Library {
             images,
             index: 0,
             undo: Vec::new(),
+            copied: None,
+            paste_requested: false,
             request: None,
             marked: Vec::new(),
         })
@@ -287,6 +329,72 @@ impl Library {
     }
 
     /// The frames set aside for comparison, in shoot order.
+    /// Take a look, to give to the marked frames.
+    pub fn copy_edit(&mut self, state: EditState) {
+        self.copied = Some(state);
+    }
+
+    /// Whether a paste is waiting, clearing the flag.
+    pub fn take_paste(&mut self) -> bool {
+        std::mem::take(&mut self.paste_requested)
+    }
+
+    /// Give the copied look to every marked frame.
+    ///
+    /// **Tone and white balance travel; orientation and crop stay.** A pasted
+    /// crop silently reframes photographs whose composition differs, and since
+    /// previews rebuild on their own the damage is not noticed until the exports
+    /// come out wrong. A locked-off sequence that genuinely wants one crop is a
+    /// separate command, not a default.
+    ///
+    /// Returns how many frames changed. Ones already carrying this look are not
+    /// counted and cost nothing: `edits::save` is a no-op when the hash matches.
+    pub fn paste_into_marked(&mut self) -> Result<usize> {
+        let Some(look) = self.copied.clone() else {
+            return Err(anyhow!("nothing copied — press S on a frame first"));
+        };
+        if self.marked.is_empty() {
+            return Err(anyhow!("mark the frames to apply it to with M first"));
+        }
+
+        let mut undo = Vec::new();
+        let mut changed = 0;
+        for index in self.marked.clone() {
+            let id = self.images[index].id;
+            let before = rawkit_catalog::edits::latest(&self.catalog, id)?.map(|(_, state)| state);
+            let merged = EditState {
+                tone: look.tone,
+                white_balance: look.white_balance,
+                ..before.clone().unwrap_or_default()
+            };
+            // Nothing to do covers two cases that look different and are not:
+            // the frame already carries this look, and the look is the identity
+            // on a frame that had no edit. Writing either marks a photograph as
+            // edited by a decision nobody made.
+            if merged == before.clone().unwrap_or_default() {
+                continue;
+            }
+            if rawkit_catalog::edits::save(
+                &self.catalog,
+                id,
+                &merged,
+                rawkit_editstate::EditSource::User,
+            )?
+            .is_some()
+            {
+                undo.push((index, before));
+                changed += 1;
+            }
+        }
+        if !undo.is_empty() {
+            self.undo.push(Undone::Pasted { frames: undo });
+            if self.undo.len() > UNDO_DEPTH {
+                self.undo.remove(0);
+            }
+        }
+        Ok(changed)
+    }
+
     pub fn marked(&self) -> &[usize] {
         &self.marked
     }
@@ -407,6 +515,11 @@ impl Library {
             // wildcard so adding a cull action still fails to compile here,
             // which is what has kept this match honest.
             CullAction::Crop | CullAction::CropApply | CullAction::CropCancel => {}
+            // The clipboard is filled in the command handler, which is the only
+            // place that can see the session — this frame's edit is what is on
+            // screen, not what was last written to the catalog.
+            CullAction::CopyEdit => {}
+            CullAction::PasteEdit => self.paste_requested = true,
             CullAction::Next => self.go(self.index + 1),
             CullAction::SelectNext => self.select(self.index + 1),
             CullAction::SelectPrevious => self.select(self.index.saturating_sub(1)),
@@ -495,8 +608,28 @@ impl Library {
                     }
                 }
             }
-            CullAction::Undo => {
-                if let Some((index, previous)) = self.undo.pop() {
+            CullAction::Undo => match self.undo.pop() {
+                Some(Undone::Pasted { frames }) => {
+                    for (index, before) in &frames {
+                        let state = before.clone().unwrap_or_default();
+                        rawkit_catalog::edits::save(
+                            &self.catalog,
+                            self.images[*index].id,
+                            &state,
+                            rawkit_editstate::EditSource::User,
+                        )?;
+                    }
+                    // Back to a frame it touched, so the reversal is visible
+                    // rather than something the user has to go and check.
+                    if let Some((index, _)) = frames.first() {
+                        self.go(*index);
+                        self.index = *index;
+                    }
+                }
+                Some(Undone::Judged {
+                    index,
+                    before: previous,
+                }) => {
                     cull::set(&self.catalog, self.images[index].id, &previous)?;
                     // A survey drops what it judges, so undoing a judgement has
                     // to put the frame back where it was being compared —
@@ -509,7 +642,8 @@ impl Library {
                     self.go(index);
                     self.index = index;
                 }
-            }
+                None => {}
+            },
         }
         self.view()
     }
@@ -524,7 +658,10 @@ impl Library {
             return Ok(());
         }
         cull::set(&self.catalog, id, &after)?;
-        self.undo.push((self.index, before));
+        self.undo.push(Undone::Judged {
+            index: self.index,
+            before,
+        });
         if self.undo.len() > UNDO_DEPTH {
             self.undo.remove(0);
         }
@@ -565,6 +702,7 @@ impl Library {
             picks,
             rejects,
             undoable: !self.undo.is_empty(),
+            copied: self.copied.is_some(),
             marked: self.marked.len(),
             is_marked: self.marked.contains(&self.index),
             mode: crate::mode_name(),
@@ -925,8 +1063,10 @@ mod saver_tests {
     }
 }
 
+/// The marked set, and the two things that use it: comparing, and applying one
+/// frame's look to the rest.
 #[cfg(test)]
-mod survey_tests {
+mod marked_set_tests {
     use super::tests::{library_at, Scratch};
     use super::*;
 
@@ -1021,5 +1161,153 @@ mod survey_tests {
         assert_eq!(library.index(), 1, "round the end, not off it");
         library.act(CullAction::SelectMarked(-1)).unwrap();
         assert_eq!(library.index(), 6);
+    }
+
+    /// The look one frame carries, as stored.
+    fn stored(library: &Library, index: usize) -> Option<EditState> {
+        rawkit_catalog::edits::latest(&library.catalog, library.images[index].id)
+            .unwrap()
+            .map(|(_, state)| state)
+    }
+
+    fn a_look() -> EditState {
+        let mut state = EditState::default();
+        state.tone.exposure_ev = 0.8;
+        state.tone.contrast = 0.35;
+        state.white_balance.temperature_k = Some(4800.0);
+        state
+    }
+
+    #[test]
+    fn a_pasted_look_leaves_each_frame_its_own_framing() {
+        // The decision this slice made: tone and white balance travel, crop and
+        // orientation stay. A pasted crop reframes photographs whose composition
+        // differs, and previews rebuild quietly, so nobody finds out until the
+        // exports are wrong.
+        let dir = Scratch::new("paste");
+        let mut library = library_at(&dir.0, 3);
+
+        // Frame 2 already has a crop of its own, and must keep it.
+        let framed = EditState {
+            crop: rawkit_editstate::Crop {
+                left: 0.1,
+                top: 0.1,
+                right: 0.6,
+                bottom: 0.6,
+            },
+            orientation: rawkit_editstate::Orientation::Rotate90Cw,
+            ..EditState::default()
+        };
+        rawkit_catalog::edits::save(
+            &library.catalog,
+            library.images[2].id,
+            &framed,
+            rawkit_editstate::EditSource::User,
+        )
+        .unwrap();
+
+        library.act(CullAction::SelectBy(1)).unwrap();
+        library.act(CullAction::Mark).unwrap();
+        library.act(CullAction::SelectBy(1)).unwrap();
+        library.act(CullAction::Mark).unwrap();
+
+        let source = a_look();
+        library.copy_edit(source.clone());
+        assert_eq!(library.paste_into_marked().unwrap(), 2);
+
+        for index in [1, 2] {
+            let got = stored(&library, index).expect("a look was pasted");
+            assert_eq!(got.tone, source.tone, "frame {index} took the tone");
+            assert_eq!(got.white_balance, source.white_balance);
+        }
+        assert_eq!(
+            stored(&library, 2).unwrap().crop,
+            framed.crop,
+            "its own crop"
+        );
+        assert_eq!(stored(&library, 2).unwrap().orientation, framed.orientation);
+        assert!(
+            stored(&library, 0).is_none(),
+            "an unmarked frame is untouched"
+        );
+    }
+
+    #[test]
+    fn pasting_twice_writes_one_version() {
+        // `edits::save` is a no-op when the hash matches, so a second paste over
+        // the same frames costs nothing and reports nothing — which is what
+        // stops a sync key filling the history with decisions nobody made.
+        let dir = Scratch::new("paste-twice");
+        let mut library = library_at(&dir.0, 2);
+        library.act(CullAction::Mark).unwrap();
+        library.copy_edit(a_look());
+
+        assert_eq!(library.paste_into_marked().unwrap(), 1);
+        assert_eq!(library.paste_into_marked().unwrap(), 0, "nothing changed");
+
+        // And an identity look on a frame that has no edit is also nothing:
+        // writing it would mark the photograph as edited by a decision nobody
+        // made. Found by driving the shell, where cropping one frame and pasting
+        // its *look* wrote empty versions to the others.
+        library.copy_edit(EditState::default());
+        library.act(CullAction::ClearMarks).unwrap();
+        library.act(CullAction::SelectBy(1)).unwrap();
+        library.act(CullAction::Mark).unwrap();
+        assert_eq!(library.paste_into_marked().unwrap(), 0);
+        assert!(stored(&library, 1).is_none(), "no version was written");
+        let history =
+            rawkit_catalog::edits::history(&library.catalog, library.images[0].id).unwrap();
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn undo_puts_back_what_each_frame_had() {
+        // One key reverses whichever happened last, so a paste has to be on the
+        // same stack as a judgement — and it has to restore *per frame*, because
+        // the frames it overwrote did not all start from the same place.
+        let dir = Scratch::new("paste-undo");
+        let mut library = library_at(&dir.0, 3);
+
+        let mut had = EditState::default();
+        had.tone.exposure_ev = -1.5;
+        rawkit_catalog::edits::save(
+            &library.catalog,
+            library.images[1].id,
+            &had,
+            rawkit_editstate::EditSource::User,
+        )
+        .unwrap();
+
+        library.act(CullAction::SelectBy(1)).unwrap();
+        library.act(CullAction::Mark).unwrap();
+        library.act(CullAction::SelectBy(1)).unwrap();
+        library.act(CullAction::Mark).unwrap();
+        library.copy_edit(a_look());
+        library.paste_into_marked().unwrap();
+
+        library.act(CullAction::Undo).unwrap();
+        assert_eq!(
+            stored(&library, 1).unwrap().tone,
+            had.tone,
+            "frame 1 as it was"
+        );
+        assert_eq!(
+            stored(&library, 2).unwrap(),
+            EditState::default(),
+            "frame 2 had no edit, so it goes back to the identity"
+        );
+    }
+
+    #[test]
+    fn pasting_says_what_is_missing_rather_than_doing_nothing() {
+        let dir = Scratch::new("paste-refuse");
+        let mut library = library_at(&dir.0, 2);
+
+        let no_copy = library.paste_into_marked().unwrap_err().to_string();
+        assert!(no_copy.contains("nothing copied"), "{no_copy}");
+
+        library.copy_edit(a_look());
+        let no_marks = library.paste_into_marked().unwrap_err().to_string();
+        assert!(no_marks.contains("mark the frames"), "{no_marks}");
     }
 }

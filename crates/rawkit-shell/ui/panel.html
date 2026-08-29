@@ -47,7 +47,7 @@
   <span id="label"></span>
   <span id="counts"></span>
   <span id="mode">loupe</span>
-  <span id="keys">G grid · E loupe · R crop · [ ] rotate · M mark · C compare · P pick · X reject · 1–5 rate · Z undo</span>
+  <span id="keys">G grid · E loupe · R crop · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · Z undo</span>
 </div>
 
 <main>
@@ -259,7 +259,9 @@
     label.style.color = { red: "#e0705f", yellow: "#d8bf63", green: "#6fc27a", blue: "#6f9ade" }[view.colour] ?? "";
     document.getElementById("counts").textContent =
       `${view.picks} picked · ${view.rejects} rejected` +
-      (view.marked ? ` · ${view.marked} marked${view.is_marked ? " ✓" : ""}` : "");
+      (view.marked ? ` · ${view.marked} marked${view.is_marked ? " ✓" : ""}` : "") +
+      // A clipboard nobody can see is a key that sometimes does nothing.
+      (view.copied ? " · settings copied" : "");
     setMode(view.mode);
   };
 
@@ -329,6 +331,9 @@
       case "p": act("pick"); break;
       case "x": act("reject"); break;
       case "u": act("clear_flag"); break;
+      // S takes this frame's look, A applies it to everything marked.
+      case "s": act("copy_edit"); break;
+      case "a": act("paste_edit"); break;
       case "z": act("undo"); break;
       default: return;
     }
