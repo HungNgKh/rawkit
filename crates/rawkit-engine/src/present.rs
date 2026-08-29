@@ -102,14 +102,22 @@ impl Presenter {
                 cache: None,
             });
 
-        // Nearest, deliberately. The canvas is rendered at the size it is shown
-        // at, so there is nothing to interpolate and filtering would only soften
-        // a 1:1 image. When the canvas is stale mid-resize the honest artifact is
-        // a blocky frame for one vsync, not a blurry one.
+        // Linear, and this was Nearest until the viewport gained a real scale.
+        //
+        // The canvas holds *level* pixels, and `Viewport::level` picks
+        // `floor(log2(1/scale))`, so a level pixel is between half a screen
+        // pixel and one: the canvas is up to twice the surface's size and only
+        // exactly equal at powers of two. Nearest sampling at those ratios
+        // aliases, and on fine detail — sea spray, foliage — aliasing reads as
+        // shimmer while panning.
+        //
+        // Linear is the cheap correct-enough answer, not the right one. A real
+        // downscale filter belongs with output sharpening, which is its own P0
+        // item; doing half of it here would mean two places to change.
         let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("present"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 

@@ -70,7 +70,19 @@ struct Params {
     // Where this tile lands in the canvas and how to trim it: `.xy` is the
     // destination pixel, `.z` the tile edge, `.w` the halo width. Rewritten per
     // tile, unlike everything above it, which moves only when the edit does.
-    present: vec4<u32>,
+    //
+    // Signed, because a tile that begins left of or above the viewport is the
+    // ordinary case as soon as the image can be panned — the tile grid does not
+    // move with the view.
+    present: vec4<i32>,
+    // How much of this tile is actually inside the image, in pixels: `.xy`.
+    //
+    // A tile at the right or bottom edge overhangs, and the gather clamps out
+    // there — which repeats a column and so breaks the CFA phase, and a broken
+    // phase demosaics to magenta rather than to something merely soft. The
+    // whole-image path drops the overhang when it copies each tile out; the
+    // canvas path has to be told.
+    extent: vec4<i32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -702,18 +714,21 @@ fn tone_map(x: vec3<f32>) -> vec3<f32> {
 // ---------------------------------------------------------------------------
 @compute @workgroup_size(8, 8)
 fn present(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let tile = params.present.z;
+    let tile = u32(params.present.z);
     if (gid.x >= tile || gid.y >= tile) {
         return;
     }
-    let dest = params.present.xy + gid.xy;
-    // A tile at the edge of the image overhangs the canvas. Dropping those
-    // pixels beats clamping them, which would smear the last column outwards.
-    let bounds = textureDimensions(canvas);
-    if (dest.x >= bounds.x || dest.y >= bounds.y) {
+    if (i32(gid.x) >= params.extent.x || i32(gid.y) >= params.extent.y) {
+        return;
+    }
+    let dest = params.present.xy + vec2<i32>(gid.xy);
+    // A tile can overhang the canvas on any side. Dropping those pixels beats
+    // clamping them, which would smear an edge column across the view.
+    let bounds = vec2<i32>(textureDimensions(canvas));
+    if (dest.x < 0 || dest.y < 0 || dest.x >= bounds.x || dest.y >= bounds.y) {
         return;
     }
     let halo = params.present.w;
-    let src = idx(i32(gid.x + halo), i32(gid.y + halo));
-    textureStore(canvas, dest, rgba_out[src]);
+    let src = idx(i32(gid.x) + halo, i32(gid.y) + halo);
+    textureStore(canvas, vec2<u32>(dest), rgba_out[src]);
 }

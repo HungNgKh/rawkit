@@ -142,7 +142,7 @@ fn tiles_land_where_they_are_told() {
                 0,
                 tx,
                 ty,
-                [tx * TILE, ty * TILE],
+                [(tx * TILE) as i32, (ty * TILE) as i32],
                 Output::Display,
             )
             .expect("draw");
@@ -218,4 +218,124 @@ fn a_tile_overhanging_the_canvas_is_clipped_not_wrapped() {
     // And the part that does fit is real picture, not zeros.
     let inside = drawn[(((70 * cw) + 70) * 4) as usize];
     assert!(inside > 0.0, "the visible corner of the tile is blank");
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_tile_starting_before_the_canvas_is_clipped_on_that_side_too() {
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let cfa = mosaic();
+    let image = frame(&cfa);
+    let renderer = Renderer::with_tile_size(&gpu, TILE);
+    let pyramid = Pyramid::build(&image, TILE);
+    let buffers = renderer.allocate(&gpu, &image);
+    renderer
+        .set_edit(&gpu, &buffers, &image, &EditState::default())
+        .expect("upload edit");
+
+    // Once the image can be panned, the first visible tile almost always begins
+    // left of and above the viewport — the tile grid is fixed to the image and
+    // does not move with the view. A negative destination is the ordinary case,
+    // not an edge case, which is why the destination is signed at all.
+    let canvas = renderer.create_canvas(&gpu, TILE, TILE);
+    let offset = -(TILE as i32) / 4;
+    renderer
+        .draw_tile(
+            &gpu,
+            &buffers,
+            &canvas,
+            &pyramid,
+            0,
+            1,
+            1,
+            [offset, offset],
+            Output::Display,
+        )
+        .expect("a tile may start off the canvas");
+    let drawn = canvas.read_back(&gpu).expect("canvas readback");
+
+    let expected = renderer
+        .render_tile(&gpu, &buffers, &pyramid, 0, 1, 1, Output::Display)
+        .expect("readback path");
+
+    // The visible part must be the tail of the tile, shifted — not the head of
+    // it, which is what an unsigned destination wrapping to a huge number would
+    // have produced, and not blank.
+    let shift = (-offset) as u32;
+    for y in 0..TILE - shift {
+        for x in 0..TILE - shift {
+            for c in 0..3 {
+                let found = drawn[(((y * TILE) + x) * 4 + c) as usize];
+                let want = expected[((((y + shift) * TILE) + x + shift) * 4 + c) as usize];
+                assert!(
+                    (found - want).abs() < F16_TOLERANCE,
+                    "canvas ({x}, {y}) holds {found}; the tile shifted by {offset} says {want}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_tile_overhanging_the_image_does_not_draw_its_overhang() {
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+
+    // An image whose width is not a multiple of the tile: the last tile column
+    // is 32 pixels of picture and 32 of nothing. Sensor sizes are rarely tidy,
+    // so this is the normal case rather than a contrived one.
+    const ODD: u32 = 160;
+    let cfa: Vec<f32> = (0..ODD)
+        .flat_map(|y| (0..ODD).map(move |x| (x, y)))
+        .map(|(x, y)| [0.6, 0.5, 0.4][colour_at(x, y)])
+        .collect();
+    let image = Frame {
+        data: &cfa,
+        width: ODD,
+        height: ODD,
+        phase: BayerPhase::Rggb,
+        as_shot_wb: [1.0, 1.0, 1.0],
+        clip_level: f32::INFINITY,
+        profile: CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
+    };
+    let renderer = Renderer::with_tile_size(&gpu, TILE);
+    let pyramid = Pyramid::build(&image, TILE);
+    let buffers = renderer.allocate(&gpu, &image);
+    renderer
+        .set_edit(&gpu, &buffers, &image, &EditState::default())
+        .expect("upload edit");
+
+    let canvas = renderer.create_canvas(&gpu, TILE, TILE);
+    renderer
+        .draw_tile(
+            &gpu,
+            &buffers,
+            &canvas,
+            &pyramid,
+            0,
+            2,
+            0,
+            [0, 0],
+            Output::Display,
+        )
+        .expect("draw the last tile");
+    let drawn = canvas.read_back(&gpu).expect("canvas readback");
+
+    // Beyond the image the gather clamps, which repeats a column and breaks the
+    // CFA phase — and a broken phase demosaics to magenta, not to something
+    // merely soft. Those pixels must never reach the canvas.
+    let valid = ODD - 2 * TILE;
+    for y in 0..TILE {
+        for x in valid..TILE {
+            let i = (((y * TILE) + x) * 4) as usize;
+            assert_eq!(
+                &drawn[i..i + 3],
+                &[0.0, 0.0, 0.0],
+                "({x}, {y}) is past the image edge and was drawn anyway"
+            );
+        }
+    }
+    // And the part that is inside the image is real picture.
+    let inside = drawn[(((TILE / 2) * TILE + valid / 2) * 4) as usize];
+    assert!(inside > 0.0, "the valid part of the tile is blank");
 }

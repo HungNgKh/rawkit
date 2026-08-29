@@ -216,7 +216,12 @@ struct Params {
     /// `[dest_x, dest_y, tile, halo]`. Rewritten per tile; everything above it
     /// moves only when the edit does, which is why this sits last and is
     /// patched in place rather than re-uploading the whole uniform.
-    present: [u32; 4],
+    ///
+    /// Signed: once the image can be panned, a tile beginning left of or above
+    /// the viewport is ordinary rather than exceptional.
+    present: [i32; 4],
+    /// How much of the tile is inside the image, in pixels. See `present`.
+    extent: [i32; 4],
 }
 
 /// Byte offset of `Params::present`, for the per-tile partial write.
@@ -758,7 +763,7 @@ impl Renderer {
         level: u8,
         tx: u32,
         ty: u32,
-        dest: [u32; 2],
+        dest: [i32; 2],
         intent: Output,
     ) -> Result<(), EngineError> {
         let (data, lw, lh) = pyramid.level(level).ok_or_else(|| {
@@ -784,12 +789,20 @@ impl Renderer {
         // by `set_edit` and does not move because a different tile is being
         // drawn — writes and submits are ordered on the queue, so this lands
         // before the dispatch that reads it.
-        let present: [u32; 4] = [dest[0], dest[1], self.tile, HALO];
-        gpu.queue.write_buffer(
-            &buffers.params,
-            PRESENT_OFFSET,
-            bytemuck::cast_slice(&present),
-        );
+        // Everything the present pass needs, written as one patch at the tail of
+        // the uniform: where the tile goes, and how much of it is real.
+        let tail: [i32; 8] = [
+            dest[0],
+            dest[1],
+            self.tile as i32,
+            HALO as i32,
+            (lw - ox).min(self.tile) as i32,
+            (lh - oy).min(self.tile) as i32,
+            0,
+            0,
+        ];
+        gpu.queue
+            .write_buffer(&buffers.params, PRESENT_OFFSET, bytemuck::cast_slice(&tail));
 
         let mut encoder = gpu
             .device
@@ -861,7 +874,8 @@ impl Renderer {
                 Some(m) => [m.hue_divisions, m.sat_divisions, m.value_divisions, 0],
                 None => [1, 1, 1, 0],
             },
-            present: [0, 0, self.tile, HALO],
+            present: [0, 0, self.tile as i32, HALO as i32],
+            extent: [self.tile as i32, self.tile as i32, 0, 0],
         };
         gpu.queue
             .write_buffer(&buffers.params, 0, bytemuck::bytes_of(&params));

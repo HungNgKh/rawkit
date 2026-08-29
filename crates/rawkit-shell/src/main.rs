@@ -101,47 +101,20 @@
 
 #[cfg(target_os = "linux")]
 mod canvas;
+mod session_canvas;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use rawkit_editstate::EditState;
-use rawkit_engine::{BayerPhase, CameraProfile, Frame, Gpu, Output, Presenter, Pyramid, Renderer};
-use tauri::{
-    webview::WebviewBuilder, window::WindowBuilder, LogicalPosition, LogicalSize, WebviewUrl,
-    WebviewWindowBuilder,
+use rawkit_engine::{
+    render::DEFAULT_TILE, BayerPhase, CameraProfile, Frame, Gpu, Presenter, Pyramid,
 };
-
-/// Which arrangement to test. `RAWKIT_PROBE_ROUTE=1` for the cutout, anything
-/// else for child webviews.
-///
-/// Route 1 stays in the code after being ruled out on Linux, because it is
-/// reported to work on macOS and Windows and this is how that gets checked
-/// there. A probe that only tests the arrangement you settled on cannot tell
-/// you when the other one starts working.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Route {
-    /// One full-window webview with a transparent hole, wgpu behind it.
-    Cutout,
-    /// A window with no webview of its own, wgpu across it, and the chrome as a
-    /// child webview occupying its own rectangle. Nothing overlaps, so nothing
-    /// needs to be transparent.
-    ChildWebview,
-    /// A native widget packed beside the webview, with the surface on *its* X
-    /// window rather than the toplevel. Nothing is transparent and nothing
-    /// overlaps, and X clips each window's output to its own rectangle.
-    NativeChild,
-}
-
-/// Width of the chrome, in logical pixels. The canvas is everything to the
-/// right of it.
-const PANEL_WIDTH: f64 = 400.0;
-/// Height the chrome keeps in route 3. `default_vbox` is a vertical box, and the
-/// probe needs two disjoint rectangles rather than the final layout.
-///
-/// Linux-only, like route 3 itself: the equivalent on macOS and Windows will be
-/// a child NSView and a child HWND, and those will bring their own geometry.
-#[cfg(target_os = "linux")]
-const PANEL_HEIGHT: i32 = 200;
-const WINDOW: (f64, f64) = (1200.0, 800.0);
+use rawkit_session::{Command, Event, Session};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use tauri::{
+    webview::WebviewBuilder, window::WindowBuilder, LogicalPosition, LogicalSize, Manager,
+    WebviewUrl, WebviewWindowBuilder,
+};
 
 /// Deliberately a colour no UI would ever use, so a screenshot can be checked by
 /// value rather than by eye.
@@ -156,6 +129,67 @@ const PROBE_GREEN: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
+/// Which arrangement to build. `RAWKIT_PROBE_ROUTE=1` for the cutout, `2` for
+/// child webviews, anything else for the native child that actually works.
+///
+/// The first two stay in the code after being ruled out on Linux, because they
+/// are reported to work on macOS and Windows and this is how that gets checked
+/// there. A probe that only tests the arrangement you settled on cannot tell you
+/// when another one starts working.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Route {
+    /// One full-window webview with a transparent hole, wgpu behind it.
+    Cutout,
+    /// A window with no webview of its own and the chrome as a child webview in
+    /// its own rectangle. Nothing overlaps, so nothing needs transparency.
+    ChildWebview,
+    /// A native window for the canvas, created directly rather than borrowed
+    /// from a widget, with the chrome beside it. X clips each to its own
+    /// rectangle and they never contend.
+    NativeChild,
+}
+
+/// Width of the chrome in route 2, in logical pixels.
+const PANEL_WIDTH: f64 = 400.0;
+/// Height the chrome keeps in route 3. `default_vbox` is a vertical box, and two
+/// disjoint rectangles is what the arrangement needs.
+///
+/// Linux-only, like route 3 itself: the equivalents on macOS and Windows will be
+/// a child NSView and a child HWND, and those bring their own geometry.
+#[cfg(target_os = "linux")]
+const PANEL_HEIGHT: i32 = 200;
+const WINDOW: (f64, f64) = (1200.0, 800.0);
+
+/// The session, shared between the page's commands and the render loop.
+///
+/// A mutex rather than a channel because the two sides want different things:
+/// the page wants to apply a command and see the result immediately, and the
+/// loop wants a consistent snapshot. Contention is a lock held for the length of
+/// `apply`, which touches a handful of floats.
+struct Shared(Arc<Mutex<Session>>);
+
+/// The only way the page can change anything.
+///
+/// Note what does *not* cross: the return is an [`Event`], which has no variant
+/// that can hold an image. The page learns that the edit changed and what
+/// generation it is at; the pixels go to the canvas, which the page cannot see.
+#[tauri::command]
+fn apply(state: tauri::State<'_, Shared>, command: Command) -> Event {
+    state.0.lock().expect("session lock").apply(command)
+}
+
+/// What the page needs to draw its own controls: the edit, and where the view is.
+#[tauri::command]
+fn snapshot(state: tauri::State<'_, Shared>) -> serde_json::Value {
+    let session = state.0.lock().expect("session lock");
+    serde_json::json!({
+        "state": session.state(),
+        "viewport": session.viewport(),
+        "image": session.image_size(),
+        "generation": session.generation(),
+    })
+}
+
 fn main() -> Result<()> {
     // Before GTK, before Tauri, before anything opens a display.
     #[cfg(target_os = "linux")]
@@ -166,108 +200,15 @@ fn main() -> Result<()> {
         Ok("2") => Route::ChildWebview,
         _ => Route::NativeChild,
     };
+    let raw = std::env::args().nth(1).map(PathBuf::from);
     eprintln!("route      : {route:?}");
 
     tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![apply, snapshot])
         .setup(move |app| {
-            // The surface is created here, on the main thread, because the raw
-            // window handle comes from GTK on this platform and GTK is not
-            // thread-safe. Drawing afterwards is fine from anywhere.
-            let (gpu, surface, size) = match route {
-                Route::Cutout => {
-                    let builder = WebviewWindowBuilder::new(
-                        app,
-                        "main",
-                        WebviewUrl::App("index.html".into()),
-                    )
-                    .title("rawkit")
-                    .inner_size(WINDOW.0, WINDOW.1);
-                    // A third strike against route 1, found by CI rather than by
-                    // the probe: on macOS `transparent` is behind Tauri's
-                    // `macos-private-api` feature, and using a private API bars
-                    // App Store distribution. So route 1 costs a distribution
-                    // channel even on the platform where it works.
-                    #[cfg(not(target_os = "macos"))]
-                    let builder = builder.transparent(true);
-                    let window = builder.build()?;
-                    let size = window.inner_size()?;
-                    let (gpu, surface) = Gpu::with_surface(window.clone())?;
-                    (gpu, surface, size)
-                }
-                Route::ChildWebview => {
-                    // A window with no webview of its own. The chrome becomes a
-                    // child occupying the left strip, and the GPU gets the rest
-                    // — or rather, gets the whole window and is expected to be
-                    // clipped out of the child's rectangle by X.
-                    let window = WindowBuilder::new(app, "main")
-                        .title("rawkit")
-                        .inner_size(WINDOW.0, WINDOW.1)
-                        .build()?;
-                    let panel = window.add_child(
-                        WebviewBuilder::new("panel", WebviewUrl::App("panel.html".into())),
-                        LogicalPosition::new(0.0, 0.0),
-                        LogicalSize::new(PANEL_WIDTH, WINDOW.1),
-                    )?;
-                    // Restating the bounds is not belt and braces: the size
-                    // given to `add_child` alone left the child filling the
-                    // whole window, which would have made the probe answer a
-                    // question nobody asked.
-                    panel.set_auto_resize(false)?;
-                    panel.set_position(LogicalPosition::new(0.0, 0.0))?;
-                    panel.set_size(LogicalSize::new(PANEL_WIDTH, WINDOW.1))?;
-                    eprintln!("panel      : {:?} (at creation)", panel.bounds()?);
-                    // Try again once the page has loaded, in case the bounds
-                    // are only honoured after the webview exists in earnest.
-                    let later = panel.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(1500));
-                        let _ = later.set_auto_resize(false);
-                        let _ = later.set_position(LogicalPosition::new(0.0, 0.0));
-                        let _ = later.set_size(LogicalSize::new(PANEL_WIDTH, WINDOW.1));
-                        eprintln!("panel      : {:?} (after load)", later.bounds());
-                    });
-                    let size = window.inner_size()?;
-                    let (gpu, surface) = Gpu::with_surface(window.clone())?;
-                    (gpu, surface, size)
-                }
-                #[cfg(target_os = "linux")]
-                Route::NativeChild => {
-                    // A normal Tauri window, webview and all — the difference is
-                    // entirely in where the surface goes.
-                    let window = WebviewWindowBuilder::new(
-                        app,
-                        "main",
-                        WebviewUrl::App("panel.html".into()),
-                    )
-                    .title("rawkit")
-                    .inner_size(WINDOW.0, WINDOW.1)
-                    .build()?;
-                    let canvas = canvas::attach(&window.as_ref().window(), PANEL_HEIGHT)?;
-                    eprintln!("canvas     : X window {canvas:?}");
-                    // The widget reports 2x2 at this point: it has an X window
-                    // but GTK has not laid the window out yet. Size the surface
-                    // from what the layout is *going* to be instead of waiting
-                    // for an allocation — X clips the surface to the widget
-                    // either way, and the probe is asking about clipping, not
-                    // about resize handling.
-                    let outer = window.inner_size()?;
-                    let scale = window.scale_factor()?;
-                    let panel = (PANEL_HEIGHT as f64 * scale) as u32;
-                    let size = tauri::PhysicalSize::new(
-                        outer.width,
-                        outer.height.saturating_sub(panel).max(1),
-                    );
-                    let (gpu, surface) = Gpu::with_surface(canvas)?;
-                    (gpu, surface, size)
-                }
-                #[cfg(not(target_os = "linux"))]
-                Route::NativeChild => {
-                    return Err(anyhow!(
-                        "the native-child canvas is implemented for X11 only so far"
-                    )
-                    .into())
-                }
-            };
+            // The surface is created on the main thread because the raw window
+            // handle comes from GTK on this platform and GTK is not thread-safe.
+            let (gpu, surface, size) = build_window(app, route)?;
             eprintln!(
                 "gpu        : {} ({:?})",
                 gpu.adapter_info.name, gpu.adapter_info.backend
@@ -281,105 +222,196 @@ fn main() -> Result<()> {
             );
             surface.configure(&gpu.device, &config);
 
-            // Set RAWKIT_PROBE_NO_GPU=1 to leave the surface alone. If the page
-            // is red then, the webview works and the question is purely one of
-            // ordering; if it is still blank, the page never loaded and the
-            // compositing result would have been meaningless.
-            if std::env::var_os("RAWKIT_PROBE_NO_GPU").is_some() {
-                eprintln!("paint      : disabled (RAWKIT_PROBE_NO_GPU)");
-                return Ok(());
-            }
-            // Everything from here down is the real path: a frame is rendered
-            // into a Canvas by the engine and blitted to the surface. The clear
-            // colour that the compositing probe used is gone — set
-            // RAWKIT_PROBE_ROUTE and RAWKIT_PROBE_NO_GPU still select the window
-            // arrangement, but what lands in the window is now a picture.
-            let presenter = Presenter::new(&gpu, config.format);
-            let renderer = Renderer::new(&gpu);
-            let canvas = renderer.create_canvas(&gpu, size.width, size.height);
-
-            // A synthetic frame until the shell learns to open a file. It is a
-            // real render through every stage — decode is the only thing missing.
-            let mosaic = test_mosaic(size.width, size.height);
+            // The mosaic outlives everything that borrows it, and there is
+            // exactly one per process. Leaking it is honest about that; the
+            // alternative is a self-referential struct to hold a Vec and a Frame
+            // that points into it.
+            let (mosaic, image, phase, wb, profile) = load_image(raw.as_deref())?;
+            let mosaic: &'static [f32] = Box::leak(mosaic.into_boxed_slice());
             let frame = Frame {
-                data: &mosaic.samples,
-                width: mosaic.width,
-                height: mosaic.height,
-                phase: BayerPhase::Rggb,
-                as_shot_wb: [1.0, 1.0, 1.0],
+                data: mosaic,
+                width: image[0],
+                height: image[1],
+                phase,
+                as_shot_wb: wb,
                 clip_level: 1.0,
-                profile: CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
+                profile,
             };
-            let state = EditState::default();
-            let buffers = renderer.allocate(&gpu, &frame);
-            renderer.set_edit(&gpu, &buffers, &frame, &state)?;
-            let pyramid = Pyramid::build(&frame, rawkit_engine::render::DEFAULT_TILE);
+            let pyramid = Pyramid::build(&frame, DEFAULT_TILE);
 
-            // One pass over every visible tile at 1:1. Progressive refinement,
-            // level selection and the rest of the loop belong with the command
-            // bus; this proves the chain reaches the screen.
-            let level = 0;
-            let (_, level_w, level_h) = pyramid.level(level).expect("level 0 always exists");
-            let tile = rawkit_engine::render::DEFAULT_TILE;
-            let mut tiles = 0;
-            for ty in 0..level_h.div_ceil(tile) {
-                for tx in 0..level_w.div_ceil(tile) {
-                    tiles += 1;
-                    renderer.draw_tile(
-                        &gpu,
-                        &buffers,
-                        &canvas,
-                        &pyramid,
-                        level,
-                        tx,
-                        ty,
-                        [tx * tile, ty * tile],
-                        Output::Display,
-                    )?;
-                }
-            }
-            eprintln!("canvas     : {tiles} tiles at level {level} ({level_w}x{level_h})");
+            let mut session = Session::new(image, DEFAULT_TILE, EditState::default());
+            session.apply(Command::Resize {
+                width: size.width,
+                height: size.height,
+            });
+            session.apply(Command::FitToView);
+            let shared = Arc::new(Mutex::new(session));
+            app.manage(Shared(shared.clone()));
+
+            let mut canvas_renderer =
+                session_canvas::CanvasRenderer::new(&gpu, &frame, [size.width, size.height]);
+            canvas_renderer.target(&gpu, config.format);
 
             // Painting happens on the main thread, driven by GTK's own loop.
             //
             // Not a style preference. Presenting from a spawned thread means two
-            // threads on one Xlib connection, and the failure is not a race that
-            // corrupts an occasional frame — it is `xcb_xlib_threads_sequence_lost`,
-            // an abort inside libxcb. `XInitThreads` would license it, but the
-            // symbol is not linked here and the arrangement would still be the
-            // wrong one: a canvas wants to draw on the compositor's schedule, not
-            // on a sleep. This timer is a step towards GTK's frame clock rather
-            // than the destination.
-            //
-            // The race was always there. Earlier probes presented from a thread
-            // and never aborted, because a static page generates almost no X
-            // traffic; it surfaced the moment the window had a real page and a
-            // real render in it.
+            // threads on one Xlib connection; `XInitThreads` licenses that, but
+            // the arrangement would still be wrong — a canvas wants to draw on
+            // the compositor's schedule, not on a sleep. This timer is a step
+            // towards GTK's frame clock rather than the destination.
+            let surface_size = [size.width, size.height];
             #[cfg(target_os = "linux")]
-            gtk::glib::timeout_add_local(
-                std::time::Duration::from_millis(16),
-                move || match paint(&gpu, &surface, &presenter, &canvas) {
+            gtk::glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                let result = (|| -> Result<()> {
+                    {
+                        let mut session = shared.lock().expect("session lock");
+                        canvas_renderer.advance(
+                            &gpu,
+                            &mut session,
+                            &frame,
+                            &pyramid,
+                            surface_size,
+                        )?;
+                    }
+                    paint(
+                        &gpu,
+                        &surface,
+                        canvas_renderer.presenter(),
+                        canvas_renderer.canvas(),
+                    )
+                })();
+                match result {
                     Ok(()) => gtk::glib::ControlFlow::Continue,
                     Err(e) => {
                         eprintln!("paint: {e}");
                         gtk::glib::ControlFlow::Break
                     }
-                },
-            );
-            // macOS and Windows have no equivalent constraint, and the routes
-            // they are here to probe do not use a native child widget anyway.
-            #[cfg(not(target_os = "linux"))]
-            std::thread::spawn(move || loop {
-                if let Err(e) = paint(&gpu, &surface, &presenter, &canvas) {
-                    eprintln!("paint: {e}");
-                    return;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(16));
             });
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (canvas_renderer, frame, pyramid, surface_size, gpu, surface);
+                eprintln!("paint      : the render loop is implemented for X11 only so far");
+            }
             Ok(())
         })
         .run(tauri::generate_context!())?;
     Ok(())
+}
+
+/// Build the window for the chosen arrangement and put a surface on it.
+#[allow(clippy::type_complexity)]
+fn build_window(
+    app: &tauri::App,
+    route: Route,
+) -> Result<(Gpu, wgpu::Surface<'static>, tauri::PhysicalSize<u32>)> {
+    match route {
+        Route::Cutout => {
+            let builder =
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                    .title("rawkit")
+                    .inner_size(WINDOW.0, WINDOW.1);
+            // A third strike against route 1, found by CI rather than by the
+            // probe: on macOS `transparent` is behind Tauri's
+            // `macos-private-api` feature, and shipping a private API bars App
+            // Store distribution. So route 1 costs a distribution channel even
+            // on the platform where it works.
+            #[cfg(not(target_os = "macos"))]
+            let builder = builder.transparent(true);
+            let window = builder.build()?;
+            let size = window.inner_size()?;
+            let (gpu, surface) = Gpu::with_surface(window.clone())?;
+            Ok((gpu, surface, size))
+        }
+        Route::ChildWebview => {
+            let window = WindowBuilder::new(app, "main")
+                .title("rawkit")
+                .inner_size(WINDOW.0, WINDOW.1)
+                .build()?;
+            let panel = window.add_child(
+                WebviewBuilder::new("panel", WebviewUrl::App("panel.html".into())),
+                LogicalPosition::new(0.0, 0.0),
+                LogicalSize::new(PANEL_WIDTH, WINDOW.1),
+            )?;
+            panel.set_auto_resize(false)?;
+            panel.set_position(LogicalPosition::new(0.0, 0.0))?;
+            panel.set_size(LogicalSize::new(PANEL_WIDTH, WINDOW.1))?;
+            eprintln!(
+                "panel      : {:?} (ignored on Linux; see the module docs)",
+                panel.bounds()?
+            );
+            let size = window.inner_size()?;
+            let (gpu, surface) = Gpu::with_surface(window.clone())?;
+            Ok((gpu, surface, size))
+        }
+        #[cfg(target_os = "linux")]
+        Route::NativeChild => {
+            let window =
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("panel.html".into()))
+                    .title("rawkit")
+                    .inner_size(WINDOW.0, WINDOW.1)
+                    .build()?;
+            let canvas = canvas::attach(&window.as_ref().window(), PANEL_HEIGHT)?;
+            eprintln!("canvas     : X window {canvas:?}");
+            let outer = window.inner_size()?;
+            let scale = window.scale_factor()?;
+            let panel = (PANEL_HEIGHT as f64 * scale) as u32;
+            let size =
+                tauri::PhysicalSize::new(outer.width, outer.height.saturating_sub(panel).max(1));
+            let (gpu, surface) = Gpu::with_surface(canvas)?;
+            Ok((gpu, surface, size))
+        }
+        #[cfg(not(target_os = "linux"))]
+        Route::NativeChild => Err(anyhow!(
+            "the native-child canvas is implemented for X11 only so far"
+        )),
+    }
+}
+
+/// Decode a RAW, or synthesise one when no file was given.
+#[allow(clippy::type_complexity)]
+fn load_image(
+    path: Option<&std::path::Path>,
+) -> Result<(Vec<f32>, [u32; 2], BayerPhase, [f32; 3], CameraProfile)> {
+    let Some(path) = path else {
+        eprintln!("image      : no file given, using a synthetic mosaic");
+        let (width, height) = (2048u32, 1365u32);
+        return Ok((
+            test_mosaic(width, height),
+            [width & !1, height & !1],
+            BayerPhase::Rggb,
+            [1.0, 1.0, 1.0],
+            CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
+        ));
+    };
+
+    let raw =
+        rawkit_decode::decode_file(path).with_context(|| format!("decoding {}", path.display()))?;
+    let phase = BayerPhase::from_cfa(raw.cfa).ok_or_else(|| {
+        anyhow!(
+            "{:?} is not a Bayer sensor; RCD cannot demosaic it",
+            raw.cfa
+        )
+    })?;
+    eprintln!(
+        "image      : {} {} · {}x{} · {:?}",
+        raw.camera.make, raw.camera.model, raw.width, raw.height, raw.cfa
+    );
+    // The decoder's own matrix, treated as a single D65 illuminant. Defensible
+    // and not accurate; a .dcp is what makes it accurate, and the shell has
+    // nowhere to ask for one yet.
+    let profile = if raw.cam_to_xyz.iter().flatten().all(|&v| v == 0.0) {
+        CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY)
+    } else {
+        CameraProfile::from_color_matrix([raw.cam_to_xyz[0], raw.cam_to_xyz[1], raw.cam_to_xyz[2]])
+    };
+    let wb = [
+        raw.as_shot_neutral[0],
+        raw.as_shot_neutral[1],
+        raw.as_shot_neutral[2],
+    ];
+    let size = [raw.width, raw.height];
+    Ok((rawkit_engine::normalise(&raw), size, phase, wb, profile))
 }
 
 /// Blit the canvas to the surface and present. Repeated at ~30Hz rather than
@@ -435,16 +467,10 @@ fn paint(
 
 /// A Bayer mosaic of a scene with structure at every scale.
 ///
-/// Stands in for a decoded RAW until the shell learns to open one. Everything
-/// downstream of it is the real pipeline, so what appears in the window is a
-/// genuine render rather than a picture of one.
-struct TestMosaic {
-    samples: Vec<f32>,
-    width: u32,
-    height: u32,
-}
-
-fn test_mosaic(width: u32, height: u32) -> TestMosaic {
+/// For running the shell with no file to hand. Everything downstream of it is
+/// the real pipeline, so what appears in the window is a genuine render either
+/// way — only the sensor is imaginary.
+fn test_mosaic(width: u32, height: u32) -> Vec<f32> {
     // Even dimensions: an odd one would put the last row or column on the wrong
     // half of a CFA block.
     let (width, height) = (width & !1, height & !1);
@@ -465,9 +491,5 @@ fn test_mosaic(width: u32, height: u32) -> TestMosaic {
             samples.push(rgb[channel]);
         }
     }
-    TestMosaic {
-        samples,
-        width,
-        height,
-    }
+    samples
 }

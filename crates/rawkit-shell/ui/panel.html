@@ -1,19 +1,139 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>rawkit panel</title>
+<title>rawkit</title>
 <style>
-  /* Fills its own rectangle. Route 2 needs no transparency anywhere: the panel
-     and the canvas never overlap, which is the whole idea being tested. */
-  html, body { margin: 0; height: 100%; background: rgb(255, 0, 0); }
-  /* Same repaint forcing as index.html: a static page paints once, loses, and
-     stays lost, which reads as a stable z-order. */
-  @keyframes nudge { from { opacity: 0.996; } to { opacity: 1; } }
-  body { animation: nudge 0.05s infinite alternate; }
-  main { color: white; font: 14px system-ui, sans-serif; padding: 16px; }
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #1e1e22; color: #e8e8ea;
+               font: 13px/1.4 system-ui, sans-serif; }
+  main { padding: 14px 18px; display: flex; gap: 28px; align-items: flex-start; }
+  section { min-width: 260px; }
+  h1 { font-size: 13px; font-weight: 600; margin: 0 0 10px; letter-spacing: .02em; }
+  label { display: flex; align-items: center; gap: 10px; margin: 7px 0; }
+  label span:first-child { width: 74px; color: #9a9aa2; }
+  input[type=range] { flex: 1; }
+  output { width: 56px; text-align: right; font-variant-numeric: tabular-nums; }
+  button { background: #303038; color: inherit; border: 1px solid #45454f;
+           border-radius: 5px; padding: 4px 11px; font: inherit; cursor: pointer; }
+  button:hover { background: #3a3a44; }
+  .row { display: flex; gap: 7px; margin-top: 10px; }
+  #log { color: #7d7d87; margin-top: 12px; font-variant-numeric: tabular-nums; }
+  #log.refused { color: #e0705f; }
 </style>
+
 <main>
-  <strong>webview child</strong>
-  <p>Opaque red, in its own window rather than over the whole one.</p>
-  <p>If this survives while the rest is green, X is clipping the parent's
-     drawing to exclude this child and the two layers never contend.</p>
+  <section>
+    <h1>Tone</h1>
+    <label><span>Exposure</span>
+      <input id="exposure" type="range" min="-4" max="4" step="0.01" value="0">
+      <output id="exposure-value">0.00</output></label>
+    <label><span>Contrast</span>
+      <input id="contrast" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="contrast-value">0.00</output></label>
+  </section>
+
+  <section>
+    <h1>White balance</h1>
+    <label><span>Temp</span>
+      <input id="temperature" type="range" min="2000" max="12000" step="10" value="5500">
+      <output id="temperature-value">as shot</output></label>
+    <label><span>Tint</span>
+      <input id="tint" type="range" min="-100" max="100" step="1" value="0">
+      <output id="tint-value">0</output></label>
+    <div class="row"><button id="as-shot">As shot</button></div>
+  </section>
+
+  <section>
+    <h1>View</h1>
+    <div class="row">
+      <button data-zoom="0.5">−</button>
+      <button data-fit>Fit</button>
+      <button data-zoom="1" data-absolute>1:1</button>
+      <button data-zoom="2">+</button>
+    </div>
+    <div class="row">
+      <button data-pan="-200,0">←</button>
+      <button data-pan="0,-200">↑</button>
+      <button data-pan="0,200">↓</button>
+      <button data-pan="200,0">→</button>
+    </div>
+    <div id="log">ready</div>
+  </section>
 </main>
+
+<script type="module">
+  // The whole of the UI's contract with the engine. Commands go down, events
+  // come back; no pixels cross in either direction, and there is no API here
+  // that could carry one.
+  const invoke = window.__TAURI__.core.invoke;
+  const log = document.getElementById("log");
+
+  let scale = 1;
+
+  async function send(command) {
+    const event = await invoke("apply", { command });
+    log.className = event.event === "refused" ? "refused" : "";
+    log.textContent =
+      event.event === "refused"
+        ? `refused ${event.command}: ${event.reason}`
+        : event.event === "edit_changed"
+          ? `edit ${event.generation}`
+          : "view changed";
+    return event;
+  }
+
+  // A drag emits far more commands than the GPU renders frames. That is fine
+  // and deliberate: the session has no queue, so the extra ones cost a lock and
+  // a float each, and only the last one is ever rendered.
+  const slider = (id, build, format) => {
+    const input = document.getElementById(id);
+    const out = document.getElementById(id + "-value");
+    input.addEventListener("input", () => {
+      const value = parseFloat(input.value);
+      out.textContent = format(value);
+      send(build(value));
+    });
+  };
+
+  slider("exposure", v => ({ command: "set_exposure", params: v }), v => v.toFixed(2));
+  slider("contrast", v => ({ command: "set_contrast", params: v }), v => v.toFixed(2));
+  slider("temperature", v => ({ command: "set_temperature", params: v }), v => `${v | 0} K`);
+  slider("tint", v => ({ command: "set_tint", params: v }), v => `${v | 0}`);
+
+  document.getElementById("as-shot").addEventListener("click", () => {
+    document.getElementById("temperature-value").textContent = "as shot";
+    send({ command: "set_temperature", params: null });
+  });
+
+  for (const button of document.querySelectorAll("[data-zoom]")) {
+    button.addEventListener("click", async () => {
+      const factor = parseFloat(button.dataset.zoom);
+      scale = button.hasAttribute("data-absolute") ? factor : scale * factor;
+      // Anchor at the centre of the canvas: these are buttons, so there is no
+      // cursor to hold still.
+      const { viewport } = await invoke("snapshot");
+      await send({
+        command: "zoom_to",
+        params: { scale, anchor: [viewport.size[0] / 2, viewport.size[1] / 2] },
+      });
+    });
+  }
+
+  document.querySelector("[data-fit]").addEventListener("click", async () => {
+    await send({ command: "fit_to_view" });
+    scale = (await invoke("snapshot")).viewport.scale;
+  });
+
+  for (const button of document.querySelectorAll("[data-pan]")) {
+    const [dx, dy] = button.dataset.pan.split(",").map(Number);
+    button.addEventListener("click", () => send({ command: "pan", params: { dx, dy } }));
+  }
+
+  // Pointer input over the *canvas* does not reach this page: the canvas is its
+  // own X window, which is exactly what stops it fighting the webview. Drag and
+  // scroll therefore need native event handling on that window, and until then
+  // the view is driven by these buttons.
+  invoke("snapshot").then(s => {
+    scale = s.viewport.scale;
+    log.textContent = `${s.image[0]}x${s.image[1]}`;
+  });
+</script>
