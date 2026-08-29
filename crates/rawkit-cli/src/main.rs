@@ -79,6 +79,16 @@ enum Command {
     /// which backend and driver produced a given render is the first thing any
     /// cross-platform divergence report needs.
     Gpu,
+
+    /// Open or create a catalog, and report what it is.
+    ///
+    /// Creating one applies every migration, takes a backup on close, and
+    /// refuses the file outright if it fails SQLite's integrity check — so this
+    /// is also how to check that a catalog is sound before trusting it.
+    Catalog {
+        /// The catalog file. Created if it does not exist.
+        path: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -111,6 +121,30 @@ fn main() -> Result<()> {
             profile,
             exposure,
         } => render::render(&input, &output, max_dim, tile, profile.as_deref(), exposure)?,
+        Command::Catalog { path } => {
+            let catalog = rawkit_catalog::db::Catalog::open(&path)?;
+            println!("path       : {}", path.display());
+            println!(
+                "schema     : v{} of v{}",
+                catalog.version()?,
+                rawkit_catalog::SCHEMA_VERSION
+            );
+            println!("journal    : {}", catalog.journal_mode());
+            match catalog.backup_dir() {
+                Some(dir) => {
+                    let existing = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+                    println!(
+                        "backups    : {} ({existing} kept, {} max)",
+                        dir.display(),
+                        rawkit_catalog::backup::KEEP
+                    );
+                }
+                None => println!("backups    : none"),
+            }
+            // Dropping the catalog is what writes the backup, so say so after.
+            drop(catalog);
+            println!("closed     : backup written");
+        }
         Command::Gpu => {
             let gpu = rawkit_engine::Gpu::new()?;
             let info = &gpu.adapter_info;

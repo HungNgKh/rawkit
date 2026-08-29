@@ -16,6 +16,7 @@ path = "src/main.rs"
 rawkit-editstate.workspace = true
 rawkit-decode.workspace = true
 rawkit-engine.workspace = true
+rawkit-catalog.workspace = true
 rawkit-export.workspace = true
 clap.workspace = true
 anyhow.workspace = true
