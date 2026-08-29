@@ -101,7 +101,8 @@ fn real_preview(gpu: &Gpu, raw: &Path, longest_edge: u32) -> (Vec<u8>, u32, u32)
             &rawkit_editstate::EditState::default(),
             rawkit_engine::Output::Display,
         )
-        .expect("render");
+        .expect("render")
+        .pixels;
 
     // Area-averaged to the exact target. A local copy of what the preview
     // builder does, because this is a fixture generator and the alternative is

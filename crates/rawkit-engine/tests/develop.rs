@@ -52,7 +52,8 @@ fn develop(gpu: &Gpu, renderer: &Renderer, value: f32, state: &EditState) -> [f3
             state,
             Output::Display,
         )
-        .expect("render failed");
+        .expect("render failed")
+        .pixels;
     let i = ((N / 2 * N + N / 2) * 4) as usize;
     [out[i], out[i + 1], out[i + 2]]
 }
@@ -179,7 +180,8 @@ fn white_balance_multiplies_channels_independently() {
             &EditState::default(),
             Output::Display,
         )
-        .expect("render failed");
+        .expect("render failed")
+        .pixels;
     let i = ((N / 2 * N + N / 2) * 4) as usize;
 
     for (c, m) in wb.iter().enumerate() {
@@ -228,7 +230,8 @@ fn setting_a_temperature_warms_or_cools_the_render() {
                 &state,
                 Output::Display,
             )
-            .expect("render failed");
+            .expect("render failed")
+            .pixels;
         let i = ((N / 2 * N + N / 2) * 4) as usize;
         [out[i], out[i + 1], out[i + 2]]
     };

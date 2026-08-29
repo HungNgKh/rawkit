@@ -56,7 +56,8 @@ fn render(gpu: &Gpu, camera: [f32; 3], wb: [f32; 3], clip: f32) -> [f32; 3] {
             &EditState::default(),
             Output::Display,
         )
-        .expect("render failed");
+        .expect("render failed")
+        .pixels;
     let i = ((N / 2 * N + N / 2) * 4) as usize;
     [out[i], out[i + 1], out[i + 2]]
 }

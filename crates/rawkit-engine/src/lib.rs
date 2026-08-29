@@ -23,6 +23,7 @@
 
 use rawkit_editstate::EditState;
 
+pub mod geometry;
 pub mod pipeline;
 pub mod present;
 pub mod preview;
@@ -30,12 +31,14 @@ pub mod profile;
 pub mod render;
 mod tone;
 
+pub use geometry::Geometry;
 pub use pipeline::{Domain, Stage};
 pub use present::Presenter;
 pub use preview::{Cell, PreviewBlit, PreviewImage};
 pub use profile::CameraProfile;
 pub use render::{
-    normalise, BayerPhase, Canvas, Frame, Output, Pyramid, Renderer, TileBuffers, CANVAS_FORMAT,
+    normalise, BayerPhase, Canvas, Frame, Output, Pyramid, Rendered, Renderer, TileBuffers,
+    CANVAS_FORMAT,
 };
 
 /// Failures the engine can produce that are not programmer error.

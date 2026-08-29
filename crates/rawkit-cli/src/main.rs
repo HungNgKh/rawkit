@@ -66,32 +66,8 @@ enum Command {
         /// can be — Adobe's are not redistributable.
         #[arg(long)]
         profile: Option<PathBuf>,
-        /// Exposure in stops, applied in scene-linear light before the tone map.
-        ///
-        /// The `signal` line this command prints says how far the frame sits
-        /// from clipping, which is the number to set this from: a file peaking
-        /// at -1.2 EV has that much room before anything blows.
-        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
-        exposure: f32,
-        /// Contrast, about middle grey. -1 to 1.
-        ///
-        /// This and the four below are display-referred: they shape what the
-        /// tone map produced, rather than how much light there was. Whites and
-        /// blacks are the two that clip.
-        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
-        contrast: f32,
-        /// Highlights. Negative recovers, -1 to 1.
-        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
-        highlights: f32,
-        /// Shadows. Positive opens them, -1 to 1.
-        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
-        shadows: f32,
-        /// White point. Positive blows the brightest values to white, -1 to 1.
-        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
-        whites: f32,
-        /// Black point. Negative crushes the darkest values to black, -1 to 1.
-        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
-        blacks: f32,
+        #[command(flatten)]
+        edit: EditFlags,
     },
 
     /// Render the edits you made, into files you can send someone.
@@ -215,26 +191,14 @@ fn main() -> Result<()> {
             max_dim,
             tile,
             profile,
-            exposure,
-            contrast,
-            highlights,
-            shadows,
-            whites,
-            blacks,
+            edit,
         } => render::render(
             &input,
             &output,
             max_dim,
             tile,
             profile.as_deref(),
-            rawkit_editstate::Tone {
-                exposure_ev: exposure,
-                contrast,
-                highlights,
-                shadows,
-                whites,
-                blacks,
-            },
+            &edit.state()?,
         )?,
         Command::Catalog {
             path,
@@ -459,4 +423,123 @@ fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+/// The edit, as command-line flags.
+///
+/// Grouped rather than passed as eight arguments, which is what clippy objected
+/// to and it was right: these are one thing — a description of how to develop
+/// the frame — and they belong together for the same reason `EditState` does.
+#[derive(clap::Args, Debug)]
+pub struct EditFlags {
+    /// Exposure in stops, applied in scene-linear light before the tone map.
+    ///
+    /// The `signal` line this command prints says how far the frame sits
+    /// from clipping, which is the number to set this from: a file peaking
+    /// at -1.2 EV has that much room before anything blows.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    exposure: f32,
+    /// Contrast, about middle grey. -1 to 1.
+    ///
+    /// This and the four below are display-referred: they shape what the
+    /// tone map produced, rather than how much light there was. Whites and
+    /// blacks are the two that clip.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    contrast: f32,
+    /// Highlights. Negative recovers, -1 to 1.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    highlights: f32,
+    /// Shadows. Positive opens them, -1 to 1.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    shadows: f32,
+    /// White point. Positive blows the brightest values to white, -1 to 1.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    whites: f32,
+    /// Black point. Negative crushes the darkest values to black, -1 to 1.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    blacks: f32,
+    /// Rotate in 90-degree steps clockwise: 0, 90, 180 or 270.
+    ///
+    /// Applied before the crop, so a crop is always read in the frame you
+    /// are looking at.
+    #[arg(long, default_value_t = 0)]
+    rotate: u32,
+    /// Keep only this rectangle, as fractions of the rotated frame:
+    /// `left,top,right,bottom`, each from 0 to 1.
+    ///
+    /// Fractions rather than pixels because the same numbers have to be
+    /// right for a full-resolution export and for a thumbnail.
+    #[arg(long, value_name = "L,T,R,B")]
+    crop: Option<String>,
+}
+
+impl EditFlags {
+    /// The edit these flags describe.
+    ///
+    /// Parsed and refused here, before anything reads a file: a mistyped
+    /// rotation should not cost a two-second decode of a 24 MP frame before it
+    /// is reported.
+    pub fn state(&self) -> anyhow::Result<rawkit_editstate::EditState> {
+        use anyhow::{anyhow, bail};
+        use rawkit_editstate::{EditState, Orientation, Tone};
+
+        if !self.exposure.is_finite() {
+            bail!("exposure must be a finite number of stops");
+        }
+        for (name, value) in [
+            ("contrast", self.contrast),
+            ("highlights", self.highlights),
+            ("shadows", self.shadows),
+            ("whites", self.whites),
+            ("blacks", self.blacks),
+        ] {
+            if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
+                bail!("{name} runs from -1 to 1; got {value}");
+            }
+        }
+        let orientation = match self.rotate {
+            0 => Orientation::AsShot,
+            90 => Orientation::Rotate90Cw,
+            180 => Orientation::Rotate180,
+            270 => Orientation::Rotate270Cw,
+            other => bail!("--rotate takes 0, 90, 180 or 270; got {other}"),
+        };
+        let crop = match self.crop.as_deref() {
+            Some(text) => parse_crop(text)?,
+            None => rawkit_editstate::Crop::default(),
+        };
+        crop.validate().map_err(|e| anyhow!("{e}; see --crop"))?;
+
+        Ok(EditState {
+            tone: Tone {
+                exposure_ev: self.exposure,
+                contrast: self.contrast,
+                highlights: self.highlights,
+                shadows: self.shadows,
+                whites: self.whites,
+                blacks: self.blacks,
+            },
+            orientation,
+            crop,
+            ..Default::default()
+        })
+    }
+}
+
+/// `left,top,right,bottom`, each a fraction of the rotated frame.
+fn parse_crop(text: &str) -> anyhow::Result<rawkit_editstate::Crop> {
+    use anyhow::{anyhow, Context};
+    let parts: Vec<&str> = text.split(',').map(str::trim).collect();
+    let [left, top, right, bottom] = <[&str; 4]>::try_from(parts.as_slice())
+        .map_err(|_| anyhow!("--crop takes four fractions, `left,top,right,bottom`"))?;
+    let number = |name: &str, text: &str| -> anyhow::Result<f32> {
+        text.parse::<f32>()
+            .with_context(|| format!("--crop {name} is `{text}`, which is not a number"))
+    };
+    Ok(rawkit_editstate::Crop {
+        left: number("left", left)?,
+        top: number("top", top)?,
+        right: number("right", right)?,
+        bottom: number("bottom", bottom)?,
+    })
 }

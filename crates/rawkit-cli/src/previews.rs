@@ -223,7 +223,7 @@ fn one(
         height,
         ..frame
     };
-    let rgba = renderer.run(gpu, &reduced, state, Output::Display)?;
+    let developed = renderer.run(gpu, &reduced, state, Output::Display)?;
     lap("render", &mut clock);
 
     // Largest first, each one resampled from the previous rather than from the
@@ -233,7 +233,8 @@ fn one(
     let mut order: Vec<Level> = levels.to_vec();
     order.sort_by_key(|l| std::cmp::Reverse(l.longest_edge().unwrap_or(u32::MAX)));
 
-    let mut source = (rgba, width, height);
+    // The developed size, which a crop makes different from the reduced frame's.
+    let mut source = (developed.pixels, developed.width, developed.height);
     let mut built = Vec::new();
     for wanted in order {
         let edge = wanted.longest_edge().unwrap_or(source.1.max(source.2));

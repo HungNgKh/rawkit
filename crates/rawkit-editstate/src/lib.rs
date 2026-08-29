@@ -18,7 +18,8 @@
 //!
 //! # Scope right now
 //!
-//! Only the parameters P0 actually renders: white balance and the tone block.
+//! Only the parameters the renderer actually honours: white balance, the tone
+//! block, and the geometry — orientation and crop.
 //! Fields are added as the renderer learns to honour them — an `EditState` field
 //! that nothing renders is a lie the whole codebase has to keep.
 
@@ -40,6 +41,8 @@ pub enum EditStateError {
     UnsupportedVersion { found: u32 },
     #[error("serialisation failed: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("crop is not a rectangle: {0}")]
+    InvalidCrop(String),
 }
 
 /// How the image should be rendered. `Default` is the identity edit: the photo
@@ -55,6 +58,8 @@ pub struct EditState {
     pub tone: Tone,
     #[serde(default)]
     pub orientation: Orientation,
+    #[serde(default)]
+    pub crop: Crop,
 }
 
 fn default_schema_version() -> u32 {
@@ -68,6 +73,7 @@ impl Default for EditState {
             white_balance: WhiteBalance::default(),
             tone: Tone::default(),
             orientation: Orientation::default(),
+            crop: Crop::default(),
         }
     }
 }
@@ -76,9 +82,15 @@ impl EditState {
     /// Stable content hash, used as the cache key for rendered previews.
     ///
     /// Stability matters more than speed here: this value is written to disk and
-    /// compared against on later runs, possibly by a later build. It is derived
-    /// from the serialised form so that adding a field with a default does not
-    /// invalidate every cached preview in an existing catalogue.
+    /// compared against on later runs, possibly by a later build.
+    ///
+    /// It is derived from the serialised form, so **adding a field rebuilds
+    /// every cached preview once**, even for photographs whose rendering did not
+    /// change. (This comment used to claim the opposite; adding `crop` is what
+    /// showed it was wrong.) That is the right trade: the alternative is
+    /// omitting defaults from the JSON, which would make the schema — shared
+    /// artifact #1, consumed from outside this workspace — inconsistent about
+    /// which fields exist, to save a rebuild that happens once per release.
     pub fn content_hash(&self) -> String {
         let canonical = serde_json::to_vec(self).expect("EditState is always serialisable");
         blake3::hash(&canonical).to_hex().to_string()
@@ -93,6 +105,7 @@ impl EditState {
                 found: self.schema_version,
             });
         }
+        self.crop.validate()?;
         Ok(())
     }
 
@@ -155,6 +168,79 @@ impl Default for Tone {
             whites: 0.0,
             blacks: 0.0,
         }
+    }
+}
+
+/// The visible rectangle, as fractions of the oriented frame.
+///
+/// # Why fractions
+///
+/// A crop outlives the pixels it was drawn on. The same edit is applied to a
+/// full-resolution export, to a 2560-pixel preview and to a thumbnail, and
+/// eventually to a smart preview that is not the original size at all —
+/// fractions mean one number is right for all of them, where pixel coordinates
+/// would need a scale factor carried alongside and would be wrong the moment
+/// somebody forgot it.
+///
+/// # Why it is in *oriented* coordinates
+///
+/// [`Orientation`] is applied first, then this. That is what makes rotating a
+/// cropped photograph rotate the crop with it, which is what every editor does
+/// and what a user expects — and it means the rectangle the interface drew is
+/// the rectangle that gets stored, with no frame conversion in between to get
+/// backwards.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Crop {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+impl Default for Crop {
+    /// The whole frame.
+    fn default() -> Self {
+        Self {
+            left: 0.0,
+            top: 0.0,
+            right: 1.0,
+            bottom: 1.0,
+        }
+    }
+}
+
+impl Crop {
+    /// Whether this is the whole frame, and so has nothing to do.
+    pub fn is_full_frame(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Refused rather than clamped, unlike the tone sliders.
+    ///
+    /// A slider outside its range has an obvious nearest meaning. A rectangle
+    /// whose right edge is left of its left edge does not: clamping it would
+    /// invent a crop the user never asked for and render it as though they had.
+    pub fn validate(&self) -> Result<(), EditStateError> {
+        for (name, value) in [
+            ("left", self.left),
+            ("top", self.top),
+            ("right", self.right),
+            ("bottom", self.bottom),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(EditStateError::InvalidCrop(format!(
+                    "{name} is {value}, and every edge is a fraction from 0 to 1"
+                )));
+            }
+        }
+        if self.left >= self.right || self.top >= self.bottom {
+            return Err(EditStateError::InvalidCrop(format!(
+                "left {} must be less than right {}, and top {} less than bottom {}",
+                self.left, self.right, self.top, self.bottom
+            )));
+        }
+        Ok(())
     }
 }
 

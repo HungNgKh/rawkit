@@ -244,7 +244,8 @@ fn renders_match_the_committed_references() {
                 &(case.state)(),
                 Output::Display,
             )
-            .expect("render failed");
+            .expect("render failed")
+            .pixels;
 
         let actual = to_16bit(&rendered);
         let digest = blake3::hash(bytemuck::cast_slice(&actual));

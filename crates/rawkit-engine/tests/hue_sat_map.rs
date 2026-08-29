@@ -89,7 +89,8 @@ fn render_colour(gpu: &Gpu, profile: &CameraProfile, camera_rgb: [f32; 3]) -> [f
             &EditState::default(),
             Output::Display,
         )
-        .expect("render failed");
+        .expect("render failed")
+        .pixels;
     let i = ((N / 2 * N + N / 2) * 4) as usize;
     [out[i], out[i + 1], out[i + 2]]
 }

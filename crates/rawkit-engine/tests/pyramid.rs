@@ -79,7 +79,8 @@ fn a_level_zero_tile_is_identical_to_the_whole_image_render() {
 
     let whole = renderer
         .run(&gpu, &image, &state, Output::Display)
-        .expect("whole-image render");
+        .expect("whole-image render")
+        .pixels;
 
     let pyramid = Pyramid::build(&image, TILE);
     let buffers = renderer.allocate(&gpu, &image);
@@ -171,7 +172,8 @@ fn a_coarse_tile_shows_the_same_photograph() {
 
     let whole = renderer
         .run(&gpu, &image, &state, Output::Display)
-        .expect("whole-image render");
+        .expect("whole-image render")
+        .pixels;
     let pyramid = Pyramid::build(&image, TILE);
     let buffers = renderer.allocate(&gpu, &image);
     renderer

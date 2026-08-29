@@ -54,7 +54,7 @@
 //! handful of tiles rather than ninety-two.
 
 use crate::profile::{CameraProfile, Matrix3};
-use crate::{EngineError, Gpu};
+use crate::{EngineError, Geometry, Gpu};
 use rawkit_editstate::EditState;
 
 /// Which colour sits at pixel (0,0). Bayer only: RCD is a Bayer algorithm, and
@@ -235,6 +235,21 @@ struct Params {
 /// writes a tile's position over somebody else's uniform — which shows up as a
 /// wrong-looking picture, not as an error.
 const PRESENT_OFFSET: u64 = std::mem::offset_of!(Params, present) as u64;
+
+/// A developed photograph: the pixels, and how wide they are.
+///
+/// The two travel together because they are only correct together. Before crop
+/// existed a caller could reasonably assume the result was the sensor's size;
+/// now that assumption is wrong exactly when someone has cropped, which is the
+/// case least likely to be tried before shipping. Handing back a width makes the
+/// mistake impossible rather than unlikely.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rendered {
+    /// Interleaved RGBA, `width * height * 4` long.
+    pub pixels: Vec<f32>,
+    pub width: u32,
+    pub height: u32,
+}
 
 /// What the caller wants back.
 ///
@@ -540,7 +555,7 @@ impl Renderer {
         image: &Frame<'_>,
         state: &EditState,
         intent: Output,
-    ) -> Result<Vec<f32>, EngineError> {
+    ) -> Result<Rendered, EngineError> {
         state.validate()?;
         let (w, h) = (image.width as usize, image.height as usize);
         if image.data.len() != w * h {
@@ -581,7 +596,17 @@ impl Renderer {
             }
         }
 
-        Ok(result)
+        // Geometry last, and outside the tile loop: orientation and crop select
+        // and permute, so they compose with a finished frame rather than with
+        // each tile — and doing it here is what keeps a cropped export
+        // bit-identical to the same region of an uncropped one.
+        let (pixels, [width, height]) =
+            Geometry::new(state).apply(&result, [image.width, image.height]);
+        Ok(Rendered {
+            pixels,
+            width,
+            height,
+        })
     }
 
     /// Render one tile of a [`Pyramid`], at that tile's resolution level.

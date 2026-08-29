@@ -33,25 +33,8 @@ pub fn render(
     max_dim: u32,
     tile: u32,
     profile_path: Option<&Path>,
-    tone: rawkit_editstate::Tone,
+    state: &EditState,
 ) -> Result<()> {
-    if !tone.exposure_ev.is_finite() {
-        bail!("exposure must be a finite number of stops");
-    }
-    // The renderer clamps these anyway, at the boundary where it has to. Saying
-    // so here is the difference between a slider that silently did something
-    // else and one that told you what you asked for was out of range.
-    for (name, value) in [
-        ("contrast", tone.contrast),
-        ("highlights", tone.highlights),
-        ("shadows", tone.shadows),
-        ("whites", tone.whites),
-        ("blacks", tone.blacks),
-    ] {
-        if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
-            bail!("{name} runs from -1 to 1; got {value}");
-        }
-    }
     let raw = rawkit_decode::decode_file(input)
         .with_context(|| format!("decoding {}", input.display()))?;
     eprintln!(
@@ -151,10 +134,6 @@ pub fn render(
     // As-shot white balance and whatever exposure the caller asked for.
     // Everything else the renderer does comes from the frame itself, which is
     // what makes the default a baseline worth looking at.
-    let state = EditState {
-        tone,
-        ..Default::default()
-    };
     let renderer = Renderer::with_tile_size(&gpu, tile);
     let frame = Frame {
         data: &mosaic,
@@ -172,17 +151,19 @@ pub fn render(
     };
     let (temperature, tint) = frame.as_shot_temperature();
     eprintln!("as-shot    : {temperature:.0} K, tint {tint:+.0}");
-    let rgba = renderer.run(&gpu, &frame, &state, Output::Display)?;
+    let developed = renderer.run(&gpu, &frame, state, Output::Display)?;
+    if developed.width != raw.width || developed.height != raw.height {
+        eprintln!(
+            "geometry   : {}x{} after orientation and crop",
+            developed.width, developed.height
+        );
+    }
 
-    let step = downsample_step(raw.width, raw.height, max_dim);
-    let (scaled, out_w, out_h) = downsample(&rgba, raw.width, raw.height, step);
+    let step = downsample_step(developed.width, developed.height, max_dim);
+    let (scaled, out_w, out_h) =
+        downsample(&developed.pixels, developed.width, developed.height, step);
     write_image(output, &scaled, out_w, out_h)?;
-    eprintln!(
-        "wrote      : {} ({}x{})",
-        output.display(),
-        raw.width / step,
-        raw.height / step
-    );
+    eprintln!("wrote      : {} ({out_w}x{out_h})", output.display());
     Ok(())
 }
 

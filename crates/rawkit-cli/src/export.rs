@@ -185,9 +185,13 @@ fn one(
     };
 
     // Level zero, the whole frame. No pyramid, no averaging.
-    let rgba = renderer.run(gpu, &frame, state, Output::Display)?;
-    let step = crate::render::downsample_step(raw.width, raw.height, max_dim);
-    let (scaled, width, height) = crate::render::downsample(&rgba, raw.width, raw.height, step);
+    let developed = renderer.run(gpu, &frame, state, Output::Display)?;
+    // The *developed* size, not the sensor's: a cropped frame that asked for a
+    // 2000-pixel edge would otherwise be scaled by the factor its uncropped
+    // version needed, and come out smaller than requested.
+    let step = crate::render::downsample_step(developed.width, developed.height, max_dim);
+    let (scaled, width, height) =
+        crate::render::downsample(&developed.pixels, developed.width, developed.height, step);
     let bytes = rawkit_export::encode(
         &scaled,
         width,

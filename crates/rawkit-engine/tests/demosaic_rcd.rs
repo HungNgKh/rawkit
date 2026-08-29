@@ -196,7 +196,8 @@ fn rcd_reconstructs_better_than_a_direction_blind_baseline() {
             &EditState::default(),
             Output::SceneLinear,
         )
-        .expect("demosaic failed");
+        .expect("demosaic failed")
+        .pixels;
     assert_eq!(rgba.len(), (W * H * 4) as usize);
 
     let rcd_at = |x: u32, y: u32| {
@@ -252,7 +253,8 @@ fn every_bayer_phase_reconstructs_equally_well() {
                     &EditState::default(),
                     Output::SceneLinear,
                 )
-                .expect("demosaic failed");
+                .expect("demosaic failed")
+                .pixels;
             let db = psnr(&truth, |x, y| {
                 let i = ((y * W + x) * 4) as usize;
                 [rgba[i], rgba[i + 1], rgba[i + 2]]
@@ -294,7 +296,8 @@ fn tiling_does_not_change_a_single_pixel() {
             &EditState::default(),
             Output::SceneLinear,
         )
-        .expect("single-tile render failed");
+        .expect("single-tile render failed")
+        .pixels;
     let tiled = Renderer::with_tile_size(&gpu, 96)
         .run(
             &gpu,
@@ -302,7 +305,8 @@ fn tiling_does_not_change_a_single_pixel() {
             &EditState::default(),
             Output::SceneLinear,
         )
-        .expect("tiled render failed");
+        .expect("tiled render failed")
+        .pixels;
 
     assert_eq!(whole.len(), tiled.len());
     let mut worst = 0.0f32;
@@ -355,7 +359,8 @@ fn a_full_frame_renders_within_webgpu_default_limits() {
             &EditState::default(),
             Output::SceneLinear,
         )
-        .expect("a full frame must render on default limits");
+        .expect("a full frame must render on default limits")
+        .pixels;
 
     assert_eq!(out.len(), (w * h * 4) as usize);
     // A flat mosaic must demosaic to a flat image; anything else means the
