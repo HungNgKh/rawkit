@@ -25,3 +25,7 @@ node_modules/
 dist/
 
 .DS_Store
+/probe*.xwd
+
+# Tauri regenerates these from tauri.conf.json on every build.
+crates/rawkit-shell/gen/schemas/

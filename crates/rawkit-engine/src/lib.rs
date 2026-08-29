@@ -56,6 +56,9 @@ pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub adapter_info: wgpu::AdapterInfo,
+    /// Kept because a surface has to be configured against the adapter that
+    /// will present to it, not merely against a device.
+    pub adapter: wgpu::Adapter,
 }
 
 impl Gpu {
@@ -101,9 +104,74 @@ impl Gpu {
 
         Ok(Self {
             adapter_info: adapter.get_info(),
+            adapter,
             device,
             queue,
         })
+    }
+
+    /// Acquire a device that can present to a window, plus the surface itself.
+    ///
+    /// The same device as [`Gpu::new`] in every respect that matters — same
+    /// default limits, same everything — differing only in that the adapter is
+    /// chosen for compatibility with this surface. An adapter that cannot
+    /// present to the window it is meant to draw into is a real possibility on a
+    /// multi-GPU laptop, and finding out at present time gives no useful error.
+    ///
+    /// The instance is created *without* a display handle, and the window
+    /// supplies both handles when the surface is made. That is not a
+    /// simplification — it is the only thing that works here.
+    ///
+    /// wgpu refuses to create a surface when the instance was given one display
+    /// handle and the target reports another, and **Tauri returns a different
+    /// Xlib display pointer on every call**: asking twice in a row gives two
+    /// addresses, so it appears to open a fresh X connection each time. Passing
+    /// a handle obtained from the window and then letting wgpu ask the same
+    /// window again is therefore guaranteed to mismatch.
+    ///
+    /// Taking both handles from one call to the target sidesteps it entirely.
+    /// X11 resource IDs are server-side and valid across connections, so a
+    /// surface built this way is sound even if the connection differs from the
+    /// one that created the window.
+    pub fn with_surface<'w>(
+        window: impl Into<wgpu::SurfaceTarget<'w>>,
+    ) -> Result<(Self, wgpu::Surface<'w>), EngineError> {
+        pollster::block_on(Self::with_surface_async(window))
+    }
+
+    async fn with_surface_async<'w>(
+        window: impl Into<wgpu::SurfaceTarget<'w>>,
+    ) -> Result<(Self, wgpu::Surface<'w>), EngineError> {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let surface = instance
+            .create_surface(window)
+            .map_err(|e| EngineError::DeviceRequest(e.to_string()))?;
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: Some(&surface),
+            })
+            .await
+            .map_err(|_| EngineError::NoAdapter)?;
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("rawkit engine"),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| EngineError::DeviceRequest(e.to_string()))?;
+
+        Ok((
+            Self {
+                adapter_info: adapter.get_info(),
+                adapter,
+                device,
+                queue,
+            },
+            surface,
+        ))
     }
 }
 

@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>rawkit compositing probe</title>
+<style>
+  /* The whole point of the probe. If the webview paints an opaque background
+     here, nothing behind it can ever show through, and the transparent-cutout
+     approach is dead on this platform. */
+  html, body { background: transparent; margin: 0; height: 100%; }
+  /* Forces the webview to repaint continuously. Without this the page paints
+     once and a stable capture cannot tell "the GPU is strictly on top" from
+     "whoever painted last wins", and those two want different fallbacks. */
+  @keyframes nudge { from { opacity: 0.996; } to { opacity: 1; } }
+  #panel {
+    animation: nudge 0.05s infinite alternate;
+    position: fixed; top: 0; left: 0; bottom: 0; width: 33.333%;
+    background: rgb(255, 0, 0);
+    color: white; font: 14px system-ui, sans-serif; padding: 16px;
+    box-sizing: border-box;
+  }
+  #cutout {
+    position: fixed; top: 0; right: 0; bottom: 0; width: 66.667%;
+    /* Nothing painted here at all. Whatever is behind the webview is what
+       should be visible. */
+  }
+</style>
+<div id="panel">
+  <strong>webview layer</strong>
+  <p>Opaque red. This is the UI chrome.</p>
+  <p>To the right: nothing painted. If the window is green there, the GPU
+     surface is compositing underneath and the cutout approach works.</p>
+</div>
+<div id="cutout"></div>

@@ -30,9 +30,10 @@ accept an LGPL dependency here.
 ## Allowed
 
 Apache-2.0 · Apache-2.0 WITH LLVM-exception · MIT · MIT-0 · BSD-2-Clause ·
-BSD-3-Clause · ISC · Zlib · BSL-1.0 · CC0-1.0 · Unicode-3.0 · Unlicense · IJG
+BSD-3-Clause · ISC · Zlib · BSL-1.0 · CC0-1.0 · Unicode-3.0 · Unlicense · IJG ·
+MPL-2.0
 
-### The one entry that was added rather than chosen at the start
+### The two entries that were added rather than chosen at the start
 
 **IJG**, added 2026-08-29. `jpeg-encoder`'s forward DCT descends from the
 Independent JPEG Group's code, so the crate is `(MIT OR Apache-2.0) AND IJG` and
@@ -43,8 +44,47 @@ obligation is an acknowledgement in the documentation, in the IJG's own words:
 *"this software is based in part on the work of the Independent JPEG Group"*.
 `NOTICE` carries exactly that sentence, which is the whole cost of the entry.
 
+**MPL-2.0**, added 2026-08-29. Tauri pulls five MPL crates for CSP parsing —
+`cssparser`, `cssparser-macros`, `selectors`, `dtoa-short`, `option-ext` — and
+`cargo deny` refused the build for the second time.
+
+MPL-2.0 is *file-level* copyleft, the same shape as LibRaw's CDDL: those files
+stay MPL and modifications to them stay MPL, but §3.3 explicitly permits
+distributing the Larger Work under other terms. Apache-2.0 outbound is
+unaffected and the v2 AI can still be proprietary.
+
+**The reason this is allowed where LGPL is excluded is not a softer view of
+copyleft — it is the relinking requirement.** LGPL §6 would oblige us to ship
+relinkable object files with every release because Rust links statically. MPL
+imposes nothing of the sort; its duty is to make the source of *those files*
+available, and they are unmodified upstream crates, so crates.io is that.
+`cargo-about` records them in `THIRD-PARTY.md`.
+
+Unlike CDDL, MPL is **not** quarantined to one crate. It could be — the crates
+are all transitive under `rawkit-shell` — but there is nothing to contain: the
+obligation travels with the files, not with what links them, and no rawkit
+source is derived from them.
+
 The authoritative copy of this list is `deny.toml`; if the two ever disagree,
 `deny.toml` is what actually runs.
+
+## Advisories: vulnerabilities always, unmaintained only where we can act
+
+Adding Tauri brought **sixteen advisories at once and not one vulnerability**:
+the whole gtk-rs GTK3 binding family (GTK3 is what webkit2gtk requires, and
+gtk-rs has moved on to GTK4), `proc-macro-error`, and the `unic-*` crates under
+`urlpattern`. None has a safe upgrade and none is ours to fix.
+
+That left two honest options — relax the rule, or paste sixteen IDs into an
+ignore list that rots the moment Tauri changes a dependency. `deny.toml` now
+sets `unmaintained = "workspace"`: unmaintained notices fail for crates this
+workspace depends on **directly**, where we could actually do something, and not
+for transitive ones. Vulnerabilities still fail for every crate in the graph,
+and `yanked = "deny"` is untouched.
+
+The cost is worth naming rather than burying: an unmaintained transitive crate
+no longer announces itself, so a vulnerability in one is now the only thing that
+will.
 
 ## Excluded, and why
 

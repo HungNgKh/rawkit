@@ -88,9 +88,29 @@ once it is genuinely part of a build:
   png                         -- MIT / Apache-2.0
                                              https://github.com/image-rs/image-png
 
+  Tauri                       -- MIT / Apache-2.0
+                                             https://tauri.app
+
+      The desktop shell: window, webview and event loop. Linked only by
+      crates/rawkit-shell, so the engine stays usable headless.
+
+      Tauri brings five **MPL-2.0** crates for CSP parsing -- cssparser,
+      cssparser-macros, selectors, dtoa-short and option-ext. MPL-2.0 is
+      file-level copyleft: those files remain MPL and modifications to them
+      remain MPL, while section 3.3 permits distributing the Larger Work under
+      other terms. They are unmodified upstream crates, so the source-availability
+      duty is met by crates.io; see docs/licence-policy.md for why MPL is allowed
+      where LGPL is not.
+
+      The MPL-2.0 text is available at https://mozilla.org/MPL/2.0/
+
+  wgpu                        -- MIT / Apache-2.0
+                                             https://wgpu.rs
+
+      The GPU abstraction over Vulkan, DX12 and Metal. One engine compiled for
+      three platforms sharing WGSL verbatim is the whole reason it is here.
+
   (planned) OpenColorIO       -- BSD-3-Clause LUT / look handling.
-  (planned) Tauri             -- MIT/Apache-2.0  Desktop shell.
-  (planned) wgpu              -- MIT/Apache-2.0  GPU abstraction (Vulkan/DX12/Metal).
 
 Nothing in this file grants rights beyond those in the respective upstream
 licences.

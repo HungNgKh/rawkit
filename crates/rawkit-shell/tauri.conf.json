@@ -1,0 +1,23 @@
+{
+  "productName": "rawkit",
+  "version": "0.0.1",
+  "identifier": "dev.rawkit.app",
+  "build": {
+    "frontendDist": "ui"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "rawkit",
+        "width": 1200,
+        "height": 800,
+        "transparent": true,
+        "decorations": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  }
+}

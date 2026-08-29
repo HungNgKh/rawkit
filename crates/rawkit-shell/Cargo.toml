@@ -1,0 +1,20 @@
+[package]
+name = "rawkit-shell"
+description = "The desktop shell. Owns the window and the surface; the only crate that knows Tauri exists."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rawkit-editstate.workspace = true
+rawkit-engine.workspace = true
+rawkit-session.workspace = true
+tauri.workspace = true
+anyhow.workspace = true
+wgpu.workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true

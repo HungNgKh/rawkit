@@ -33,6 +33,20 @@ allow = [
     "CC0-1.0",
     "Unicode-3.0",
     "Unlicense",
+    # Added 2026-08-29 with Tauri, which pulls five MPL-2.0 crates for CSP
+    # parsing (cssparser, cssparser-macros, selectors, dtoa-short, option-ext).
+    #
+    # MPL-2.0 is *file-level* copyleft, the same shape as LibRaw's CDDL: those
+    # files stay MPL and any modification to them stays MPL, but section 3.3
+    # explicitly permits distributing the Larger Work under other terms. So
+    # Apache-2.0 outbound is unaffected, the v2 AI can still be proprietary, and
+    # there is no LGPL-style relinking obligation. The duty is to make the source
+    # of those files available; they are unmodified upstream crates, so crates.io
+    # is that, and cargo-about records them in THIRD-PARTY.md.
+    #
+    # This is why LGPL is refused and MPL is not: the difference is the relinking
+    # requirement, not the word "copyleft".
+    "MPL-2.0",
     # Added 2026-08-29 for jpeg-encoder, whose forward DCT descends from the
     # Independent JPEG Group's code. Permissive and FSF-recognised; its one real
     # obligation is an acknowledgement in the documentation, which NOTICE
@@ -79,6 +93,21 @@ deny = [
 [advisories]
 yanked = "deny"
 ignore = []
+# Vulnerabilities always fail, for every crate in the graph. *Unmaintained*
+# notices only fail for crates this workspace depends on directly.
+#
+# Adding Tauri brought sixteen unmaintained advisories at once and not one
+# vulnerability among them: the whole gtk-rs GTK3 binding family (GTK3 is what
+# webkit2gtk requires, and gtk-rs has moved to GTK4), proc-macro-error, and the
+# unic-* crates under urlpattern. None have a safe upgrade and none are ours to
+# fix — the honest options were to relax the rule or to paste sixteen IDs into an
+# ignore list that would rot the moment Tauri changed a dependency.
+#
+# Scoping to direct dependencies keeps the rule actionable: it fires exactly when
+# we could do something about it. The cost is real and worth naming — an
+# unmaintained transitive crate no longer announces itself, so a *vulnerability*
+# in one is now the only thing that will.
+unmaintained = "workspace"
 
 [sources]
 unknown-registry = "deny"
