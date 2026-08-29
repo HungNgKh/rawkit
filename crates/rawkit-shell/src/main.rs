@@ -162,15 +162,21 @@ fn main() -> Result<()> {
             // thread-safe. Drawing afterwards is fine from anywhere.
             let (gpu, surface, size) = match route {
                 Route::Cutout => {
-                    let window = WebviewWindowBuilder::new(
+                    let builder = WebviewWindowBuilder::new(
                         app,
                         "main",
                         WebviewUrl::App("index.html".into()),
                     )
                     .title("rawkit")
-                    .inner_size(WINDOW.0, WINDOW.1)
-                    .transparent(true)
-                    .build()?;
+                    .inner_size(WINDOW.0, WINDOW.1);
+                    // A third strike against route 1, found by CI rather than by
+                    // the probe: on macOS `transparent` is behind Tauri's
+                    // `macos-private-api` feature, and using a private API bars
+                    // App Store distribution. So route 1 costs a distribution
+                    // channel even on the platform where it works.
+                    #[cfg(not(target_os = "macos"))]
+                    let builder = builder.transparent(true);
+                    let window = builder.build()?;
                     let size = window.inner_size()?;
                     let (gpu, surface) = Gpu::with_surface(window.clone())?;
                     (gpu, surface, size)
