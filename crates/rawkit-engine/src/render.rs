@@ -779,12 +779,14 @@ impl Renderer {
             )));
         }
 
+        let t0 = std::time::Instant::now();
         {
             let mut scratch = buffers.scratch.borrow_mut();
             gather_padded(data, lw, lh, ox, oy, buffers.padded, &mut scratch);
             gpu.queue
                 .write_buffer(&buffers.cfa, 0, bytemuck::cast_slice(&scratch));
         }
+        let t1 = std::time::Instant::now();
         // Patch only the tail of the uniform. The colour half was resolved once
         // by `set_edit` and does not move because a different tile is being
         // drawn — writes and submits are ordered on the queue, so this lands
@@ -822,6 +824,18 @@ impl Renderer {
             pass.dispatch_workgroups(groups, groups, 1);
         }
         gpu.queue.submit([encoder.finish()]);
+        // Kept because it answered a real question — whether a pan was slow
+        // because of submission overhead or because of the gather — and the
+        // next such question deserves the same treatment. It prints per tile,
+        // so it costs a few milliseconds a frame while enabled: read the split
+        // it reports, not the frame times it distorts.
+        if std::env::var_os("RAWKIT_TIME_TILES").is_some() {
+            eprintln!(
+                "tile       : gather+upload {:.3} ms, encode+submit {:.3} ms",
+                (t1 - t0).as_secs_f64() * 1000.0,
+                t1.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         Ok(())
     }
 
@@ -1183,6 +1197,18 @@ struct Colour {
 /// Clamping here has to match what the shader does when it reads out of bounds,
 /// or the tiled result would differ from an untiled one along the image border.
 /// Both clamp to the nearest edge pixel.
+///
+/// # Why this is written in three parts
+///
+/// The obvious version clamps every sample, and measurement said that was 58% of
+/// what a tile costs — 0.625 ms of scalar work per tile, which at twenty-seven
+/// visible tiles is most of a frame's budget spent deciding that coordinates are
+/// in range.
+///
+/// They almost always are. A tile away from the border has every row fully
+/// inside the image, so the row is a contiguous run of the source and copies as
+/// one memcpy. Only the tiles at the edges need the clamped path, and only for
+/// the few columns that actually hang over.
 #[allow(clippy::too_many_arguments)]
 fn gather_padded(
     mosaic: &[f32],
@@ -1193,16 +1219,30 @@ fn gather_padded(
     padded: u32,
     out: &mut [f32],
 ) {
-    let w = width as i64;
-    let h = height as i64;
-    for py in 0..padded as i64 {
+    let (w, h) = (width as i64, height as i64);
+    let (padded, first_x) = (padded as i64, ox as i64 - HALO as i64);
+
+    // How the row splits: `left` columns clamped to the first pixel, `run`
+    // columns copied straight, the rest clamped to the last.
+    let left = (-first_x).clamp(0, padded) as usize;
+    let start = first_x.max(0);
+    let end = (first_x + padded).min(w);
+    let run = (end - start).max(0) as usize;
+    let right = padded as usize - left - run;
+
+    for py in 0..padded {
         let gy = (oy as i64 - HALO as i64 + py).clamp(0, h - 1);
-        let row = (gy * w) as usize;
-        let dst = (py * padded as i64) as usize;
-        for px in 0..padded as i64 {
-            let gx = (ox as i64 - HALO as i64 + px).clamp(0, w - 1);
-            out[dst + px as usize] = mosaic[row + gx as usize];
+        let src = (gy * w) as usize;
+        let dst = (py * padded) as usize;
+        let row = &mut out[dst..dst + padded as usize];
+
+        row[..left].fill(mosaic[src]);
+        if run > 0 {
+            let from = src + start as usize;
+            row[left..left + run].copy_from_slice(&mosaic[from..from + run]);
         }
+        row[left + run..].fill(mosaic[src + (w - 1) as usize]);
+        debug_assert_eq!(left + run + right, padded as usize);
     }
 }
 
