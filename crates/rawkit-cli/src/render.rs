@@ -185,6 +185,11 @@ pub fn render(
 ///
 /// LibRaw pads its matrix to four rows for four-colour sensors; we take the
 /// three that describe an RGB camera.
+pub(crate) fn profile_for(raw: &rawkit_decode::RawImage) -> CameraProfile {
+    single_illuminant_profile(&raw.cam_to_xyz)
+        .unwrap_or_else(|| CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY))
+}
+
 fn single_illuminant_profile(cam_xyz: &[[f32; 3]; 4]) -> Option<CameraProfile> {
     if cam_xyz.iter().flatten().all(|&v| v == 0.0) {
         return None;
@@ -204,7 +209,7 @@ fn encode_srgb(v: f32) -> f32 {
     }
 }
 
-fn downsample_step(width: u32, height: u32, max_dim: u32) -> u32 {
+pub(crate) fn downsample_step(width: u32, height: u32, max_dim: u32) -> u32 {
     if max_dim == 0 {
         return 1;
     }
@@ -217,7 +222,7 @@ fn downsample_step(width: u32, height: u32, max_dim: u32) -> u32 {
 /// Averaging before the transfer function is the only correct order;
 /// downsampling encoded values darkens detailed areas, which reads as the
 /// resize "losing contrast" and is really a gamma error.
-fn downsample(rgba: &[f32], width: u32, height: u32, step: u32) -> (Vec<f32>, u32, u32) {
+pub(crate) fn downsample(rgba: &[f32], width: u32, height: u32, step: u32) -> (Vec<f32>, u32, u32) {
     if step <= 1 {
         return (rgba.to_vec(), width, height);
     }

@@ -228,9 +228,45 @@ impl Catalog {
         Ok(())
     }
 
+    /// Run one migration with foreign keys off, and refuse to commit if that
+    /// left anything dangling.
+    ///
+    /// SQLite cannot alter a `CHECK` in place, so changing one means rebuilding
+    /// the table — and dropping a table that others reference, with foreign keys
+    /// *on*, performs an implicit delete that fires every `ON DELETE CASCADE`
+    /// hanging off it. Rebuilding `volumes` that way would take every folder,
+    /// file and image in the library with it, and would look like a successful
+    /// migration.
+    ///
+    /// `PRAGMA foreign_keys` is a no-op inside a transaction, so it has to be
+    /// set here rather than in the SQL. `foreign_key_check` inside the
+    /// transaction is what keeps the safety the pragma is holding open: a
+    /// rebuild that lost a row fails instead of committing.
     fn apply(&mut self, migration: &Migration) -> Result<(), CatalogError> {
+        self.connection.pragma_update(None, "foreign_keys", false)?;
+        let result = self.apply_within(migration);
+        // Restored whether or not the migration worked: a connection left with
+        // foreign keys off treats every `REFERENCES` in the schema as a comment.
+        self.connection.pragma_update(None, "foreign_keys", true)?;
+        result
+    }
+
+    fn apply_within(&mut self, migration: &Migration) -> Result<(), CatalogError> {
         let transaction = self.connection.transaction()?;
         transaction.execute_batch(migration.sql)?;
+
+        let dangling: i64 =
+            transaction.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })?;
+        if dangling > 0 {
+            return Err(CatalogError::Sqlite(format!(
+                "migration {} ({}) left {dangling} row(s) referencing something that is gone; \
+                 rolled back",
+                migration.version, migration.name
+            )));
+        }
+
         // Bumped inside the same transaction as the schema change. Separately,
         // a crash between the two would leave a catalog claiming a version whose
         // tables never arrived — the failure this ordering exists to prevent.
@@ -315,14 +351,106 @@ pub(crate) mod tests {
         names
     }
 
+    /// A catalog carrying only migration 1, the way a user's would be before
+    /// upgrading. Built by hand because `open` always migrates to the top.
+    fn at_version_one() -> Catalog {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        let mut catalog = Catalog {
+            connection,
+            journal_mode: "memory".into(),
+            path: None,
+        };
+        catalog.apply_all(0, &crate::MIGRATIONS[..1]).unwrap();
+        assert_eq!(catalog.version().unwrap(), 1);
+        catalog
+    }
+
+    #[test]
+    fn migrating_to_v2_keeps_everything_hanging_off_the_rebuilt_volumes_table() {
+        // The hazard this migration is built around. Changing a CHECK means
+        // rebuilding the table, and `DROP TABLE volumes` with foreign keys ON
+        // performs an implicit delete that fires every ON DELETE CASCADE
+        // beneath it — taking every folder, file and image in the library, and
+        // reporting success. A library that opens and is empty.
+        let mut catalog = at_version_one();
+        catalog
+            .connection
+            .execute_batch(
+                "INSERT INTO volumes (id, kind, uuid, last_mount_path, path_convention)
+                      VALUES (1, 'uuid', 'abc-123', '/photos', 'exact');
+                 INSERT INTO folders (id, volume_id, relative_path, path_key)
+                      VALUES (1, 1, '2026', '2026');
+                 INSERT INTO files (id, folder_id, filename, filename_key, size, mtime, imported_at)
+                      VALUES (1, 1, 'a.ARW', 'a.arw', 10, 20, 30);
+                 INSERT INTO images (id, file_id, created_at) VALUES (1, 1, 30);",
+            )
+            .unwrap();
+
+        catalog.apply_all(1, &crate::MIGRATIONS[1..]).unwrap();
+        assert_eq!(catalog.version().unwrap(), SCHEMA_VERSION);
+
+        let counts: Vec<i64> = ["volumes", "folders", "files", "images"]
+            .iter()
+            .map(|table| {
+                catalog
+                    .connection
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(counts, [1, 1, 1, 1], "the library survived the rebuild");
+
+        // And the volume kept its identity rather than being copied as a blank.
+        let uuid: String = catalog
+            .connection
+            .query_row("SELECT uuid FROM volumes WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uuid, "abc-123");
+    }
+
+    #[test]
+    fn v2_admits_a_volume_with_no_stable_identity() {
+        // The point of the rebuild: a filesystem with no UUID can be catalogued.
+        let catalog = Catalog::in_memory().unwrap();
+        catalog
+            .connection
+            .execute(
+                "INSERT INTO volumes (kind, mount_path, path_convention)
+                      VALUES ('mount_path', '/tmp', 'exact')",
+                [],
+            )
+            .unwrap();
+
+        // ...and the CHECK still refuses a row claiming two identities at once,
+        // which is how a relink matches the wrong drive.
+        assert!(catalog
+            .connection
+            .execute(
+                "INSERT INTO volumes (kind, uuid, mount_path, path_convention)
+                      VALUES ('mount_path', 'abc', '/tmp2', 'exact')",
+                [],
+            )
+            .is_err());
+    }
+
     #[test]
     fn a_fresh_catalog_arrives_at_the_current_version() {
         let catalog = Catalog::in_memory().unwrap();
         assert_eq!(catalog.version().unwrap(), SCHEMA_VERSION);
         assert_eq!(
             tables(&catalog),
-            ["edit_states", "files", "folders", "images", "volumes"],
-            "the spine, and nothing speculative alongside it"
+            [
+                "edit_states",
+                "files",
+                "folders",
+                "images",
+                "previews",
+                "volumes"
+            ],
+            "the spine plus previews, and nothing speculative alongside them"
         );
     }
 

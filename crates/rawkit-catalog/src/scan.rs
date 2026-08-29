@@ -279,31 +279,35 @@ fn upsert_volume(
         PathConvention::CaseInsensitive => "case_insensitive",
         PathConvention::CaseInsensitiveNormalised => "case_insensitive_normalised",
     };
-    let (kind, uuid, serial, host, share) = match volume {
-        VolumeId::Uuid(u) => ("uuid", Some(u.clone()), None, None, None),
-        VolumeId::WindowsSerial(s) => ("windows_serial", None, Some(*s as i64), None, None),
+    let (kind, uuid, serial, host, share, mount_path) = match volume {
+        VolumeId::Uuid(u) => ("uuid", Some(u.clone()), None, None, None, None),
+        VolumeId::WindowsSerial(s) => ("windows_serial", None, Some(*s as i64), None, None, None),
         VolumeId::NetworkShare { host, share } => (
             "network_share",
             None,
             None,
             Some(host.clone()),
             Some(share.clone()),
+            None,
         ),
+        VolumeId::MountPath(at) => ("mount_path", None, None, None, None, Some(at.clone())),
     };
     let mount = root.to_string_lossy().into_owned();
 
     transaction.execute(
-        "INSERT INTO volumes (kind, uuid, windows_serial, host, share, last_mount_path, path_convention)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO volumes
+              (kind, uuid, windows_serial, host, share, mount_path, last_mount_path, path_convention)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT DO UPDATE SET last_mount_path = excluded.last_mount_path",
-        rusqlite::params![kind, uuid, serial, host, share, mount, convention],
+        rusqlite::params![kind, uuid, serial, host, share, mount_path, mount, convention],
     )?;
     Ok(transaction.query_row(
         "SELECT id FROM volumes
           WHERE kind = ?1 AND ifnull(uuid,'') = ifnull(?2,'')
             AND ifnull(windows_serial,-1) = ifnull(?3,-1)
-            AND ifnull(host,'') = ifnull(?4,'') AND ifnull(share,'') = ifnull(?5,'')",
-        rusqlite::params![kind, uuid, serial, host, share],
+            AND ifnull(host,'') = ifnull(?4,'') AND ifnull(share,'') = ifnull(?5,'')
+            AND ifnull(mount_path,'') = ifnull(?6,'')",
+        rusqlite::params![kind, uuid, serial, host, share, mount_path],
         |row| row.get(0),
     )?)
 }

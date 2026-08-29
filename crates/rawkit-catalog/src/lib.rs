@@ -26,18 +26,20 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The schema version this build expects. `0` means "no tables yet": the
-/// migration list is empty and the first real migration in P1 will be version 1.
 pub mod backup;
 pub mod cull;
 pub mod db;
 pub mod edits;
 pub mod path;
+pub mod previews;
 pub mod relink;
 pub mod scan;
 pub mod volume;
 
-pub const SCHEMA_VERSION: u32 = 1;
+/// The schema version this build expects, and the last entry in [`MIGRATIONS`].
+/// A catalog reporting anything higher was written by a newer build and is
+/// refused rather than half-understood.
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -88,11 +90,18 @@ pub struct Migration {
 /// diffed as SQL. Once a migration has shipped its text is frozen: editing it
 /// changes what a catalog already carrying that version *thinks* it has, and the
 /// only safe correction is another migration.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "spine",
-    sql: include_str!("../migrations/001-spine.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "spine",
+        sql: include_str!("../migrations/001-spine.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "previews-and-weak-volumes",
+        sql: include_str!("../migrations/002-previews-and-weak-volumes.sql"),
+    },
+];
 
 /// Migrations that a catalog at `current_version` still needs.
 ///
@@ -147,14 +156,23 @@ pub enum VolumeId {
     /// Network shares, which have neither: identified by their mount target.
     /// Weakest form, and flagged as such so relinking can fall back to hashes.
     NetworkShare { host: String, share: String },
+    /// A local filesystem that has no stable identity to offer: tmpfs,
+    /// overlayfs, a container mount, some network mounts.
+    ///
+    /// Added because refusing these outright locked out anyone whose photos sit
+    /// on one — CI found it, since its runners are on exactly such a filesystem.
+    /// It is deliberately *not* spelled as a `NetworkShare`, which would have
+    /// satisfied the schema while lying about what the volume is; this says
+    /// plainly that the identity is the mount point and therefore weak.
+    MountPath(String),
 }
 
 impl VolumeId {
-    /// Whether this identity survives a remount. Network shares do not, which is
-    /// why `files.content_hash` is the relink fallback rather than an
-    /// optimisation.
+    /// Whether this identity survives a remount. Network shares and bare mount
+    /// paths do not, which is why `files.content_hash` is the relink fallback
+    /// rather than an optimisation.
     pub fn is_stable(&self) -> bool {
-        !matches!(self, VolumeId::NetworkShare { .. })
+        !matches!(self, VolumeId::NetworkShare { .. } | VolumeId::MountPath(_))
     }
 }
 

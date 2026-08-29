@@ -5,10 +5,12 @@
 //! here first: it makes the behaviour scriptable and, more usefully, testable on
 //! three operating systems without a display attached.
 
+mod previews;
 mod render;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use rawkit_catalog::previews::Level as PreviewLevel;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -104,6 +106,20 @@ enum Command {
         /// external one.
         #[arg(long)]
         hash: bool,
+        /// Render the previews a grid and a filmstrip need, into a directory
+        /// beside the catalog.
+        ///
+        /// Only what is missing or stale, so interrupting it and running it
+        /// again picks up where it stopped. An edit makes every preview of that
+        /// photograph stale, which is what keeps a grid honest.
+        #[arg(long)]
+        previews: bool,
+        /// Delete preview files the catalog no longer refers to.
+        ///
+        /// Regenerating after an edit writes a new file and leaves the old one,
+        /// so a library that is edited often accumulates orphans.
+        #[arg(long)]
+        sweep: bool,
     },
 }
 
@@ -137,7 +153,13 @@ fn main() -> Result<()> {
             profile,
             exposure,
         } => render::render(&input, &output, max_dim, tile, profile.as_deref(), exposure)?,
-        Command::Catalog { path, scan, hash } => {
+        Command::Catalog {
+            path,
+            scan,
+            hash,
+            previews,
+            sweep,
+        } => {
             let mut catalog = rawkit_catalog::db::Catalog::open(&path)?;
             println!("path       : {}", path.display());
             println!(
@@ -201,6 +223,48 @@ fn main() -> Result<()> {
                 );
             }
 
+            if previews {
+                let mut last = usize::MAX;
+                let report = previews::build(&catalog, PreviewLevel::BULK, |done, total, name| {
+                    // One line per image, rewritten in place: a build is long
+                    // enough that silence reads as a hang.
+                    if done != last {
+                        last = done;
+                        eprint!("\rpreviews   : {done}/{total} {name:<40}");
+                    }
+                })?;
+                if report.images > 0 {
+                    eprintln!();
+                }
+                println!(
+                    "previews   : {} written for {} image(s), {}",
+                    report.written,
+                    report.images,
+                    human_bytes(report.bytes)
+                );
+                for (name, why) in &report.failed {
+                    println!("            {name}: {why}");
+                }
+            }
+
+            if sweep {
+                match rawkit_catalog::previews::directory(&catalog) {
+                    Some(dir) => {
+                        let (removed, freed) = rawkit_catalog::previews::sweep(&catalog, &dir)?;
+                        println!(
+                            "swept      : {removed} orphaned preview(s), {} freed",
+                            human_bytes(freed)
+                        );
+                    }
+                    None => println!("swept      : nothing (this catalog is in memory)"),
+                }
+            }
+
+            let (count, bytes) = rawkit_catalog::previews::tally(&catalog)?;
+            if count > 0 {
+                println!("previews   : {count} on disk, {}", human_bytes(bytes));
+            }
+
             // Dropping the catalog is what writes the backup, so say so after.
             drop(catalog);
             println!("closed     : backup written");
@@ -237,4 +301,20 @@ fn file_metadata(path: &std::path::Path) -> Option<rawkit_catalog::scan::FileMet
         shutter_count: found.shutter_count.map(i64::from),
         lens: found.lens,
     })
+}
+
+/// Sizes in the units a person reads, because "17179869184" is not a size.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }

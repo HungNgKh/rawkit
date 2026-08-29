@@ -24,11 +24,20 @@ use std::path::Path;
 
 impl VolumeId {
     /// The volume `path` lives on.
+    ///
+    /// A filesystem UUID when there is one, and the mount point when there is
+    /// not. The fallback is not a shrug: tmpfs, overlayfs and container mounts
+    /// have no UUID and never will, and refusing them means a photographer whose
+    /// library sits on one cannot use the application at all. `is_stable()`
+    /// reports the difference, so relink falls back to content hashes for these
+    /// rather than trusting a mount point that moves.
     #[cfg(target_os = "linux")]
     pub fn resolve(path: &Path) -> Result<Self, CatalogError> {
-        let device = device_for(path)?;
-        let uuid = uuid_for_device(&device)?;
-        Ok(VolumeId::Uuid(uuid))
+        let (device, mount) = mount_for(path)?;
+        match uuid_for_device(&device) {
+            Ok(uuid) => Ok(VolumeId::Uuid(uuid)),
+            Err(_) => Ok(VolumeId::MountPath(mount)),
+        }
     }
 
     /// The volume `path` lives on.
@@ -41,13 +50,16 @@ impl VolumeId {
     }
 }
 
-/// The device backing the filesystem that holds `path`.
+/// The device backing the filesystem that holds `path`, and where it is mounted.
 ///
 /// Longest-prefix match against `/proc/mounts`, because mounts nest: a path
 /// under `/home/user/photos` on its own disk matches both `/` and
 /// `/home/user/photos`, and only the longer one is its actual filesystem.
+///
+/// The mount point comes back too, because it is the fallback identity when the
+/// device turns out to have no UUID.
 #[cfg(target_os = "linux")]
-fn device_for(path: &Path) -> Result<String, CatalogError> {
+fn mount_for(path: &Path) -> Result<(String, String), CatalogError> {
     // Canonicalise first, or a path through a symlink is matched against the
     // wrong mount — and `..` components would defeat prefix matching entirely.
     let path = path
@@ -56,7 +68,7 @@ fn device_for(path: &Path) -> Result<String, CatalogError> {
     let mounts = std::fs::read_to_string("/proc/mounts")
         .map_err(|e| CatalogError::Io(format!("/proc/mounts: {e}")))?;
 
-    let mut best: Option<(usize, String)> = None;
+    let mut best: Option<(String, String)> = None;
     for line in mounts.lines() {
         let mut fields = line.split_whitespace();
         let (Some(device), Some(mount)) = (fields.next(), fields.next()) else {
@@ -67,13 +79,15 @@ fn device_for(path: &Path) -> Result<String, CatalogError> {
         if !path.starts_with(&mount) {
             continue;
         }
-        if best.as_ref().is_none_or(|(len, _)| mount.len() > *len) {
-            best = Some((mount.len(), unescape(device)));
+        if best
+            .as_ref()
+            .is_none_or(|(_, best_mount)| mount.len() > best_mount.len())
+        {
+            best = Some((unescape(device), mount));
         }
     }
 
-    best.map(|(_, device)| device)
-        .ok_or_else(|| CatalogError::Io(format!("no mount point contains {}", path.display())))
+    best.ok_or_else(|| CatalogError::Io(format!("no mount point contains {}", path.display())))
 }
 
 /// Reverse-lookup `/dev/disk/by-uuid`, whose entries are symlinks to devices.
@@ -138,24 +152,33 @@ mod tests {
         // Every path is under `/`, so a shorter match must never beat a longer
         // one — the bug would put a file on the wrong disk and only show up when
         // that disk was unplugged.
-        let device = device_for(Path::new("/tmp")).expect("/tmp is somewhere");
+        let (device, mount) = mount_for(Path::new("/tmp")).expect("/tmp is somewhere");
         assert!(!device.is_empty());
+        assert!(
+            Path::new("/tmp").starts_with(&mount),
+            "/tmp is not under its own mount point {mount}"
+        );
     }
 
     #[test]
-    fn a_real_path_resolves_to_a_uuid() {
-        // The home directory is on a real filesystem on any machine that can run
-        // this; tmpfs would correctly refuse, which is why /tmp is not used here.
-        let home = std::env::var("HOME").expect("HOME");
-        match VolumeId::resolve(Path::new(&home)) {
-            Ok(VolumeId::Uuid(uuid)) => {
-                assert!(uuid.contains('-') || uuid.len() >= 8, "odd uuid: {uuid}");
-                assert!(VolumeId::Uuid(uuid).is_stable());
+    fn every_local_path_resolves_to_something() {
+        // The property this needs to have, and the one it did not: a filesystem
+        // with no UUID is answered rather than refused. It used to be an error,
+        // which locked out anyone whose library sits on tmpfs, overlayfs or a
+        // container mount — including CI, which is how it was found.
+        //
+        // Both /tmp and $HOME, because on any given machine either one may or
+        // may not carry a UUID and the point is that neither is a failure.
+        for path in [std::env::temp_dir(), std::env::var("HOME").unwrap().into()] {
+            match VolumeId::resolve(&path) {
+                Ok(id @ VolumeId::Uuid(_)) => assert!(id.is_stable()),
+                Ok(id @ VolumeId::MountPath(_)) => assert!(
+                    !id.is_stable(),
+                    "a mount point is not a stable identity and must not claim to be"
+                ),
+                Ok(other) => panic!("Linux should not produce {other:?}"),
+                Err(e) => panic!("{} was refused: {e}", path.display()),
             }
-            Ok(other) => panic!("Linux should resolve to a Uuid, got {other:?}"),
-            // A UUID-less filesystem is a legitimate answer, not a failure.
-            Err(CatalogError::Unsupported(_)) => {}
-            Err(e) => panic!("{e}"),
         }
     }
 }
