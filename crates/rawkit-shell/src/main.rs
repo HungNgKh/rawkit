@@ -882,8 +882,12 @@ pub(crate) fn in_crop() -> bool {
     mode() == MODE_CROP
 }
 
-/// The rectangle being drawn on the canvas, in surface pixels, and whether the
-/// pointer has been let go.
+/// The rectangle being drawn on the canvas, in surface pixels.
+///
+/// There is no "finished" flag: letting go of the button stops the motion
+/// handler updating it, which is the same fact expressed once instead of twice.
+/// The version that carried one was dead code on the two platforms whose canvas
+/// does not exist yet.
 ///
 /// Surface pixels because that is what the pointer produces and what the outline
 /// is drawn in; turning it into a crop needs the viewport, which lives in the
@@ -897,8 +901,6 @@ static CROP_COMMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 pub(crate) struct Marquee {
     pub start: [f64; 2],
     pub end: [f64; 2],
-    /// Set on button release. Until then the rectangle is still being sized.
-    pub settled: bool,
 }
 
 impl Marquee {

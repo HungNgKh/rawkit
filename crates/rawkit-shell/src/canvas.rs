@@ -236,11 +236,8 @@ pub fn attach_input(
         } else if crate::in_crop() {
             // A new drag replaces whatever rectangle was there. Starting from
             // the old one instead would mean a crop could only ever shrink.
-            *crate::CANVAS_MARQUEE.lock().expect("marquee lock") = Some(crate::Marquee {
-                start: at,
-                end: at,
-                settled: false,
-            });
+            *crate::CANVAS_MARQUEE.lock().expect("marquee lock") =
+                Some(crate::Marquee { start: at, end: at });
             held.set(Some(event.position()));
         } else {
             held.set(Some(event.position()));
@@ -250,13 +247,10 @@ pub fn attach_input(
 
     let held = dragging.clone();
     gtk_window.connect_button_release_event(move |_, _| {
+        // Letting go is the whole of it: the motion handler stops updating the
+        // rectangle, and it stays on screen until Enter takes it or Escape
+        // throws it away, so a drag that came out wrong can be redrawn.
         held.set(None);
-        if let Some(marquee) = crate::CANVAS_MARQUEE.lock().expect("marquee lock").as_mut() {
-            // Settled, not applied. The rectangle stays on screen until Enter
-            // takes it, so a drag that came out wrong can be redrawn rather than
-            // undone.
-            marquee.settled = true;
-        }
         gtk::glib::Propagation::Proceed
     });
 

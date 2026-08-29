@@ -53,7 +53,7 @@ and say so rather than working around it.
 
 ## Platform code
 
-**Priority: this has broken CI five times, all the same way.**
+**Priority: this has broken CI six times, all the same way.**
 
 Platform code lives in two crates and nowhere else: `rawkit-shell`, for windows
 and canvases, and `rawkit-catalog`, for volume identity and path conventions.
@@ -88,6 +88,18 @@ platforms**, even if the counterpart only prints what is missing and returns
 `Ok`. Never a bare `let _ = (...)` to silence it, and never `allow(dead_code)` —
 both hide the fact that a platform cannot do the thing, which is exactly what
 you want to know.
+
+**A field the platform file only *writes* is the same bug again, and this one
+the dev box cannot see.** Failure number six: a `settled` flag on the crop
+marquee, set by `canvas.rs` and read by nobody. On Linux that assignment counts
+as a use, so `-D warnings` is silent here; on macOS and Windows `canvas.rs` is
+not compiled at all, the field has no use whatsoever, and the build stops. The
+cross-target trick above does not help — `rawkit-shell` links GTK and a webview
+and will not cross-compile — so CI is the only place this shows up. Which means
+the defence is the rule, not a check: **if the only thing that touches a field
+is the platform file, it should not exist.** The flag was removed rather than
+read; letting go of the button already stops the motion handler updating the
+rectangle, so the state was recorded twice and used once.
 
 **A helper that only the platform file calls is the same bug wearing a hat.**
 That is failure number five: two small accessors in `main.rs`, written for
