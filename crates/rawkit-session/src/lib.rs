@@ -48,22 +48,19 @@
 //!
 //! # What is not connected yet
 //!
-//! Two things, named here so that "the command bus is done" cannot be read as
-//! "the canvas works".
+//! A [`RenderJob`] is executable: `rawkit_engine::Renderer::render_tile` takes a
+//! level and a tile position and draws exactly that, and a level-0 tile is
+//! bit-identical to the same region of a whole-image render.
 //!
-//! 1. **The engine has no per-tile entry point.** `Renderer::run` tiles
-//!    internally and returns one assembled image; nothing yet accepts a
-//!    [`TileId`] and renders that region at that level. Until it does, a
-//!    [`RenderJob`] describes work no one can execute. That is the next piece,
-//!    and it is why this crate ships with no end-to-end render test — a test
-//!    that pretended to close the loop would be measuring its own mock.
-//! 2. **Nothing presents the result.** `run` reads pixels back to the CPU, which
-//!    is right for export and wrong for a canvas; the interactive path needs to
-//!    keep the result on the GPU and blit it to a surface. That needs a window,
-//!    which is the Tauri shell.
+//! What is missing is **presentation**. That render reads its pixels back to the
+//! CPU, which is right for export and wrong for a canvas; the interactive path
+//! has to keep the result on the GPU and blit it to a surface. A surface needs a
+//! window, which is the Tauri shell — so until that exists, this crate has no
+//! end-to-end test that closes the loop, and one built against a mock canvas
+//! would be measuring the mock.
 //!
-//! The bus is deliberately first. It is the part that constrains the other two,
-//! and the only part that can be fully tested before a window exists.
+//! The bus was deliberately first. It constrains the other two, and it is the
+//! only part that can be fully tested before a window exists.
 
 use rawkit_editstate::{EditState, Orientation};
 use serde::{Deserialize, Serialize};

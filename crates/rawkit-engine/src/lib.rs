@@ -29,7 +29,7 @@ pub mod render;
 
 pub use pipeline::{Domain, Stage};
 pub use profile::CameraProfile;
-pub use render::{normalise, BayerPhase, Frame, Output, Renderer};
+pub use render::{normalise, BayerPhase, Frame, Output, Pyramid, Renderer, TileBuffers};
 
 /// Failures the engine can produce that are not programmer error.
 #[derive(Debug, thiserror::Error)]
