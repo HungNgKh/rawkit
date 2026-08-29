@@ -154,9 +154,10 @@ const PANEL_WIDTH: f64 = 400.0;
 /// Height the chrome keeps in route 3. `default_vbox` is a vertical box, and two
 /// disjoint rectangles is what the arrangement needs.
 ///
-/// Linux-only, like route 3 itself: the equivalents on macOS and Windows will be
-/// a child NSView and a child HWND, and those bring their own geometry.
-#[cfg(target_os = "linux")]
+/// The equivalents on macOS and Windows will be a child NSView and a child
+/// HWND, and those will bring their own geometry — but the constant is not
+/// gated, because a value only some platforms can see is how this file has
+/// broken the build four times.
 const PANEL_HEIGHT: i32 = 200;
 const WINDOW: (f64, f64) = (1200.0, 800.0);
 
@@ -248,10 +249,14 @@ fn main() -> Result<()> {
             let shared = Arc::new(Mutex::new(session));
             app.manage(Shared(shared.clone()));
 
-            #[cfg(target_os = "linux")]
-            if route == Route::NativeChild {
-                canvas::attach_input(&window_handle, PANEL_HEIGHT, shared.clone())?;
-            }
+            // Routes 1 and 2 put the canvas over the whole window; route 3
+            // reserves a strip for the chrome.
+            let panel = if route == Route::NativeChild {
+                PANEL_HEIGHT
+            } else {
+                0
+            };
+            attach_input(&window_handle, panel, shared.clone())?;
 
             let mut canvas_renderer =
                 session_canvas::CanvasRenderer::new(&gpu, &frame, [size.width, size.height]);
@@ -313,6 +318,32 @@ fn main() -> Result<()> {
             Ok(())
         })
         .run(tauri::generate_context!())?;
+    Ok(())
+}
+
+/// Route pointer input over the canvas into the session.
+///
+/// One signature for every platform, and a body per platform, rather than a
+/// call the other two cannot see. Four CI failures in this file have had the
+/// same shape: something used only inside a `cfg` block, so the platforms
+/// without it saw dead code. A stub that says what is missing costs one
+/// function and cannot rot.
+#[cfg(target_os = "linux")]
+fn attach_input(
+    window: &tauri::Window,
+    panel_height: i32,
+    session: Arc<Mutex<Session>>,
+) -> Result<()> {
+    canvas::attach_input(window, panel_height, session)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn attach_input(
+    _window: &tauri::Window,
+    _panel_height: i32,
+    _session: Arc<Mutex<Session>>,
+) -> Result<()> {
+    eprintln!("input      : pointer input on the canvas is implemented for X11 only so far");
     Ok(())
 }
 

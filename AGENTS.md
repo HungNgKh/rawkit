@@ -51,6 +51,23 @@ and say so rather than working around it.
    holds no pixel type and no GPU handle — if you find yourself wanting to add
    one, that is the invariant, not an obstacle to it.
 
+## Platform code
+
+**Priority: this file has broken CI four times, all the same way.**
+
+`rawkit-shell` is the only crate with `#[cfg(target_os = ...)]` in it, and that
+is deliberate — the engine must stay portable. But a `cfg` block that *uses*
+something means the platforms without that block see dead code, and `-D warnings`
+turns dead code into a build failure on machines you are not developing on.
+
+So: **every `cfg`-gated piece of behaviour gets a counterpart for the other
+platforms**, even if the counterpart only prints what is missing and returns
+`Ok`. Never a bare `let _ = (...)` to silence it, and never `allow(dead_code)` —
+both hide the fact that a platform cannot do the thing, which is exactly what
+you want to know.
+
+The engine has never broken the matrix. Keep the platform knowledge here.
+
 ## Dependencies
 
 Every dependency is declared in the root `Cargo.toml` `[workspace.dependencies]`
