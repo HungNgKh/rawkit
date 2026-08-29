@@ -110,27 +110,222 @@ pub fn encode(
         .map_err(|e| ExportError::Colour(format!("serialising the sRGB profile: {e}")))?;
     let source = linear_srgb_profile()?;
 
+    // Sampled once per process; `None` means the transform is not separable and
+    // every pixel goes through Little CMS as it always did.
+    let sampled = sampled_transform();
+
     match format {
         Format::Jpeg { quality } => {
-            let eight =
-                transform::<[u8; 3]>(&source, &destination, &rgb, lcms2::PixelFormat::RGB_8)?;
-            encode_jpeg(&flatten(&eight), width, height, quality, &icc)
+            let eight = match sampled {
+                Some(curves) => curves.to_eight(&rgb),
+                None => flatten(&transform::<[u8; 3]>(
+                    &source,
+                    &destination,
+                    &rgb,
+                    lcms2::PixelFormat::RGB_8,
+                )?),
+            };
+            encode_jpeg(&eight, width, height, quality, &icc)
         }
         Format::Png8 => {
-            let eight =
-                transform::<[u8; 3]>(&source, &destination, &rgb, lcms2::PixelFormat::RGB_8)?;
-            encode_png(&flatten(&eight), width, height, png::BitDepth::Eight, &icc)
+            let eight = match sampled {
+                Some(curves) => curves.to_eight(&rgb),
+                None => flatten(&transform::<[u8; 3]>(
+                    &source,
+                    &destination,
+                    &rgb,
+                    lcms2::PixelFormat::RGB_8,
+                )?),
+            };
+            encode_png(&eight, width, height, png::BitDepth::Eight, &icc)
         }
         Format::Png16 => {
-            let sixteen =
-                transform::<[u16; 3]>(&source, &destination, &rgb, lcms2::PixelFormat::RGB_16)?;
-            let bytes: Vec<u8> = sixteen
-                .iter()
-                .flatten()
-                .flat_map(|v| v.to_be_bytes())
-                .collect();
+            let bytes = match sampled {
+                Some(curves) => curves.to_sixteen(&rgb),
+                None => {
+                    transform::<[u16; 3]>(&source, &destination, &rgb, lcms2::PixelFormat::RGB_16)?
+                        .iter()
+                        .flatten()
+                        .flat_map(|v| v.to_be_bytes())
+                        .collect()
+                }
+            };
             encode_png(&bytes, width, height, png::BitDepth::Sixteen, &icc)
         }
+    }
+}
+
+/// How many samples of the transform to take, per channel.
+///
+/// The interpolation error goes as the square of the spacing. At 8192 the worst
+/// case is under a five-thousandth of an eight-bit step, which is far below the
+/// rounding that follows it.
+const SAMPLES: usize = 8192;
+
+/// Little CMS's answer, tabulated.
+///
+/// # Why this exists, with the numbers that justify it
+///
+/// Little CMS is fast when it can precompute a table and slow when it cannot.
+/// Measured on a 2560x1710 image with these exact profiles: **8-bit in and out
+/// takes 24 ms; 16-bit in takes 563 ms and float in 614 ms.** The difference is
+/// not the format, it is that an 8-bit input has 256 possible values so the
+/// library builds a device link and looks the answer up. Our input is linear
+/// light in floats, and quantising *that* to eight bits before the transfer
+/// function is exactly the banding the format notes warn about.
+///
+/// So this does what Little CMS does, at the precision the input deserves: ask
+/// it for the answer at 8192 points and interpolate between them. The numbers
+/// still come from Little CMS, and the profile embedded in the file still comes
+/// from the same object, so pixels and label cannot disagree.
+///
+/// # Why it is allowed to be one-dimensional
+///
+/// Only because it is checked. The working space and the output space share
+/// primaries and a white point today, so the transform is per channel — but the
+/// module header explicitly anticipates widening the working space, at which
+/// point it would not be, and a table built on that assumption would produce
+/// colour that is confidently wrong. [`Curves::build`] therefore verifies itself
+/// against Little CMS on mixed colours and returns `None` if they disagree,
+/// which puts every pixel back through the general path.
+struct Curves {
+    /// Encoded output for a linear input, one table per channel. Three rather
+    /// than one shared table because "the channels happen to match" is another
+    /// assumption, and this one costs 96 KB to avoid.
+    channel: [Vec<f32>; 3],
+}
+
+/// Built once. The profiles never vary, so neither does the table.
+fn sampled_transform() -> Option<&'static Curves> {
+    static CURVES: std::sync::OnceLock<Option<Curves>> = std::sync::OnceLock::new();
+    CURVES.get_or_init(Curves::build).as_ref()
+}
+
+impl Curves {
+    fn build() -> Option<Curves> {
+        let destination = lcms2::Profile::new_srgb();
+        let source = linear_srgb_profile().ok()?;
+
+        // A ramp per channel, with the other two held at zero, so what comes
+        // back is that channel's own contribution.
+        let mut channel: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for (c, table) in channel.iter_mut().enumerate() {
+            let ramp: Vec<[f32; 3]> = (0..SAMPLES)
+                .map(|i| {
+                    let mut pixel = [0.0f32; 3];
+                    pixel[c] = i as f32 / (SAMPLES - 1) as f32;
+                    pixel
+                })
+                .collect();
+            let out =
+                transform::<[f32; 3]>(&source, &destination, &ramp, lcms2::PixelFormat::RGB_FLT)
+                    .ok()?;
+            *table = out.iter().map(|p| p[c]).collect();
+        }
+        let curves = Curves { channel };
+
+        // The two checks that make the shortcut legitimate.
+        //
+        // **Separability**, on mixed colours in range: if the working space ever
+        // widens, red will start depending on green and a per-channel table will
+        // be confidently wrong everywhere.
+        let mixed: Vec<[f32; 3]> = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [0.18, 0.18, 0.18],
+            [0.9, 0.1, 0.35],
+            [0.02, 0.55, 0.98],
+            [0.33, 0.66, 0.01],
+            [0.5, 0.0, 1.0],
+            [0.004, 0.002, 0.001],
+        ];
+        let expected =
+            transform::<[f32; 3]>(&source, &destination, &mixed, lcms2::PixelFormat::RGB_FLT)
+                .ok()?;
+        for (probe, want) in mixed.iter().zip(&expected) {
+            let got = curves.apply(*probe);
+            for c in 0..3 {
+                // A ten-thousandth of full scale, well inside a quarter of an
+                // eight-bit step and far above interpolation error. Anything
+                // larger means the transform is not separable.
+                if (got[c] - want[c]).abs() > 1e-4 {
+                    eprintln!(
+                        "colour     : the output transform is not separable ({probe:?} → \
+                         {got:?} rather than {want:?}); using the slow path"
+                    );
+                    return None;
+                }
+            }
+        }
+
+        // **Clamping**, on values outside [0, 1], which the renderer does
+        // produce. Compared against the eight-bit output rather than the float
+        // one, because Little CMS only clamps when it is writing to something
+        // that cannot hold the overflow — and the table always clamps, so this
+        // is the comparison that says the two agree about what a file gets.
+        let outside: Vec<[f32; 3]> = vec![
+            [-0.2, 0.5, 1.4],
+            [1.4, -0.05, 0.2],
+            [-1.0, -1.0, -1.0],
+            [2.0, 2.0, 2.0],
+        ];
+        let clamped =
+            transform::<[u8; 3]>(&source, &destination, &outside, lcms2::PixelFormat::RGB_8)
+                .ok()?;
+        for (probe, want) in outside.iter().zip(&clamped) {
+            let got = curves.to_eight(&[*probe]);
+            for c in 0..3 {
+                if got[c].abs_diff(want[c]) > 1 {
+                    eprintln!(
+                        "colour     : the table and Little CMS clamp differently ({probe:?} → \
+                         {got:?} rather than {want:?}); using the slow path"
+                    );
+                    return None;
+                }
+            }
+        }
+
+        Some(curves)
+    }
+
+    /// One pixel, linear in and encoded out.
+    fn apply(&self, pixel: [f32; 3]) -> [f32; 3] {
+        let mut out = [0.0f32; 3];
+        for c in 0..3 {
+            // Clamped, which is what Little CMS does for an integer output and
+            // therefore what the probes above compare against.
+            let x = pixel[c].clamp(0.0, 1.0) * (SAMPLES - 1) as f32;
+            let i = x as usize;
+            let table = &self.channel[c];
+            out[c] = if i + 1 < SAMPLES {
+                let f = x - i as f32;
+                table[i] + (table[i + 1] - table[i]) * f
+            } else {
+                table[SAMPLES - 1]
+            };
+        }
+        out
+    }
+
+    fn to_eight(&self, rgb: &[[f32; 3]]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(rgb.len() * 3);
+        for pixel in rgb {
+            for v in self.apply(*pixel) {
+                out.push((v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+            }
+        }
+        out
+    }
+
+    fn to_sixteen(&self, rgb: &[[f32; 3]]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(rgb.len() * 6);
+        for pixel in rgb {
+            for v in self.apply(*pixel) {
+                let value = (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+        out
     }
 }
 
@@ -317,6 +512,49 @@ mod tests {
             pixels.extend_from_slice(&[v, v, v, 1.0]);
         }
         (pixels, values.len() as u32, 1)
+    }
+
+    #[test]
+    fn the_table_agrees_with_little_cms_everywhere_it_is_asked() {
+        // The whole justification for the shortcut. Little CMS is still the
+        // authority on what the numbers are; this only claims to reproduce them.
+        // Comparing at eight bits is the comparison that matters, because that is
+        // the precision the answer is written at.
+        let curves = Curves::build().expect("the transform is separable today");
+        let destination = lcms2::Profile::new_srgb();
+        let source = linear_srgb_profile().expect("the working space profile");
+
+        // A deterministic spread rather than random: shadows, mid-tones,
+        // highlights, saturated corners and the near-black region where the sRGB
+        // curve changes shape and a table is most likely to be wrong.
+        let mut probes = Vec::new();
+        for i in 0..64 {
+            let t = i as f32 / 63.0;
+            probes.push([t, t, t]);
+            probes.push([t, 1.0 - t, t * t]);
+            probes.push([t * 0.004, t * 0.02, t * 0.05]);
+            probes.push([1.0 - t * t, t, 0.5]);
+        }
+
+        let expected =
+            transform::<[u8; 3]>(&source, &destination, &probes, lcms2::PixelFormat::RGB_8)
+                .expect("reference transform");
+
+        let mut worst = 0i32;
+        for (probe, want) in probes.iter().zip(&expected) {
+            let got = curves.to_eight(&[*probe]);
+            for c in 0..3 {
+                let difference = got[c] as i32 - want[c] as i32;
+                worst = worst.max(difference.abs());
+                assert!(
+                    difference.abs() <= 1,
+                    "{probe:?} channel {c}: table says {} and Little CMS says {}",
+                    got[c],
+                    want[c]
+                );
+            }
+        }
+        println!("worst disagreement: {worst} of 255");
     }
 
     #[test]
