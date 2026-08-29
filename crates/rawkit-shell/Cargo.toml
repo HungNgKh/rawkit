@@ -13,6 +13,7 @@ rawkit-editstate.workspace = true
 rawkit-engine.workspace = true
 rawkit-session.workspace = true
 rawkit-decode.workspace = true
+rawkit-export.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
 anyhow.workspace = true

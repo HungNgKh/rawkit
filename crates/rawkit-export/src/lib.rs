@@ -38,7 +38,10 @@
 
 use std::io::Cursor;
 
+pub mod display;
+
 #[derive(Debug, thiserror::Error)]
+
 pub enum ExportError {
     #[error("{width}x{height} needs {expected} samples, got {actual}")]
     WrongSize {

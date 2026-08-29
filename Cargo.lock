@@ -3036,6 +3036,7 @@ dependencies = [
  "rawkit-decode",
  "rawkit-editstate",
  "rawkit-engine",
+ "rawkit-export",
  "rawkit-session",
  "serde_json",
  "tauri",

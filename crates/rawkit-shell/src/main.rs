@@ -222,6 +222,7 @@ fn main() -> Result<()> {
                 config.format, size.width, size.height
             );
             surface.configure(&gpu.device, &config);
+            let mut config = config;
 
             // The mosaic outlives everything that borrows it, and there is
             // exactly one per process. Leaking it is honest about that; the
@@ -260,7 +261,38 @@ fn main() -> Result<()> {
 
             let mut canvas_renderer =
                 session_canvas::CanvasRenderer::new(&gpu, &frame, [size.width, size.height]);
-            canvas_renderer.target(&gpu, config.format);
+
+            // Correct for the monitor when the desktop says what it is. The
+            // table already encodes, so the surface has to stop doing it —
+            // hence reconfiguring to the non-sRGB form of the same format.
+            let lut = display_profile().and_then(|bytes| {
+                match rawkit_export::display::DisplayLut::from_icc(&bytes) {
+                    Ok(Some(lut)) => {
+                        eprintln!("display    : correcting for {}", lut.description());
+                        Some(lut)
+                    }
+                    Ok(None) => {
+                        eprintln!("display    : monitor profile matches sRGB, no correction");
+                        None
+                    }
+                    Err(e) => {
+                        eprintln!("display    : unusable monitor profile: {e}");
+                        None
+                    }
+                }
+            });
+            match &lut {
+                Some(lut) => {
+                    let plain = config.format.remove_srgb_suffix();
+                    if plain != config.format {
+                        config.format = plain;
+                        config.view_formats = vec![plain];
+                        surface.configure(&gpu.device, &config);
+                    }
+                    canvas_renderer.target_with_lut(&gpu, config.format, lut);
+                }
+                None => canvas_renderer.target(&gpu, config.format),
+            }
 
             // One frame: let the session decide, draw what it asked for, blit.
             //
@@ -319,6 +351,29 @@ fn main() -> Result<()> {
         })
         .run(tauri::generate_context!())?;
     Ok(())
+}
+
+/// The monitor's ICC profile, if the desktop is managing colour.
+///
+/// One signature per platform, per the rule in AGENTS.md. ColorSync on macOS
+/// and ICM on Windows are the equivalents and are not written yet, so those
+/// platforms say so and assume sRGB — which is what they did before, only now
+/// out loud.
+#[cfg(target_os = "linux")]
+fn display_profile() -> Option<Vec<u8>> {
+    match canvas::display_profile() {
+        Ok(profile) => profile,
+        Err(e) => {
+            eprintln!("display    : could not read the monitor profile: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn display_profile() -> Option<Vec<u8>> {
+    eprintln!("display    : reading the monitor profile is implemented for X11 only so far");
+    None
 }
 
 /// Route pointer input over the canvas into the session.

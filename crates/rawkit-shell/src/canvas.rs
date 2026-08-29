@@ -277,3 +277,74 @@ pub fn attach_input(
 
     Ok(())
 }
+
+/// The monitor's ICC profile, as the desktop advertises it.
+///
+/// X11 has carried this since the ICC Profiles in X specification: the colour
+/// manager — colord under GNOME, here — writes the profile bytes onto the root
+/// window as `_ICC_PROFILE`, and every application is expected to read it. No
+/// D-Bus, no colord dependency, and it works whatever set the property.
+///
+/// `Ok(None)` means the desktop is not managing colour, which is ordinary and
+/// not an error: the renderer then does what it always did and assumes sRGB.
+///
+/// Only the first monitor's profile is read. `_ICC_PROFILE_AT_N` carries the
+/// others, and picking between them needs to know which monitor the window is
+/// actually on — a question worth answering when the app can be dragged between
+/// two calibrated displays, and not before.
+pub fn display_profile() -> Result<Option<Vec<u8>>> {
+    use x11::xlib;
+
+    // SAFETY: every call below is an ordinary Xlib read against a display we
+    // open and close ourselves. The property may be absent, which is the
+    // `format == 0` case rather than an error.
+    unsafe {
+        let display = xlib::XOpenDisplay(std::ptr::null());
+        if display.is_null() {
+            return Ok(None);
+        }
+        let atom = xlib::XInternAtom(
+            display,
+            c"_ICC_PROFILE".as_ptr() as *const _,
+            xlib::True, // only if it already exists
+        );
+        if atom == 0 {
+            xlib::XCloseDisplay(display);
+            return Ok(None);
+        }
+
+        let root = xlib::XDefaultRootWindow(display);
+        let mut kind: xlib::Atom = 0;
+        let mut format: i32 = 0;
+        let mut count: u64 = 0;
+        let mut remaining: u64 = 0;
+        let mut data: *mut u8 = std::ptr::null_mut();
+        // 8 MB in 32-bit words is far more than any profile, and asking for a
+        // fixed large amount avoids the two-call length dance.
+        let status = xlib::XGetWindowProperty(
+            display,
+            root,
+            atom,
+            0,
+            2 * 1024 * 1024,
+            xlib::False,
+            xlib::AnyPropertyType as xlib::Atom,
+            &mut kind,
+            &mut format,
+            &mut count,
+            &mut remaining,
+            &mut data,
+        );
+
+        let profile = if status == xlib::Success as i32 && !data.is_null() && format == 8 {
+            Some(std::slice::from_raw_parts(data, count as usize).to_vec())
+        } else {
+            None
+        };
+        if !data.is_null() {
+            xlib::XFree(data.cast());
+        }
+        xlib::XCloseDisplay(display);
+        Ok(profile)
+    }
+}

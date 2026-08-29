@@ -66,6 +66,16 @@ impl CanvasRenderer {
         self.presenter = Presenter::new(gpu, format);
     }
 
+    /// The same, but correcting for a monitor that is not sRGB.
+    pub fn target_with_lut(
+        &mut self,
+        gpu: &Gpu,
+        format: wgpu::TextureFormat,
+        lut: &rawkit_export::display::DisplayLut,
+    ) {
+        self.presenter = Presenter::with_display_lut(gpu, format, lut.entries(), lut.grid());
+    }
+
     pub fn canvas(&self) -> &Canvas {
         &self.canvas
     }

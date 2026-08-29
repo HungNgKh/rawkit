@@ -46,6 +46,34 @@ fn fs_shader_encode(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(encode_srgb(linear), 1.0);
 }
 
+@group(0) @binding(2) var display_lut: texture_3d<f32>;
+@group(0) @binding(3) var lut_sampler: sampler;
+
+/// For a monitor whose own profile said it is not sRGB.
+///
+/// The table maps linear sRGB straight to that monitor's device values —
+/// primaries, transfer curve and all — so what comes out here is already
+/// encoded and the target must *not* be an `-Srgb` format. Encoding twice is
+/// the washed-out failure; this path exists to avoid the subtler one, where a
+/// wider-than-sRGB screen quietly oversaturates every colour.
+///
+/// Sampling is trilinear, done by the sampler. A 33-per-axis grid is what ICC
+/// itself uses for `A2B` tables and its interpolation error sits far below what
+/// an 8-bit framebuffer can show.
+@fragment
+fn fs_display_lut(in: VsOut) -> @location(0) vec4<f32> {
+    let linear = clamp(
+        textureSample(canvas, canvas_sampler, in.uv).rgb,
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
+    // Sample at texel centres: a value of 0 must land on the first entry and 1
+    // on the last, not half a texel outside either.
+    let size = vec3<f32>(textureDimensions(display_lut));
+    let uvw = (linear * (size - 1.0) + 0.5) / size;
+    return vec4<f32>(textureSample(display_lut, lut_sampler, uvw).rgb, 1.0);
+}
+
 /// The sRGB transfer function. Not a tone curve: the tone map already ran, in
 /// scene-linear light, several stages ago.
 fn encode_srgb(c: vec3<f32>) -> vec3<f32> {
