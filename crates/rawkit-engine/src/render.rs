@@ -31,6 +31,20 @@
 //! path holds one set for as long as an image is open and `run` builds a
 //! throwaway set for the one-shot case.
 //!
+//! # Two ways out
+//!
+//! [`Renderer::render_tile`] ends in a `map_async` and a blocking device poll:
+//! the caller wanted the pixels, so it pays a full CPU/GPU sync to get them.
+//! That is right for export and fatal for a canvas — a dozen visible tiles is a
+//! dozen stalls a frame, which no amount of tiling or level selection recovers
+//! from.
+//!
+//! [`Renderer::draw_tile`] writes into a [`Canvas`] texture and returns. Nothing
+//! synchronises; the frame becomes visible when the surface is presented, which
+//! is the one place a frame should wait. The two paths share every kernel, and
+//! a test measures their disagreement at 2^-11 — the spacing of half floats,
+//! and nothing else.
+//!
 //! # Resolution levels
 //!
 //! [`Pyramid`] reduces the *mosaic*, not the image, keeping the CFA pattern
@@ -199,7 +213,14 @@ struct Params {
     working_to_display: [[f32; 4]; 3],
     develop: [f32; 4],
     hsm_dims: [u32; 4],
+    /// `[dest_x, dest_y, tile, halo]`. Rewritten per tile; everything above it
+    /// moves only when the edit does, which is why this sits last and is
+    /// patched in place rather than re-uploading the whole uniform.
+    present: [u32; 4],
 }
+
+/// Byte offset of `Params::present`, for the per-tile partial write.
+const PRESENT_OFFSET: u64 = 176;
 
 /// What the caller wants back.
 ///
@@ -254,7 +275,9 @@ pub const DEFAULT_TILE: u32 = 512;
 /// slow to sit on a render path.
 pub struct Renderer {
     layout: wgpu::BindGroupLayout,
+    canvas_layout: wgpu::BindGroupLayout,
     pipelines: Vec<wgpu::ComputePipeline>,
+    present: wgpu::ComputePipeline,
     tile: u32,
 }
 
@@ -337,9 +360,46 @@ impl Renderer {
             })
             .collect();
 
+        // The canvas lives in its own group so a window resize rebuilds one
+        // small bind group rather than the per-image buffers beside it.
+        let canvas_layout = gpu
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("canvas"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: CANVAS_FORMAT,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                }],
+            });
+        let present_layout = gpu
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("present layout"),
+                bind_group_layouts: &[Some(&layout), Some(&canvas_layout)],
+                immediate_size: 0,
+            });
+        let present = gpu
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("present"),
+                layout: Some(&present_layout),
+                module: &module,
+                entry_point: Some("present"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
         Self {
             layout,
+            canvas_layout,
             pipelines,
+            present,
             tile,
         }
     }
@@ -588,24 +648,7 @@ impl Renderer {
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rcd") });
-        {
-            // One pass per stage. The stage boundaries are vkdt's barriers: each
-            // reads what the previous one wrote, so they cannot be merged
-            // without reintroducing the workgroup-memory version.
-            let stages = match intent {
-                Output::SceneLinear => &self.pipelines[..STAGES.len() - 1],
-                Output::Display => &self.pipelines[..],
-            };
-            for (pipeline, stage) in stages.iter().zip(STAGES) {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some(stage),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &buffers.bind_group, &[]);
-                pass.dispatch_workgroups(buffers.padded.div_ceil(8), buffers.padded.div_ceil(8), 1);
-            }
-        }
+        self.dispatch_stages(&mut encoder, buffers, intent);
         encoder.copy_buffer_to_buffer(&buffers.out, 0, &buffers.staging, 0, buffers.out_size);
         gpu.queue.submit([encoder.finish()]);
 
@@ -629,6 +672,143 @@ impl Renderer {
         };
         buffers.staging.unmap();
         Ok(pixels)
+    }
+
+    /// One pass per stage. The stage boundaries are vkdt's barriers: each reads
+    /// what the previous one wrote, so they cannot be merged without
+    /// reintroducing the workgroup-memory version.
+    fn dispatch_stages(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        buffers: &TileBuffers,
+        intent: Output,
+    ) {
+        let stages = match intent {
+            Output::SceneLinear => &self.pipelines[..STAGES.len() - 1],
+            Output::Display => &self.pipelines[..],
+        };
+        let groups = buffers.padded.div_ceil(8);
+        for (pipeline, stage) in stages.iter().zip(STAGES) {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(stage),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &buffers.bind_group, &[]);
+            pass.dispatch_workgroups(groups, groups, 1);
+        }
+    }
+
+    /// A canvas to draw tiles into. Sized in screen pixels and rebuilt on
+    /// resize; the per-image buffers beside it are untouched by that.
+    pub fn create_canvas(&self, gpu: &Gpu, width: u32, height: u32) -> Canvas {
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("canvas"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: CANVAS_FORMAT,
+            // STORAGE to be written by `present`, TEXTURE_BINDING so a surface
+            // blit can sample it, COPY_SRC so a test can check what landed.
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("canvas"),
+            layout: &self.canvas_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            }],
+        });
+        Canvas {
+            texture,
+            bind_group,
+            size: [width.max(1), height.max(1)],
+        }
+    }
+
+    /// Draw one tile into `canvas` at `dest`, and **do not wait for it**.
+    ///
+    /// This is the interactive path, and the whole difference from
+    /// [`Renderer::render_tile`] is the absence of a readback. That call ends in
+    /// `map_async` and a blocking device poll — a full CPU/GPU sync per tile,
+    /// which at a dozen visible tiles is a dozen stalls a frame. Nothing about
+    /// tiling or resolution levels reaches 60fps through those.
+    ///
+    /// Work is submitted and the function returns. The result becomes visible
+    /// when the caller presents the surface, which is the only place a frame
+    /// should synchronise.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_tile(
+        &self,
+        gpu: &Gpu,
+        buffers: &TileBuffers,
+        canvas: &Canvas,
+        pyramid: &Pyramid<'_>,
+        level: u8,
+        tx: u32,
+        ty: u32,
+        dest: [u32; 2],
+        intent: Output,
+    ) -> Result<(), EngineError> {
+        let (data, lw, lh) = pyramid.level(level).ok_or_else(|| {
+            EngineError::DeviceRequest(format!(
+                "level {level} does not exist; the pyramid has {}",
+                pyramid.levels()
+            ))
+        })?;
+        let (ox, oy) = (tx * self.tile, ty * self.tile);
+        if ox >= lw || oy >= lh {
+            return Err(EngineError::DeviceRequest(format!(
+                "tile ({tx}, {ty}) at level {level} starts outside a {lw}x{lh} mosaic"
+            )));
+        }
+
+        {
+            let mut scratch = buffers.scratch.borrow_mut();
+            gather_padded(data, lw, lh, ox, oy, buffers.padded, &mut scratch);
+            gpu.queue
+                .write_buffer(&buffers.cfa, 0, bytemuck::cast_slice(&scratch));
+        }
+        // Patch only the tail of the uniform. The colour half was resolved once
+        // by `set_edit` and does not move because a different tile is being
+        // drawn — writes and submits are ordered on the queue, so this lands
+        // before the dispatch that reads it.
+        let present: [u32; 4] = [dest[0], dest[1], self.tile, HALO];
+        gpu.queue.write_buffer(
+            &buffers.params,
+            PRESENT_OFFSET,
+            bytemuck::cast_slice(&present),
+        );
+
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("draw tile"),
+            });
+        self.dispatch_stages(&mut encoder, buffers, intent);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("present"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.present);
+            pass.set_bind_group(0, &buffers.bind_group, &[]);
+            pass.set_bind_group(1, &canvas.bind_group, &[]);
+            let groups = self.tile.div_ceil(8);
+            pass.dispatch_workgroups(groups, groups, 1);
+        }
+        gpu.queue.submit([encoder.finish()]);
+        Ok(())
     }
 
     /// Resolve the edit against the frame's profile and upload the result.
@@ -680,6 +860,7 @@ impl Renderer {
                 Some(m) => [m.hue_divisions, m.sat_divisions, m.value_divisions, 0],
                 None => [1, 1, 1, 0],
             },
+            present: [0, 0, self.tile, HALO],
         };
         gpu.queue
             .write_buffer(&buffers.params, 0, bytemuck::bytes_of(&params));
@@ -732,6 +913,136 @@ pub struct TileBuffers {
     scratch: std::cell::RefCell<Vec<f32>>,
     /// Bound by the bind group but never touched by name again.
     _held: Vec<wgpu::Buffer>,
+}
+
+/// What the canvas holds.
+///
+/// Display-referred **linear**, in half floats. Not 8-bit, because these values
+/// have no transfer function applied yet and eight bits of linear bands visibly
+/// in the shadows once encoded; not 32-bit, because half floats already carry
+/// more precision than a display can resolve and a canvas spends its budget on
+/// bandwidth.
+pub const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// A GPU-resident destination for rendered tiles.
+///
+/// The pixels stay here. A surface blit samples this texture and applies the
+/// output transform on the way to the screen; nothing on the interactive path
+/// copies them to the CPU, which is the entire point.
+pub struct Canvas {
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    size: [u32; 2],
+}
+
+impl Canvas {
+    /// The underlying texture, for a surface blit to sample.
+    pub fn texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+
+    pub fn size(&self) -> [u32; 2] {
+        self.size
+    }
+
+    /// Pull the canvas back to the CPU as interleaved RGBA.
+    ///
+    /// For tests and for anything offline. Deliberately *not* part of drawing a
+    /// frame: this is the synchronising, stalling operation that
+    /// [`Renderer::draw_tile`] exists to keep off the hot path.
+    pub fn read_back(&self, gpu: &Gpu) -> Result<Vec<f32>, EngineError> {
+        const BYTES_PER_PIXEL: u32 = 8;
+        let [w, h] = self.size;
+        // Texture-to-buffer copies want rows aligned to 256 bytes, which an
+        // arbitrary canvas width will not be. Pad the copy and drop the padding
+        // on the way out rather than constraining what widths are allowed.
+        let padded_row = (w * BYTES_PER_PIXEL).div_ceil(256) * 256;
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("canvas readback"),
+            size: (padded_row * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("canvas readback"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        gpu.queue.submit([encoder.finish()]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| EngineError::DeviceRequest(e.to_string()))?;
+        rx.recv()
+            .map_err(|_| EngineError::DeviceRequest("readback never completed".into()))?
+            .map_err(|e| EngineError::DeviceRequest(e.to_string()))?;
+
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        {
+            let view = staging.slice(..).get_mapped_range();
+            for y in 0..h {
+                let row = (y * padded_row) as usize;
+                let halves: &[u16] =
+                    bytemuck::cast_slice(&view[row..row + (w * BYTES_PER_PIXEL) as usize]);
+                out.extend(halves.iter().copied().map(half_to_f32));
+            }
+        }
+        staging.unmap();
+        Ok(out)
+    }
+}
+
+/// IEEE 754 binary16 to binary32.
+///
+/// Written out rather than pulled from a crate: it is fifteen lines, it is used
+/// only off the hot path, and every dependency in this workspace costs a licence
+/// review (see `docs/licence-policy.md`).
+fn half_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) as u32) << 31;
+    let exponent = ((h >> 10) & 0x1f) as u32;
+    let mantissa = (h & 0x3ff) as u32;
+    let bits = match exponent {
+        // Zero or subnormal. Every subnormal half is a *normal* float, so the
+        // leading bit has to be located and the exponent rebuilt around it —
+        // the one branch here with real arithmetic in it, and the reason
+        // `half_floats_decode_exactly` covers it explicitly.
+        0 if mantissa == 0 => sign,
+        0 => {
+            let leading = mantissa.leading_zeros();
+            let msb = 31 - leading;
+            sign | ((134 - leading) << 23) | ((mantissa << (23 - msb)) & 0x7f_ffff)
+        }
+        // Infinity or NaN.
+        31 => sign | 0x7f80_0000 | (mantissa << 13),
+        _ => sign | ((exponent + 127 - 15) << 23) | (mantissa << 13),
+    };
+    f32::from_bits(bits)
 }
 
 /// A Bayer mosaic and its phase-preserving reductions.
@@ -922,4 +1233,42 @@ pub fn normalise(raw: &rawkit_decode::RawImage) -> Vec<f32> {
             (sample as f32 - black) / (white - black)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::half_to_f32;
+
+    /// Hand-written bit manipulation, so it gets a test that names values rather
+    /// than trusting it to look right. Subnormals are the branch worth the
+    /// trouble: they are the only one that has to find a leading bit and rebuild
+    /// an exponent, and a canvas would show the error as a black shadow region
+    /// rather than as anything obviously wrong.
+    #[test]
+    fn half_floats_decode_exactly() {
+        let cases: [(u16, f32); 10] = [
+            (0x0000, 0.0),
+            (0x8000, -0.0),
+            (0x3c00, 1.0),
+            (0xc000, -2.0),
+            (0x3800, 0.5),
+            (0x3555, 0.333_251_95),
+            // Largest and smallest normal halves.
+            (0x7bff, 65504.0),
+            (0x0400, 6.103_515_6e-5),
+            // Subnormals: the smallest positive half, and the largest subnormal.
+            (0x0001, 5.960_464_5e-8),
+            (0x03ff, 6.097_555e-5),
+        ];
+        for (bits, expected) in cases {
+            let found = half_to_f32(bits);
+            assert_eq!(
+                found.to_bits(),
+                expected.to_bits(),
+                "0x{bits:04x} decoded to {found:e}, not {expected:e}"
+            );
+        }
+        assert!(half_to_f32(0x7c00).is_infinite());
+        assert!(half_to_f32(0x7e00).is_nan());
+    }
 }

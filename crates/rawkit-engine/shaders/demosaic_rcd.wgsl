@@ -67,6 +67,10 @@ struct Params {
     develop: vec4<f32>,
     // Hue, saturation and value divisions of the table. `.w` unused.
     hsm_dims: vec4<u32>,
+    // Where this tile lands in the canvas and how to trim it: `.xy` is the
+    // destination pixel, `.z` the tile edge, `.w` the halo width. Rewritten per
+    // tile, unlike everything above it, which moves only when the edit does.
+    present: vec4<u32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -86,6 +90,18 @@ struct Params {
 // saturation scale, value scale. Padded to vec4 because a vec3 array has a
 // stride of 16 bytes anyway.
 @group(0) @binding(8) var<storage, read> hue_sat_map: array<vec4<f32>>;
+
+// The canvas, in its own bind group so it can be resized with the window
+// without disturbing the per-image buffers in group 0. Storage textures are a
+// separate WebGPU limit from storage buffers (four per stage against eight), so
+// this costs nothing against the eight already spent.
+//
+// rgba16float, not rgba8: the pixels here are display-referred *linear* and the
+// transfer function belongs to whoever presents them. Eight bits of linear
+// would band visibly in the shadows once encoded. Not rgba32float either —
+// half floats carry more precision than a display can show, at half the
+// bandwidth, and bandwidth is what a canvas spends.
+@group(1) @binding(0) var canvas: texture_storage_2d<rgba16float, write>;
 
 const EPS: f32 = 1e-5;
 
@@ -670,4 +686,34 @@ fn tone_map(x: vec3<f32>) -> vec3<f32> {
     let k = 0.82;
     let clamped = max(x, vec3<f32>(0.0));
     return clamped / (clamped + vec3<f32>(k));
+}
+
+// ---------------------------------------------------------------------------
+// present — a finished tile's interior into the canvas.
+//
+// The last stage of an interactive render and the reason it can be interactive:
+// the result stays on the GPU. Reading it back to the CPU, as export does,
+// means a full device sync per tile, and no amount of tiling reaches 60fps
+// through a dozen stalls a frame.
+//
+// Trimming the halo here rather than on the way out is what lets the copy be a
+// straight dispatch: the tile's interior begins `halo` pixels in on both axes,
+// and everything outside it exists only to make the interior correct.
+// ---------------------------------------------------------------------------
+@compute @workgroup_size(8, 8)
+fn present(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let tile = params.present.z;
+    if (gid.x >= tile || gid.y >= tile) {
+        return;
+    }
+    let dest = params.present.xy + gid.xy;
+    // A tile at the edge of the image overhangs the canvas. Dropping those
+    // pixels beats clamping them, which would smear the last column outwards.
+    let bounds = textureDimensions(canvas);
+    if (dest.x >= bounds.x || dest.y >= bounds.y) {
+        return;
+    }
+    let halo = params.present.w;
+    let src = idx(i32(gid.x + halo), i32(gid.y + halo));
+    textureStore(canvas, dest, rgba_out[src]);
 }

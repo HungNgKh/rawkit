@@ -52,12 +52,14 @@
 //! level and a tile position and draws exactly that, and a level-0 tile is
 //! bit-identical to the same region of a whole-image render.
 //!
-//! What is missing is **presentation**. That render reads its pixels back to the
-//! CPU, which is right for export and wrong for a canvas; the interactive path
-//! has to keep the result on the GPU and blit it to a surface. A surface needs a
-//! window, which is the Tauri shell — so until that exists, this crate has no
-//! end-to-end test that closes the loop, and one built against a mock canvas
-//! would be measuring the mock.
+//! Tiles are GPU-resident too: `Renderer::draw_tile` writes into a `Canvas`
+//! texture and returns without synchronising, so a frame costs one submission
+//! rather than one device stall per tile.
+//!
+//! What is missing is the last hop — **blitting that canvas to a window**. A
+//! surface needs a window, which is the Tauri shell, so until that exists this
+//! crate has no end-to-end test that closes the loop; one built against a mock
+//! canvas would be measuring the mock.
 //!
 //! The bus was deliberately first. It constrains the other two, and it is the
 //! only part that can be fully tested before a window exists.
