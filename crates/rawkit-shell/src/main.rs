@@ -234,7 +234,7 @@ fn main() -> Result<()> {
             // A library, if that is what was passed. The catalog is what makes
             // an edit outlive the process, so it is opened before the image it
             // describes rather than bolted on after.
-            let mut library = open_library(target.as_deref())?;
+            let library = open_library(target.as_deref())?;
             let raw = library
                 .as_ref()
                 .map(|(_, path)| PathBuf::from(path))
