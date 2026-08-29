@@ -161,6 +161,15 @@ pub enum CullAction {
     ClearColour,
     /// Put back what the last judgement replaced, and go to that frame.
     Undo,
+    /// Set this frame aside to compare, or take it back out.
+    Mark,
+    /// Move within the marked set rather than through the whole shoot.
+    SelectMarked(i32),
+    /// Judge the frame under the cursor **and drop it from the comparison**, so
+    /// the field narrows as you eliminate. `true` keeps it, `false` discards it.
+    SurveyJudge(bool),
+    /// Empty the comparison.
+    ClearMarks,
     /// Move the selection without loading anything — what a grid does. The
     /// loupe uses `Next`/`Previous`, which ask for the photograph as well.
     SelectNext,
@@ -170,6 +179,7 @@ pub enum CullAction {
     /// Which view to show.
     Grid,
     Loupe,
+    Survey,
     /// Larger or smaller cells, in steps.
     Cells(i32),
 }
@@ -187,6 +197,10 @@ pub struct CullView {
     pub picks: usize,
     pub rejects: usize,
     pub undoable: bool,
+    /// How many frames are set aside to compare.
+    pub marked: usize,
+    /// Whether this one is among them.
+    pub is_marked: bool,
     /// Which view is showing. Here because the *canvas* can change it — a
     /// double-click on a cell opens the loupe — and the page would otherwise go
     /// on claiming the grid was up.
@@ -205,6 +219,10 @@ pub struct Library {
     undo: Vec<(usize, Judgement)>,
     /// A navigation the render loop has not acted on yet.
     request: Option<usize>,
+    /// Frames set aside to compare against each other, as positions in the
+    /// sequence, kept in order so a survey reads left to right the way the shoot
+    /// happened.
+    marked: Vec<usize>,
 }
 
 /// How many judgements can be taken back. Enough to cover a mis-keyed run
@@ -233,6 +251,7 @@ impl Library {
             index: 0,
             undo: Vec::new(),
             request: None,
+            marked: Vec::new(),
         })
     }
 
@@ -260,6 +279,11 @@ impl Library {
     /// when someone zooms in.
     pub fn preview_for(&self, needed: u32, edit_state_hash: &str) -> Result<Option<Decoded>> {
         self.preview_at(self.index, needed, Some(edit_state_hash))
+    }
+
+    /// The frames set aside for comparison, in shoot order.
+    pub fn marked(&self) -> &[usize] {
+        &self.marked
     }
 
     pub fn count(&self) -> usize {
@@ -423,11 +447,57 @@ impl Library {
             }
             // Handled by the shell, which owns the layout and the render loop.
             // Listed here so the page has one vocabulary rather than two.
-            CullAction::Grid | CullAction::Loupe | CullAction::Cells(_) => {}
+            CullAction::Grid | CullAction::Loupe | CullAction::Survey | CullAction::Cells(_) => {}
+            CullAction::Mark => match self.marked.iter().position(|i| *i == self.index) {
+                Some(at) => {
+                    self.marked.remove(at);
+                }
+                None => {
+                    self.marked.push(self.index);
+                    self.marked.sort_unstable();
+                }
+            },
+            CullAction::ClearMarks => self.marked.clear(),
+            CullAction::SelectMarked(step) => {
+                if !self.marked.is_empty() {
+                    let at = self
+                        .marked
+                        .iter()
+                        .position(|i| *i == self.index)
+                        .unwrap_or(0) as i64;
+                    let next = (at + step as i64).rem_euclid(self.marked.len() as i64);
+                    self.index = self.marked[next as usize];
+                }
+            }
+            CullAction::SurveyJudge(keep) => {
+                let flag = if keep { Flag::Pick } else { Flag::Reject };
+                self.judge(|j| Judgement {
+                    flag: Some(flag),
+                    ..j
+                })?;
+                // Out of the comparison, and the cursor lands on whatever is
+                // still in it — which is what makes this a winnowing rather
+                // than a survey you have to leave and re-enter.
+                if let Some(at) = self.marked.iter().position(|i| *i == self.index) {
+                    self.marked.remove(at);
+                    if let Some(next) = self.marked.get(at).or_else(|| self.marked.last()) {
+                        self.index = *next;
+                    }
+                }
+            }
             CullAction::Undo => {
                 if let Some((index, previous)) = self.undo.pop() {
                     cull::set(&self.catalog, self.images[index].id, &previous)?;
+                    // A survey drops what it judges, so undoing a judgement has
+                    // to put the frame back where it was being compared —
+                    // otherwise the key that reverses a mistake leaves you
+                    // looking at a comparison the mistake is missing from.
+                    if !self.marked.is_empty() && !self.marked.contains(&index) {
+                        self.marked.push(index);
+                        self.marked.sort_unstable();
+                    }
                     self.go(index);
+                    self.index = index;
                 }
             }
         }
@@ -485,6 +555,8 @@ impl Library {
             picks,
             rejects,
             undoable: !self.undo.is_empty(),
+            marked: self.marked.len(),
+            is_marked: self.marked.contains(&self.index),
             mode: crate::mode_name(),
         })
     }
@@ -840,5 +912,104 @@ mod saver_tests {
             .query_row("SELECT count(*) FROM edit_states", [], |r| r.get(0))
             .unwrap();
         assert_eq!(versions, 0);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod survey_tests {
+    use super::tests::{library_at, Scratch};
+    use super::*;
+
+    #[test]
+    fn marking_is_a_toggle_and_keeps_shoot_order() {
+        let dir = Scratch::new("marks");
+        let mut library = library_at(&dir.0, 5);
+        for index in [3usize, 1, 4] {
+            library.select(index);
+            library.act(CullAction::Mark).unwrap();
+        }
+        assert_eq!(library.marked(), [1, 3, 4], "left to right as shot");
+
+        library.select(3);
+        library.act(CullAction::Mark).unwrap();
+        assert_eq!(library.marked(), [1, 4], "the same key takes it back out");
+    }
+
+    #[test]
+    fn judging_in_a_survey_narrows_the_field() {
+        // The gesture a survey exists for: "which of these". Each judgement
+        // takes one out, so what is left is the question that remains.
+        let dir = Scratch::new("winnow");
+        let mut library = library_at(&dir.0, 6);
+        for index in [0usize, 1, 2] {
+            library.select(index);
+            library.act(CullAction::Mark).unwrap();
+        }
+        library.select(0);
+
+        library.act(CullAction::SurveyJudge(false)).unwrap();
+        assert_eq!(
+            library.marked(),
+            [1, 2],
+            "the rejected one left the comparison"
+        );
+        assert_eq!(library.index(), 1, "and the cursor is on what remains");
+
+        library.act(CullAction::SurveyJudge(true)).unwrap();
+        assert_eq!(
+            library.marked(),
+            [2],
+            "a keeper leaves it too — both narrow"
+        );
+        assert_eq!(library.index(), 2);
+
+        library.act(CullAction::SurveyJudge(true)).unwrap();
+        assert!(library.marked().is_empty(), "and the comparison is over");
+    }
+
+    #[test]
+    fn undo_puts_a_frame_back_into_the_comparison() {
+        // Otherwise the key that reverses a mistake leaves you looking at a
+        // comparison the mistake is missing from — the flag is restored and the
+        // frame is still gone, which is half a fix and reads as a broken undo.
+        let dir = Scratch::new("survey-undo");
+        let mut library = library_at(&dir.0, 4);
+        for index in [0usize, 1, 2] {
+            library.select(index);
+            library.act(CullAction::Mark).unwrap();
+        }
+        library.select(1);
+        library.act(CullAction::SurveyJudge(false)).unwrap();
+        assert_eq!(library.marked(), [0, 2]);
+
+        let view = library.act(CullAction::Undo).unwrap();
+        assert_eq!(
+            library.marked(),
+            [0, 1, 2],
+            "back where it was being compared"
+        );
+        assert_eq!(view.flag, None, "and unflagged again");
+        assert_eq!(library.index(), 1, "with the cursor on it");
+    }
+
+    #[test]
+    fn moving_within_a_comparison_wraps_and_ignores_everything_else() {
+        // Arrows in a survey move between the frames being compared, not
+        // through the shoot — otherwise one press leaves the comparison.
+        let dir = Scratch::new("survey-move");
+        let mut library = library_at(&dir.0, 8);
+        for index in [1usize, 5, 6] {
+            library.select(index);
+            library.act(CullAction::Mark).unwrap();
+        }
+        library.select(1);
+        library.act(CullAction::SelectMarked(1)).unwrap();
+        assert_eq!(library.index(), 5);
+        library.act(CullAction::SelectMarked(1)).unwrap();
+        assert_eq!(library.index(), 6);
+        library.act(CullAction::SelectMarked(1)).unwrap();
+        assert_eq!(library.index(), 1, "round the end, not off it");
+        library.act(CullAction::SelectMarked(-1)).unwrap();
+        assert_eq!(library.index(), 6);
     }
 }

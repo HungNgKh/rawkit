@@ -217,6 +217,17 @@ fn cull(state: tauri::State<'_, Shelf>, action: CullAction) -> Result<CullView, 
             MODE.store(MODE_GRID, std::sync::atomic::Ordering::Relaxed);
             CullAction::SelectBy(0)
         }
+        // A survey needs at least two frames to be a comparison. Refusing is
+        // better than showing one photograph in a view named for choosing
+        // between several.
+        CullAction::Survey => {
+            let enough = library.lock().expect("library lock").marked().len() >= 2;
+            if !enough {
+                return Err("mark at least two frames with M before comparing them".into());
+            }
+            MODE.store(MODE_SURVEY, std::sync::atomic::Ordering::Relaxed);
+            CullAction::SelectMarked(0)
+        }
         CullAction::Loupe => {
             MODE.store(MODE_LOUPE, std::sync::atomic::Ordering::Relaxed);
             // The loupe has been showing something else since it last ran, so
@@ -244,6 +255,12 @@ fn cull(state: tauri::State<'_, Shelf>, action: CullAction) -> Result<CullView, 
                 CullAction::SelectBy(0)
             }
         }
+        // In a survey, arrows move within the comparison and P and X narrow it.
+        // Same keys, same meanings, over a smaller set.
+        CullAction::Next if mode() == MODE_SURVEY => CullAction::SelectMarked(1),
+        CullAction::Previous if mode() == MODE_SURVEY => CullAction::SelectMarked(-1),
+        CullAction::Pick if mode() == MODE_SURVEY => CullAction::SurveyJudge(true),
+        CullAction::Reject if mode() == MODE_SURVEY => CullAction::SurveyJudge(false),
         // Arrows move without loading in the grid and with loading in the loupe,
         // which is the same key meaning the same thing in both.
         CullAction::Next if mode() == MODE_GRID => CullAction::SelectNext,
@@ -759,6 +776,8 @@ fn label_colour(name: &str) -> Option<[f32; 3]> {
 
 const MODE_LOUPE: u8 = 0;
 const MODE_GRID: u8 = 1;
+/// A handful of frames side by side, to choose between.
+const MODE_SURVEY: u8 = 2;
 
 fn mode() -> u8 {
     MODE.load(std::sync::atomic::Ordering::Relaxed)
@@ -769,15 +788,18 @@ fn mode() -> u8 {
 /// Named rather than a comparison at each call site because the canvas widget
 /// asks it, and that file is the one where platform-specific code is allowed to
 /// live — the less it knows about the rest of the shell, the better.
+/// Whether the canvas is laying out cells rather than showing one photograph.
+/// Both the grid and a survey are; the canvas widget only needs to know that
+/// clicks pick a cell rather than pan an image.
 pub(crate) fn in_grid() -> bool {
-    mode() == MODE_GRID
+    matches!(mode(), MODE_GRID | MODE_SURVEY)
 }
 
 pub(crate) fn mode_name() -> &'static str {
-    if in_grid() {
-        "grid"
-    } else {
-        "loupe"
+    match mode() {
+        MODE_GRID => "grid",
+        MODE_SURVEY => "survey",
+        _ => "loupe",
     }
 }
 
@@ -847,7 +869,23 @@ fn draw_grid(
     // actual size, so a row always fills the width. Laying out at the requested
     // size instead leaves a ragged strip down the right — which reads as a
     // margin nobody asked for, and wastes an eighth of the window.
-    let asked = GRID_CELL.load(std::sync::atomic::Ordering::Relaxed).max(80) as f64;
+    // A survey shows only what was set aside, and sizes its cells to fill the
+    // canvas rather than to a chosen density — the whole point is to see a few
+    // frames as large as they will go.
+    let survey = mode() == MODE_SURVEY;
+    let chosen: Vec<usize> = library.lock().expect("library lock").marked().to_vec();
+    if survey && chosen.is_empty() {
+        // Nothing left to compare, which is what winnowing down to one and then
+        // judging it looks like. Back to the grid rather than an empty canvas.
+        MODE.store(MODE_GRID, std::sync::atomic::Ordering::Relaxed);
+    }
+    let survey = survey && !chosen.is_empty();
+
+    let asked = if survey {
+        best_survey_cell(chosen.len(), surface)
+    } else {
+        GRID_CELL.load(std::sync::atomic::Ordering::Relaxed).max(80) as f64
+    };
     let columns = ((surface[0] as f64 / asked).round() as usize).max(1);
     GRID_COLUMNS.store(columns, std::sync::atomic::Ordering::Relaxed);
     let pitch_x = surface[0] as f64 / columns as f64;
@@ -861,12 +899,25 @@ fn draw_grid(
     let slot_h = (cell / 1.5).round();
     let pitch_y = slot_h + gap;
 
-    let (count, mut selected) = {
+    let (total, mut selected) = {
         let library = library.lock().expect("library lock");
         (library.count(), library.index())
     };
+    // What the layout is over: every photograph, or only the comparison.
+    let shown: Vec<usize> = if survey { chosen } else { (0..total).collect() };
+    let count = shown.len();
     let rows = count.div_ceil(columns);
 
+    // A survey never fills the canvas exactly — three 3:2 frames across a wide
+    // window are one row of a third its height — so the block is centred. Left
+    // at the top it reads as a layout that ran out rather than one that chose.
+    let centring = if survey {
+        ((surface[1] as f64 - rows as f64 * pitch_y) / 2.0).max(0.0)
+    } else {
+        0.0
+    };
+
+    // A survey never scrolls: everything in it is on screen by construction.
     // A wheel notch moves half a row, which is small enough to feel like
     // scrolling and large enough to get somewhere.
     let notches = CANVAS_SCROLL.swap(0, std::sync::atomic::Ordering::Relaxed);
@@ -877,10 +928,10 @@ fn draw_grid(
     // A click picks the cell under it; a double-click opens that cell.
     if let Some(([x, y], double)) = CANVAS_CLICK.lock().expect("click lock").take() {
         let column = (x / pitch_x).floor() as i64;
-        let row = ((y + grid.scroll) / pitch_y).floor() as i64;
+        let row = ((y + grid.scroll - centring) / pitch_y).floor() as i64;
         if (0..columns as i64).contains(&column) && row >= 0 {
-            let index = row as usize * columns + column as usize;
-            if index < count {
+            let slot = row as usize * columns + column as usize;
+            if let Some(&index) = shown.get(slot) {
                 selected = index;
                 let mut library = library.lock().expect("library lock");
                 library.select(index);
@@ -895,7 +946,8 @@ fn draw_grid(
     // Follow the selection rather than making the user chase it. Only ever by
     // the minimum needed, so a selection already on screen does not move the
     // view at all.
-    let selected_row = (selected / columns) as f64;
+    let at = shown.iter().position(|i| *i == selected).unwrap_or(0);
+    let selected_row = (at / columns) as f64;
     let top = selected_row * pitch_y;
     let bottom = top + pitch_y;
     if top < grid.scroll {
@@ -912,7 +964,11 @@ fn draw_grid(
 
     // Load a bounded number per frame, nearest to the selection first, so what
     // you are looking at fills in before what you are not.
-    let mut wanted: Vec<usize> = (from..to).filter(|i| !grid.cells.contains_key(i)).collect();
+    let mut wanted: Vec<usize> = shown[from.min(count)..to.min(count)]
+        .iter()
+        .copied()
+        .filter(|i| !grid.cells.contains_key(i))
+        .collect();
     wanted.sort_by_key(|i| i.abs_diff(selected));
     let needed = cell.round() as u32;
     for index in wanted.into_iter().take(LOADS_PER_FRAME) {
@@ -926,26 +982,38 @@ fn draw_grid(
         }
     }
     // Anything far outside the view is not coming back soon.
-    let keep = from.saturating_sub(columns * 4)..to + columns * 4;
+    let keep: std::collections::HashSet<usize> = shown
+        [from.saturating_sub(columns * 4).min(count)..(to + columns * 4).min(count)]
+        .iter()
+        .copied()
+        .collect();
     grid.cells.retain(|index, _| keep.contains(index));
 
-    let flags = library.lock().expect("library lock").flags_in(from, to)?;
-
     let mut cells = Vec::new();
-    for index in from..to {
+    for (slot, &index) in shown
+        .iter()
+        .enumerate()
+        .take(to.min(count))
+        .skip(from.min(count))
+    {
         let Some(image) = grid.cells.get(&index) else {
             continue;
         };
-        let row = index / columns;
-        let column = index % columns;
+        let row = slot / columns;
+        let column = slot % columns;
         // Fit the photograph inside the slot, keeping its shape.
         let (iw, ih) = (image.width as f64, image.height as f64);
         let scale = (cell / iw).min(slot_h / ih);
         let (w, h) = (iw * scale, ih * scale);
         let slot_x = gap / 2.0 + column as f64 * pitch_x;
-        let slot_y = gap / 2.0 + row as f64 * pitch_y - grid.scroll;
+        let slot_y = centring + gap / 2.0 + row as f64 * pitch_y - grid.scroll;
 
-        let (flag, label) = flags.get(index - from).cloned().unwrap_or((None, None));
+        let (flag, label) = library
+            .lock()
+            .expect("library lock")
+            .flags_in(index, index + 1)?
+            .pop()
+            .unwrap_or((None, None));
         let tint = match flag {
             // A third the brightness. The shape of a cull becomes visible
             // without reading anything, which is the whole point of a grid.
@@ -988,6 +1056,24 @@ fn draw_grid(
     let drawn = cells.len();
     blit.draw_grid(gpu, canvas_renderer.canvas(), &cells);
     Ok(drawn)
+}
+
+/// The cell size that lets `count` frames fill the canvas.
+///
+/// Tries every column count and keeps the one that makes the cells largest. A
+/// survey of three is a row of three; a survey of five is three above two,
+/// because that is bigger than one row of five on a wide canvas.
+fn best_survey_cell(count: usize, surface: [u32; 2]) -> f64 {
+    let (width, height) = (surface[0] as f64, surface[1] as f64);
+    let mut best = 80.0f64;
+    for columns in 1..=count {
+        let rows = count.div_ceil(columns) as f64;
+        let cell_w = width / columns as f64;
+        // Slots are 3:2, so the height a row needs is two thirds of the width.
+        let cell_h = (height / rows) * 1.5;
+        best = best.max(cell_w.min(cell_h));
+    }
+    best
 }
 
 /// Whether a path names a catalog rather than a photograph.

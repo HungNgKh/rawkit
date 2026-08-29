@@ -40,7 +40,7 @@
   <span id="label"></span>
   <span id="counts"></span>
   <span id="mode">loupe</span>
-  <span id="keys">G grid · E loupe · P pick · X reject · U unflag · 1–5 rate · 6–9 label · Z undo</span>
+  <span id="keys">G grid · E loupe · M mark · C compare · P pick · X reject · 1–5 rate · 6–9 label · Z undo</span>
 </div>
 
 <main>
@@ -232,7 +232,8 @@
     label.textContent = view.colour ? view.colour.toUpperCase() : "";
     label.style.color = { red: "#e0705f", yellow: "#d8bf63", green: "#6fc27a", blue: "#6f9ade" }[view.colour] ?? "";
     document.getElementById("counts").textContent =
-      `${view.picks} picked · ${view.rejects} rejected`;
+      `${view.picks} picked · ${view.rejects} rejected` +
+      (view.marked ? ` · ${view.marked} marked${view.is_marked ? " ✓" : ""}` : "");
     setMode(view.mode);
   };
 
@@ -266,8 +267,11 @@
     if (labels[key]) return act("colour", labels[key]), event.preventDefault();
     switch (key.toLowerCase()) {
       // G and E, because that is what a Lightroom user's hands already do.
-      case "g": act("grid"); setMode("grid"); break;
-      case "e": case "enter": case "escape": act("loupe"); setMode("loupe"); break;
+      case "g": act("grid"); break;
+      case "e": case "enter": case "escape": act("loupe"); break;
+      // M sets a frame aside, C compares what you set aside.
+      case "m": act("mark"); break;
+      case "c": act("survey"); break;
       case "arrowright": case " ": act("next"); break;
       case "arrowleft": act("previous"); break;
       // Rows in the grid; neighbours in the loupe. Which one is resolved by the
