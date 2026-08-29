@@ -123,7 +123,7 @@ pub fn render(
     // scene, or a scaling bug in decode — and they look identical in the image.
     // 1.0 means a channel reached the white level.
     {
-        let mut sorted: Vec<f32> = mosaic.iter().copied().collect();
+        let mut sorted = mosaic.to_vec();
         sorted.sort_by(f32::total_cmp);
         let at = |q: f64| sorted[((sorted.len() - 1) as f64 * q) as usize];
         eprintln!(
