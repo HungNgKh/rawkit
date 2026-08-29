@@ -232,7 +232,7 @@ pub fn attach_input(
             // place that knows the layout. This widget's whole job is turning
             // GTK's logical coordinates into canvas ones.
             let double = event.event_type() == gtk::gdk::EventType::DoubleButtonPress;
-            *crate::canvas_click() = Some((at, double));
+            *crate::CANVAS_CLICK.lock().expect("click lock") = Some((at, double));
         } else {
             held.set(Some(event.position()));
         }
@@ -277,7 +277,7 @@ pub fn attach_input(
                 gtk::gdk::ScrollDirection::Smooth => event.delta().1.round() as i32,
                 _ => 0,
             };
-            crate::add_canvas_scroll(notches);
+            crate::CANVAS_SCROLL.fetch_add(notches, std::sync::atomic::Ordering::Relaxed);
             return gtk::glib::Propagation::Proceed;
         }
         let step = match event.direction() {

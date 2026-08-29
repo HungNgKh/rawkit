@@ -405,7 +405,7 @@ fn main() -> Result<()> {
                 // nothing else: no decode, no session, no viewport. Returning
                 // here is what keeps the two views from having to know about
                 // each other.
-                if mode() == MODE_GRID {
+                if in_grid() {
                     if let Some(library) = &navigating {
                         let drawn = draw_grid(
                             &gpu,
@@ -738,9 +738,10 @@ static GRID_CELL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::n
 /// that is** is worked out by the render loop, which is the only place that knows
 /// the layout. Publishing the column count and pitch instead would put the same
 /// arithmetic in two files and let them disagree.
-static CANVAS_CLICK: Mutex<Option<([f64; 2], bool)>> = Mutex::new(None);
+pub(crate) static CANVAS_CLICK: Mutex<Option<([f64; 2], bool)>> = Mutex::new(None);
 /// Wheel notches since the last frame, positive downwards.
-static CANVAS_SCROLL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+pub(crate) static CANVAS_SCROLL: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
 
 /// What a colour label looks like, in linear light.
 ///
@@ -778,14 +779,6 @@ pub(crate) fn mode_name() -> &'static str {
     } else {
         "loupe"
     }
-}
-
-pub(crate) fn canvas_click() -> std::sync::MutexGuard<'static, Option<([f64; 2], bool)>> {
-    CANVAS_CLICK.lock().expect("click lock")
-}
-
-pub(crate) fn add_canvas_scroll(notches: i32) {
-    CANVAS_SCROLL.fetch_add(notches, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The grid's own state: what is on the GPU, and where the view is.

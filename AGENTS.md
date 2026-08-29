@@ -66,6 +66,14 @@ platforms**, even if the counterpart only prints what is missing and returns
 both hide the fact that a platform cannot do the thing, which is exactly what
 you want to know.
 
+**A helper that only the platform file calls is the same bug wearing a hat.**
+That is failure number five: two small accessors in `main.rs`, written for
+`canvas.rs` to call, were dead code on macOS and Windows and stopped the build
+there. A `pub(crate) fn` is not exempt from `dead_code` just because it looks
+like infrastructure. So either the shared code uses it too, or it should not
+exist — the accessors were deleted and the platform file now touches the statics
+directly, which is one fewer thing that can be unused.
+
 The engine has never broken the matrix. Keep the platform knowledge here.
 
 ## Tests must not assume the host filesystem
