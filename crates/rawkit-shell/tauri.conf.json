@@ -10,6 +10,7 @@
     "windows": [],
     "security": {
       "csp": null
-    }
+    },
+    "macOSPrivateApi": true
   }
 }

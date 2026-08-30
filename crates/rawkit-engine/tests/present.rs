@@ -45,6 +45,64 @@ fn to_half(value: f32) -> u16 {
     half
 }
 
+/// Every pixel of a `SIZE x SIZE` BGRA target, tightly packed.
+///
+/// Texture-to-buffer copies want rows aligned to 256 bytes and `SIZE` is 8, so
+/// each row arrives with 224 bytes of padding behind it. Dropping that here
+/// rather than at every call site: the first version returned the padded buffer
+/// and indexed it as though it were tight, which read the wrong pixel for every
+/// row but the first.
+fn read_back(gpu: &Gpu, target: &wgpu::Texture) -> Vec<u8> {
+    let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("present readback"),
+        size: (256 * SIZE) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &staging,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(256),
+                rows_per_image: Some(SIZE),
+            },
+        },
+        wgpu::Extent3d {
+            width: SIZE,
+            height: SIZE,
+            depth_or_array_layers: 1,
+        },
+    );
+    gpu.queue.submit([encoder.finish()]);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    rx.recv().expect("readback").expect("readback");
+    let out = {
+        let view = staging.slice(..).get_mapped_range();
+        (0..SIZE as usize)
+            .flat_map(|y| view[y * 256..y * 256 + SIZE as usize * 4].to_vec())
+            .collect()
+    };
+    staging.unmap();
+    out
+}
+
 /// Fill a canvas with one colour and present it into `target_format`, returning
 /// the first pixel as BGRA bytes.
 fn round_trip(gpu: &Gpu, linear: [f32; 3], target_format: wgpu::TextureFormat) -> [u8; 4] {
@@ -207,4 +265,107 @@ fn black_and_white_survive_the_ends_of_the_curve() {
     let white = round_trip(&gpu, [1.0, 1.0, 1.0], wgpu::TextureFormat::Bgra8UnormSrgb);
     assert_eq!(&black[..3], &[0, 0, 0], "linear 0 must stay 0");
     assert_eq!(&white[..3], &[255, 255, 255], "linear 1 must reach full");
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn drawing_into_a_rectangle_leaves_the_rest_of_the_window_alone() {
+    // For the arrangement where the chrome floats over the surface rather than
+    // beside it: the swapchain is the whole window, and the photograph belongs
+    // only where the interface is not covering. Two things have to hold, and
+    // the second is the one a viewport gets wrong — the picture has to be
+    // *scaled into* the rectangle, not merely clipped to it.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+    let presenter = Presenter::new(&gpu, format);
+    let canvas = Renderer::new(&gpu).create_canvas(&gpu, SIZE, SIZE);
+    // Mid-grey, so a written pixel is unmistakably not the cleared background.
+    let halves: Vec<u16> = (0..SIZE * SIZE)
+        .flat_map(|_| [to_half(0.5), to_half(0.5), to_half(0.5), to_half(1.0)])
+        .collect();
+    gpu.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: canvas.texture(),
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::cast_slice(&halves),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(SIZE * 8),
+            rows_per_image: Some(SIZE),
+        },
+        wgpu::Extent3d {
+            width: SIZE,
+            height: SIZE,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("windowed target"),
+        size: wgpu::Extent3d {
+            width: SIZE,
+            height: SIZE,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+    // Clear the whole thing to black first, so "untouched" is a value the test
+    // can recognise rather than whatever the driver left.
+    {
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        gpu.queue.submit([encoder.finish()]);
+    }
+
+    let strip = SIZE / 4;
+    presenter
+        .draw_into(&gpu, &canvas, &view, [0, strip, SIZE, SIZE - strip])
+        .expect("present into a rectangle");
+    let pixels = read_back(&gpu, &target);
+
+    let at = |x: u32, y: u32| {
+        let i = ((y * SIZE + x) * 4) as usize;
+        [pixels[i], pixels[i + 1], pixels[i + 2]]
+    };
+    // Above the rectangle: exactly what was there, because the chrome is drawn
+    // over it and anything written would show through wherever it is not.
+    for y in 0..strip {
+        assert_eq!(at(SIZE / 2, y), [0, 0, 0], "row {y} was painted over");
+    }
+    // Inside it: the photograph, everywhere including the last row — a viewport
+    // that clipped instead of scaling would leave the bottom quarter black.
+    for y in [strip, SIZE / 2, SIZE - 1] {
+        let got = at(SIZE / 2, y);
+        assert!(got[0] > 100, "row {y} is {got:?}, not the canvas");
+    }
 }

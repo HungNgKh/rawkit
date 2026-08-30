@@ -267,11 +267,32 @@ impl Presenter {
     ///
     /// Submits and returns; nothing waits. The caller presents the surface,
     /// which is the one place a frame should synchronise.
+    /// Draw `canvas` into the whole of `target`.
     pub fn draw(
         &self,
         gpu: &Gpu,
         canvas: &Canvas,
         target: &wgpu::TextureView,
+    ) -> Result<(), EngineError> {
+        let [w, h] = canvas.size();
+        self.draw_into(gpu, canvas, target, [0, 0, w, h])
+    }
+
+    /// Draw `canvas` into one rectangle of `target`, leaving the rest alone.
+    ///
+    /// For an arrangement where the chrome floats over the surface rather than
+    /// beside it: the swapchain is the whole window, but the photograph belongs
+    /// only in the part the interface is not covering. Drawing the full surface
+    /// there instead would put the top of every photograph behind the panel.
+    ///
+    /// Outside the rectangle nothing is written, so whatever the window already
+    /// had stays — which is the chrome, painted by the webview on top.
+    pub fn draw_into(
+        &self,
+        gpu: &Gpu,
+        canvas: &Canvas,
+        target: &wgpu::TextureView,
+        at: [u32; 4],
     ) -> Result<(), EngineError> {
         let view = canvas
             .texture()
@@ -324,6 +345,15 @@ impl Presenter {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
+            // The viewport maps the triangle onto the rectangle; the scissor
+            // stops the oversized part of it reaching anything else. Same pair
+            // the preview grid uses, and for the same reason.
+            let [x, y, w, h] = at;
+            if w == 0 || h == 0 {
+                return Ok(());
+            }
+            pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
+            pass.set_scissor_rect(x, y, w, h);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..3, 0..1);
         }

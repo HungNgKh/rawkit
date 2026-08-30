@@ -5,6 +5,13 @@
   :root { color-scheme: dark; }
   html, body { margin: 0; height: 100%; background: #1e1e22; color: #e8e8ea;
                font: 13px/1.4 system-ui, sans-serif; }
+  /* Under a transparent cutout the page covers the whole window and the GPU
+     surface is behind it, so everything below the chrome has to paint nothing
+     at all — an opaque pixel here is a pixel of photograph nobody can see.
+     Route 3 gives the canvas its own window and never sets this, which is why
+     it is a class rather than the default. */
+  body.cutout { background: transparent; }
+  body.cutout #chrome { background: #1e1e22; }
   main { padding: 14px 18px; display: flex; gap: 24px; align-items: flex-start; }
   section { min-width: 200px; }
   /* Six tone controls in one column would need a taller panel, and the panel is
@@ -44,6 +51,7 @@
   #flag.reject { color: #e0705f; }
 </style>
 
+<div id="chrome">
 <div id="cull" class="hidden">
   <span id="frame"></span>
   <span id="position"></span>
@@ -117,6 +125,7 @@
     <div id="log">ready</div>
   </section>
 </main>
+</div>
 
 <script type="module">
   // The whole of the UI's contract with the engine. Commands go down, events
@@ -287,6 +296,11 @@
       (view.copied ? " · settings copied" : "");
     setMode(view.mode);
   };
+
+  // Told by the Rust side which arrangement this is. Route 3 hands the canvas
+  // its own window and the page keeps its background; a cutout needs the page
+  // to paint nothing where the photograph belongs.
+  if (location.search.includes("cutout")) document.body.classList.add("cutout");
 
   const act = async (action, value) => {
     try {

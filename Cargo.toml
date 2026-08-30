@@ -74,7 +74,12 @@ jpeg-encoder = "0.7"
 jpeg-decoder = "0.3"
 # The desktop shell. Only rawkit-shell may depend on these; the engine must stay
 # usable headless, which is what keeps the golden tests and export honest.
-tauri = { version = "2", features = ["unstable"] }
+# `macos-private-api` is what makes a transparent window possible on macOS, and
+# a transparent window is what route 1 is. It bars *App Store* distribution and
+# nothing else — notarised direct download, which is how a tool like this ships,
+# is unaffected. Chosen deliberately over writing a child NSView: see the route
+# notes in rawkit-shell.
+tauri = { version = "2", features = ["unstable", "macos-private-api"] }
 tauri-build = "2"
 # Linux only, and pinned to the versions Tauri already links so the GTK types
 # are the same types. Used to pack a native widget beside the webview and hang

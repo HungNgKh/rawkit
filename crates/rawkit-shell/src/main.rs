@@ -1,5 +1,32 @@
-//! The compositing probe — **and its result, which is that route 1 does not
-//! work on Linux/WebKitGTK.**
+//! The desktop shell, and the compositing probe it grew out of — **whose result
+//! is that no single arrangement works on all three platforms.**
+//!
+//! # Which route runs where
+//!
+//! | platform | route | why |
+//! |---|---|---|
+//! | Linux | 3, a native child widget | route 1's layers fight; see below |
+//! | macOS | 1, transparent cutout | no GTK to hang a widget on |
+//! | Windows | 1, transparent cutout | the same |
+//!
+//! They are not fallbacks for one another. Route 3 needs a native widget to put
+//! the surface on, which so far means a GTK one; route 1 needs a transparent
+//! window, which is exactly what Linux/WebKitGTK cannot composite. Which is
+//! right depends on the compositor, so the default is chosen per platform and
+//! `RAWKIT_PROBE_ROUTE` overrides it.
+//!
+//! On macOS that costs Tauri's `macos-private-api`, and so bars **App Store**
+//! distribution — not notarised direct download, which is how a tool like this
+//! ships. The alternative was a child `NSView`: several hundred lines of FFI
+//! that nobody here can run, to buy back a channel this project is not using.
+//!
+//! **Neither macOS nor Windows has been run.** CI proves the shell compiles and
+//! links on both, and for window and pointer code that is a weak claim: a
+//! surface behind an opaque view, or a canvas that never sees a click, are
+//! things no compiler notices. The geometry is verified — route 1 on Linux
+//! reports the right surface and canvas rectangles and draws the photograph
+//! below the chrome — but the compositing on those two platforms rests on the
+//! probe research rather than on a machine.
 //!
 //! # The question
 //!
@@ -325,7 +352,15 @@ fn main() -> Result<()> {
     let route = match std::env::var("RAWKIT_PROBE_ROUTE").as_deref() {
         Ok("1") => Route::Cutout,
         Ok("2") => Route::ChildWebview,
-        _ => Route::NativeChild,
+        Ok("3") => Route::NativeChild,
+        // The default is per platform, and each is the one the probe found
+        // works there. Route 3 needs a native widget to hang the surface on,
+        // which so far means a GTK one; route 1 needs a transparent window,
+        // which is exactly what Linux/WebKitGTK cannot composite. Neither is a
+        // fallback for the other — they are the two answers to one question,
+        // and which is right depends on the compositor.
+        _ if cfg!(target_os = "linux") => Route::NativeChild,
+        _ => Route::Cutout,
     };
     // One positional argument. A `.rawkit` file opens a library and its first
     // image; anything else is a raw opened directly, which is how the shell has
@@ -338,18 +373,24 @@ fn main() -> Result<()> {
         .setup(move |app| {
             // The surface is created on the main thread because the raw window
             // handle comes from GTK on this platform and GTK is not thread-safe.
-            let (gpu, surface, size, window_handle) = build_window(app, route)?;
+            let (gpu, surface, layout, window_handle) = build_window(app, route)?;
             eprintln!(
                 "gpu        : {} ({:?})",
                 gpu.adapter_info.name, gpu.adapter_info.backend
             );
             let config = surface
-                .get_default_config(&gpu.adapter, size.width, size.height)
+                .get_default_config(&gpu.adapter, layout.surface.width, layout.surface.height)
                 .ok_or_else(|| anyhow!("this surface supports no configuration we can use"))?;
             eprintln!(
                 "surface    : {:?} {}x{}",
-                config.format, size.width, size.height
+                config.format, layout.surface.width, layout.surface.height
             );
+            if layout.top > 0 {
+                eprintln!(
+                    "canvas     : {}x{} at y={} (the chrome floats over the surface)",
+                    layout.canvas.width, layout.canvas.height, layout.top
+                );
+            }
             surface.configure(&gpu.device, &config);
             let mut config = config;
 
@@ -371,8 +412,8 @@ fn main() -> Result<()> {
             let loaded = Loaded::open(raw.as_deref(), DEFAULT_TILE)?;
             let mut session = Session::new(loaded.size, DEFAULT_TILE, EditState::default());
             session.apply(Command::Resize {
-                width: size.width,
-                height: size.height,
+                width: layout.canvas.width,
+                height: layout.canvas.height,
             });
             session.apply(Command::FitToView);
 
@@ -395,7 +436,7 @@ fn main() -> Result<()> {
             let mut canvas_renderer = session_canvas::CanvasRenderer::new(
                 &gpu,
                 &loaded.frame(),
-                [size.width, size.height],
+                [layout.canvas.width, layout.canvas.height],
             );
             let blit = rawkit_engine::PreviewBlit::new(&gpu);
             // One white pixel, uploaded once. The crop outline is drawn as four
@@ -452,7 +493,10 @@ fn main() -> Result<()> {
             // texture per tile so a pan redraws only what it exposes — should be
             // decided by what a pan actually costs rather than by the fact that
             // it obviously costs something.
-            let surface_size = [size.width, size.height];
+            let surface_size = [layout.canvas.width, layout.canvas.height];
+            // Where the photograph goes inside the swapchain. Under route 3 that
+            // is all of it; under a cutout it starts below the chrome.
+            let canvas_rect = [0, layout.top, layout.canvas.width, layout.canvas.height];
             let mut stats = FrameStats::default();
             let navigating = library.clone();
             // The rectangle the canvas currently carries, so a settled one is
@@ -480,6 +524,7 @@ fn main() -> Result<()> {
                             &surface,
                             canvas_renderer.presenter(),
                             canvas_renderer.canvas(),
+                            canvas_rect,
                         )?;
                         stats.record(drawn, started.elapsed());
                         return Ok(());
@@ -678,6 +723,7 @@ fn main() -> Result<()> {
                     &surface,
                     canvas_renderer.presenter(),
                     canvas_renderer.canvas(),
+                    canvas_rect,
                 )?;
                 stats.record(drawn, started.elapsed());
                 Ok(())
@@ -763,8 +809,31 @@ fn attach_input(
     _panel_height: i32,
     _session: Arc<Mutex<Session>>,
 ) -> Result<()> {
-    eprintln!("input      : pointer input on the canvas is implemented for X11 only so far");
+    // Nothing to attach *to*: under a cutout the canvas has no window of its
+    // own, so the pointer belongs to the webview and the page would have to
+    // forward it. That is not written, which leaves the zoom and pan buttons in
+    // the View panel as the way to move around — they go through the same
+    // command bus and work everywhere.
+    eprintln!(
+        "input      : dragging on the canvas needs a native child window; use the View buttons"
+    );
     Ok(())
+}
+
+/// Where the swapchain is, and where in it the photograph goes.
+///
+/// The same rectangle only when the canvas has a window of its own. Under a
+/// transparent cutout the swapchain is the whole window and the chrome floats
+/// over the top of it, so the photograph has to be told to stay below the
+/// chrome — otherwise its top strip is behind the panel and simply not visible.
+#[derive(Debug, Clone, Copy)]
+struct Layout {
+    /// What the surface is configured at: always the window.
+    surface: tauri::PhysicalSize<u32>,
+    /// The photograph's rectangle within it.
+    canvas: tauri::PhysicalSize<u32>,
+    /// How far down that rectangle starts, in surface pixels.
+    top: u32,
 }
 
 /// Build the window for the chosen arrangement and put a surface on it.
@@ -772,30 +841,41 @@ fn attach_input(
 fn build_window(
     app: &tauri::App,
     route: Route,
-) -> Result<(
-    Gpu,
-    wgpu::Surface<'static>,
-    tauri::PhysicalSize<u32>,
-    tauri::Window,
-)> {
+) -> Result<(Gpu, wgpu::Surface<'static>, Layout, tauri::Window)> {
     match route {
         Route::Cutout => {
+            // The real interface, told to leave the canvas area unpainted. The
+            // probe page it used to load answered a different question and has
+            // no controls on it.
             let builder =
-                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("panel.html?cutout".into()))
                     .title("rawkit")
                     .inner_size(WINDOW.0, WINDOW.1);
-            // A third strike against route 1, found by CI rather than by the
-            // probe: on macOS `transparent` is behind Tauri's
-            // `macos-private-api` feature, and shipping a private API bars App
-            // Store distribution. So route 1 costs a distribution channel even
-            // on the platform where it works.
-            #[cfg(not(target_os = "macos"))]
+            // Transparent on every platform, macOS included. That needs
+            // Tauri's `macos-private-api`, which bars *App Store* distribution
+            // and nothing else — notarised direct download, which is how a tool
+            // like this ships, is unaffected. The alternative was a child
+            // NSView, several hundred lines of FFI nobody here can run.
             let builder = builder.transparent(true);
             let window = builder.build()?;
-            let size = window.inner_size()?;
+            let surface_size = window.inner_size()?;
+            let scale = window.scale_factor()?;
+            let top = (PANEL_HEIGHT as f64 * scale) as u32;
             let (gpu, surface) = Gpu::with_surface(window.clone())?;
             let handle = window.as_ref().window();
-            Ok((gpu, surface, size, handle))
+            Ok((
+                gpu,
+                surface,
+                Layout {
+                    surface: surface_size,
+                    canvas: tauri::PhysicalSize::new(
+                        surface_size.width,
+                        surface_size.height.saturating_sub(top).max(1),
+                    ),
+                    top,
+                },
+                handle,
+            ))
         }
         Route::ChildWebview => {
             let window = WindowBuilder::new(app, "main")
@@ -816,7 +896,18 @@ fn build_window(
             );
             let size = window.inner_size()?;
             let (gpu, surface) = Gpu::with_surface(window.clone())?;
-            Ok((gpu, surface, size, window))
+            // A probe route, kept for the record rather than shipped: its chrome
+            // is a side strip and nothing has ever placed it correctly.
+            Ok((
+                gpu,
+                surface,
+                Layout {
+                    surface: size,
+                    canvas: size,
+                    top: 0,
+                },
+                window,
+            ))
         }
         #[cfg(target_os = "linux")]
         Route::NativeChild => {
@@ -834,7 +925,18 @@ fn build_window(
                 tauri::PhysicalSize::new(outer.width, outer.height.saturating_sub(panel).max(1));
             let (gpu, surface) = Gpu::with_surface(canvas)?;
             let handle = window.as_ref().window();
-            Ok((gpu, surface, size, handle))
+            // The canvas has a window of its own, so the surface *is* the
+            // photograph's rectangle and there is nothing to offset.
+            Ok((
+                gpu,
+                surface,
+                Layout {
+                    surface: size,
+                    canvas: size,
+                    top: 0,
+                },
+                handle,
+            ))
         }
         #[cfg(not(target_os = "linux"))]
         Route::NativeChild => Err(anyhow!(
@@ -1292,6 +1394,7 @@ fn paint(
     surface: &wgpu::Surface<'static>,
     presenter: &Presenter,
     canvas: &rawkit_engine::Canvas,
+    at: [u32; 4],
 ) -> Result<()> {
     use wgpu::CurrentSurfaceTexture as Current;
     let frame = match surface.get_current_texture() {
@@ -1329,7 +1432,7 @@ fn paint(
         });
         gpu.queue.submit([encoder.finish()]);
     } else {
-        presenter.draw(gpu, canvas, &view)?;
+        presenter.draw_into(gpu, canvas, &view, at)?;
     }
     frame.present();
     Ok(())
