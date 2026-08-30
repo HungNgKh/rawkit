@@ -56,6 +56,7 @@ fn frame(cfa: &[f32]) -> Frame<'_> {
         as_shot_wb: [1.0, 1.0, 1.0],
         clip_level: f32::INFINITY,
         profile: CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
+        recorded_orientation: rawkit_editstate::Orientation::AsShot,
     }
 }
 
@@ -95,7 +96,7 @@ fn a_cropped_render_is_bit_identical_to_the_region_it_kept() {
         .run(&gpu, &image, &state, Output::Display)
         .expect("cropped render");
 
-    let geometry = Geometry::new(&state);
+    let geometry = Geometry::new(&state, Orientation::AsShot);
     let [ow, oh] = geometry.output_size([W, H]);
     assert_eq!([cropped.width, cropped.height], [ow, oh]);
     assert!(
@@ -194,6 +195,7 @@ fn the_canvas_straightens_the_same_way_the_export_does() {
     let stored = flat.read_back(&gpu).expect("flat readback");
 
     let geometry = Geometry::from_parts(
+        Orientation::AsShot,
         Orientation::AsShot,
         Crop {
             angle_deg: 7.5,

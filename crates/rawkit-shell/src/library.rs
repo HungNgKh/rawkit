@@ -54,12 +54,16 @@ pub struct Loaded {
     /// Which body took it, so the catalog can be asked what to render it with.
     /// `None` for the synthetic mosaic, which no profile describes.
     camera: Option<rawkit_decode::CameraId>,
+    /// What the camera says it takes to stand this frame upright. Kept beside
+    /// `wb` because it is the same kind of fact: what the file recorded, which
+    /// the matching `EditState` field resolves to.
+    pub orientation: rawkit_editstate::Orientation,
 }
 
 impl Loaded {
     /// Decode a RAW, or synthesise one when there is no file to open.
     pub fn open(path: Option<&Path>, tile: u32) -> Result<Self> {
-        let (mosaic, size, phase, wb, profile, camera) = match path {
+        let (mosaic, size, phase, wb, profile, camera, orientation) = match path {
             None => {
                 eprintln!("image      : no file given, using a synthetic mosaic");
                 let (width, height) = (2048u32, 1365u32);
@@ -70,6 +74,9 @@ impl Loaded {
                     [1.0, 1.0, 1.0],
                     CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
                     None,
+                    // A synthetic mosaic has no camera and so nothing to say
+                    // about which way up it is.
+                    rawkit_editstate::Orientation::AsShot,
                 )
             }
             Some(path) => {
@@ -97,6 +104,7 @@ impl Loaded {
                 ];
                 let size = [raw.width, raw.height];
                 let camera = raw.camera.clone();
+                let orientation = raw.orientation;
                 (
                     rawkit_engine::normalise(&raw),
                     size,
@@ -104,6 +112,7 @@ impl Loaded {
                     wb,
                     profile,
                     Some(camera),
+                    orientation,
                 )
             }
         };
@@ -118,6 +127,7 @@ impl Loaded {
             wb,
             profile,
             camera,
+            orientation,
         };
         loaded.levels = Pyramid::build(&loaded.frame(), tile).into_levels();
         Ok(loaded)
@@ -146,6 +156,7 @@ impl Loaded {
             as_shot_wb: self.wb,
             clip_level: 1.0,
             profile: self.profile.clone(),
+            recorded_orientation: self.orientation,
         }
     }
 
@@ -334,11 +345,15 @@ impl Library {
     ///
     /// A header parse — under a millisecond — which is what lets a viewport be
     /// set up for a frame whose pixels are going to come from a preview.
-    pub fn size_of_current(&self) -> Result<[u32; 2]> {
+    pub fn size_of_current(&self) -> Result<([u32; 2], rawkit_editstate::Orientation)> {
         let path = &self.current().path;
         let meta = rawkit_decode::read_metadata(Path::new(path))
             .with_context(|| format!("reading {path}"))?;
-        Ok([meta.width, meta.height])
+        // The orientation travels with the size because the two are one answer:
+        // a viewport built from the sensor's dimensions alone is the wrong shape
+        // for every portrait frame, and would correct itself only once the
+        // decode landed — a visible flip a moment after the photograph opens.
+        Ok(([meta.width, meta.height], meta.orientation))
     }
 
     /// A rendered copy big enough for what the view is about to show, if there
@@ -1040,6 +1055,7 @@ mod saver_tests {
             [100, 100],
             64,
             EditState::default(),
+            rawkit_editstate::Orientation::AsShot,
         )));
         let mut saver = Saver::new(Some(library.clone()), session.clone());
         saver.restore(&mut session.lock().unwrap());
@@ -1072,6 +1088,7 @@ mod saver_tests {
             [100, 100],
             64,
             EditState::default(),
+            rawkit_editstate::Orientation::AsShot,
         )));
         let mut saver = Saver::new(Some(library.clone()), session.clone());
         saver.restore(&mut session.lock().unwrap());
@@ -1107,6 +1124,7 @@ mod saver_tests {
             [100, 100],
             64,
             EditState::default(),
+            rawkit_editstate::Orientation::AsShot,
         )));
         let mut saver = Saver::new(Some(library.clone()), session.clone());
 

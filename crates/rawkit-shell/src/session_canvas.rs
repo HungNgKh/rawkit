@@ -139,6 +139,7 @@ impl CanvasRenderer {
             as_shot_wb: frame.as_shot_wb,
             clip_level: frame.clip_level,
             profile: frame.profile.clone(),
+            recorded_orientation: frame.recorded_orientation,
         };
         Ok(self.renderer.run(gpu, &level, state, Output::Display)?)
     }

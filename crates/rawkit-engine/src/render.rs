@@ -128,6 +128,16 @@ pub struct Frame<'a> {
     /// the renderer can ask it for the transform *at the chosen temperature* —
     /// which is the whole reason a profile is a profile and not a constant.
     pub profile: CameraProfile,
+    /// What the camera says it takes to stand this frame upright.
+    ///
+    /// Beside `as_shot_wb` because it is the same kind of thing: a fact the file
+    /// carries, which the matching `EditState` field resolves to when the user
+    /// has not overridden it. `Orientation::AsShot` means *this*, and a rotation
+    /// the user asks for composes on top of it.
+    ///
+    /// A field with no default, so a caller that has one and forgets to pass it
+    /// fails to compile rather than rendering every portrait frame on its side.
+    pub recorded_orientation: rawkit_editstate::Orientation,
 }
 
 impl Frame<'_> {
@@ -804,8 +814,11 @@ impl Renderer {
         // and permute, so they compose with a finished frame rather than with
         // each tile — and doing it here is what keeps a cropped export
         // bit-identical to the same region of an uncropped one.
-        let (pixels, [width, height]) =
-            crate::geometry::apply(&Geometry::new(state), &result, [image.width, image.height]);
+        let (pixels, [width, height]) = crate::geometry::apply(
+            &Geometry::new(state, image.recorded_orientation),
+            &result,
+            [image.width, image.height],
+        );
         Ok(Rendered {
             pixels,
             width,

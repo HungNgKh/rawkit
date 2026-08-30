@@ -148,6 +148,7 @@ pub fn render(
         // `normalise` puts the decoder's white level at 1.0.
         clip_level: 1.0,
         profile,
+        recorded_orientation: raw.orientation,
     };
     let (temperature, tint) = frame.as_shot_temperature();
     eprintln!("as-shot    : {temperature:.0} K, tint {tint:+.0}");

@@ -3021,6 +3021,7 @@ name = "rawkit-decode"
 version = "0.0.1"
 dependencies = [
  "libraw-rs-sys",
+ "rawkit-editstate",
  "thiserror 2.0.20",
 ]
 

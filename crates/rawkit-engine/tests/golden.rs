@@ -233,6 +233,7 @@ fn renders_match_the_committed_references() {
                     phase: case.phase,
                     as_shot_wb: [1.9, 1.0, 1.4],
                     clip_level: 1.0,
+                    recorded_orientation: rawkit_editstate::Orientation::AsShot,
                     // A real camera's matrix rather than the identity, so a
                     // reference would catch the profile stage silently becoming
                     // a no-op. These are the decoder's numbers for an

@@ -55,6 +55,7 @@ fn saturation_halves(gpu: &Gpu, state: &EditState) -> (f32, f32) {
                 as_shot_wb: [1.0, 1.0, 1.0],
                 clip_level: f32::INFINITY,
                 profile: CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
+                recorded_orientation: rawkit_editstate::Orientation::AsShot,
             },
             state,
             Output::Display,

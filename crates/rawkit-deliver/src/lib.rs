@@ -308,6 +308,7 @@ fn one(
         ],
         clip_level: 1.0,
         profile: profile.unwrap_or_else(|| rawkit_engine::render::profile_for(&raw)),
+        recorded_orientation: raw.orientation,
     };
 
     // Level zero, the whole frame. No pyramid, no averaging.

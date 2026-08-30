@@ -38,6 +38,15 @@ use crate::{Crop, EditState, Orientation};
 /// The frame the edit says to show, given the frame the sensor recorded.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Geometry {
+    /// What the camera says it takes to stand the frame upright.
+    ///
+    /// A fact about the file rather than a decision about it, and held
+    /// separately for that reason: folding it into `orientation` would put a
+    /// per-file value inside the edit, and the same `EditState` would then mean
+    /// different things on two photographs. The counterpart of `as_shot_wb`,
+    /// which `WhiteBalance::temperature_k == None` resolves to in exactly the
+    /// same way.
+    recorded: Orientation,
     orientation: Orientation,
     crop: Crop,
 }
@@ -49,14 +58,23 @@ impl Geometry {
     /// drags a rectangle and wants to know what the frame would become, and
     /// building a whole `EditState` to ask that would mean the interface could
     /// accidentally answer with a different edit's orientation.
-    pub fn from_parts(orientation: Orientation, crop: Crop) -> Self {
-        Self { orientation, crop }
+    pub fn from_parts(recorded: Orientation, orientation: Orientation, crop: Crop) -> Self {
+        Self {
+            recorded,
+            orientation,
+            crop,
+        }
     }
 
     /// Reads only the two fields it needs, rather than holding the whole edit —
     /// so nothing here can accidentally depend on a tone value.
-    pub fn new(state: &EditState) -> Self {
+    /// `recorded` is the camera's own orientation, which is not in the edit and
+    /// cannot be — see the field. It is a parameter rather than a default so
+    /// that a caller which does not have it has to say so, instead of silently
+    /// rendering every portrait frame on its side.
+    pub fn new(state: &EditState, recorded: Orientation) -> Self {
         Self {
+            recorded,
             orientation: state.orientation,
             crop: state.crop,
         }
@@ -68,7 +86,7 @@ impl Geometry {
     /// keeps "an unedited photograph is bit-identical to one from a build before
     /// this existed" true rather than approximately true.
     pub fn is_identity(&self) -> bool {
-        self.orientation == Orientation::AsShot && self.crop.is_full_frame()
+        self.turns() == 0 && self.crop.is_full_frame()
     }
 
     /// The straighten, in radians clockwise. Zero when there is none.
@@ -144,14 +162,9 @@ impl Geometry {
         scale.clamp(0.0, 1.0)
     }
 
-    /// Quarter-turns clockwise.
+    /// Quarter-turns clockwise: the camera's, then the user's.
     pub fn turns(&self) -> u32 {
-        match self.orientation {
-            Orientation::AsShot => 0,
-            Orientation::Rotate90Cw => 1,
-            Orientation::Rotate180 => 2,
-            Orientation::Rotate270Cw => 3,
-        }
+        self.orientation.after(self.recorded).turns()
     }
 
     /// The frame's size after rotation, before cropping.
@@ -388,8 +401,66 @@ impl Geometry {
 mod tests {
     use super::*;
 
+    /// A frame the camera recorded upright, so these tests keep measuring the
+    /// edit's own rotation. Composition has its own tests below.
     fn with(orientation: Orientation, crop: Crop) -> Geometry {
-        Geometry { orientation, crop }
+        Geometry {
+            recorded: Orientation::AsShot,
+            orientation,
+            crop,
+        }
+    }
+
+    fn shot_as(recorded: Orientation, orientation: Orientation) -> Geometry {
+        Geometry {
+            recorded,
+            orientation,
+            crop: Crop::default(),
+        }
+    }
+
+    #[test]
+    fn a_frame_the_camera_turned_opens_upright() {
+        // The bug this exists for: a portrait exposure from a body that writes
+        // landscape pixels rendered on its side, because `AsShot` meant "no
+        // rotation" rather than "what the camera recorded".
+        let portrait = shot_as(Orientation::Rotate90Cw, Orientation::AsShot);
+        assert_eq!(portrait.turns(), 1);
+        assert_eq!(
+            portrait.output_size([6000, 4000]),
+            [4000, 6000],
+            "a turned frame is taller than it is wide"
+        );
+    }
+
+    #[test]
+    fn the_users_rotation_turns_the_upright_frame_not_the_sensor() {
+        // What makes `[` and `]` behave: a quarter turn is a quarter turn from
+        // what you are looking at, not from the sensor's axes.
+        assert_eq!(
+            shot_as(Orientation::Rotate90Cw, Orientation::Rotate90Cw).turns(),
+            2
+        );
+        assert_eq!(
+            shot_as(Orientation::Rotate90Cw, Orientation::Rotate270Cw).turns(),
+            0,
+            "turning a portrait frame back a quarter lands on the sensor's own axes"
+        );
+        assert_eq!(
+            shot_as(Orientation::Rotate270Cw, Orientation::Rotate180).turns(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_upright_frame_with_no_edit_still_has_nothing_to_do() {
+        // The identity path hands the render back untouched, and it is keyed on
+        // the *composed* turn now. A landscape frame must not lose that.
+        assert!(shot_as(Orientation::AsShot, Orientation::AsShot).is_identity());
+        // And a portrait one must not claim it.
+        assert!(!shot_as(Orientation::Rotate90Cw, Orientation::AsShot).is_identity());
+        // Even though the two rotations cancelling out is genuinely nothing to do.
+        assert!(shot_as(Orientation::Rotate90Cw, Orientation::Rotate270Cw).is_identity());
     }
 
     #[test]

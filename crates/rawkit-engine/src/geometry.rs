@@ -140,7 +140,7 @@ mod tests {
     }
 
     fn with(orientation: Orientation, crop: Crop) -> Geometry {
-        Geometry::from_parts(orientation, crop)
+        Geometry::from_parts(Orientation::AsShot, orientation, crop)
     }
 
     #[test]
@@ -148,7 +148,11 @@ mod tests {
         // The property that keeps an unedited photograph unchanged by the
         // existence of this module.
         let pixels = frame(7, 5);
-        let (out, size) = apply(&Geometry::new(&EditState::default()), &pixels, [7, 5]);
+        let (out, size) = apply(
+            &Geometry::new(&EditState::default(), Orientation::AsShot),
+            &pixels,
+            [7, 5],
+        );
         assert_eq!(size, [7, 5]);
         assert_eq!(out, pixels);
     }
@@ -287,6 +291,7 @@ mod tests {
     fn tilted(degrees: f32) -> Geometry {
         Geometry::from_parts(
             Orientation::AsShot,
+            Orientation::AsShot,
             Crop {
                 angle_deg: degrees,
                 ..Crop::default()
@@ -375,6 +380,7 @@ mod tests {
         // the property the crop tests rest on.
         let pixels = frame(9, 7);
         let g = Geometry::from_parts(
+            Orientation::AsShot,
             Orientation::Rotate180,
             Crop {
                 left: 0.1,

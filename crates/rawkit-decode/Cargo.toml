@@ -10,4 +10,5 @@ authors.workspace = true
 
 [dependencies]
 libraw-rs-sys.workspace = true
+rawkit-editstate.workspace = true
 thiserror.workspace = true

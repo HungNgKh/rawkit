@@ -65,6 +65,7 @@ fn render(gpu: &Gpu, camera: [f32; 3], wb: [f32; 3], clip: f32) -> [f32; 3] {
                 as_shot_wb: wb,
                 clip_level: clip,
                 profile: neutral_profile(),
+                recorded_orientation: rawkit_editstate::Orientation::AsShot,
             },
             &unsharpened(),
             Output::Display,

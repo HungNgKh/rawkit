@@ -97,6 +97,7 @@ fn render_with(
                 as_shot_wb: [1.0, 1.0, 1.0],
                 clip_level: 1.0,
                 profile: profile.clone(),
+                recorded_orientation: rawkit_editstate::Orientation::AsShot,
             },
             state,
             Output::Display,

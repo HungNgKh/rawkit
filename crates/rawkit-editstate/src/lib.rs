@@ -821,6 +821,38 @@ pub enum Orientation {
     Rotate270Cw,
 }
 
+impl Orientation {
+    /// Quarter-turns clockwise.
+    pub fn turns(self) -> u32 {
+        match self {
+            Orientation::AsShot => 0,
+            Orientation::Rotate90Cw => 1,
+            Orientation::Rotate180 => 2,
+            Orientation::Rotate270Cw => 3,
+        }
+    }
+
+    /// The rotation that `turns` quarter-turns clockwise amounts to, wrapping.
+    pub fn from_turns(turns: u32) -> Self {
+        match turns % 4 {
+            1 => Orientation::Rotate90Cw,
+            2 => Orientation::Rotate180,
+            3 => Orientation::Rotate270Cw,
+            _ => Orientation::AsShot,
+        }
+    }
+
+    /// This rotation applied after `first`.
+    ///
+    /// What makes `AsShot` mean *as shot*: the camera's recorded orientation is
+    /// the first turn, and whatever the user asked for turns the result. So a
+    /// portrait frame opens upright, and `[` still turns it a quarter from
+    /// wherever it is rather than from the sensor's own axes.
+    pub fn after(self, first: Orientation) -> Self {
+        Orientation::from_turns(first.turns() + self.turns())
+    }
+}
+
 /// Where an `EditState` came from.
 ///
 /// This is not bookkeeping. From the moment the editor ships it is what makes a

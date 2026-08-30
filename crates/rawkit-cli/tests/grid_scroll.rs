@@ -75,6 +75,7 @@ fn real_preview(gpu: &Gpu, raw: &Path, longest_edge: u32) -> (Vec<u8>, u32, u32)
         ],
         clip_level: 1.0,
         profile: rawkit_engine::CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
+        recorded_orientation: rawkit_editstate::Orientation::AsShot,
     };
 
     // Render a coarse pyramid level — the same choice the preview builder makes,

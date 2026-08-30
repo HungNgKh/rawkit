@@ -59,6 +59,7 @@ fn frame(cfa: &[f32]) -> Frame<'_> {
         as_shot_wb: [1.0, 1.0, 1.0],
         clip_level: f32::INFINITY,
         profile: CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
+        recorded_orientation: rawkit_editstate::Orientation::AsShot,
     }
 }
 
@@ -301,6 +302,7 @@ fn a_tile_overhanging_the_image_does_not_draw_its_overhang() {
         as_shot_wb: [1.0, 1.0, 1.0],
         clip_level: f32::INFINITY,
         profile: CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
+        recorded_orientation: rawkit_editstate::Orientation::AsShot,
     };
     let renderer = Renderer::with_tile_size(&gpu, TILE);
     let pyramid = Pyramid::build(&image, TILE);

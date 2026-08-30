@@ -29,6 +29,8 @@ pub mod libraw;
 
 pub use libraw::{decode_file, read_metadata};
 
+use rawkit_editstate::Orientation;
+
 /// Failures that decoding can produce. Every variant is something a user can
 /// hit with a real file, which is why "unsupported camera" is a first-class
 /// case rather than a generic error: it has a specific answer (run the file
@@ -110,6 +112,13 @@ pub struct RawMetadata {
     /// decoded — which is the whole point of showing a cached preview.
     pub width: u32,
     pub height: u32,
+    /// What the camera says it takes to stand the frame upright.
+    ///
+    /// Here for the same reason `width` and `height` are: an interface sizing a
+    /// viewport for a photograph it has not decoded needs to know a portrait
+    /// exposure is portrait *before* the pixels arrive, or the view flips a
+    /// moment after it opens.
+    pub orientation: Orientation,
     /// When the photograph was taken, as the camera's own clock read it.
     ///
     /// **This is a wall clock, not an instant.** EXIF capture times carry no
@@ -165,7 +174,45 @@ pub struct RawImage {
     /// enough to call the result colour-managed. All-zero when the decoder has
     /// no data for the body.
     pub xyz_to_camera: [[f32; 3]; 4],
+    /// What the camera says it takes to stand this frame upright.
+    ///
+    /// A fact about the file, not a decision about it — the exact counterpart of
+    /// [`RawImage::as_shot_neutral`], and resolved the same way:
+    /// `EditState::orientation` being `AsShot` means *this*, and any rotation
+    /// the user asks for composes on top.
+    ///
+    /// Written in our own vocabulary rather than LibRaw's, because LibRaw's is a
+    /// foreign schema and this is the boundary where those get translated. See
+    /// [`orientation_from_flip`] for what the translation is and why the four
+    /// values a camera actually produces are the four it handles.
+    pub orientation: Orientation,
     pub data: Vec<u16>,
+}
+
+/// Translate dcraw's `flip` encoding, which LibRaw inherits, into ours.
+///
+/// dcraw stores orientation as three independent bits rather than as a rotation:
+/// `4` transposes the axes, `2` flips vertically, `1` flips horizontally. So a
+/// quarter turn clockwise is transpose-then-flip-vertically, which is `6`, and
+/// the value is not a number of turns however much it looks like one.
+///
+/// The four values a camera produces are the pure rotations — `0`, `3`, `5` and
+/// `6` — because EXIF orientations 1, 3, 6 and 8 are the only ones a body ever
+/// writes. The other four encode mirror images, which arrive only from a file
+/// that has been through an editor, and which [`Orientation`] cannot express: it
+/// is four rotations, on purpose, because a raw converter that silently mirrored
+/// a photograph would be doing something no camera asked for.
+///
+/// Those are taken as upright rather than half-applied. Applying the rotation
+/// half of a mirror leaves the picture wrong in a way that looks deliberate;
+/// leaving it alone leaves it wrong in the way the file already was.
+pub fn orientation_from_flip(flip: i32) -> Orientation {
+    match flip {
+        3 => Orientation::Rotate180,
+        5 => Orientation::Rotate270Cw,
+        6 => Orientation::Rotate90Cw,
+        _ => Orientation::AsShot,
+    }
 }
 
 impl RawImage {
@@ -188,6 +235,28 @@ impl RawImage {
 mod tests {
     use super::*;
 
+    #[test]
+    fn dcraw_flip_codes_become_rotations() {
+        // Not a number of turns, however much `6` looks like one: dcraw stores
+        // orientation as three bits — 4 transposes, 2 flips vertically, 1 flips
+        // horizontally — so a quarter turn clockwise is 4|2 = 6.
+        assert_eq!(orientation_from_flip(0), Orientation::AsShot);
+        assert_eq!(orientation_from_flip(3), Orientation::Rotate180);
+        assert_eq!(orientation_from_flip(5), Orientation::Rotate270Cw);
+        assert_eq!(orientation_from_flip(6), Orientation::Rotate90Cw);
+    }
+
+    #[test]
+    fn a_mirrored_flip_is_left_upright_rather_than_half_applied() {
+        // 1, 2, 4 and 7 encode mirror images, which no camera writes and which
+        // `Orientation` deliberately cannot express. Rotating by their rotation
+        // component would leave the picture wrong in a way that looks
+        // deliberate, which is worse than leaving it as the file already had it.
+        for mirrored in [1, 2, 4, 7] {
+            assert_eq!(orientation_from_flip(mirrored), Orientation::AsShot);
+        }
+    }
+
     fn sample(width: u32, height: u32) -> RawImage {
         RawImage {
             camera: CameraId {
@@ -204,6 +273,7 @@ mod tests {
             },
             as_shot_neutral: [2.1, 1.0, 1.5, 1.0],
             xyz_to_camera: [[0.0; 3]; 4],
+            orientation: Orientation::AsShot,
             data: vec![1000; (width * height) as usize],
         }
     }

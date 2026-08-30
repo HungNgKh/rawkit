@@ -200,6 +200,7 @@ fn one(
         ],
         clip_level: 1.0,
         profile,
+        recorded_orientation: raw.orientation,
     };
 
     // The largest thing being asked for decides how much detail has to survive.

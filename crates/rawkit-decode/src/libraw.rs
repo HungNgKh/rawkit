@@ -136,6 +136,10 @@ pub fn decode_file(path: &Path) -> Result<RawImage, DecodeError> {
         },
         as_shot_neutral: colour.cam_mul,
         xyz_to_camera: colour.cam_xyz,
+        // Read here rather than derived from the aspect ratio, which is the
+        // tempting shortcut and is wrong: a square crop, and a portrait frame
+        // from a body that writes landscape pixels, both defeat it.
+        orientation: crate::orientation_from_flip(data.sizes.flip),
         data: pixels,
     };
     image.validate()?;
@@ -173,6 +177,7 @@ fn metadata(data: &libraw_sys::libraw_data_t) -> RawMetadata {
         // the pixels that arrive later.
         width: data.sizes.width as u32,
         height: data.sizes.height as u32,
+        orientation: crate::orientation_from_flip(data.sizes.flip),
         // The maker note carries the capture time as the characters the camera
         // wrote, which is the only form with no timezone applied to it. LibRaw
         // exposes that string per vendor and only ever exposes the timezone-

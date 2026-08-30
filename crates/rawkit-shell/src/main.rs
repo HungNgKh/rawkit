@@ -869,7 +869,12 @@ fn main() -> Result<()> {
             let mut loaded = Loaded::open(raw.as_deref(), DEFAULT_TILE)?;
             *PROFILE_NAME.lock().expect("profile lock") =
                 apply_profile(library.as_ref(), &mut loaded);
-            let mut session = Session::new(loaded.size, DEFAULT_TILE, EditState::default());
+            let mut session = Session::new(
+                loaded.size,
+                DEFAULT_TILE,
+                EditState::default(),
+                loaded.orientation,
+            );
             session.apply(Command::Resize {
                 width: layout.canvas.width,
                 height: layout.canvas.height,
@@ -913,6 +918,7 @@ fn main() -> Result<()> {
             let mut showing = Showing {
                 path: raw.clone(),
                 size: loaded.size,
+                orientation: loaded.orientation,
                 preview: None,
                 raw: Some(loaded),
             };
@@ -1038,13 +1044,20 @@ fn main() -> Result<()> {
                     let library = navigating.as_ref().expect("a request implies a library");
                     // A header parse, so the viewport can be set up for a
                     // photograph nothing has decoded.
-                    let size = library.lock().expect("library lock").size_of_current()?;
+                    let (size, orientation) =
+                        library.lock().expect("library lock").size_of_current()?;
 
                     let mut session = shared.lock().expect("session lock");
-                    if size != showing.size {
+                    if (size, orientation) != (showing.size, showing.orientation) {
                         // A different body, or a different orientation. Nothing
                         // about the old view means anything, so start again.
-                        *session = Session::new(size, DEFAULT_TILE, EditState::default());
+                        //
+                        // The orientation half of that comment was a claim this
+                        // code could not make until the header parse started
+                        // reporting it: two frames off one body are the same
+                        // sensor size whichever way up they were taken.
+                        *session =
+                            Session::new(size, DEFAULT_TILE, EditState::default(), orientation);
                         session.apply(Command::Resize {
                             width: surface_size[0],
                             height: surface_size[1],
@@ -1054,6 +1067,7 @@ fn main() -> Result<()> {
                     // Same size: the viewport is left exactly as it was, which
                     // is what carries a 1:1 sharpness check from frame to frame.
                     showing.size = size;
+                    showing.orientation = orientation;
                     showing.path = Some(PathBuf::from(&path));
                     showing.raw = None;
                     // The edit first, because which preview is current depends on
@@ -1864,6 +1878,10 @@ struct Showing {
     /// The photograph's full resolution — from a header parse, not a decode. The
     /// viewport is expressed in these coordinates whichever source is drawing.
     size: [u32; 2],
+    /// And which way up the camera says it goes, from the same header parse.
+    /// Held beside the size because the two decide the viewport together: the
+    /// sensor's dimensions alone are the wrong shape for every portrait frame.
+    orientation: rawkit_editstate::Orientation,
     preview: Option<rawkit_engine::PreviewImage>,
     raw: Option<Loaded>,
 }

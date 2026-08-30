@@ -430,6 +430,14 @@ impl RenderJob {
 /// state needed to decide what to render.
 pub struct Session {
     image: [u32; 2],
+    /// What the camera says it takes to stand this frame upright.
+    ///
+    /// Held here because every size the session computes depends on it: a
+    /// portrait exposure from a landscape sensor is taller than it is wide once
+    /// it is standing up, and a viewport that did not know would fit, pan and
+    /// zoom against the wrong rectangle. Not part of the edit — see
+    /// `Geometry::recorded`.
+    recorded: Orientation,
     /// The frame after orientation and crop — what the viewport is measured in.
     ///
     /// Cached rather than derived on every call because it changes only when the
@@ -473,16 +481,17 @@ impl Session {
     /// land on the same CFA phase as the image, and an odd tile guarantees they
     /// do not. The two constants are checked against each other in
     /// `tile_size_matches_the_engine`.
-    pub fn new(image: [u32; 2], tile: u32, state: EditState) -> Self {
+    pub fn new(image: [u32; 2], tile: u32, state: EditState, recorded: Orientation) -> Self {
         assert!(tile > 0 && tile % 2 == 0, "tile size must be even");
         assert!(
             image[0] > 0 && image[1] > 0,
             "an image with no pixels has nothing to render"
         );
         let max_level = max_level(image, tile);
-        let developed = Geometry::new(&state).output_size(image);
+        let developed = Geometry::new(&state, recorded).output_size(image);
         let mut session = Self {
             image,
+            recorded,
             developed,
             tile,
             max_level,
@@ -533,7 +542,7 @@ impl Session {
 
     /// The map between the sensor's frame and the photograph's.
     pub fn geometry(&self) -> Geometry {
-        Geometry::new(&self.state)
+        Geometry::new(&self.state, self.recorded)
     }
 
     /// Apply one command. Never blocks and never renders.
@@ -859,7 +868,7 @@ impl Session {
         // rotated and never will be, because rotating it would move the CFA
         // phase. So the visible rectangle is carried back across the geometry
         // before it becomes tile indices.
-        let rect = Geometry::new(&self.state).sensor_rect(seen, self.image);
+        let rect = Geometry::new(&self.state, self.recorded).sensor_rect(seen, self.image);
         let span = (self.tile << level) as f64;
         let tiles_x = (self.image[0] as f64 / span).ceil() as u32;
         let tiles_y = (self.image[1] as f64 / span).ceil() as u32;
@@ -966,7 +975,7 @@ impl Session {
         // two multiplications, and remembering which commands are geometric is a
         // rule somebody eventually forgets.
         let was = self.developed;
-        self.developed = Geometry::new(&self.state).output_size(self.image);
+        self.developed = Geometry::new(&self.state, self.recorded).output_size(self.image);
         if self.developed != was {
             // The photograph is a different shape, so the old scale and centre
             // describe a frame that no longer exists — a rotate would leave it
@@ -1072,7 +1081,7 @@ mod tests {
     const TILE: u32 = 512;
 
     fn session() -> Session {
-        let mut s = Session::new(IMAGE, TILE, EditState::default());
+        let mut s = Session::new(IMAGE, TILE, EditState::default(), Orientation::AsShot);
         s.apply(Command::Resize {
             width: 1600,
             height: 1000,
@@ -1763,7 +1772,7 @@ mod tests {
     fn a_canvas_with_no_size_asks_for_no_work() {
         // A window that has not been laid out yet. Rendering into it would be
         // work for nobody.
-        let s = Session::new(IMAGE, TILE, EditState::default());
+        let s = Session::new(IMAGE, TILE, EditState::default(), Orientation::AsShot);
         assert_eq!(s.viewport().size, [0, 0]);
         assert!(s.pending_work().is_empty());
     }

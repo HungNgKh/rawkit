@@ -48,6 +48,7 @@ fn develop(gpu: &Gpu, renderer: &Renderer, value: f32, state: &EditState) -> [f3
                 // values under test.
                 clip_level: f32::INFINITY,
                 profile: neutral_profile(),
+                recorded_orientation: rawkit_editstate::Orientation::AsShot,
             },
             state,
             Output::Display,
@@ -176,6 +177,7 @@ fn white_balance_multiplies_channels_independently() {
                 as_shot_wb: wb,
                 clip_level: f32::INFINITY,
                 profile: neutral_profile(),
+                recorded_orientation: rawkit_editstate::Orientation::AsShot,
             },
             &EditState::default(),
             Output::Display,
@@ -226,6 +228,7 @@ fn setting_a_temperature_warms_or_cools_the_render() {
                     as_shot_wb: [1.0, 1.0, 1.0],
                     clip_level: f32::INFINITY,
                     profile: profile.clone(),
+                    recorded_orientation: rawkit_editstate::Orientation::AsShot,
                 },
                 &state,
                 Output::Display,
@@ -266,6 +269,7 @@ fn as_shot_reports_a_plausible_temperature() {
         phase: BayerPhase::Rggb,
         as_shot_wb: [2.750, 1.0, 1.695],
         clip_level: 1.0,
+        recorded_orientation: rawkit_editstate::Orientation::AsShot,
         profile,
     };
     let (temperature, tint) = frame.as_shot_temperature();

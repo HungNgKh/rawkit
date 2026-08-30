@@ -65,6 +65,7 @@ fn frame(cfa: &[f32]) -> Frame<'_> {
         // `Pyramid`, and this test is measuring something else.
         clip_level: f32::INFINITY,
         profile: CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
+        recorded_orientation: rawkit_editstate::Orientation::AsShot,
     }
 }
 
