@@ -727,7 +727,12 @@ impl Session {
                 // zooming drifts toward the centre and the thing being examined
                 // slides out from under the cursor.
                 let fixed = self.viewport.image_at(anchor);
-                self.viewport.scale = scale;
+                // Never below fit. See `fit_scale`.
+                self.viewport.scale = match self.fit_scale() {
+                    Some(smallest) => scale.max(smallest),
+                    None => scale,
+                };
+                let scale = self.viewport.scale;
                 let half = [
                     self.viewport.size[0] as f64 / 2.0,
                     self.viewport.size[1] as f64 / 2.0,
@@ -943,8 +948,21 @@ impl Session {
         }
         // The *developed* frame: fitting the sensor's would leave a cropped
         // photograph small and off-centre, surrounded by the part it removed.
-        self.viewport.scale =
-            (w as f64 / self.developed[0] as f64).min(h as f64 / self.developed[1] as f64);
+        self.viewport.scale = self.fit_scale().unwrap_or(self.viewport.scale);
+    }
+
+    /// The scale at which the whole photograph is visible, or `None` before the
+    /// canvas has a size.
+    ///
+    /// Also the *smallest* scale allowed. Zooming further out shows a smaller
+    /// photograph surrounded by more nothing, and it is not free: the canvas is
+    /// sized in level pixels, so halving the scale doubles the texture. Left
+    /// unbounded it eventually asks the device for a texture larger than it
+    /// allows, which is not a slow frame but a dead process.
+    fn fit_scale(&self) -> Option<f64> {
+        let [w, h] = self.viewport.size;
+        (w != 0 && h != 0)
+            .then(|| (w as f64 / self.developed[0] as f64).min(h as f64 / self.developed[1] as f64))
     }
 
     /// Keep the centre on the image, so the photo cannot be flung off screen.
@@ -1388,6 +1406,39 @@ mod tests {
             s.pending_work().tiles.contains(&tile),
             "pixels for a superseded edit must not satisfy the new one"
         );
+    }
+
+    #[test]
+    fn the_view_cannot_zoom_out_past_the_whole_photograph() {
+        // Found by crashing the application. The canvas is sized in level
+        // pixels, so every halving of the scale doubles the texture; the level
+        // stops rising at the coarsest pyramid level, and after that the canvas
+        // grows without limit. Twenty-odd notches out, the device is asked for a
+        // texture wider than it allows and the process aborts — a dead window,
+        // not a slow one.
+        let mut s = session();
+        s.apply(Command::FitToView);
+        let fitted = s.viewport().scale;
+
+        for _ in 0..40 {
+            s.apply(Command::ZoomTo {
+                scale: s.viewport().scale / 1.15,
+                anchor: [800.0, 500.0],
+            });
+        }
+        assert_eq!(
+            s.viewport().scale,
+            fitted,
+            "the view zoomed out past fit, where the canvas grows without bound"
+        );
+
+        // And zooming *in* is still unrestricted, which is the whole point of
+        // having a photograph.
+        s.apply(Command::ZoomTo {
+            scale: 8.0,
+            anchor: [800.0, 500.0],
+        });
+        assert_eq!(s.viewport().scale, 8.0);
     }
 
     #[test]

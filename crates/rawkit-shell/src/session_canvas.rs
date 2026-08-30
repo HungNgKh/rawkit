@@ -175,9 +175,18 @@ impl CanvasRenderer {
 
         // Canvas in level pixels, so tiles land 1:1 in it and the presenter does
         // the fractional part.
+        //
+        // Clamped to what the device will actually allocate. The session refuses
+        // to zoom out past fit, which is what keeps this sane for an ordinary
+        // frame — but "ordinary" is doing work in that sentence: a large enough
+        // sensor in a small enough window reaches the limit at fit itself, and
+        // asking for a texture wider than the device allows is not a bad frame,
+        // it is a dead process. A clamped canvas merely shows the photograph
+        // slightly softer than it could be.
+        let largest = gpu.device.limits().max_texture_dimension_2d;
         let wanted = [
-            ((surface[0] as f64 / scale).ceil() as u32).max(1),
-            ((surface[1] as f64 / scale).ceil() as u32).max(1),
+            ((surface[0] as f64 / scale).ceil() as u32).clamp(1, largest),
+            ((surface[1] as f64 / scale).ceil() as u32).clamp(1, largest),
         ];
         if self.canvas.size() != wanted {
             self.canvas = self.renderer.create_canvas(gpu, wanted[0], wanted[1]);
