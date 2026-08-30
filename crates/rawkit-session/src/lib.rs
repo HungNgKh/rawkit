@@ -457,6 +457,14 @@ pub struct Session {
     /// because redoing onto a history that has since branched would replay a
     /// decision the user has already replaced.
     future: Vec<EditState>,
+    /// Whether the view is *fitted* rather than at a scale someone chose.
+    ///
+    /// Not derivable from the scale: after the window changes size the fitting
+    /// scale is a different number, so "is this the fit scale" would answer no
+    /// for a view that has been fitted all along. Kept as the fact it is, so a
+    /// window that grows keeps showing the whole photograph and one that was
+    /// left at 1:1 stays at 1:1.
+    fitted: bool,
     /// The control that opened the step now on top of `past`, so a run of the
     /// same one collapses into it. `None` means the next edit starts a new step
     /// whatever it is.
@@ -491,6 +499,9 @@ impl Session {
         let developed = Geometry::new(&state, recorded).output_size(image);
         let mut session = Self {
             image,
+            // `fit_to_view` below sets it; declared here because a struct
+            // literal has to name every field.
+            fitted: false,
             recorded,
             developed,
             tile,
@@ -799,6 +810,11 @@ impl Session {
                 if !anchor[0].is_finite() || !anchor[1].is_finite() {
                     return refused(name, "anchor must be finite");
                 }
+                // A scale someone chose is no longer a fit, so a later resize
+                // must leave it alone. Set before the arithmetic so an early
+                // return cannot skip it — there is none today, and a guard that
+                // depends on there never being one is a guard waiting to fail.
+                self.fitted = false;
                 // Hold the image point under the anchor still. Without this,
                 // zooming drifts toward the centre and the thing being examined
                 // slides out from under the cursor.
@@ -823,7 +839,15 @@ impl Session {
 
             Command::Resize { width, height } => {
                 self.viewport.size = [width, height];
-                self.clamp_center();
+                // A fitted view stays fitted. The alternative — leaving the
+                // scale alone — means growing the window puts the photograph in
+                // the middle of a larger expanse of nothing, which is the one
+                // thing a bigger window was not supposed to give you.
+                if self.fitted {
+                    self.fit_to_view();
+                } else {
+                    self.clamp_center();
+                }
                 Event::ViewChanged
             }
 
@@ -1014,6 +1038,7 @@ impl Session {
     }
 
     fn fit_to_view(&mut self) {
+        self.fitted = true;
         let [w, h] = self.viewport.size;
         self.viewport.center = [
             self.developed[0] as f64 / 2.0,
@@ -1104,6 +1129,50 @@ mod tests {
             height: 1000,
         });
         s
+    }
+
+    #[test]
+    fn a_fitted_view_stays_fitted_when_the_window_changes_size() {
+        // What a bigger window is for. Leaving the scale alone would put the
+        // photograph in the middle of a larger expanse of nothing.
+        let mut s = session();
+        s.apply(Command::FitToView);
+        let before = s.viewport().scale;
+
+        s.apply(Command::Resize {
+            width: 3200,
+            height: 2000,
+        });
+        let after = s.viewport().scale;
+        assert!(
+            after > before * 1.5,
+            "a fitted view did not grow with the window: {before} -> {after}"
+        );
+        assert_eq!(
+            after,
+            s.fit_scale().expect("a fit scale"),
+            "and it is fitted, not merely larger"
+        );
+    }
+
+    #[test]
+    fn a_scale_someone_chose_survives_the_window_changing_size() {
+        // The other half, and the reason the flag exists rather than a
+        // comparison against the fit scale: 1:1 must stay 1:1.
+        let mut s = session();
+        s.apply(Command::ZoomTo {
+            scale: 1.0,
+            anchor: [800.0, 500.0],
+        });
+        s.apply(Command::Resize {
+            width: 3200,
+            height: 2000,
+        });
+        assert_eq!(
+            s.viewport().scale,
+            1.0,
+            "a chosen zoom was overridden by a resize"
+        );
     }
 
     #[test]

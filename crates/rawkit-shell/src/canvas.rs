@@ -128,13 +128,25 @@ pub fn init_threads() {
 /// So the window is created directly instead. GTK has no widget for it, never
 /// lays it out and never paints it, and X clips the toplevel's own drawing to
 /// exclude it. The cost is that nothing moves or resizes it for us — which for a
-/// canvas is control rather than a chore.
-pub fn attach(window: &tauri::Window, panel_width: i32) -> Result<CanvasWindow> {
+/// canvas is control rather than a chore, but it does mean the tracking below
+/// has to be written by hand.
+///
+/// `panel` is read on every allocation rather than captured once, because the
+/// divider can move it while the window stays exactly the same size. It must be
+/// the width the panel is actually *given* rather than the one someone asked
+/// for: in a window too narrow for their choice the two differ, and placing this
+/// window from one while the surface is configured from the other leaves the
+/// canvas and its swapchain describing different rectangles.
+pub fn attach(
+    window: &tauri::Window,
+    panel: &'static std::sync::atomic::AtomicI32,
+) -> Result<CanvasWindow> {
     let gtk_window = window.gtk_window()?;
     let parent = gtk_window
         .window()
         .ok_or_else(|| anyhow!("the toplevel has no X window yet"))?;
 
+    let panel_width = panel.load(std::sync::atomic::Ordering::Relaxed);
     let (width, height) = (gtk_window.allocated_width(), gtk_window.allocated_height());
     // At the origin, ending where the chrome begins. The photograph takes the
     // left of the window and the controls the right, which is also why nothing
@@ -174,10 +186,19 @@ pub fn attach(window: &tauri::Window, panel_width: i32) -> Result<CanvasWindow> 
     let display =
         unsafe { gdkx11::ffi::gdk_x11_display_get_xdisplay(x11_display.to_glib_none().0) };
 
-    // The window must outlive every surface built on it, and nothing else here
-    // has a lifetime long enough to own it. One window, once, for as long as the
-    // process runs.
-    std::mem::forget(child);
+    // Kept, not forgotten. It used to be `mem::forget`ed on the grounds that
+    // nothing here had a lifetime long enough to own it — true then, and it also
+    // meant nothing could ever move or resize it, so the window did not survive
+    // being made bigger: the canvas kept its old rectangle and drew the
+    // photograph over the controls.
+    //
+    // Two owners now, both on the GTK main thread and neither able to outlive
+    // the toplevel: the `size-allocate` handler below, and `CHILD` for the
+    // divider, which changes where the canvas ends without changing the window.
+    CHILD.with(|slot| *slot.borrow_mut() = Some(child.clone()));
+    gtk_window.connect_size_allocate(move |_, allocation| {
+        place(&child, panel, allocation.width(), allocation.height());
+    });
 
     Ok(CanvasWindow {
         window: NonZeroU32::new(x11_window.xid() as u32)
@@ -186,6 +207,47 @@ pub fn attach(window: &tauri::Window, panel_width: i32) -> Result<CanvasWindow> 
             .ok_or_else(|| anyhow!("GTK reported a null X display"))?,
         screen: x11_screen.screen_number(),
     })
+}
+
+thread_local! {
+    /// The canvas window, reachable from the main thread for the one case the
+    /// `size-allocate` signal does not cover: the divider moving while the
+    /// toplevel's allocation stays the same.
+    ///
+    /// Thread-local rather than a static because a `gdk::Window` is neither
+    /// `Send` nor `Sync`, and this is exactly the guarantee that makes that
+    /// sound — only the thread that created it can reach it, and that is the
+    /// thread GTK requires anyway.
+    static CHILD: std::cell::RefCell<Option<gdk::Window>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Put the canvas where the panel is not.
+///
+/// Logical units throughout, which is what GTK allocations are in. GDK scales to
+/// device pixels on a HiDPI display, and the surface is configured from the
+/// window's *physical* size — the two agree because they are the same rectangle
+/// expressed twice, not because anyone converts between them here.
+fn place(child: &gdk::Window, panel: &std::sync::atomic::AtomicI32, width: i32, height: i32) {
+    let panel = panel.load(std::sync::atomic::Ordering::Relaxed);
+    child.move_resize(0, 0, (width - panel).max(1), height.max(1));
+}
+
+/// Re-place the canvas after the divider has moved, with the window unchanged.
+///
+/// Must be called on the GTK main thread; on Linux the render loop runs there,
+/// which is what makes this callable at all.
+pub fn reposition(window: &tauri::Window, panel: &std::sync::atomic::AtomicI32) -> Result<()> {
+    let gtk_window = window.gtk_window()?;
+    let (width, height) = (gtk_window.allocated_width(), gtk_window.allocated_height());
+    // Empty only if this is not the thread `attach` ran on, which on Linux it
+    // always is: the render loop is a GTK timeout on the main context.
+    CHILD.with(|slot| {
+        if let Some(child) = slot.borrow().as_ref() {
+            place(child, panel, width, height);
+        }
+    });
+    Ok(())
 }
 
 /// Route pointer input over the canvas into the session.

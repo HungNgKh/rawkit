@@ -140,6 +140,7 @@ mod canvas;
 mod library;
 mod pointer;
 mod session_canvas;
+mod window_state;
 
 use anyhow::{anyhow, Result};
 use library::{CullAction, CullView, Library, Loaded, Saver};
@@ -202,6 +203,53 @@ enum Route {
 /// 360 rather than less: a control is a 58px label, a readout, and a slider,
 /// and below about 280 the slider is too short to place a value on.
 const PANEL_WIDTH: f64 = 360.0;
+
+/// The panel's width right now, in logical pixels, once the divider can move it.
+///
+/// A static because three places need it and none of them can hold it: the GTK
+/// size-allocate handler that places the canvas child, the render loop that
+/// configures the surface, and the command the page calls when the divider is
+/// dragged. Stored as whole logical pixels — the divider snaps to them anyway,
+/// and an integer is a value the three can agree on exactly.
+static PANEL_NOW: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(PANEL_WIDTH as i32);
+
+/// The width the panel is actually being given, after the window has had its
+/// say. Differs from [`PANEL_NOW`] only in a window too narrow for the width
+/// somebody chose — and the page has to be told, or it draws a panel wider than
+/// the space the canvas left it and the photograph covers half the controls.
+static PANEL_SHOWN: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(PANEL_WIDTH as i32);
+
+/// A window resize nobody has acted on yet, in *physical* pixels.
+///
+/// The event arrives on the main thread and the surface is reconfigured on the
+/// render loop, which on Linux is the same thread and elsewhere is not. A slot
+/// rather than a channel because only the newest size matters: a drag emits
+/// hundreds and every one but the last is already wrong by the time it is read.
+static PENDING_RESIZE: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+
+/// The narrowest useful window, in logical pixels.
+///
+/// Below this the panel would be most of the window and the photograph a strip.
+/// Enforced by the window manager rather than by clamping after the fact, so the
+/// window simply cannot be dragged smaller.
+const MIN_WINDOW: (f64, f64) = (720.0, 480.0);
+
+/// What the divider may do to the panel, in logical pixels.
+///
+/// The lower bound is where the widest label — the noise-reduction pair — starts
+/// wrapping, measured rather than guessed; the upper is where the photograph
+/// stops being the larger half of a minimum-width window.
+const PANEL_MIN: f64 = 280.0;
+const PANEL_MAX: f64 = 640.0;
+
+/// The least photograph worth showing, in logical pixels.
+///
+/// What gives way in a window too narrow for both: the panel, not the picture.
+/// A control panel that has squeezed the photograph into a strip has stopped
+/// being a photo editor, and the panel's own minimum is the smaller loss.
+const PHOTO_MIN: f64 = 320.0;
 /// The same width where a platform wants whole pixels.
 ///
 /// The equivalents on macOS and Windows will be a child NSView and a child
@@ -252,6 +300,11 @@ fn snapshot(state: tauri::State<'_, Shared>) -> serde_json::Value {
         // said, not what anyone decided. It is here so the panel can *say* why
         // a photograph opened turned — a reason the user cannot see is
         // indistinguishable from a bug.
+        // What the panel is actually being given. Polled rather than pushed
+        // because the window can narrow without the page doing anything, and a
+        // stylesheet that has not heard draws a column wider than the canvas
+        // left it — the photograph then covers the controls' left edge.
+        "panel": PANEL_SHOWN.load(std::sync::atomic::Ordering::Relaxed),
         "orientation": {
             "recorded": session.recorded_orientation().turns(),
             "effective": session.effective_orientation().turns(),
@@ -637,6 +690,57 @@ fn parse_groups(names: &[String]) -> Result<Vec<rawkit_editstate::Group>, String
         .collect()
 }
 
+/// Move the boundary between the photograph and the controls.
+///
+/// The page owns the gesture and the shell owns the consequence: the canvas is a
+/// window of its own on Linux and a hole in a surface elsewhere, and neither is
+/// something a stylesheet can move. So the drag arrives here as a number and
+/// leaves through the same slot a window resize uses — one path to relayout,
+/// exercised by both, rather than a second one that only the divider takes.
+///
+/// Clamped here rather than in the page. A refusal the page could talk its way
+/// past is not a limit, and the numbers are the shell's: they are what keeps the
+/// widest label from wrapping and the photograph from becoming a strip.
+#[tauri::command]
+fn set_panel_width(window: tauri::Window, px: f64) -> Result<f64, String> {
+    if !px.is_finite() {
+        return Err("a panel width must be a number".into());
+    }
+    let px = px.clamp(PANEL_MIN, PANEL_MAX);
+    PANEL_NOW.store(px as i32, std::sync::atomic::Ordering::Relaxed);
+    // The window has not changed size; asking for a relayout at the size it
+    // already is is what makes the divider and a resize the same operation.
+    let size = window.inner_size().map_err(|e| e.to_string())?;
+    *PENDING_RESIZE.lock().expect("resize lock") = Some((size.width, size.height));
+    // Remembered with the rest of the geometry: reopening at the right size with
+    // the panel back at its default is only half of coming back to where you
+    // were. Rate-limited inside, so a drag does not write a file per frame.
+    remember_window(&window.app_handle().clone(), &window, false);
+    // Handed back so the page can settle on what it actually got rather than on
+    // what it asked for — the clamp is invisible otherwise, and a divider that
+    // stops moving while the pointer keeps going reads as a stuck window.
+    Ok(px)
+}
+
+/// In and out of fullscreen.
+///
+/// A toggle rather than a setter because the key is a toggle, and asking the
+/// window what it currently is keeps the two from drifting — a page holding its
+/// own idea of the state would be wrong the moment the window manager did it.
+#[tauri::command]
+fn toggle_fullscreen(window: tauri::Window) -> Result<bool, String> {
+    let now = window.is_fullscreen().map_err(|e| e.to_string())?;
+    window.set_fullscreen(!now).map_err(|e| e.to_string())?;
+    Ok(!now)
+}
+
+/// What the panel is currently, so the page can draw itself the right width on
+/// load without a flash at the default.
+#[tauri::command]
+fn panel_width() -> f64 {
+    PANEL_SHOWN.load(std::sync::atomic::Ordering::Relaxed) as f64
+}
+
 /// The open library, when a catalog was what was opened.
 ///
 /// Separate state from [`Shared`] because the two answer to different things: a
@@ -837,12 +941,26 @@ fn main() -> Result<()> {
             snapshots,
             take_snapshot,
             restore_snapshot,
-            forget_snapshot
+            forget_snapshot,
+            set_panel_width,
+            panel_width,
+            toggle_fullscreen
         ])
         .setup(move |app| {
             // The surface is created on the main thread because the raw window
             // handle comes from GTK on this platform and GTK is not thread-safe.
-            let (gpu, surface, layout, window_handle) = build_window(app, route)?;
+            // Where it was last time, before anything is built from a size.
+            // The panel is part of it, and has to be in place before the canvas
+            // is created — otherwise the first frame is drawn at the default
+            // width and the window visibly settles a moment after it opens.
+            let saved = window_state::load(&app.handle().clone());
+            if let Some(saved) = saved {
+                PANEL_NOW.store(
+                    saved.panel.clamp(PANEL_MIN, PANEL_MAX) as i32,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            let (gpu, surface, layout, window_handle) = build_window(app, route, saved)?;
             eprintln!(
                 "gpu        : {} ({:?})",
                 gpu.adapter_info.name, gpu.adapter_info.backend
@@ -862,6 +980,39 @@ fn main() -> Result<()> {
             }
             surface.configure(&gpu.device, &config);
             let mut config = config;
+
+            // The window manager may resize us at any moment; the surface can
+            // only be reconfigured between frames. So the event leaves the new
+            // size in a slot and the render loop picks it up — see
+            // `PENDING_RESIZE` for why a slot and not a queue.
+            //
+            // A floor rather than a clamp afterwards: below this the panel would
+            // be most of the window and the photograph a strip, and the honest
+            // way to say that is to make the window refuse to go there.
+            window_handle
+                .set_min_size(Some(tauri::LogicalSize::new(MIN_WINDOW.0, MIN_WINDOW.1)))?;
+            let remembering = window_handle.clone();
+            let app_handle = app.handle().clone();
+            window_handle.on_window_event(move |event| {
+                match event {
+                    tauri::WindowEvent::Resized(size) => {
+                        *PENDING_RESIZE.lock().expect("resize lock") =
+                            Some((size.width, size.height));
+                    }
+                    // Moving changes nothing about what is drawn, and is worth
+                    // hearing only so the window comes back where it was.
+                    tauri::WindowEvent::Moved(_) => {}
+                    // The last chance: a window manager sends this before it
+                    // takes the window away, and `Drop` will not run for a
+                    // process that is killed.
+                    tauri::WindowEvent::CloseRequested { .. } => {
+                        remember_window(&app_handle, &remembering, true);
+                        return;
+                    }
+                    _ => return,
+                }
+                remember_window(&app_handle, &remembering, false);
+            });
 
             // A library, if that is what was passed. The catalog is what makes
             // an edit outlive the process, so it is opened before the image it
@@ -973,13 +1124,13 @@ fn main() -> Result<()> {
             // texture per tile so a pan redraws only what it exposes — should be
             // decided by what a pan actually costs rather than by the fact that
             // it obviously costs something.
-            let surface_size = [layout.canvas.width, layout.canvas.height];
+            let mut surface_size = [layout.canvas.width, layout.canvas.height];
             // Where the photograph goes inside the swapchain. Under route 3 that
             // is all of it; under a cutout it starts below the chrome.
             // The origin under every route now: the chrome is a column beside
             // the photograph rather than a strip above it, so there is nothing
             // to push it down past.
-            let canvas_rect = [0, 0, layout.canvas.width, layout.canvas.height];
+            let mut canvas_rect = [0, 0, layout.canvas.width, layout.canvas.height];
             let mut stats = FrameStats::default();
             let navigating = library.clone();
             // The rectangle the canvas currently carries, so a settled one is
@@ -987,8 +1138,47 @@ fn main() -> Result<()> {
             let mut last_marquee: Option<[f64; 4]> = None;
             // When the histogram was last recomputed. See `SURVEY_INTERVAL`.
             let mut last_survey: Option<std::time::Instant> = None;
+            // Read once. Following a window onto a monitor with a different
+            // HiDPI factor is a separate problem and deliberately not this one;
+            // the value is captured here rather than re-read so that nothing
+            // half-handles it.
+            let scale = window_handle.scale_factor()?;
+            let resizing = window_handle.clone();
+
             let mut tick = move || -> Result<()> {
                 let started = std::time::Instant::now();
+
+                // A resize the window manager has already performed, applied
+                // between frames because that is the only moment a swapchain can
+                // be rebuilt. Everything downstream is derived from `layout`, so
+                // this is the one place that has to change.
+                if let Some((width, height)) = PENDING_RESIZE.lock().expect("resize lock").take() {
+                    let now = Layout::for_window(
+                        route,
+                        tauri::PhysicalSize::new(width.max(1), height.max(1)),
+                        scale,
+                    );
+                    // On Linux the canvas is a window of its own, and GTK has
+                    // already moved it — this covers the other case, the divider
+                    // shifting where the panel ends while the window stays put.
+                    #[cfg(target_os = "linux")]
+                    if route == Route::NativeChild {
+                        canvas::reposition(&resizing, &PANEL_SHOWN)?;
+                    }
+                    config.width = now.surface.width;
+                    config.height = now.surface.height;
+                    surface.configure(&gpu.device, &config);
+                    surface_size = [now.canvas.width, now.canvas.height];
+                    canvas_rect = [0, 0, now.canvas.width, now.canvas.height];
+                    // The session measures the viewport in these pixels, so it
+                    // has to be told before anything asks it what to draw.
+                    let mut session = shared.lock().expect("session lock");
+                    session.apply(Command::Resize {
+                        width: surface_size[0],
+                        height: surface_size[1],
+                    });
+                    canvas_renderer.invalidate();
+                }
 
                 // The grid draws from the same cache the loupe does and touches
                 // nothing else: no decode, no session, no viewport. Returning
@@ -1521,12 +1711,96 @@ struct Layout {
     canvas: tauri::PhysicalSize<u32>,
 }
 
+/// Write the window's geometry down, at most once a second unless it is the
+/// last chance.
+///
+/// Rate-limited because a drag emits geometry events far faster than anyone
+/// changes their mind, and the file is only ever read at startup — the writes in
+/// between are all superseded. `force` is the close, where the current value is
+/// the one that matters and there is no later write to supersede it.
+fn remember_window(app: &tauri::AppHandle, window: &tauri::Window, force: bool) {
+    use std::sync::atomic::Ordering;
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    if !force {
+        let mut last = LAST.lock().expect("window state lock");
+        let recent = last.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(1));
+        if recent {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    let panel = PANEL_NOW.load(Ordering::Relaxed) as f64;
+    if let Some(state) = window_state::of(window, panel) {
+        window_state::save(app, state);
+    }
+}
+
+/// Put the window back where it was, in the order the two settings require.
+///
+/// Position before maximise: a maximised window's own geometry is the screen's,
+/// so setting the position afterwards would move the *maximised* window and lose
+/// the rectangle to come back to when it is restored.
+fn place_window(window: &tauri::Window, saved: Option<window_state::Remembered>) -> Result<()> {
+    let Some(saved) = saved else { return Ok(()) };
+    window.set_position(tauri::LogicalPosition::new(saved.x, saved.y))?;
+    if saved.maximised {
+        window.maximize()?;
+    }
+    Ok(())
+}
+
+impl Layout {
+    /// How a window of this size divides, for this arrangement.
+    ///
+    /// One function rather than the three it used to be, because a resize has to
+    /// arrive at exactly the division the window was built with — and the way to
+    /// guarantee that is for there to be only one description of it.
+    ///
+    /// The routes differ in what the surface covers, not in where the photograph
+    /// goes. Under a cutout the surface is the whole window and the canvas is the
+    /// part the chrome does not float over; with a native child the surface *is*
+    /// the child, so the two are the same rectangle.
+    fn for_window(route: Route, window: tauri::PhysicalSize<u32>, scale: f64) -> Self {
+        // The panel yields to the window rather than the other way round, and
+        // yields *here* rather than by writing a smaller number back: the width
+        // someone chose is theirs, and a window that narrows and widens again
+        // should give it back rather than having quietly forgotten it.
+        let room = window.width as f64 / scale;
+        let wanted = PANEL_NOW.load(std::sync::atomic::Ordering::Relaxed) as f64;
+        let shown = wanted.min((room - PHOTO_MIN).max(PANEL_MIN));
+        PANEL_SHOWN.store(shown as i32, std::sync::atomic::Ordering::Relaxed);
+        let panel = (shown * scale) as u32;
+        let canvas = tauri::PhysicalSize::new(
+            window.width.saturating_sub(panel).max(1),
+            window.height.max(1),
+        );
+        match route {
+            Route::Cutout => Layout {
+                surface: window,
+                canvas,
+            },
+            // The probe route, which has never placed its chrome correctly; it
+            // gets the whole window so that what it does draw is at least whole.
+            Route::ChildWebview => Layout {
+                surface: window,
+                canvas: window,
+            },
+            Route::NativeChild => Layout {
+                surface: canvas,
+                canvas,
+            },
+        }
+    }
+}
+
 /// Build the window for the chosen arrangement and put a surface on it.
 #[allow(clippy::type_complexity)]
 fn build_window(
     app: &tauri::App,
     route: Route,
+    saved: Option<window_state::Remembered>,
 ) -> Result<(Gpu, wgpu::Surface<'static>, Layout, tauri::Window)> {
+    let (width, height) = saved.map_or(WINDOW, |s| (s.width, s.height));
     match route {
         Route::Cutout => {
             // The real interface, told to leave the canvas area unpainted. The
@@ -1535,7 +1809,7 @@ fn build_window(
             let builder =
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("panel.html?cutout".into()))
                     .title("rawkit")
-                    .inner_size(WINDOW.0, WINDOW.1);
+                    .inner_size(width, height);
             // Transparent on every platform, macOS included. That needs
             // Tauri's `macos-private-api`, which bars *App Store* distribution
             // and nothing else — notarised direct download, which is how a tool
@@ -1543,82 +1817,55 @@ fn build_window(
             // NSView, several hundred lines of FFI nobody here can run.
             let builder = builder.transparent(true);
             let window = builder.build()?;
-            let surface_size = window.inner_size()?;
-            let scale = window.scale_factor()?;
-            let panel = (PANEL_WIDTH * scale) as u32;
+            let layout = Layout::for_window(route, window.inner_size()?, window.scale_factor()?);
             let (gpu, surface) = Gpu::with_surface(window.clone())?;
             let handle = window.as_ref().window();
-            Ok((
-                gpu,
-                surface,
-                Layout {
-                    surface: surface_size,
-                    canvas: tauri::PhysicalSize::new(
-                        surface_size.width.saturating_sub(panel).max(1),
-                        surface_size.height,
-                    ),
-                },
-                handle,
-            ))
+            Ok((gpu, surface, layout, handle))
         }
         Route::ChildWebview => {
             let window = WindowBuilder::new(app, "main")
                 .title("rawkit")
-                .inner_size(WINDOW.0, WINDOW.1)
+                .inner_size(width, height)
                 .build()?;
             let panel = window.add_child(
                 WebviewBuilder::new("panel", WebviewUrl::App("panel.html".into())),
                 LogicalPosition::new(0.0, 0.0),
-                LogicalSize::new(PANEL_WIDTH, WINDOW.1),
+                LogicalSize::new(PANEL_WIDTH, height),
             )?;
             panel.set_auto_resize(false)?;
             panel.set_position(LogicalPosition::new(0.0, 0.0))?;
-            panel.set_size(LogicalSize::new(PANEL_WIDTH, WINDOW.1))?;
+            panel.set_size(LogicalSize::new(PANEL_WIDTH, height))?;
             eprintln!(
                 "panel      : {:?} (ignored on Linux; see the module docs)",
                 panel.bounds()?
             );
-            let size = window.inner_size()?;
+            let layout = Layout::for_window(route, window.inner_size()?, window.scale_factor()?);
             let (gpu, surface) = Gpu::with_surface(window.clone())?;
             // A probe route, kept for the record rather than shipped: its chrome
             // is a side strip and nothing has ever placed it correctly.
-            Ok((
-                gpu,
-                surface,
-                Layout {
-                    surface: size,
-                    canvas: size,
-                },
-                window,
-            ))
+            Ok((gpu, surface, layout, window))
         }
         #[cfg(target_os = "linux")]
         Route::NativeChild => {
             let window =
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("panel.html".into()))
                     .title("rawkit")
-                    .inner_size(WINDOW.0, WINDOW.1)
+                    .inner_size(width, height)
                     .build()?;
-            let canvas = canvas::attach(&window.as_ref().window(), PANEL_PIXELS)?;
+            place_window(&window.as_ref().window(), saved)?;
+            // The layout first, because it is what settles `PANEL_SHOWN` — and
+            // the canvas is placed from that, not from the width somebody asked
+            // for. Attaching first would put the child window at the unclamped
+            // width and configure a surface at the clamped one, which is two
+            // rectangles for one canvas and looks like half a photograph.
+            let layout = Layout::for_window(route, window.inner_size()?, window.scale_factor()?);
+            let canvas = canvas::attach(&window.as_ref().window(), &PANEL_SHOWN)?;
             eprintln!("canvas     : X window {canvas:?}");
-            let outer = window.inner_size()?;
-            let scale = window.scale_factor()?;
-            let panel = (PANEL_WIDTH * scale) as u32;
-            let size =
-                tauri::PhysicalSize::new(outer.width.saturating_sub(panel).max(1), outer.height);
             let (gpu, surface) = Gpu::with_surface(canvas)?;
             let handle = window.as_ref().window();
             // The canvas has a window of its own, so the surface *is* the
             // photograph's rectangle and there is nothing to offset.
-            Ok((
-                gpu,
-                surface,
-                Layout {
-                    surface: size,
-                    canvas: size,
-                },
-                handle,
-            ))
+            Ok((gpu, surface, layout, handle))
         }
         #[cfg(not(target_os = "linux"))]
         Route::NativeChild => Err(anyhow!(

@@ -20,9 +20,24 @@
      to agree: the canvas is a separate window placed at that boundary, so a
      disagreement is a strip of photograph behind the panel or a strip of
      desktop beside it. */
-  #chrome { position: fixed; top: 0; right: 0; bottom: 0; width: 360px;
+  #chrome { position: fixed; top: 0; right: 0; bottom: 0; width: var(--panel, 360px);
             display: flex; flex-direction: column; background: #1e1e22;
             border-left: 1px solid #2c2c34; }
+
+  /* The divider: eight pixels of grab area over a one-pixel line, because a
+     one-pixel target is a target you hunt for.
+     It sits *inside* the chrome rather than straddling the boundary, which is
+     the usual way. On Linux the canvas is an X window of its own and sits on top
+     of the page, so a strip of divider hanging over it would be neither visible
+     nor clickable — the grab area has to be entirely on the panel's side. */
+  #divider { position: absolute; top: 0; left: 0; bottom: 0; width: 8px;
+             cursor: col-resize; z-index: 10; }
+  #divider:hover::after, #divider.dragging::after {
+    content: ""; position: absolute; top: 0; bottom: 0; left: 0; width: 1px;
+    background: #5a5a68; }
+  /* While dragging, the pointer owns the whole page: without this the cursor
+     flickers to a text caret every time it crosses a label. */
+  body.dividing { cursor: col-resize; user-select: none; }
 
   /* The only thing that scrolls, which is the whole point of a column: the
      sections can outgrow the window and nothing has to be taken away to make
@@ -75,7 +90,7 @@
   /* Full width of its own group, so the slider reads as belonging to the wheel
      above it rather than to the row of them. */
   .wheel-group input[type=range] { width: 92px; }
-  #curve { width: 296px; height: 296px; margin: 8px 0 2px; border-radius: 3px;
+  #curve { width: 100%; aspect-ratio: 1; margin: 8px 0 2px; border-radius: 3px;
            background: #141418; display: block; cursor: crosshair;
            touch-action: none; }
   /* The profile's own name, which can be long and is not ours to shorten. */
@@ -110,7 +125,7 @@
      take its space. */
   #bar { padding: 12px 16px 10px; border-bottom: 1px solid #2c2c34;
          font-variant-numeric: tabular-nums; flex-shrink: 0; }
-  #histogram { width: 328px; height: 84px; border-radius: 3px;
+  #histogram { width: 100%; height: 84px; border-radius: 3px;
                background: #141418; display: block; }
   #readout { display: flex; align-items: baseline; gap: 14px; margin-top: 7px; }
   /* A swatch beside each band's name. The mixer is the one panel where the
@@ -145,6 +160,7 @@
 </style>
 
 <div id="chrome">
+<div id="divider" title="drag to resize the panel"></div>
 <div id="bar">
   <canvas id="histogram" title="the developed photograph, in the values a file would carry"></canvas>
   <div id="readout">
@@ -320,7 +336,7 @@
   </details>
   <details id="s-keys">
     <summary>Keys</summary>
-    <div id="keys">G grid · E loupe · R crop · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · Z undo cull · ⌃Z undo edit · ⌃E export</div>
+    <div id="keys">G grid · E loupe · R crop · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · Z undo cull · ⌃Z undo edit · ⌃E export · F11 fullscreen</div>
   </details>
 </main>
 </div>
@@ -585,6 +601,13 @@
       seen = s.generation;
       sync(s.state);
     }
+    // The panel's width is the shell's answer, not ours: a window too narrow
+    // for the width someone chose gets less, and the page finds out here.
+    if (!dividing && s.panel && s.panel !== shownPanel) {
+      shownPanel = s.panel;
+      setPanel(s.panel);
+      redrawWide();
+    }
     // Which way up, and why. Two facts rather than one: the camera's turn is
     // not in the edit and cannot be — it is what the file recorded — so a
     // photograph that opens sideways would otherwise be doing it for a reason
@@ -623,7 +646,6 @@
   // composited additively, so two adjacent fills sharing a fractional edge sum
   // to full coverage instead of leaving the seam a source-over blend would.
   const BINS = 256;
-  const WIDE = 328;
   const TALL = 84;
 
   const drawScope = data => {
@@ -631,8 +653,12 @@
     // bin per CSS pixel is exactly 256 wide, which is why the widget is that
     // width and not a round number that would resample the bins.
     const dpr = window.devicePixelRatio || 1;
-    if (scope.width !== Math.round(WIDE * dpr)) {
-      scope.width = Math.round(WIDE * dpr);
+    // Measured rather than declared: the divider makes the column a width the
+    // stylesheet does not know, and a histogram drawn at yesterday's width would
+    // be stretched by the browser instead of redrawn at the new one.
+    const wide = Math.max(1, Math.round(scope.clientWidth * dpr));
+    if (scope.width !== wide) {
+      scope.width = wide;
       scope.height = Math.round(TALL * dpr);
     }
     const ctx = scope.getContext("2d");
@@ -910,10 +936,14 @@
 
   const drawCurve = () => {
     const dpr = window.devicePixelRatio || 1;
-    const size = 296;
-    if (curveCanvas.width !== Math.round(size * dpr)) {
-      curveCanvas.width = Math.round(size * dpr);
-      curveCanvas.height = Math.round(size * dpr);
+    // Square, at whatever width the column currently is. The pointer mapping
+    // normalises through `getBoundingClientRect`, so the editor does not care
+    // what that number is — which is what makes a resizable curve free.
+    const size = Math.max(1, curveCanvas.clientWidth);
+    const px = Math.round(size * dpr);
+    if (curveCanvas.width !== px) {
+      curveCanvas.width = px;
+      curveCanvas.height = px;
     }
     const ctx = curveCanvas.getContext("2d");
     ctx.setTransform(curveCanvas.width / size, 0, 0, curveCanvas.height / size, 0, 0);
@@ -1031,6 +1061,9 @@
   drawCurve();
 
   const exportLine = document.getElementById("export");
+  /// The generation the histogram on screen was drawn at; `null` asks for it
+  /// again whatever it is, which is how a column that changed width gets a
+  /// redraw rather than a stretched copy of the old one.
   let drawn = null;
   setInterval(async () => {
     const data = await invoke("histogram", { seen: drawn });
@@ -1227,6 +1260,82 @@
     const button = event.target.closest("button");
     if (button && event.detail > 0) button.blur();
   });
+
+  // ---- The divider ---------------------------------------------------------
+  //
+  // The page owns the gesture; the shell owns the consequence. On Linux the
+  // canvas is an X window of its own, so where the photograph ends is not
+  // something a stylesheet can decide — the width goes down to the shell and
+  // comes back clamped, and the page settles on what it actually got.
+  //
+  // The width is *not* remembered here. The shell holds it, because it also has
+  // to survive the window being rebuilt and has to be right before the first
+  // frame; a copy in localStorage would be a second answer to one question.
+
+  const divider = document.getElementById("divider");
+  const setPanel = px => document.documentElement.style.setProperty("--panel", `${px}px`);
+  /// The width last applied from the shell, so the poll does not restyle and
+  /// redraw two canvases four times a second for no reason.
+  let shownPanel = null;
+
+  invoke("panel_width").then(setPanel).catch(() => {});
+
+  let dividing = false;
+  divider.addEventListener("pointerdown", event => {
+    dividing = true;
+    divider.classList.add("dragging");
+    document.body.classList.add("dividing");
+    // Best effort. `setPointerCapture` on the divider tracked one drag and not
+    // the next, which is why the listeners below are on the window instead: X
+    // hands every motion event to the window the press landed on until the
+    // button comes up, so the webview keeps hearing the drag even while the
+    // pointer is over the canvas — a sibling X window it would otherwise have
+    // handed the events to.
+    try { divider.setPointerCapture(event.pointerId); } catch (e) {}
+    event.preventDefault();
+  });
+
+  // Coalesced to one call per frame. A drag emits motion far faster than the
+  // renderer rebuilds a swapchain, and every call but the last is already wrong.
+  let wanted = null;
+  window.addEventListener("pointermove", event => {
+    if (!dividing) return;
+    if (wanted === null) requestAnimationFrame(settle);
+    wanted = window.innerWidth - event.clientX;
+  });
+
+  const settle = () => {
+    if (wanted === null) return;
+    const asked = wanted;
+    wanted = null;
+    setPanel(asked);
+    // The shell hands back what it allowed, so a clamp shows up as the divider
+    // stopping rather than as the panel and the photograph disagreeing.
+    invoke("set_panel_width", { px: asked }).then(setPanel).catch(say);
+    redrawWide();
+  };
+
+  /// The two canvases that fill the column. CSS resizes the *element*; a canvas
+  /// keeps its bitmap and lets the browser stretch it, which is a histogram that
+  /// goes soft and a curve whose grid stops being square. Both size themselves
+  /// from `clientWidth` when they draw, so all this has to do is ask.
+  const redrawWide = () => {
+    drawn = null;
+    drawCurve();
+  };
+
+  const stopDividing = () => {
+    if (!dividing) return;
+    dividing = false;
+    divider.classList.remove("dragging");
+    document.body.classList.remove("dividing");
+    // `user-select: none` stops a *new* selection; one the press had already
+    // begun survives the drag and leaves half the panel highlighted.
+    const selection = window.getSelection();
+    if (selection) selection.removeAllRanges();
+  };
+  window.addEventListener("pointerup", stopDividing);
+  window.addEventListener("pointercancel", stopDividing);
 
   // ---- Sections ------------------------------------------------------------
   //
@@ -1434,6 +1543,9 @@
       case "s": act("copy_edit"); break;
       case "a": act("paste_edit"); break;
       case "z": act("undo"); break;
+      // The window's own key, handled here for the same reason every other key
+      // is: the webview has focus, so this is where a keypress arrives.
+      case "f11": invoke("toggle_fullscreen").catch(say); break;
       default: return;
     }
     event.preventDefault();
