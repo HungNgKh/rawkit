@@ -74,6 +74,10 @@ pub struct ExportReport {
 pub struct Chosen {
     pub image: cull::LibraryImage,
     pub state: EditState,
+    /// The camera profile this body has been given, if any. Resolved here
+    /// rather than at render time so that a file written from the terminal and
+    /// the same photograph on screen cannot disagree about colour.
+    pub profile: Option<rawkit_engine::CameraProfile>,
 }
 
 /// Where the files go.
@@ -108,6 +112,8 @@ impl Destination {
 /// halfway through.
 pub fn gather(catalog: &Catalog, selection: Selection) -> Result<Vec<Chosen>> {
     let mut chosen = Vec::new();
+    let mut parsed: std::collections::HashMap<String, Option<rawkit_engine::CameraProfile>> =
+        std::collections::HashMap::new();
     for image in cull::sequence(catalog)? {
         let judgement = cull::judgement(catalog, image.id)?;
         let wanted = match selection {
@@ -123,7 +129,35 @@ pub fn gather(catalog: &Catalog, selection: Selection) -> Result<Vec<Chosen>> {
         let state = rawkit_catalog::edits::latest(catalog, image.id)?
             .map(|(_, state)| state)
             .unwrap_or_default();
-        chosen.push(Chosen { image, state });
+        // One parse per profile, not per photograph: a batch is usually one
+        // body, and these files run to hundreds of kilobytes.
+        let profile = match rawkit_catalog::profiles::for_image(catalog, image.id)? {
+            Some(found) => match parsed.entry(found.path.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let loaded = std::fs::read(&found.path)
+                        .ok()
+                        .and_then(|bytes| rawkit_engine::profile::dcp::parse(&bytes).ok());
+                    if loaded.is_none() {
+                        // Named rather than silently ignored: a profile that has
+                        // moved should say so, because the alternative is an
+                        // export that quietly changes colour.
+                        eprintln!(
+                            "profile    : {} is missing or unreadable; {} renders with the \
+                             decoder's own matrix",
+                            found.path, image.filename
+                        );
+                    }
+                    e.insert(loaded).clone()
+                }
+            },
+            None => None,
+        };
+        chosen.push(Chosen {
+            image,
+            state,
+            profile,
+        });
     }
     if chosen.is_empty() {
         bail!("nothing in the library matches that selection");
@@ -168,7 +202,12 @@ pub fn write(
             let (next, chosen, gpu, renderer) = (&next, &chosen, &gpu, &renderer);
             scope.spawn(move || loop {
                 let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(Chosen { image, state }) = chosen.get(index) else {
+                let Some(Chosen {
+                    image,
+                    state,
+                    profile,
+                }) = chosen.get(index)
+                else {
                     break;
                 };
                 let destination = match to {
@@ -189,6 +228,7 @@ pub fn write(
                         renderer,
                         Path::new(&image.path),
                         state,
+                        profile.clone(),
                         max_dim,
                         &destination,
                     )
@@ -241,11 +281,13 @@ pub fn export(
 }
 
 /// Decode, render with the stored edit, and write one file.
+#[allow(clippy::too_many_arguments)]
 fn one(
     gpu: &Gpu,
     renderer: &Renderer,
     raw_path: &Path,
     state: &EditState,
+    profile: Option<rawkit_engine::CameraProfile>,
     max_dim: u32,
     destination: &Path,
 ) -> Result<u64> {
@@ -265,7 +307,7 @@ fn one(
             raw.as_shot_neutral[2],
         ],
         clip_level: 1.0,
-        profile: rawkit_engine::render::profile_for(&raw),
+        profile: profile.unwrap_or_else(|| rawkit_engine::render::profile_for(&raw)),
     };
 
     // Level zero, the whole frame. No pyramid, no averaging.
@@ -339,6 +381,7 @@ mod tests {
                     filename: format!("{i}.arw"),
                 },
                 state: EditState::default(),
+                profile: None,
             })
             .collect();
         let refused = write(

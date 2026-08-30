@@ -241,6 +241,9 @@ fn snapshot(state: tauri::State<'_, Shared>) -> serde_json::Value {
         "viewport": session.viewport(),
         "image": session.image_size(),
         "generation": session.generation(),
+        // `None` means the decoder's own matrix, which is a state worth naming
+        // rather than an absence to be guessed at.
+        "profile": *PROFILE_NAME.lock().expect("profile lock"),
     })
 }
 
@@ -347,6 +350,76 @@ fn export_progress() -> Option<serde_json::Value> {
         "filename": exporting.filename,
         "finished": exporting.finished,
     }))
+}
+
+/// Choose a camera profile for the body on screen, and remember it.
+///
+/// Per camera rather than per photograph, because that is what a DCP describes.
+/// The choice goes in the catalog, so an export made from the terminal renders
+/// the same colour as the window did.
+#[tauri::command]
+fn choose_profile(app: tauri::AppHandle, state: tauri::State<'_, Shelf>) -> Result<(), String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let Some(library) = state.0.clone() else {
+        return Err("no catalog is open, so there is nowhere to remember a profile".into());
+    };
+    let Some((make, model)) = CURRENT_CAMERA.lock().expect("camera lock").clone() else {
+        return Err("no photograph is open, so there is no camera to profile".into());
+    };
+
+    let leave = move |chosen: Option<tauri_plugin_dialog::FilePath>| {
+        let Some(path) = chosen.and_then(|p| p.into_path().ok()) else {
+            return;
+        };
+        // Parsed before it is remembered: a file that is not a profile should
+        // be refused at the moment somebody picks it, not silently stored and
+        // then quietly ignored on every future open.
+        let parsed = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| rawkit_engine::profile::dcp::parse(&bytes).ok());
+        let Some(profile) = parsed else {
+            eprintln!("profile    : {} is not a camera profile", path.display());
+            return;
+        };
+        let library = library.lock().expect("library lock");
+        if let Err(e) = rawkit_catalog::profiles::remember(
+            library.catalog(),
+            &make,
+            &model,
+            &path.to_string_lossy(),
+            profile.name.as_deref(),
+        ) {
+            eprintln!("profile    : could not remember it: {e}");
+            return;
+        }
+        eprintln!("profile    : {model} renders with {}", path.display());
+        PROFILE_CHANGED.store(true, std::sync::atomic::Ordering::Relaxed);
+    };
+    app.dialog()
+        .file()
+        .add_filter("Camera profile", &["dcp"])
+        .pick_file(leave);
+    Ok(())
+}
+
+/// Go back to the decoder's own matrix for this camera.
+#[tauri::command]
+fn clear_profile(state: tauri::State<'_, Shelf>) -> Result<(), String> {
+    let Some(library) = state.0.clone() else {
+        return Err("no catalog is open".into());
+    };
+    let Some((make, model)) = CURRENT_CAMERA.lock().expect("camera lock").clone() else {
+        return Err("no photograph is open".into());
+    };
+    rawkit_catalog::profiles::forget(
+        library.lock().expect("library lock").catalog(),
+        &make,
+        &model,
+    )
+    .map_err(|e| e.to_string())?;
+    PROFILE_CHANGED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 /// The open library, when a catalog was what was opened.
@@ -538,7 +611,9 @@ fn main() -> Result<()> {
             canvas_pointer,
             histogram,
             export,
-            export_progress
+            export_progress,
+            choose_profile,
+            clear_profile
         ])
         .setup(move |app| {
             // The surface is created on the main thread because the raw window
@@ -579,7 +654,9 @@ fn main() -> Result<()> {
             };
             app.manage(Shelf(library.clone()));
 
-            let loaded = Loaded::open(raw.as_deref(), DEFAULT_TILE)?;
+            let mut loaded = Loaded::open(raw.as_deref(), DEFAULT_TILE)?;
+            *PROFILE_NAME.lock().expect("profile lock") =
+                apply_profile(library.as_ref(), &mut loaded);
             let mut session = Session::new(loaded.size, DEFAULT_TILE, EditState::default());
             session.apply(Command::Resize {
                 width: layout.canvas.width,
@@ -797,6 +874,20 @@ fn main() -> Result<()> {
 
                 saver.tick();
 
+                // A profile the picker has just stored. Applied on this thread
+                // because the profile changes the size of a GPU buffer, and
+                // this is the thread that owns them.
+                if PROFILE_CHANGED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(loaded) = showing.raw.as_mut() {
+                        *PROFILE_NAME.lock().expect("profile lock") =
+                            apply_profile(exporting_from.as_ref(), loaded);
+                        canvas_renderer.reload(&gpu, &loaded.frame());
+                        canvas_renderer.invalidate();
+                        // The histogram describes colour, so it is stale too.
+                        *SCOPE.lock().expect("histogram lock") = None;
+                    }
+                }
+
                 // A destination the picker has already collected. Gathered here
                 // rather than in the command, because this is the thread that
                 // owns the saver: `flush` puts the edit you were making a moment
@@ -828,7 +919,11 @@ fn main() -> Result<()> {
                 };
                 if !covered && showing.raw.is_none() {
                     let decoding = std::time::Instant::now();
-                    let next = Loaded::open(showing.path.as_deref(), DEFAULT_TILE)?;
+                    let mut next = Loaded::open(showing.path.as_deref(), DEFAULT_TILE)?;
+                    // Before the reload, not after: the profile decides how big
+                    // the table buffer is, and `reload` is what allocates it.
+                    *PROFILE_NAME.lock().expect("profile lock") =
+                        apply_profile(exporting_from.as_ref(), &mut next);
                     canvas_renderer.reload(&gpu, &next.frame());
                     showing.size = next.size;
                     showing.raw = Some(next);
@@ -1392,6 +1487,55 @@ pub(crate) fn in_crop() -> bool {
 /// catches up, because the "is it stale" test stays true until a survey
 /// actually happens.
 const SURVEY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The body of the photograph on screen, so the picker knows which camera it is
+/// choosing a profile for. `None` before anything is open, and for the
+/// synthetic mosaic, which no profile describes.
+static CURRENT_CAMERA: Mutex<Option<(String, String)>> = Mutex::new(None);
+/// What that camera is currently rendered with, for the page to show. `None`
+/// means the decoder's own matrix.
+static PROFILE_NAME: Mutex<Option<String>> = Mutex::new(None);
+/// Set when the choice changes, so the render loop reloads with it. The loop
+/// owns the GPU buffers and the profile decides how big one of them is.
+static PROFILE_CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Render this photograph with whatever profile its camera has been given.
+///
+/// Returns what to call it, or `None` for the decoder's own matrix — which is
+/// also what a profile that has moved falls back to, loudly.
+fn apply_profile(library: Option<&Arc<Mutex<Library>>>, loaded: &mut Loaded) -> Option<String> {
+    let camera = loaded.camera().cloned()?;
+    *CURRENT_CAMERA.lock().expect("camera lock") =
+        Some((camera.make.clone(), camera.model.clone()));
+
+    let chosen = rawkit_catalog::profiles::chosen(
+        library?.lock().expect("library lock").catalog(),
+        &camera.make,
+        &camera.model,
+    )
+    .ok()??;
+
+    match std::fs::read(&chosen.path)
+        .ok()
+        .and_then(|bytes| rawkit_engine::profile::dcp::parse(&bytes).ok())
+    {
+        Some(profile) => {
+            loaded.set_profile(profile);
+            Some(chosen.name.unwrap_or(chosen.path))
+        }
+        // Named rather than silently ignored. A profile that has moved should
+        // say so; the alternative is a photograph quietly changing colour
+        // between one session and the next.
+        None => {
+            eprintln!(
+                "profile    : {} is missing or unreadable; rendering with the decoder's \
+                 own matrix",
+                chosen.path
+            );
+            None
+        }
+    }
+}
 
 /// An export the user has chosen a destination for, waiting for the render loop
 /// to pick it up.

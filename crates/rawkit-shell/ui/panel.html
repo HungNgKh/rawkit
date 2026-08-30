@@ -65,6 +65,8 @@
          overflow-wrap: anywhere; }
   #log.refused { color: #e0705f; }
   #keys { color: #7d7d87; font-size: 11px; line-height: 1.7; }
+  /* The profile's own name, which can be long and is not ours to shorten. */
+  #profile-name { color: #9a9aa2; overflow-wrap: anywhere; margin: 7px 0; }
 
   /* The histogram sits at the top of the column, above everything it describes.
      Fixed height, so a long export line or a wrapping status block can never
@@ -194,6 +196,15 @@
       <input id="tint" type="range" min="-100" max="100" step="1" value="0">
       <output id="tint-value">0</output></label>
     <div class="row"><button id="as-shot">As shot</button></div>
+  </details>
+
+  <details id="s-profile">
+    <summary>Camera profile</summary>
+    <div id="profile-name">camera matrix</div>
+    <div class="row">
+      <button id="profile-choose">Choose…</button>
+      <button id="profile-clear">Camera matrix</button>
+    </div>
   </details>
 
   <details id="s-view"><summary>View</summary>
@@ -433,6 +444,10 @@
       seen = s.generation;
       sync(s.state);
     }
+    // Not gated on the generation: a profile is not part of the edit, so
+    // choosing one does not move it.
+    const profile = s.profile ?? "camera matrix";
+    if (profileName.textContent !== profile) profileName.textContent = profile;
     // The canvas changes the selection too — clicking a cell, and
     // double-clicking to open it — and none of that passes through this page.
     // Without this the strip goes on describing the frame you were on two
@@ -531,6 +546,17 @@
   // Polled faster than the sliders are, and it costs nothing to do so: the
   // command returns nothing at all unless the generation it holds differs from
   // the one already drawn, so an idle editor pays a lock and a comparison.
+  // The camera profile. Per body rather than per photograph, so this reads as a
+  // property of the camera you are working with rather than of the frame.
+  const profileName = document.getElementById("profile-name");
+  const profileAction = (command) => () =>
+    invoke(command).catch(e => {
+      log.className = "refused";
+      log.textContent = String(e);
+    });
+  document.getElementById("profile-choose").addEventListener("click", profileAction("choose_profile"));
+  document.getElementById("profile-clear").addEventListener("click", profileAction("clear_profile"));
+
   const exportLine = document.getElementById("export");
   let drawn = null;
   setInterval(async () => {

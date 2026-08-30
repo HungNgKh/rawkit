@@ -443,6 +443,7 @@ pub(crate) mod tests {
         assert_eq!(
             tables(&catalog),
             [
+                "camera_profiles",
                 "edit_states",
                 "files",
                 "folders",
@@ -450,7 +451,8 @@ pub(crate) mod tests {
                 "previews",
                 "volumes"
             ],
-            "the spine plus previews, and nothing speculative alongside them"
+            "the spine plus previews and camera profiles, and nothing \
+             speculative alongside them"
         );
     }
 

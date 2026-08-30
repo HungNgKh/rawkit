@@ -51,12 +51,15 @@ pub struct Loaded {
     phase: BayerPhase,
     wb: [f32; 3],
     profile: CameraProfile,
+    /// Which body took it, so the catalog can be asked what to render it with.
+    /// `None` for the synthetic mosaic, which no profile describes.
+    camera: Option<rawkit_decode::CameraId>,
 }
 
 impl Loaded {
     /// Decode a RAW, or synthesise one when there is no file to open.
     pub fn open(path: Option<&Path>, tile: u32) -> Result<Self> {
-        let (mosaic, size, phase, wb, profile) = match path {
+        let (mosaic, size, phase, wb, profile, camera) = match path {
             None => {
                 eprintln!("image      : no file given, using a synthetic mosaic");
                 let (width, height) = (2048u32, 1365u32);
@@ -66,6 +69,7 @@ impl Loaded {
                     BayerPhase::Rggb,
                     [1.0, 1.0, 1.0],
                     CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
+                    None,
                 )
             }
             Some(path) => {
@@ -92,7 +96,15 @@ impl Loaded {
                     raw.as_shot_neutral[2],
                 ];
                 let size = [raw.width, raw.height];
-                (rawkit_engine::normalise(&raw), size, phase, wb, profile)
+                let camera = raw.camera.clone();
+                (
+                    rawkit_engine::normalise(&raw),
+                    size,
+                    phase,
+                    wb,
+                    profile,
+                    Some(camera),
+                )
             }
         };
 
@@ -105,9 +117,24 @@ impl Loaded {
             phase,
             wb,
             profile,
+            camera,
         };
         loaded.levels = Pyramid::build(&loaded.frame(), tile).into_levels();
         Ok(loaded)
+    }
+
+    /// Which body took this photograph.
+    pub fn camera(&self) -> Option<&rawkit_decode::CameraId> {
+        self.camera.as_ref()
+    }
+
+    /// Render it with a different profile from here on.
+    ///
+    /// The pyramid does not have to be rebuilt: it reduces the *mosaic*, and a
+    /// mosaic is what the sensor recorded rather than what a profile makes of
+    /// it.
+    pub fn set_profile(&mut self, profile: CameraProfile) {
+        self.profile = profile;
     }
 
     pub fn frame(&self) -> Frame<'_> {
