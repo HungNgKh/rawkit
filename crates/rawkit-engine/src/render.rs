@@ -1624,6 +1624,40 @@ fn gather_padded(
 /// Values above white — sensors do produce them — are kept rather than clipped.
 /// Highlight reconstruction needs to know a channel blew past full scale, and
 /// clamping here would destroy that information before the stage that wants it.
+/// Build a profile from the decoder's camera table.
+///
+/// Here rather than in a caller because it takes a `RawImage` and produces a
+/// `CameraProfile`, which is exactly the seam this crate already owns —
+/// [`normalise`] is its twin. Two callers had reason to want it and only one
+/// had it.
+///
+/// The table gives one XYZ-to-camera matrix, which the profile treats as a D65
+/// characterisation. That is a real limitation and not a placeholder to be
+/// embarrassed about: a single illuminant means a tungsten scene is rendered
+/// with a daylight characterisation, which is defensible but not accurate. Two
+/// illuminants need a `.dcp`.
+///
+/// LibRaw pads its matrix to four rows for four-colour sensors; we take the
+/// three that describe an RGB camera.
+pub fn profile_for(raw: &rawkit_decode::RawImage) -> CameraProfile {
+    single_illuminant_profile(&raw.cam_to_xyz)
+        .unwrap_or_else(|| CameraProfile::from_color_matrix(crate::profile::IDENTITY))
+}
+
+/// The same table, with "this body has no matrix at all" still distinguishable.
+///
+/// [`profile_for`] folds that case into an identity profile, which is the right
+/// default and the wrong thing for a caller that wants to *say* the colour will
+/// be badly cast. Both exist because both answers are wanted.
+pub fn single_illuminant_profile(cam_xyz: &[[f32; 3]; 4]) -> Option<CameraProfile> {
+    if cam_xyz.iter().flatten().all(|&v| v == 0.0) {
+        return None;
+    }
+    Some(CameraProfile::from_color_matrix([
+        cam_xyz[0], cam_xyz[1], cam_xyz[2],
+    ]))
+}
+
 pub fn normalise(raw: &rawkit_decode::RawImage) -> Vec<f32> {
     let phase = BayerPhase::from_cfa(raw.cfa).unwrap_or(BayerPhase::Rggb);
     let (dx, dy) = phase.offset();

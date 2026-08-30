@@ -93,7 +93,7 @@ pub fn render(
             }
             profile
         }
-        None => match single_illuminant_profile(&raw.cam_to_xyz) {
+        None => match rawkit_engine::render::single_illuminant_profile(&raw.cam_to_xyz) {
             Some(p) => {
                 eprintln!("colour     : decoder camera matrix, single illuminant (no DCP)");
                 p
@@ -159,36 +159,16 @@ pub fn render(
         );
     }
 
-    let step = downsample_step(developed.width, developed.height, max_dim);
-    let (scaled, out_w, out_h) =
-        downsample(&developed.pixels, developed.width, developed.height, step);
+    let step = rawkit_engine::resize::downsample_step(developed.width, developed.height, max_dim);
+    let (scaled, out_w, out_h) = rawkit_engine::resize::downsample(
+        &developed.pixels,
+        developed.width,
+        developed.height,
+        step,
+    );
     write_image(output, &scaled, out_w, out_h)?;
     eprintln!("wrote      : {} ({out_w}x{out_h})", output.display());
     Ok(())
-}
-
-/// Build a profile from the decoder's camera table.
-///
-/// The table gives one XYZ-to-camera matrix, which the profile treats as a D65
-/// characterisation. That is a real limitation and not a placeholder to be
-/// embarrassed about: a single illuminant means a tungsten scene is rendered
-/// with a daylight characterisation, which is defensible but not accurate. Two
-/// illuminants need a `.dcp`.
-///
-/// LibRaw pads its matrix to four rows for four-colour sensors; we take the
-/// three that describe an RGB camera.
-pub(crate) fn profile_for(raw: &rawkit_decode::RawImage) -> CameraProfile {
-    single_illuminant_profile(&raw.cam_to_xyz)
-        .unwrap_or_else(|| CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY))
-}
-
-fn single_illuminant_profile(cam_xyz: &[[f32; 3]; 4]) -> Option<CameraProfile> {
-    if cam_xyz.iter().flatten().all(|&v| v == 0.0) {
-        return None;
-    }
-    Some(CameraProfile::from_color_matrix([
-        cam_xyz[0], cam_xyz[1], cam_xyz[2],
-    ]))
 }
 
 /// The sRGB transfer function. Not a tone curve — see the module header.
@@ -199,44 +179,6 @@ fn encode_srgb(v: f32) -> f32 {
     } else {
         1.055 * v.powf(1.0 / 2.4) - 0.055
     }
-}
-
-pub(crate) fn downsample_step(width: u32, height: u32, max_dim: u32) -> u32 {
-    if max_dim == 0 {
-        return 1;
-    }
-    let longest = width.max(height);
-    (longest.div_ceil(max_dim)).max(1)
-}
-
-/// Box-average down to the requested size, in linear light.
-///
-/// Averaging before the transfer function is the only correct order;
-/// downsampling encoded values darkens detailed areas, which reads as the
-/// resize "losing contrast" and is really a gamma error.
-pub(crate) fn downsample(rgba: &[f32], width: u32, height: u32, step: u32) -> (Vec<f32>, u32, u32) {
-    if step <= 1 {
-        return (rgba.to_vec(), width, height);
-    }
-    let (out_w, out_h) = (width / step, height / step);
-    let mut out = Vec::with_capacity((out_w * out_h * 4) as usize);
-    for oy in 0..out_h {
-        for ox in 0..out_w {
-            let mut acc = [0.0f32; 3];
-            let mut n = 0.0f32;
-            for sy in 0..step {
-                for sx in 0..step {
-                    let i = (((oy * step + sy) * width + ox * step + sx) * 4) as usize;
-                    for c in 0..3 {
-                        acc[c] += rgba[i + c];
-                    }
-                    n += 1.0;
-                }
-            }
-            out.extend_from_slice(&[acc[0] / n, acc[1] / n, acc[2] / n, 1.0]);
-        }
-    }
-    (out, out_w, out_h)
 }
 
 /// Write the file, choosing the format from the name the user gave it.

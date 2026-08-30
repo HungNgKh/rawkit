@@ -3008,6 +3008,7 @@ dependencies = [
  "clap",
  "rawkit-catalog",
  "rawkit-decode",
+ "rawkit-deliver",
  "rawkit-editstate",
  "rawkit-engine",
  "rawkit-export",
@@ -3020,6 +3021,18 @@ version = "0.0.1"
 dependencies = [
  "libraw-rs-sys",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "rawkit-deliver"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "rawkit-catalog",
+ "rawkit-decode",
+ "rawkit-editstate",
+ "rawkit-engine",
+ "rawkit-export",
 ]
 
 [[package]]

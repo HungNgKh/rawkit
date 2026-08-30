@@ -184,7 +184,7 @@ fn one(
         .with_context(|| format!("decoding {}", raw_path.display()))?;
     let phase = BayerPhase::from_cfa(raw.cfa)
         .with_context(|| format!("{:?} is not a Bayer sensor", raw.cfa))?;
-    let profile = crate::render::profile_for(&raw);
+    let profile = rawkit_engine::render::profile_for(&raw);
     lap("decode", &mut clock);
     let mosaic = rawkit_engine::normalise(&raw);
     lap("normalise", &mut clock);

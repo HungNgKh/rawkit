@@ -5,7 +5,6 @@
 //! here first: it makes the behaviour scriptable and, more usefully, testable on
 //! three operating systems without a display attached.
 
-mod export;
 mod previews;
 mod render;
 
@@ -396,19 +395,19 @@ fn main() -> Result<()> {
             jobs,
         } => {
             let selection = match (picks, rated, image, all) {
-                (true, _, _, _) => export::Selection::Picks,
-                (_, Some(stars), _, _) => export::Selection::Rated(stars),
-                (_, _, Some(id), _) => export::Selection::Image(id),
-                (_, _, _, true) => export::Selection::All,
+                (true, _, _, _) => rawkit_deliver::Selection::Picks,
+                (_, Some(stars), _, _) => rawkit_deliver::Selection::Rated(stars),
+                (_, _, Some(id), _) => rawkit_deliver::Selection::Image(id),
+                (_, _, _, true) => rawkit_deliver::Selection::All,
                 _ => {
                     anyhow::bail!("say what to export: --picks, --rated <n>, --image <id> or --all")
                 }
             };
             let catalog = rawkit_catalog::db::Catalog::open(&catalog)?;
-            export::check_destination(&catalog, &to)?;
+            rawkit_deliver::check_destination(&catalog, &to)?;
 
             let mut last = usize::MAX;
-            let report = export::export(
+            let report = rawkit_deliver::export(
                 &catalog,
                 selection,
                 &to,

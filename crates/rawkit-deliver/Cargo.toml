@@ -1,6 +1,6 @@
 [package]
-name = "rawkit-cli"
-description = "Headless entry point: schema emission, pipeline introspection, GPU probing."
+name = "rawkit-deliver"
+description = "Catalog selection to files on disk: the layer that composes decode, render and encode. Shared by every front end, so an export means the same thing from the terminal and from the window."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,17 +8,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-[[bin]]
-name = "rawkit"
-path = "src/main.rs"
-
 [dependencies]
 rawkit-editstate.workspace = true
 rawkit-decode.workspace = true
 rawkit-engine.workspace = true
 rawkit-catalog.workspace = true
 rawkit-export.workspace = true
-rawkit-deliver.workspace = true
-clap.workspace = true
 anyhow.workspace = true
-serde_json.workspace = true

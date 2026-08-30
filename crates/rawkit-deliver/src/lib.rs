@@ -1,5 +1,18 @@
 //! Turning what you decided into photographs.
 //!
+//! # Why this is its own crate
+//!
+//! It is the composition layer: the catalog says which photographs and what was
+//! decided about them, `rawkit-decode` and `rawkit-engine` turn one into pixels,
+//! `rawkit-export` turns those into a file. None of those four wants to know
+//! about the other three, and the code that joins them is not big — it is just
+//! the only code that has an opinion about *which* photographs and *whether to
+//! overwrite*, which is precisely the part that must not be written twice.
+//!
+//! It used to live inside the command-line binary, where the window could not
+//! reach it. Two implementations of "skip a file that already exists" is two
+//! chances to get it wrong, and only one of them would have had the test.
+//!
 //! # The loop this closes
 //!
 //! Everything before this records decisions: a scan puts files in a catalog, a
@@ -181,7 +194,7 @@ fn one(
             raw.as_shot_neutral[2],
         ],
         clip_level: 1.0,
-        profile: crate::render::profile_for(&raw),
+        profile: rawkit_engine::render::profile_for(&raw),
     };
 
     // Level zero, the whole frame. No pyramid, no averaging.
@@ -189,9 +202,13 @@ fn one(
     // The *developed* size, not the sensor's: a cropped frame that asked for a
     // 2000-pixel edge would otherwise be scaled by the factor its uncropped
     // version needed, and come out smaller than requested.
-    let step = crate::render::downsample_step(developed.width, developed.height, max_dim);
-    let (scaled, width, height) =
-        crate::render::downsample(&developed.pixels, developed.width, developed.height, step);
+    let step = rawkit_engine::resize::downsample_step(developed.width, developed.height, max_dim);
+    let (scaled, width, height) = rawkit_engine::resize::downsample(
+        &developed.pixels,
+        developed.width,
+        developed.height,
+        step,
+    );
     let bytes = rawkit_export::encode(
         &scaled,
         width,
