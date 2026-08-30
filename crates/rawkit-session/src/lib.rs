@@ -118,6 +118,9 @@ pub enum Command {
     SetSharpenRadius(f32),
     /// Smooth colour without touching luminance.
     SetChromaNoise(f32),
+    /// Smooth brightness while sparing edges. Costs detail, unlike the chroma
+    /// kind, which is why it is off unless asked for.
+    SetLuminanceNoise(f32),
     /// Every colour equally, and the one that spares the vivid ones.
     SetSaturation(f32),
     SetVibrance(f32),
@@ -182,6 +185,7 @@ impl Command {
             Command::SetSharpen(_) => "set_sharpen",
             Command::SetSharpenRadius(_) => "set_sharpen_radius",
             Command::SetChromaNoise(_) => "set_chroma_noise",
+            Command::SetLuminanceNoise(_) => "set_luminance_noise",
             Command::SetSaturation(_) => "set_saturation",
             Command::SetVibrance(_) => "set_vibrance",
             Command::SetStraighten(_) => "set_straighten",
@@ -222,6 +226,7 @@ impl Command {
             | Command::SetSharpen(_)
             | Command::SetSharpenRadius(_)
             | Command::SetChromaNoise(_)
+            | Command::SetLuminanceNoise(_)
             | Command::SetSaturation(_)
             | Command::SetVibrance(_)
             | Command::SetStraighten(_) => true,
@@ -577,6 +582,11 @@ impl Session {
             Command::SetChromaNoise(amount) => {
                 let mut detail = self.state.detail;
                 detail.chroma_noise = amount;
+                self.detail(name, detail)
+            }
+            Command::SetLuminanceNoise(amount) => {
+                let mut detail = self.state.detail;
+                detail.luminance_noise = amount;
                 self.detail(name, detail)
             }
 

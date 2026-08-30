@@ -1018,3 +1018,120 @@ fn chroma_mix(@builtin(global_invocation_id) gid: vec3<u32>) {
     let recoloured = blurred * (was / now);
     rgba_out[p] = vec4<f32>(mix(original, recoloured, amount), 1.0);
 }
+
+// ---------------------------------------------------------------------------
+// Stage F'' -- luminance noise reduction, and the one that costs something.
+//
+// Smoothing colour takes nothing you can see. Smoothing brightness takes
+// detail, because brightness is where all of the detail is — so this has to be
+// edge-aware or it is just a blur with a friendlier name. A bilateral filter is
+// the answer: neighbours are averaged in proportion to how *similar* they are,
+// so a flat area averages freely and an edge averages with almost nothing.
+//
+// # Why the comparison happens on the square root
+//
+// Sensor noise is dominated by photon shot noise, whose standard deviation
+// grows as the square root of the signal. A threshold applied to linear light
+// therefore means two different things in the same frame: generous in the
+// shadows, where it swallows real detail, and mean in the highlights, where the
+// noise it was meant to catch sails past it.
+//
+// The square root is the variance-stabilising transform for that noise — after
+// it, the noise has roughly the same width everywhere, so **one number means
+// one thing across the whole frame**. `the_same_setting_reaches_the_shadows_and
+// _the_highlights` is the test that holds this to account, and it is a test that
+// could not be written at all without this being true.
+//
+// # What the strength does
+//
+// It sets the range threshold and nothing else. At zero the filter has no
+// tolerance for difference, every neighbour weighs nothing, and the pixel keeps
+// itself; at one the tolerance is wide enough that a flat area averages
+// completely. The plastic look at the top of the range is real and is the same
+// bargain every denoiser offers — this one just does not make it for you.
+//
+// Two passes, like chroma: a neighbourhood operation cannot read the buffer it
+// is writing. The smoothed brightness goes into the red channel plane the
+// demosaic has finished with.
+// ---------------------------------------------------------------------------
+
+/// How far the bilateral reaches. Folded into `HALO` in `render.rs`, where 3
+/// and 2 happen to cost the same because the halo rounds to an even number.
+const LUMA_REACH: i32 = 3;
+/// Range tolerance at full strength, in square-root-signal units.
+///
+/// Calibrated against `noise_falls_and_the_edge_survives` rather than reasoned
+/// from a sensor model: the number that has to be right is "how much does a
+/// flat area smooth before an edge starts to move", and that is measurable.
+const LUMA_SIGMA: f32 = 0.075;
+/// Spatial falloff across the kernel, in pixels. Wide enough that the corners
+/// of a 7x7 still contribute, narrow enough that the nearest ring dominates.
+const LUMA_SPATIAL: f32 = 2.0;
+
+/// The brightness this stage smooths.
+///
+/// An unweighted mean, matching `chroma_mix`, for the same reason: putting a
+/// pixel's brightness back needs a measure of it, not a colorimetric one, and an
+/// unweighted mean cannot go negative on a wide-gamut primary.
+fn brightness(rgb: vec3<f32>) -> f32 {
+    return (rgb.r + rgb.g + rgb.b) / 3.0;
+}
+
+@compute @workgroup_size(8, 8)
+fn luminance_blur(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let strength = params.detail.w;
+    if (strength <= 0.0) {
+        return;
+    }
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    if (x >= i32(params.width) || y >= i32(params.height)) {
+        return;
+    }
+
+    let centre = brightness(rgba_out[idx(x, y)].rgb);
+    // `max` rather than a branch on negatives: a pixel below black is a real
+    // thing after white balance, and its square root is not.
+    let centre_root = sqrt(max(centre, 0.0));
+    let sigma = LUMA_SIGMA * strength;
+
+    var sum = 0.0;
+    var total = 0.0;
+    for (var j = -LUMA_REACH; j <= LUMA_REACH; j = j + 1) {
+        for (var i = -LUMA_REACH; i <= LUMA_REACH; i = i + 1) {
+            let value = brightness(rgba_out[idx(x + i, y + j)].rgb);
+            let d = sqrt(max(value, 0.0)) - centre_root;
+            let spatial = f32(i * i + j * j) / (2.0 * LUMA_SPATIAL * LUMA_SPATIAL);
+            let range = (d * d) / (2.0 * sigma * sigma);
+            let w = exp(-spatial - range);
+            sum = sum + w * value;
+            total = total + w;
+        }
+    }
+    // The centre always weighs 1, so this cannot be zero.
+    ch_r[idx(x, y)] = sum / total;
+}
+
+@compute @workgroup_size(8, 8)
+fn luminance_mix(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (params.detail.w <= 0.0) {
+        return;
+    }
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    if (x >= i32(params.width) || y >= i32(params.height)) {
+        return;
+    }
+    let p = idx(x, y);
+    let original = rgba_out[p].rgb;
+    let was = brightness(original);
+    // Nothing to scale, and dividing by it is how a denoiser makes fireflies.
+    if (was <= 1e-6) {
+        return;
+    }
+    // Scaling the triple keeps every ratio between the channels, so the colour
+    // is exactly what it was and only the brightness moved — the mirror of what
+    // `chroma_mix` does, and the reason the two can both run without either
+    // undoing the other.
+    rgba_out[p] = vec4<f32>(original * (ch_r[p] / was), 1.0);
+}

@@ -357,10 +357,19 @@ pub struct Detail {
     /// Chroma noise is the ugly kind: coloured blotches in the shadows that no
     /// amount of exposure fixes and that survive being printed. Smoothing colour
     /// costs nothing visible, because the eye takes its detail from luminance —
-    /// which is why this has a default and luminance noise reduction does not
-    /// exist here yet. That one trades detail for smoothness, and a converter
-    /// that makes that trade for you without asking is one you cannot undo.
+    /// which is why this has a default and [`Detail::luminance_noise`] does not.
     pub chroma_noise: f32,
+    /// How far to smooth *brightness*, sparing edges. 0 is off, and off is the
+    /// default.
+    ///
+    /// The asymmetry with [`Detail::chroma_noise`] is the whole point. Smoothing
+    /// colour takes nothing you can see; smoothing luminance takes detail,
+    /// because luminance is where all of the detail is. What the right amount is
+    /// depends on the ISO the frame was shot at and on whether you like grain,
+    /// and neither is something a converter can decide for you — one that made
+    /// that trade unasked would be softening photographs for a reason its user
+    /// could not see.
+    pub luminance_noise: f32,
 }
 
 impl Default for Detail {
@@ -374,6 +383,9 @@ impl Default for Detail {
             // Modest, and safe to have on: it removes blotches and takes no
             // detail with them.
             chroma_noise: 0.5,
+            // Off. See the field's own note: this one costs detail, and which
+            // frames want it is not ours to assume.
+            luminance_noise: 0.0,
         }
     }
 }
@@ -409,6 +421,12 @@ impl Detail {
             return Err(EditStateError::InvalidDetail(format!(
                 "chroma noise reduction is {}, and runs from 0 to 1",
                 self.chroma_noise
+            )));
+        }
+        if !self.luminance_noise.is_finite() || !(0.0..=1.0).contains(&self.luminance_noise) {
+            return Err(EditStateError::InvalidDetail(format!(
+                "luminance noise reduction is {}, and runs from 0 to 1",
+                self.luminance_noise
             )));
         }
         Ok(())

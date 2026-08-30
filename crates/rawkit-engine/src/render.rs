@@ -217,7 +217,7 @@ struct Params {
     tone: [f32; 4],
     /// `[black point, white point, unused, unused]`.
     levels: [f32; 4],
-    /// `[sharpen amount, sharpen radius, chroma noise, unused]`.
+    /// `[sharpen amount, sharpen radius, chroma noise, luminance noise]`.
     detail: [f32; 4],
     /// `[saturation, vibrance, unused, unused]`.
     colour: [f32; 4],
@@ -305,7 +305,7 @@ pub enum Output {
     Display,
 }
 
-const STAGES: [&str; 10] = [
+const STAGES: [&str; 12] = [
     "conv",
     "green_at_rb",
     "rb_at_br",
@@ -313,6 +313,8 @@ const STAGES: [&str; 10] = [
     "pack",
     "chroma_blur",
     "chroma_mix",
+    "luminance_blur",
+    "luminance_mix",
     "develop",
     "luma",
     "sharpen",
@@ -323,7 +325,7 @@ const STAGES: [&str; 10] = [
 /// Named rather than counted back from the end: it used to be `len() - 1`, which
 /// was right only while `develop` was last and would have silently started
 /// returning sharpened pixels the moment anything was appended.
-const SCENE_LINEAR_STAGES: usize = 7;
+const SCENE_LINEAR_STAGES: usize = 9;
 
 /// How far outside a tile the kernel reaches, in pixels.
 ///
@@ -338,18 +340,20 @@ const SCENE_LINEAR_STAGES: usize = 7;
 /// | `rb_at_g` | chroma ±3 (itself reach 8) | 11 |
 ///
 /// | `chroma_blur` | RGB ±2 (itself reach 11) | 13 |
-/// | `sharpen` | `vh` ±2 (itself the denoised value, reach 13) | 15 |
+/// | `luminance_blur` | RGB ±3 (itself reach 13) | 16 |
+/// | `sharpen` | `vh` ±2 (itself the denoised value, reach 16) | 18 |
 ///
-/// Rounded up to 16 to keep it **even**, which is not cosmetic: an odd halo
-/// shifts the CFA phase inside the tile, and every pixel would come out the
-/// wrong colour.
+/// Kept **even**, which is not cosmetic: an odd halo shifts the CFA phase inside
+/// the tile, and every pixel would come out the wrong colour.
 ///
-/// It was 12 before capture sharpening and 14 before chroma noise reduction,
-/// each of whose blurs reaches two pixels further than what feeds it.
+/// It was 12 before capture sharpening, 14 before chroma noise reduction and 16
+/// before luminance noise reduction. That last one is why the bilateral reaches
+/// three rather than two: at ±2 the chain comes to 17 and rounds to 18 anyway,
+/// so the wider kernel is free.
 /// Get this wrong and the symptom is a faint grid at the tile boundaries on
 /// detailed frames — which is why `a_level_zero_tile_is_identical_to_the_whole_image_render`
 /// is the test that guards it rather than anything that looks at a photograph.
-pub const HALO: u32 = 16;
+pub const HALO: u32 = 18;
 
 /// Tile edge in pixels, excluding halo. 512 keeps every buffer far inside
 /// WebGPU's default limits while leaving the halo a small fraction of the work
@@ -1143,7 +1147,7 @@ impl Renderer {
                 state.detail.sharpen_amount,
                 state.detail.sharpen_radius,
                 state.detail.chroma_noise,
-                0.0,
+                state.detail.luminance_noise,
             ],
             colour: [state.colour.saturation, state.colour.vibrance, 0.0, 0.0],
             // Per-tile, and rewritten before every present. The value here only
