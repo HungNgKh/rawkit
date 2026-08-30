@@ -50,6 +50,63 @@ through the public API of `rawkit-editstate` and never forks the editor. That
 boundary is reserved now — the proprietary split has to be a real interface from
 the start rather than a later disentangling.
 
+## Run the editor
+
+The window is `rawkit-shell`; the headless tools are `rawkit`. Both are in this
+workspace, so `cargo run` builds and starts them.
+
+```sh
+# Index a folder of photographs into a catalog. Creates the file if it is new,
+# and records what is there without reading whole files — headers only.
+cargo run -p rawkit-cli -- catalog ~/Pictures/library.rawkit --scan ~/Pictures/shoot
+
+# Open it. The shell takes one positional argument.
+cargo run -p rawkit-shell -- ~/Pictures/library.rawkit
+```
+
+The argument is a `.rawkit` catalog, or a single RAW opened directly — the
+second is how the shell worked before there was a catalog, and it stays useful
+for looking at one frame. **Everything that outlives the window needs the
+catalog**, because the catalog is what stores it: a RAW opened on its own
+renders and can be adjusted, but the edit is not kept, and exporting or saving
+a preset or a snapshot refuses with a reason rather than appearing to work.
+`rawkit render` is the way to get a file out of a single RAW. With no argument
+at all the window opens on a synthetic mosaic, which exercises the pipeline
+without a photograph.
+
+```sh
+cargo run -p rawkit-shell -- photo.ARW    # one frame, edits not kept
+cargo run -p rawkit-shell                 # a synthetic mosaic
+```
+
+Keys, most of them Lightroom's, so the hands already know them:
+
+| | |
+|---|---|
+| `G` `E` `R` | grid, loupe, crop |
+| `←` `→` `↑` `↓` | move through the shoot |
+| `0`–`5`, `6`–`9` | rating, colour label |
+| `P` `X` `U` | pick, reject, clear the flag |
+| `M` `C` | mark a frame, compare what is marked |
+| `S` `A` | copy this look, apply it to the marked frames |
+| `[` `]` | rotate a quarter turn |
+| `⌃Z` `⌃⇧Z` | undo and redo the edit (`⌘` on macOS) |
+| `Z` | undo a culling judgement — a separate history |
+| `⌃E` / `⌃⇧E` | export this photograph / export the picks |
+
+The develop controls live in the column on the right, and the sections you
+leave open are remembered.
+
+On Linux the shell needs the webview and GTK development headers, which is what
+CI installs before it builds:
+
+```sh
+sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev librsvg2-dev \
+                        libayatana-appindicator3-dev
+```
+
+macOS and Windows need nothing beyond the toolchain.
+
 ## Build
 
 ```sh
