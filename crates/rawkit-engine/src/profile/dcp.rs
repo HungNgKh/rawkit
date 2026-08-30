@@ -74,23 +74,18 @@ mod tag {
     /// light reads a different slice for almost every pixel.
     pub const PROFILE_LOOK_TABLE_ENCODING: u16 = 51108;
 
-    // Still read by no one, and now for a measured reason rather than only a
-    // principled one.
-    //
-    // These two are one chain with Adobe's own rendering, and half of it is
-    // worse than none. `BaselineExposureOffset` was implemented and reverted:
-    // applying its -0.35 EV to a Camera Matching profile moved every frame
-    // *further* from the camera's own JPEG, in lightness as well as colour —
-    // |ΔL*| 21.0 to 24.9, 22.5 to 26.6, 22.1 to 26.7 across three frames, with
-    // the chromaticity gap worsening alongside. Our tone map is not Adobe's, so
-    // darkening to suit their curve without having their curve simply lands
-    // between the two.
-    //
-    // Adopting the curve is the other half, and it is a product decision rather
-    // than a parse: it would have to displace our tone map, which every tone
-    // control is built on.
-    #[allow(dead_code)]
+    /// The profile's own rendering: scene-linear in, display-encoded out. Read
+    /// now, and it *replaces* our tone map rather than composing with it —
+    /// applying two tone maps would map the scene twice.
     pub const PROFILE_TONE_CURVE: u16 = 50940;
+
+    // Read by no one, and now for a measured reason rather than only a
+    // principled one. `BaselineExposureOffset` was implemented and reverted:
+    // applying its -0.35 EV moved every frame *further* from the camera's own
+    // JPEG, in lightness as well as colour — |ΔL*| 21.0 to 24.9, 22.5 to 26.6,
+    // 22.1 to 26.7 across three frames. It is the small half of a pair whose
+    // large half is the tone curve above, and the curve carries the correction
+    // in its own shape.
     #[allow(dead_code)]
     pub const BASELINE_EXPOSURE_OFFSET: u16 = 51109;
 }
@@ -185,6 +180,12 @@ pub fn parse(bytes: &[u8]) -> Result<CameraProfile, DcpError> {
         profile.look_is_srgb = find(tag::PROFILE_LOOK_TABLE_ENCODING)
             .and_then(|e| reader.longs(e, 1))
             .is_some_and(|v| v[0] == 1);
+    }
+
+    // Pairs of (x, y), which the profile stores as a flat run of floats.
+    if let Some(floats) = find(tag::PROFILE_TONE_CURVE).and_then(|e| reader.floats(e)) {
+        let points: Vec<(f32, f32)> = floats.chunks_exact(2).map(|p| (p[0], p[1])).collect();
+        profile.set_tone_curve(&points);
     }
 
     profile.name = name;

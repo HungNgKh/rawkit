@@ -111,9 +111,14 @@ pub const MAX_TEMPERATURE: f32 = 25000.0;
 /// **This is measurement, not taste**, and the structure says so: a profile
 /// carries *two* of these, one per calibration illuminant, interpolated exactly
 /// like the colour matrices. A look would not depend on what light the scene was
-/// under. That is why this is adopted while `ProfileLookTable` and
-/// `ProfileToneCurve` — of which there is one, regardless of illuminant — are
-/// deliberately not.
+/// under — which is why `ProfileLookTable` and `ProfileToneCurve` each get one,
+/// regardless of illuminant.
+/// How many entries a profile tone curve is resampled to.
+///
+/// 256 because the profiles carry half that many control points; finer would be
+/// inventing resolution the source does not have.
+pub const TONE_LUT: usize = 256;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct HueSatMap {
     pub hue_divisions: u32,
@@ -213,6 +218,15 @@ pub struct CameraProfile {
     /// Whether the look table's axes are in sRGB-encoded space rather than
     /// linear. See [`Self::look_is_srgb`].
     pub look_is_srgb: bool,
+    /// The profile's own tone curve, resampled to [`TONE_LUT`] entries evenly
+    /// spaced over `[0, 1]`.
+    ///
+    /// **Scene-linear in, display-encoded out** — it is the tone map, not an
+    /// adjustment to one, which is why adopting it means replacing ours rather
+    /// than composing with it. Measured on the Sony camera-matching profile:
+    /// `f(0.18) = 0.481`, close to sRGB's 0.459, with `f(0.5) = 0.866` where a
+    /// plain encoding gives 0.735.
+    pub tone: Option<Vec<f32>>,
     /// What the profile calls itself, for a UI to show. `None` for a profile
     /// synthesised from a decoder table, which has no name to give.
     pub name: Option<String>,
@@ -246,6 +260,7 @@ impl CameraProfile {
             hue_sat: vec![None],
             look: None,
             look_is_srgb: false,
+            tone: None,
             name: None,
         }
     }
@@ -269,6 +284,7 @@ impl CameraProfile {
             hue_sat: vec![None, None],
             look: None,
             look_is_srgb: false,
+            tone: None,
             name: None,
         }
     }
@@ -318,6 +334,53 @@ impl CameraProfile {
     /// `None` when the profile has none, when the two tables disagree about
     /// their dimensions, or — deliberately — when the profile has no forward
     /// matrix. See [`Self::camera_to_working`] for why that last one.
+    /// Give the profile a tone curve, from the `(x, y)` pairs a DCP stores.
+    ///
+    /// Resampled to an evenly spaced lookup here rather than on the GPU, because
+    /// the control points are the profile's business and a fixed-stride table is
+    /// what a shader can index without searching.
+    ///
+    /// Linear between control points. The specification describes a spline and
+    /// the difference is far below anything visible at this spacing: the Sony
+    /// profiles carry 128 points across `[0, 1]`, so a segment spans less than a
+    /// hundredth of the range.
+    pub fn set_tone_curve(&mut self, points: &[(f32, f32)]) {
+        let mut sorted: Vec<(f32, f32)> = points
+            .iter()
+            .copied()
+            .filter(|(x, y)| x.is_finite() && y.is_finite())
+            .collect();
+        sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        if sorted.len() < 2 {
+            return;
+        }
+        let lut = (0..TONE_LUT)
+            .map(|i| {
+                let x = i as f32 / (TONE_LUT - 1) as f32;
+                match sorted.iter().position(|(px, _)| *px >= x) {
+                    Some(0) => sorted[0].1,
+                    Some(at) => {
+                        let (x0, y0) = sorted[at - 1];
+                        let (x1, y1) = sorted[at];
+                        let span = x1 - x0;
+                        if span <= 0.0 {
+                            y1
+                        } else {
+                            y0 + (y1 - y0) * (x - x0) / span
+                        }
+                    }
+                    None => sorted[sorted.len() - 1].1,
+                }
+            })
+            .collect();
+        self.tone = Some(lut);
+    }
+
+    /// The profile's tone curve, if it brought one.
+    pub fn tone_curve(&self) -> Option<&[f32]> {
+        self.tone.as_deref()
+    }
+
     /// Give the profile a look table.
     pub fn set_look_table(&mut self, map: HueSatMap) {
         self.look = Some(map);
@@ -751,6 +814,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_tone_curve_is_resampled_onto_an_even_grid() {
+        // The control points are the profile's business; the lookup's stride is
+        // ours. A straight line has to come back a straight line, or every
+        // brightness in the picture is slightly wrong in a way no single frame
+        // would reveal.
+        let mut profile = CameraProfile::from_color_matrix(IDENTITY);
+        profile.set_tone_curve(&[(0.0, 0.0), (1.0, 1.0)]);
+        let lut = profile.tone_curve().expect("a curve");
+        assert_eq!(lut.len(), TONE_LUT);
+        for (i, value) in lut.iter().enumerate() {
+            let x = i as f32 / (TONE_LUT - 1) as f32;
+            assert!((value - x).abs() < 1e-5, "at {x}: {value}");
+        }
+
+        // Unevenly spaced control points interpolate between their neighbours,
+        // not between their indices.
+        let mut kinked = CameraProfile::from_color_matrix(IDENTITY);
+        kinked.set_tone_curve(&[(0.0, 0.0), (0.25, 0.8), (1.0, 1.0)]);
+        let lut = kinked.tone_curve().expect("a curve");
+        let at = |x: f32| lut[(x * (TONE_LUT - 1) as f32).round() as usize];
+        assert!(
+            (at(0.25) - 0.8).abs() < 1e-2,
+            "the kink moved: {}",
+            at(0.25)
+        );
+        assert!(
+            (at(0.125) - 0.4).abs() < 1e-2,
+            "not linear below it: {}",
+            at(0.125)
+        );
+        assert!(
+            (at(0.625) - 0.9).abs() < 1e-2,
+            "not linear above it: {}",
+            at(0.625)
+        );
+    }
+
+    #[test]
+    fn a_curve_with_too_few_points_is_ignored() {
+        // Rather than accepted and then indexed into. One point is not a curve.
+        let mut profile = CameraProfile::from_color_matrix(IDENTITY);
+        profile.set_tone_curve(&[(0.5, 0.5)]);
+        assert!(profile.tone_curve().is_none());
     }
 
     #[test]

@@ -107,6 +107,52 @@ fn profile_with_look(look: HueSatMap) -> CameraProfile {
 
 #[test]
 #[ignore = "requires a GPU adapter"]
+fn a_profile_tone_curve_replaces_the_tone_map() {
+    // A curve that answers the same thing for every input must flatten the
+    // picture completely. If ours ran as well as the profile's, the output would
+    // still vary with the scene — two tone maps in series map the scene twice,
+    // and the symptom is a flat muddy picture rather than an error.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let mut profile = profile_with(None);
+    profile.set_tone_curve(&[(0.0, 0.5), (1.0, 0.5)]);
+
+    let dark = render_colour(&gpu, &profile, [0.05, 0.04, 0.03]);
+    let bright = render_colour(&gpu, &profile, [0.80, 0.70, 0.60]);
+    for c in 0..3 {
+        assert!(
+            (dark[c] - bright[c]).abs() < 2e-3,
+            "channel {c} still varies with the scene: {} against {}",
+            dark[c],
+            bright[c]
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_higher_profile_curve_renders_brighter() {
+    // And the curve is read rather than merely present: the same photograph
+    // through two curves differing only in height comes out at two brightnesses,
+    // in the order the curves are in.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let colour = [0.30, 0.28, 0.26];
+    let with = |points: &[(f32, f32)]| {
+        let mut profile = profile_with(None);
+        profile.set_tone_curve(points);
+        let out = render_colour(&gpu, &profile, colour);
+        0.2126 * out[0] + 0.7152 * out[1] + 0.0722 * out[2]
+    };
+    let low = with(&[(0.0, 0.0), (1.0, 0.4)]);
+    let high = with(&[(0.0, 0.0), (1.0, 0.9)]);
+    println!("profile curve height: {low:.4} against {high:.4}");
+    assert!(
+        high > low * 1.5,
+        "the taller curve did not render brighter: {high:.4} against {low:.4}"
+    );
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
 fn a_look_is_applied_even_with_no_hue_saturation_table() {
     // The regression this exists for. The working-space hop used to be taken
     // only when a profile had a hue/saturation correction, so a Camera Matching

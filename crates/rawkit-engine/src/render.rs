@@ -184,6 +184,7 @@ impl Frame<'_> {
                 hue_sat,
                 look,
                 look_is_srgb: self.profile.look_is_srgb,
+                tone: self.profile.tone_curve().map(|lut| lut.to_vec()),
             },
             // No forward matrix means no way to reach the space the tables were
             // authored in, so there is nothing to apply them to.
@@ -194,6 +195,9 @@ impl Frame<'_> {
                 hue_sat: None,
                 look: None,
                 look_is_srgb: false,
+                // The curve needs no working space, so it survives the path
+                // that has no forward matrix to reach one.
+                tone: self.profile.tone_curve().map(|lut| lut.to_vec()),
             },
         })
     }
@@ -230,6 +234,9 @@ struct Params {
     /// `[hue, saturation, value]` divisions of the look table, and `.w` its
     /// offset in cells into the shared table buffer.
     look_dims: [u32; 4],
+    /// `[offset, entries, active, unused]` for the profile's tone curve, in the
+    /// same shared buffer.
+    curve: [u32; 4],
     /// `[contrast exponent, highlights, shadows, active]` — see [`crate::tone`].
     tone: [f32; 4],
     /// `[black point, white point, unused, unused]`.
@@ -637,6 +644,12 @@ impl Renderer {
                 .profile
                 .look_table()
                 .map(|m| m.cell_count())
+                .unwrap_or(1)
+                .max(1)
+            + image
+                .profile
+                .tone_curve()
+                .map(|lut| lut.len())
                 .unwrap_or(1)
                 .max(1);
 
@@ -1165,8 +1178,10 @@ impl Renderer {
         let (wb, m) = (colour.multipliers, colour.cam_to_display);
         let working = colour.working_to_display;
         let hsm = colour.hue_sat.as_ref();
-        // Where the look begins in the shared table buffer.
+        // Where the look begins in the shared table buffer, and the tone curve
+        // after it.
         let hsm_cells = hsm.map(|m| m.cell_count()).unwrap_or(1);
+        let look_cells = colour.look.as_ref().map(|m| m.cell_count()).unwrap_or(1);
         let params = Params {
             width: padded,
             height: padded,
@@ -1238,6 +1253,10 @@ impl Renderer {
                     [back[2][0], back[2][1], back[2][2], 0.0],
                 ]
             },
+            curve: match &colour.tone {
+                Some(lut) => [(hsm_cells + look_cells) as u32, lut.len() as u32, 1, 0],
+                None => [0, 1, 0, 0],
+            },
             look_dims: match &colour.look {
                 Some(m) => [
                     m.hue_divisions,
@@ -1264,6 +1283,13 @@ impl Renderer {
         match &colour.look {
             Some(m) => table.extend(m.deltas.iter().map(|d| [d[0], d[1], d[2], 0.0])),
             None => table.push([0.0, 1.0, 1.0, 0.0]),
+        }
+        // And the tone curve behind both, one entry per `vec4`. Wasteful of
+        // three lanes and worth it: a packed curve would need its index
+        // unpacking in the shader, and this table is four kilobytes.
+        match &colour.tone {
+            Some(lut) => table.extend(lut.iter().map(|v| [*v, 0.0, 0.0, 0.0])),
+            None => table.push([0.0, 0.0, 0.0, 0.0]),
         }
         if table.len() != buffers.table_cells {
             return Err(EngineError::DeviceRequest(format!(
@@ -1706,6 +1732,8 @@ struct Colour {
     /// The profile's look, applied after the tone curve rather than before it.
     look: Option<crate::profile::HueSatMap>,
     look_is_srgb: bool,
+    /// The profile's own tone curve, which *replaces* the built-in tone map.
+    tone: Option<Vec<f32>>,
 }
 
 /// Fill `out` with the tile at `(ox, oy)` plus its halo, clamping at the image

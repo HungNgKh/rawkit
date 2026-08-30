@@ -74,6 +74,9 @@ struct Params {
     // `.xyz` the look table's divisions, `.w` where it starts in the shared
     // table buffer.
     look_dims: vec4<u32>,
+    // `[offset, entries, active, unused]` for the profile's tone curve, in the
+    // same buffer behind the two tables.
+    curve: vec4<u32>,
     // The display-referred tone controls, already reduced to curve parameters
     // on the CPU: `.x` is the contrast exponent, `.y` highlights, `.z` shadows,
     // and `.w` is 1 when any of the five is off its default. See `tone_curve`.
@@ -536,7 +539,17 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
 
     let exposed = shown * params.develop.x;
-    let mapped = tone_map(exposed);
+    // The profile's curve *instead of* ours, not as well as. Both map the scene
+    // to a display, and running two tone maps in series maps the scene twice —
+    // which reads as a flat, muddy picture rather than as a bug.
+    var mapped = tone_map(exposed);
+    if (params.curve.z > 0u) {
+        mapped = vec3<f32>(
+            profile_tone(exposed.r),
+            profile_tone(exposed.g),
+            profile_tone(exposed.b),
+        );
+    }
 
     // Stage I -- display-referred ops. The five tone controls live here and not
     // beside exposure, because the sigmoid is the boundary: exposure decides how
@@ -1004,6 +1017,29 @@ fn reconstruct_highlights(balanced: vec3<f32>) -> vec3<f32> {
 /// This is the roll-off, not the look. A curve that *feels* like a photograph
 /// is a taste problem with its own iteration loop, and pretending otherwise by
 /// tuning constants here would bury it.
+/// The profile's own tone curve, when it brought one.
+///
+/// **Scene-linear in, display-referred linear out**, with no decoding on the
+/// way. The curve's output looks like an encoding — `f(0.18) = 0.481` sits near
+/// sRGB's 0.459 — and reading it that way is wrong, which the measurement
+/// settled: taken as *linear*, `f(0.05) = 0.090` is L* 35.9 against the camera's
+/// 35.2 and `f(0.25) = 0.607` is L* 82.2 against its 82.2. Decoded first, the
+/// same curve crushed the shadows to L* 1.
+///
+/// It resembles an encoding because a display rendering has roughly that shape.
+/// It is not one.
+///
+/// Clamped at one: a tone curve is defined over `[0, 1]` and anything brighter
+/// than white is white, which is the whole point of a shoulder.
+fn profile_tone(v: f32) -> f32 {
+    let last = params.curve.y - 1u;
+    let x = clamp(v, 0.0, 1.0) * f32(last);
+    let i = min(u32(floor(x)), last);
+    let j = min(i + 1u, last);
+    let base = params.curve.x;
+    return mix(hue_sat_map[base + i].x, hue_sat_map[base + j].x, fract(x));
+}
+
 fn tone_map(x: vec3<f32>) -> vec3<f32> {
     let k = 0.82;
     let clamped = max(x, vec3<f32>(0.0));
