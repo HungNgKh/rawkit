@@ -9,7 +9,7 @@ mod export;
 mod previews;
 mod render;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use rawkit_catalog::previews::Level as PreviewLevel;
 use std::path::PathBuf;
@@ -34,6 +34,28 @@ enum Command {
     /// domain. The order is a compile-time fact in `rawkit-engine`; this prints
     /// it so a human can check it against the design without reading Rust.
     Stages,
+
+    /// Copy photographs off a card into the library, verifying every one.
+    ///
+    /// Files land in `destination/YEAR/YEAR-MM-DD/`, from the camera's own
+    /// clock, under the names the camera gave them. Each is hashed as it is
+    /// read and again after it lands, and only then given its real name — a
+    /// card reader that drops a byte does not say so, and the damage otherwise
+    /// surfaces years later in one frame nobody opened in the meantime.
+    ///
+    /// It copies. The card is the only other copy of these photographs until
+    /// this finishes, so emptying it stays a decision you make afterwards with
+    /// the files in front of you.
+    Ingest {
+        /// The catalog to add them to. Created if it does not exist.
+        catalog: PathBuf,
+        /// The card, or any folder to read from. Never written to.
+        #[arg(long)]
+        from: PathBuf,
+        /// Where the library lives.
+        #[arg(long)]
+        into: PathBuf,
+    },
 
     /// Decode, demosaic, develop and write a colour-managed image.
     ///
@@ -185,6 +207,50 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Command::Ingest {
+            catalog,
+            from,
+            into,
+        } => {
+            let mut catalog = rawkit_catalog::db::Catalog::open(&catalog)?;
+            let mut last = String::new();
+            let report = rawkit_catalog::ingest::ingest(
+                &mut catalog,
+                &from,
+                &into,
+                file_metadata,
+                |done, total, name| {
+                    if !name.is_empty() && name != last {
+                        eprint!("\rcopying    : {done}/{total} {name}   ");
+                        last = name.to_string();
+                    }
+                },
+            )?;
+            eprintln!();
+            eprintln!(
+                "copied     : {} new, {} already there, {} renamed",
+                report.copied, report.already_there, report.renamed
+            );
+            for directory in &report.unreadable {
+                eprintln!("unreadable : {}", directory.display());
+            }
+            for (path, why) in &report.failed {
+                eprintln!("FAILED     : {} — {why}", path.display());
+            }
+            if let Some(scanned) = &report.scanned {
+                eprintln!(
+                    "catalogued : {} added, {} unchanged",
+                    scanned.added, scanned.unchanged
+                );
+            }
+            if !report.failed.is_empty() {
+                bail!(
+                    "{} file(s) did not arrive intact; the card still has them",
+                    report.failed.len()
+                );
+            }
+        }
+
         Command::Render {
             input,
             output,

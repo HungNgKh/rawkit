@@ -30,6 +30,7 @@ pub mod backup;
 pub mod cull;
 pub mod db;
 pub mod edits;
+pub mod ingest;
 pub mod path;
 pub mod previews;
 pub mod relink;

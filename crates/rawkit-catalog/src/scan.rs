@@ -403,7 +403,7 @@ fn walk(dir: &Path, out: &mut Vec<Found>, report: &mut ScanReport) {
     }
 }
 
-fn is_supported(path: &Path) -> bool {
+pub(crate) fn is_supported(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| EXTENSIONS.iter().any(|s| e.eq_ignore_ascii_case(s)))
