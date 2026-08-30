@@ -300,7 +300,57 @@
   // Told by the Rust side which arrangement this is. Route 3 hands the canvas
   // its own window and the page keeps its background; a cutout needs the page
   // to paint nothing where the photograph belongs.
-  if (location.search.includes("cutout")) document.body.classList.add("cutout");
+  const cutout = location.search.includes("cutout");
+  if (cutout) document.body.classList.add("cutout");
+
+  // Under a cutout the webview owns every pixel, so the photograph gets no
+  // pointer events of its own and the page has to pass them on. Where the
+  // canvas has its own window this never runs — GTK delivers the same events
+  // without a round trip, and both paths end in the same router, so a drag
+  // means the same thing either way.
+  if (cutout) {
+    const chromeHeight = () =>
+      document.getElementById("chrome").getBoundingClientRect().height;
+    // Canvas pixels: the session works in the surface's own coordinates, and
+    // the page is the only place that knows the device ratio.
+    const at = event => {
+      const dpr = window.devicePixelRatio || 1;
+      const y = event.clientY - chromeHeight();
+      return y < 0 ? null : { x: event.clientX * dpr, y: y * dpr };
+    };
+    // Not `send`, which is already the command bus in this scope; this is the
+    // other direction of traffic and shadowing it would be a trap.
+    const forward = event => invoke("canvas_pointer", { event });
+
+    addEventListener("pointerdown", event => {
+      const p = at(event);
+      if (!p) return; // On the chrome: that belongs to the controls.
+      // Captured so a drag that leaves the window still reports where it went
+      // and when it ended — without it, releasing outside leaves the canvas
+      // believing the button is still down.
+      event.target.setPointerCapture?.(event.pointerId);
+      forward({ kind: "press", ...p, double: event.detail >= 2 });
+    });
+    addEventListener("pointermove", event => {
+      if (!event.buttons) return; // Hovering is not a drag, and IPC is not free.
+      const p = at(event);
+      if (p) forward({ kind: "motion", ...p });
+    });
+    // Delivered wherever the pointer ended up, including over the chrome: a
+    // release that never arrives leaves the canvas believing the button is
+    // still down.
+    addEventListener("pointerup", () => forward({ kind: "release" }));
+    addEventListener("wheel", event => {
+      const p = at(event);
+      if (!p) return;
+      // A wheel notch is about 100 pixels of `deltaY`; a line or a page is
+      // already one step. Normalised here so the router sees one unit whatever
+      // sent it, the same way GTK's direction and delta are.
+      const notches = event.deltaMode === 0 ? event.deltaY / 100 : event.deltaY;
+      forward({ kind: "scroll", ...p, notches });
+      event.preventDefault();
+    }, { passive: false });
+  }
 
   const act = async (action, value) => {
     try {

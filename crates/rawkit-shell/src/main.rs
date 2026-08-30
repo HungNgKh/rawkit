@@ -20,13 +20,22 @@
 //! ships. The alternative was a child `NSView`: several hundred lines of FFI
 //! that nobody here can run, to buy back a channel this project is not using.
 //!
+//! # Pointer input
+//!
+//! Two things deliver it and they have nothing in common: GTK hands route 3 real
+//! events on the canvas's own window, and under a cutout the webview owns every
+//! pixel so the page forwards what it receives. Both end in [`pointer::route`],
+//! which is where a drag becomes a pan and a wheel becomes a zoom — because two
+//! copies of that would eventually disagree about which.
+//!
 //! **Neither macOS nor Windows has been run.** CI proves the shell compiles and
-//! links on both, and for window and pointer code that is a weak claim: a
-//! surface behind an opaque view, or a canvas that never sees a click, are
-//! things no compiler notices. The geometry is verified — route 1 on Linux
-//! reports the right surface and canvas rectangles and draws the photograph
-//! below the chrome — but the compositing on those two platforms rests on the
-//! probe research rather than on a machine.
+//! links on both, and for window code that is a weak claim: a surface behind an
+//! opaque view is something no compiler notices. What *is* verified is
+//! everything short of the compositing — route 1 on Linux reports the right
+//! surface and canvas rectangles, draws the photograph below the chrome, and
+//! pans and zooms from forwarded pointer events while a drag on the chrome
+//! leaves the canvas alone. The compositing itself rests on the probe research
+//! rather than on a machine.
 //!
 //! # The question
 //!
@@ -129,6 +138,7 @@
 #[cfg(target_os = "linux")]
 mod canvas;
 mod library;
+mod pointer;
 mod session_canvas;
 
 use anyhow::{anyhow, Result};
@@ -231,6 +241,35 @@ struct Shelf(Option<Arc<Mutex<Library>>>);
 /// Returns what to draw in the status line. Errors come back as strings rather
 /// than panicking the command thread: a failed write is something the page
 /// should say, not something that should take the window down.
+/// A pointer event from the page, in canvas pixels.
+///
+/// Only the cutout arrangement sends these: where the canvas has a window of its
+/// own, GTK delivers the same events without a round trip. The page does the
+/// same small job `canvas.rs` does — say where, in the surface's own
+/// coordinates — and the meaning is decided in one place for both.
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PointerEvent {
+    Press { x: f64, y: f64, double: bool },
+    Motion { x: f64, y: f64 },
+    Release,
+    Scroll { x: f64, y: f64, notches: f64 },
+}
+
+#[tauri::command]
+fn canvas_pointer(state: tauri::State<'_, Shared>, event: PointerEvent) {
+    let routed = match event {
+        PointerEvent::Press { x, y, double } => pointer::Pointer::Press { at: [x, y], double },
+        PointerEvent::Motion { x, y } => pointer::Pointer::Motion { at: [x, y] },
+        PointerEvent::Release => pointer::Pointer::Release,
+        PointerEvent::Scroll { x, y, notches } => pointer::Pointer::Scroll {
+            at: [x, y],
+            notches,
+        },
+    };
+    pointer::route(routed, &state.0);
+}
+
 #[tauri::command]
 fn cull(
     state: tauri::State<'_, Shelf>,
@@ -369,7 +408,13 @@ fn main() -> Result<()> {
     eprintln!("route      : {route:?}");
 
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![apply, snapshot, cull, cull_view])
+        .invoke_handler(tauri::generate_handler![
+            apply,
+            snapshot,
+            cull,
+            cull_view,
+            canvas_pointer
+        ])
         .setup(move |app| {
             // The surface is created on the main thread because the raw window
             // handle comes from GTK on this platform and GTK is not thread-safe.

@@ -200,7 +200,6 @@ pub fn attach_input(
     session: std::sync::Arc<std::sync::Mutex<rawkit_session::Session>>,
 ) -> Result<()> {
     use gtk::gdk::EventMask;
-    use rawkit_session::Command;
 
     let gtk_window = window.gtk_window()?;
     gtk_window.add_events(
@@ -219,100 +218,51 @@ pub fn attach_input(
         (y >= 0.0).then_some([x * scale, y * scale])
     };
 
-    let dragging: std::rc::Rc<std::cell::Cell<Option<(f64, f64)>>> =
-        std::rc::Rc::new(std::cell::Cell::new(None));
-
-    let held = dragging.clone();
+    // GTK's job here is to say *where*, in canvas pixels. What the event means
+    // is `pointer::route`, which the cutout front end calls too — two deliverers
+    // of pointer events, one idea of what they mean.
+    let pressed = session.clone();
     gtk_window.connect_button_press_event(move |_, event| {
-        let Some(at) = to_canvas(event.position()) else {
-            return gtk::glib::Propagation::Proceed;
-        };
-        if crate::in_grid() {
-            // The grid works out which cell this is, because it is the only
-            // place that knows the layout. This widget's whole job is turning
-            // GTK's logical coordinates into canvas ones.
-            let double = event.event_type() == gtk::gdk::EventType::DoubleButtonPress;
-            *crate::CANVAS_CLICK.lock().expect("click lock") = Some((at, double));
-        } else if crate::in_crop() {
-            // A new drag replaces whatever rectangle was there. Starting from
-            // the old one instead would mean a crop could only ever shrink.
-            *crate::CANVAS_MARQUEE.lock().expect("marquee lock") =
-                Some(crate::Marquee { start: at, end: at });
-            held.set(Some(event.position()));
-        } else {
-            held.set(Some(event.position()));
+        if let Some(at) = to_canvas(event.position()) {
+            crate::pointer::route(
+                crate::pointer::Pointer::Press {
+                    at,
+                    double: event.event_type() == gtk::gdk::EventType::DoubleButtonPress,
+                },
+                &pressed,
+            );
         }
         gtk::glib::Propagation::Proceed
     });
 
-    let held = dragging.clone();
+    let released = session.clone();
     gtk_window.connect_button_release_event(move |_, _| {
-        // Letting go is the whole of it: the motion handler stops updating the
-        // rectangle, and it stays on screen until Enter takes it or Escape
-        // throws it away, so a drag that came out wrong can be redrawn.
-        held.set(None);
+        crate::pointer::route(crate::pointer::Pointer::Release, &released);
         gtk::glib::Propagation::Proceed
     });
 
-    let held = dragging.clone();
-    let dragged = session.clone();
+    let moved = session.clone();
     gtk_window.connect_motion_notify_event(move |_, event| {
-        if crate::in_crop() {
-            if held.get().is_some() {
-                if let (Some(at), Some(marquee)) = (
-                    to_canvas(event.position()),
-                    crate::CANVAS_MARQUEE.lock().expect("marquee lock").as_mut(),
-                ) {
-                    marquee.end = at;
-                }
-            }
-            return gtk::glib::Propagation::Proceed;
-        }
-        if let Some((lx, ly)) = held.get() {
-            let (x, y) = event.position();
-            held.set(Some((x, y)));
-            // A drag emits one of these per motion event, far faster than the
-            // GPU draws. The session has no queue, so the extra ones cost a
-            // lock and two floats each and only the last is ever rendered —
-            // this is the arrangement that claim was written for.
-            dragged.lock().expect("session lock").apply(Command::Pan {
-                dx: (x - lx) * scale,
-                dy: (y - ly) * scale,
-            });
+        if let Some(at) = to_canvas(event.position()) {
+            crate::pointer::route(crate::pointer::Pointer::Motion { at }, &moved);
         }
         gtk::glib::Propagation::Proceed
     });
 
     let zoomed = session;
     gtk_window.connect_scroll_event(move |_, event| {
-        let Some(anchor) = to_canvas(event.position()) else {
+        let Some(at) = to_canvas(event.position()) else {
             return gtk::glib::Propagation::Proceed;
         };
-        if crate::in_grid() {
-            // A grid scrolls; it does not zoom. Accumulated rather than applied,
-            // for the same reason the click is: the layout lives elsewhere.
-            let notches = match event.direction() {
-                gtk::gdk::ScrollDirection::Up => -1,
-                gtk::gdk::ScrollDirection::Down => 1,
-                gtk::gdk::ScrollDirection::Smooth => event.delta().1.round() as i32,
-                _ => 0,
-            };
-            crate::CANVAS_SCROLL.fetch_add(notches, std::sync::atomic::Ordering::Relaxed);
-            return gtk::glib::Propagation::Proceed;
-        }
-        let step = match event.direction() {
-            gtk::gdk::ScrollDirection::Up => 1.15,
-            gtk::gdk::ScrollDirection::Down => 1.0 / 1.15,
-            // Trackpads send Smooth with a delta rather than a direction.
-            gtk::gdk::ScrollDirection::Smooth => (-event.delta().1 * 0.15).exp2(),
+        // GTK reports a direction for a wheel and a delta for a trackpad, and
+        // the rest of the shell wants one number either way.
+        let notches = match event.direction() {
+            gtk::gdk::ScrollDirection::Up => -1.0,
+            gtk::gdk::ScrollDirection::Down => 1.0,
+            gtk::gdk::ScrollDirection::Smooth => event.delta().1,
             _ => return gtk::glib::Propagation::Proceed,
         };
-        let mut session = zoomed.lock().expect("session lock");
-        let scale = session.viewport().scale * step;
-        // Hold the image point under the cursor still, which is what makes
-        // scroll-to-zoom feel like examining a print rather than driving a
-        // camera.
-        session.apply(Command::ZoomTo { scale, anchor });
+        crate::pointer::route(crate::pointer::Pointer::Scroll { at, notches }, &zoomed);
         gtk::glib::Propagation::Proceed
     });
 
