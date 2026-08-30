@@ -32,16 +32,18 @@ pub mod db;
 pub mod edits;
 pub mod ingest;
 pub mod path;
+pub mod presets;
 pub mod previews;
 pub mod profiles;
 pub mod relink;
 pub mod scan;
+pub mod snapshots;
 pub mod volume;
 
 /// The schema version this build expects, and the last entry in [`MIGRATIONS`].
 /// A catalog reporting anything higher was written by a newer build and is
 /// refused rather than half-understood.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -107,6 +109,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "camera-profiles",
         sql: include_str!("../migrations/003-camera-profiles.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "presets-and-snapshots",
+        sql: include_str!("../migrations/004-presets-and-snapshots.sql"),
     },
 ];
 

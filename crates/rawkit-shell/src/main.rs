@@ -422,6 +422,209 @@ fn clear_profile(state: tauri::State<'_, Shelf>) -> Result<(), String> {
     Ok(())
 }
 
+/// The looks saved in this catalog, and what each one carries.
+///
+/// Group *names* cross the boundary, not indices: the page shows them, the
+/// catalog stores them, and one vocabulary between the three means a reordered
+/// enum cannot silently repoint a saved preset.
+#[tauri::command]
+fn presets(state: tauri::State<'_, Shelf>) -> Result<Vec<serde_json::Value>, String> {
+    let Some(library) = state.0.clone() else {
+        return Ok(Vec::new()); // No catalog is not an error, it is no presets.
+    };
+    let library = library.lock().expect("library lock");
+    let saved = rawkit_catalog::presets::all(library.catalog()).map_err(|e| e.to_string())?;
+    Ok(saved
+        .into_iter()
+        .map(|preset| {
+            serde_json::json!({
+                "name": preset.name,
+                "groups": preset.groups.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
+            })
+        })
+        .collect())
+}
+
+/// Which parts of the edit on screen differ from the camera's own rendering.
+///
+/// What a save dialogue should tick. Offering everything would make every preset
+/// carry six neutral settings that quietly reset whatever the target frame had.
+#[tauri::command]
+fn touched_groups(state: tauri::State<'_, Shared>) -> Vec<serde_json::Value> {
+    let session = state.0.lock().expect("session lock");
+    let touched = session.state().touched_groups();
+    rawkit_editstate::Group::ALL
+        .iter()
+        .map(|group| {
+            serde_json::json!({
+                "name": group.as_str(),
+                "label": group.label(),
+                "touched": touched.contains(group),
+            })
+        })
+        .collect()
+}
+
+/// Save the edit on screen as a look, carrying only the named groups.
+#[tauri::command]
+fn save_preset(
+    shelf: tauri::State<'_, Shelf>,
+    shared: tauri::State<'_, Shared>,
+    name: String,
+    groups: Vec<String>,
+) -> Result<(), String> {
+    let Some(library) = shelf.0.clone() else {
+        return Err("no catalog is open, so there is nowhere to save a preset".into());
+    };
+    let groups = parse_groups(&groups)?;
+    let state = shared.0.lock().expect("session lock").state().clone();
+    let library = library.lock().expect("library lock");
+    rawkit_catalog::presets::save(library.catalog(), &name, &state, &groups)
+        .map_err(|e| e.to_string())
+}
+
+/// Put a saved look onto the photograph on screen.
+///
+/// Through the command bus like any other edit, so one press of undo takes it
+/// back off. A preset that could not be undone would be the one edit in the
+/// application that a user had to be careful with.
+#[tauri::command]
+fn apply_preset(
+    shelf: tauri::State<'_, Shelf>,
+    shared: tauri::State<'_, Shared>,
+    name: String,
+) -> Result<Event, String> {
+    let Some(library) = shelf.0.clone() else {
+        return Err("no catalog is open".into());
+    };
+    let preset = {
+        let library = library.lock().expect("library lock");
+        rawkit_catalog::presets::get(library.catalog(), &name).map_err(|e| e.to_string())?
+    };
+    let preset = preset.ok_or_else(|| format!("there is no preset called {name:?}"))?;
+
+    let (event, applied) = {
+        let mut session = shared.0.lock().expect("session lock");
+        let mut state = session.state().clone();
+        preset.apply_to(&mut state);
+        let event = session.apply(Command::SetEditState(Box::new(state)));
+        // Read back rather than reuse: a refused command leaves the session
+        // where it was, and writing the state we *asked* for would record a
+        // decision that never took effect.
+        (event, session.state().clone())
+    };
+
+    // Written here, as a `Preset`, rather than left to the autosave — which
+    // knows only that the edit changed and would file it as `User`. That column
+    // exists to say where an edit came from, and a preset application followed
+    // by hand corrections is exactly the pair it was put there to capture. The
+    // autosave's own write lands on the same hash a moment later and does
+    // nothing, so this costs one row rather than two.
+    let library = library.lock().expect("library lock");
+    let image = library.current().id;
+    if let Err(e) = rawkit_catalog::edits::save(
+        library.catalog(),
+        image,
+        &applied,
+        rawkit_editstate::EditSource::Preset,
+    ) {
+        eprintln!("preset     : applied but not recorded: {e}");
+    }
+    Ok(event)
+}
+
+#[tauri::command]
+fn forget_preset(state: tauri::State<'_, Shelf>, name: String) -> Result<(), String> {
+    let Some(library) = state.0.clone() else {
+        return Err("no catalog is open".into());
+    };
+    let library = library.lock().expect("library lock");
+    rawkit_catalog::presets::forget(library.catalog(), &name).map_err(|e| e.to_string())
+}
+
+/// The places this photograph can be returned to.
+#[tauri::command]
+fn snapshots(state: tauri::State<'_, Shelf>) -> Result<Vec<serde_json::Value>, String> {
+    let Some(library) = state.0.clone() else {
+        return Ok(Vec::new());
+    };
+    let library = library.lock().expect("library lock");
+    let taken = rawkit_catalog::snapshots::all(library.catalog(), library.current().id)
+        .map_err(|e| e.to_string())?;
+    Ok(taken
+        .into_iter()
+        .map(|s| serde_json::json!({ "name": s.name, "version": s.version }))
+        .collect())
+}
+
+/// Name where this photograph is now.
+///
+/// The state is passed from the session rather than read from the catalog,
+/// because the autosave has a settle delay: a snapshot of the last *written*
+/// version would sometimes be a snapshot of something the user had already
+/// moved on from, and they would not find out until they came back to it.
+#[tauri::command]
+fn take_snapshot(
+    shelf: tauri::State<'_, Shelf>,
+    shared: tauri::State<'_, Shared>,
+    name: String,
+) -> Result<(), String> {
+    let Some(library) = shelf.0.clone() else {
+        return Err("no catalog is open, so there is nowhere to keep a snapshot".into());
+    };
+    let state = shared.0.lock().expect("session lock").state().clone();
+    let library = library.lock().expect("library lock");
+    let image = library.current().id;
+    rawkit_catalog::snapshots::take(library.catalog(), image, &name, &state)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Go back to a snapshot — which is a step *forward* in the history, and so
+/// undoable like anything else.
+#[tauri::command]
+fn restore_snapshot(
+    shelf: tauri::State<'_, Shelf>,
+    shared: tauri::State<'_, Shared>,
+    name: String,
+) -> Result<Event, String> {
+    let Some(library) = shelf.0.clone() else {
+        return Err("no catalog is open".into());
+    };
+    let saved = {
+        let library = library.lock().expect("library lock");
+        let image = library.current().id;
+        rawkit_catalog::snapshots::read(library.catalog(), image, &name)
+            .map_err(|e| e.to_string())?
+    };
+    let saved = saved.ok_or_else(|| format!("there is no snapshot called {name:?}"))?;
+    let mut session = shared.0.lock().expect("session lock");
+    Ok(session.apply(Command::SetEditState(Box::new(saved))))
+}
+
+#[tauri::command]
+fn forget_snapshot(state: tauri::State<'_, Shelf>, name: String) -> Result<(), String> {
+    let Some(library) = state.0.clone() else {
+        return Err("no catalog is open".into());
+    };
+    let library = library.lock().expect("library lock");
+    let image = library.current().id;
+    rawkit_catalog::snapshots::forget(library.catalog(), image, &name).map_err(|e| e.to_string())
+}
+
+/// A group name from the page, refused rather than skipped when it is not one
+/// of ours — a preset that silently dropped a group would be a look nobody
+/// designed, saved under a name somebody trusted.
+fn parse_groups(names: &[String]) -> Result<Vec<rawkit_editstate::Group>, String> {
+    names
+        .iter()
+        .map(|name| {
+            rawkit_editstate::Group::parse(name)
+                .ok_or_else(|| format!("{name:?} is not a part of an edit"))
+        })
+        .collect()
+}
+
 /// The open library, when a catalog was what was opened.
 ///
 /// Separate state from [`Shared`] because the two answer to different things: a
@@ -613,7 +816,16 @@ fn main() -> Result<()> {
             export,
             export_progress,
             choose_profile,
-            clear_profile
+            clear_profile,
+            presets,
+            touched_groups,
+            save_preset,
+            apply_preset,
+            forget_preset,
+            snapshots,
+            take_snapshot,
+            restore_snapshot,
+            forget_snapshot
         ])
         .setup(move |app| {
             // The surface is created on the main thread because the raw window

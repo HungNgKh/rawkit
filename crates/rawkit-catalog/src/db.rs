@@ -448,11 +448,13 @@ pub(crate) mod tests {
                 "files",
                 "folders",
                 "images",
+                "presets",
                 "previews",
+                "snapshots",
                 "volumes"
             ],
-            "the spine plus previews and camera profiles, and nothing \
-             speculative alongside them"
+            "the spine plus previews, camera profiles and the two ways of \
+             reusing an edit, and nothing speculative alongside them"
         );
     }
 
@@ -508,13 +510,20 @@ pub(crate) mod tests {
             }
         }
 
-        // Scribble over the middle of the file, past the header so it is still
+        // Scribble across the middle of the file, past the header so it is still
         // recognisably a database — the realistic shape of disk corruption, and
         // the one an eager `open` would happily write more data into.
+        //
+        // A wide span rather than one page on purpose. Scribbling exactly at the
+        // midpoint made this test depend on how many tables the schema has,
+        // because the schema's root pages come first and push the data along;
+        // adding two tables moved the midpoint onto a page whose damage the
+        // integrity check did not mind, and the test failed for a reason that
+        // had nothing to do with corruption.
         let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         let len = file.metadata().unwrap().len();
-        file.seek(SeekFrom::Start(len / 2)).unwrap();
-        file.write_all(&[0xa5; 2048]).unwrap();
+        file.seek(SeekFrom::Start(len / 4)).unwrap();
+        file.write_all(&vec![0xa5; (len / 2) as usize]).unwrap();
         file.sync_all().unwrap();
         drop(file);
 

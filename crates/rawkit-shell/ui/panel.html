@@ -81,6 +81,26 @@
   /* The profile's own name, which can be long and is not ours to shorten. */
   #profile-name { color: #9a9aa2; overflow-wrap: anywhere; margin: 7px 0; }
 
+  /* Presets and snapshots. A saved thing is a row: its name, wide and clickable,
+     and a remove that stays out of the way until it is wanted. */
+  .saved { list-style: none; margin: 8px 0 0; padding: 0; }
+  .saved li { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+  .saved button.pick { flex: 1; text-align: left; overflow: hidden;
+                       text-overflow: ellipsis; white-space: nowrap; }
+  .saved button.drop { color: #8e8e98; padding: 4px 8px; flex-shrink: 0; }
+  .saved button.drop.sure { color: #e0705f; border-color: #6a3a3a; }
+  .empty { color: #7d7d87; margin: 8px 0 0; }
+  .empty.hidden, .form.hidden { display: none; }
+  input[type=text] { flex: 1; min-width: 0; background: #141418; color: inherit;
+                     border: 1px solid #45454f; border-radius: 5px;
+                     padding: 4px 8px; font: inherit; }
+  /* Two columns, because seven tick boxes down a 360px panel is a lot of
+     scrolling to answer one question about a look. */
+  .groups { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px;
+            margin-top: 10px; }
+  .groups label { margin: 3px 0; gap: 6px; font-size: 12px; }
+  .groups label span { color: #e8e8ea; }
+
   /* The histogram sits at the top of the column, above everything it describes.
      Fixed height, so a long export line or a wrapping status block can never
      take its space. */
@@ -146,6 +166,33 @@
 </div>
 
 <main>
+  <details id="s-presets">
+    <summary>Presets</summary>
+    <ul class="saved" id="preset-list"></ul>
+    <p class="empty" id="preset-empty">Nothing saved yet.</p>
+    <div class="row"><button id="preset-new">Save this look…</button></div>
+    <div class="form hidden" id="preset-form">
+      <div class="row">
+        <input id="preset-name" type="text" placeholder="Name this look" maxlength="60">
+      </div>
+      <div class="groups" id="preset-groups"></div>
+      <div class="row">
+        <button id="preset-save">Save</button>
+        <button id="preset-cancel">Cancel</button>
+      </div>
+    </div>
+  </details>
+
+  <details id="s-snapshots">
+    <summary>Snapshots</summary>
+    <ul class="saved" id="snapshot-list"></ul>
+    <p class="empty" id="snapshot-empty">Nowhere to go back to yet.</p>
+    <div class="row">
+      <input id="snapshot-name" type="text" placeholder="Name this state" maxlength="60">
+      <button id="snapshot-take">Take</button>
+    </div>
+  </details>
+
   <details id="s-tone" open><summary>Tone</summary>
     <label><span>Exposure</span>
       <input id="exposure" type="range" min="-4" max="4" step="0.01" value="0">
@@ -514,7 +561,9 @@
     // double-clicking to open it — and none of that passes through this page.
     // Without this the strip goes on describing the frame you were on two
     // clicks ago, which is a readout lying rather than merely lagging.
-    show(await invoke("cull_view"));
+    const view = await invoke("cull_view");
+    show(view);
+    relistFor(view);
   }, 250);
 
   // ---- Histogram -----------------------------------------------------------
@@ -965,6 +1014,182 @@
       ? job.finished
       : `exporting ${job.done}/${job.total}` + (job.filename ? ` · ${job.filename}` : "");
   }, 100);
+
+  // ---- Presets and snapshots -----------------------------------------------
+  //
+  // Two ways to reuse a decision, and deliberately not the same shape. A preset
+  // is *partial* and travels between photographs, so saving one asks which parts
+  // it carries; a snapshot is *whole* and stays in one photograph, so it only
+  // asks for a name. Getting that backwards is how a preset ends up imposing
+  // somebody else's crop.
+  //
+  // Group names cross as strings — the same names `Group::as_str` produces and
+  // the catalog stores. The page never learns an index, so reordering the enum
+  // on the Rust side cannot silently repoint a preset somebody saved.
+
+  const presetList = document.getElementById("preset-list");
+  const presetEmpty = document.getElementById("preset-empty");
+  const presetForm = document.getElementById("preset-form");
+  const presetGroups = document.getElementById("preset-groups");
+  const presetName = document.getElementById("preset-name");
+  const snapshotList = document.getElementById("snapshot-list");
+  const snapshotEmpty = document.getElementById("snapshot-empty");
+  const snapshotName = document.getElementById("snapshot-name");
+
+  const say = e => { log.className = "refused"; log.textContent = String(e); };
+
+  // Removing something saved takes two clicks, and the button says so in
+  // between. `confirm` would be the obvious answer and is the wrong one here:
+  // the three webviews do not agree about whether it opens at all, so a dialog
+  // that is a guard on one platform is a silent no-op on another.
+  const armDrop = (button, remove) => {
+    button.addEventListener("click", async () => {
+      if (!button.classList.contains("sure")) {
+        button.classList.add("sure");
+        button.textContent = "sure?";
+        // Disarmed again on its own, so a button left in the armed state cannot
+        // become a one-click delete for whoever comes back to the window.
+        setTimeout(() => {
+          button.classList.remove("sure");
+          button.textContent = "×";
+        }, 2500);
+        return;
+      }
+      try { await remove(); } catch (e) { say(e); }
+    });
+  };
+
+  const savedRow = (name, note, open, remove) => {
+    const li = document.createElement("li");
+    const pick = document.createElement("button");
+    pick.className = "pick";
+    pick.textContent = name;
+    pick.title = note;
+    pick.addEventListener("click", open);
+    const drop = document.createElement("button");
+    drop.className = "drop";
+    drop.textContent = "×";
+    drop.title = `forget ${name}`;
+    armDrop(drop, remove);
+    li.append(pick, drop);
+    return li;
+  };
+
+  async function refreshPresets() {
+    let saved;
+    try { saved = await invoke("presets"); } catch (e) { return say(e); }
+    presetList.replaceChildren(...saved.map(preset =>
+      savedRow(
+        preset.name,
+        `carries ${preset.groups.join(", ")}`,
+        () => invoke("apply_preset", { name: preset.name }).catch(say),
+        async () => {
+          await invoke("forget_preset", { name: preset.name });
+          refreshPresets();
+        },
+      )));
+    presetEmpty.classList.toggle("hidden", saved.length > 0);
+  }
+
+  async function refreshSnapshots() {
+    let taken;
+    try { taken = await invoke("snapshots"); } catch (e) { return say(e); }
+    snapshotList.replaceChildren(...taken.map(snap =>
+      savedRow(
+        snap.name,
+        `edit version ${snap.version}`,
+        () => invoke("restore_snapshot", { name: snap.name }).catch(say),
+        async () => {
+          await invoke("forget_snapshot", { name: snap.name });
+          refreshSnapshots();
+        },
+      )));
+    snapshotEmpty.classList.toggle("hidden", taken.length > 0);
+  }
+
+  document.getElementById("preset-new").addEventListener("click", async () => {
+    let groups;
+    try { groups = await invoke("touched_groups"); } catch (e) { return say(e); }
+    presetGroups.replaceChildren(...groups.map(group => {
+      const label = document.createElement("label");
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.value = group.name;
+      // Ticked when this part was actually moved. Everything ticked by default
+      // would make every preset carry six neutral settings that quietly reset
+      // whatever the frame it lands on already had — the partial-preset problem
+      // coming back in through the door marked convenience.
+      box.checked = group.touched;
+      const name = document.createElement("span");
+      name.textContent = group.label;
+      label.append(box, name);
+      return label;
+    }));
+    presetForm.classList.remove("hidden");
+    presetName.focus();
+  });
+
+  const savePreset = async () => {
+    const groups = [...presetGroups.querySelectorAll("input:checked")].map(b => b.value);
+    try {
+      await invoke("save_preset", { name: presetName.value.trim(), groups });
+    } catch (e) {
+      return say(e); // An empty name or an empty claim, refused where it is made.
+    }
+    presetForm.classList.add("hidden");
+    presetName.value = "";
+    refreshPresets();
+  };
+  document.getElementById("preset-save").addEventListener("click", savePreset);
+  document.getElementById("preset-cancel").addEventListener("click", () => {
+    presetForm.classList.add("hidden");
+  });
+
+  const takeSnapshot = async () => {
+    try {
+      await invoke("take_snapshot", { name: snapshotName.value.trim() });
+    } catch (e) {
+      return say(e);
+    }
+    snapshotName.value = "";
+    refreshSnapshots();
+  };
+  document.getElementById("snapshot-take").addEventListener("click", takeSnapshot);
+
+  // Enter submits. The window's own key handler steps aside for anything typed
+  // into a field — otherwise a name containing a digit would rate the
+  // photograph — so these two have to say what Enter means for themselves.
+  presetName.addEventListener("keydown", e => { if (e.key === "Enter") savePreset(); });
+  snapshotName.addEventListener("keydown", e => { if (e.key === "Enter") takeSnapshot(); });
+
+  // Snapshots belong to one photograph, and the selection moves without this
+  // page hearing about it: an arrow key goes to the window, and a click goes to
+  // the canvas. So the list is refreshed from what the poll already fetched.
+  let listedFor = null;
+  const relistFor = view => {
+    const frame = view ? `${view.position}/${view.filename}` : null;
+    if (frame === listedFor) return;
+    listedFor = frame;
+    refreshSnapshots();
+  };
+
+  refreshPresets();
+
+  // A button that has done its job gives the keyboard back.
+  //
+  // Found by driving the window: clicking a snapshot leaves that row focused,
+  // and the key handler steps aside for anything focused — so the next arrow
+  // key went to the button instead of moving to the next photograph, silently.
+  // The keyboard belongs to the shoot; a control that has already acted has no
+  // claim on it.
+  //
+  // `detail > 0` means a real pointer click. Enter or Space on a focused button
+  // reports 0, and blurring there would throw away somebody's place in the tab
+  // order — a fix for one keyboard problem that made another.
+  document.addEventListener("click", event => {
+    const button = event.target.closest("button");
+    if (button && event.detail > 0) button.blur();
+  });
 
   // ---- Sections ------------------------------------------------------------
   //

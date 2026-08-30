@@ -24,8 +24,10 @@
 //! that nothing renders is a lie the whole codebase has to keep.
 
 pub mod geometry;
+pub mod groups;
 
 pub use geometry::Geometry;
+pub use groups::Group;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
