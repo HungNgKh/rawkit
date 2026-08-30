@@ -244,6 +244,18 @@ fn snapshot(state: tauri::State<'_, Shared>) -> serde_json::Value {
         // `None` means the decoder's own matrix, which is a state worth naming
         // rather than an absence to be guessed at.
         "profile": *PROFILE_NAME.lock().expect("profile lock"),
+        // Quarter-turns clockwise, both halves. Numbers rather than words
+        // because the page does every other bit of formatting and there is no
+        // reason for this one to be phrased twice.
+        //
+        // `recorded` is not in `state` and cannot be: it is what the camera
+        // said, not what anyone decided. It is here so the panel can *say* why
+        // a photograph opened turned — a reason the user cannot see is
+        // indistinguishable from a bug.
+        "orientation": {
+            "recorded": session.recorded_orientation().turns(),
+            "effective": session.effective_orientation().turns(),
+        },
     })
 }
 

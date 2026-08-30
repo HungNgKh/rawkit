@@ -80,6 +80,10 @@
            touch-action: none; }
   /* The profile's own name, which can be long and is not ours to shorten. */
   #profile-name { color: #9a9aa2; overflow-wrap: anywhere; margin: 7px 0; }
+  /* Which way up the frame is, and where that came from. Muted like the profile
+     name because it is a readout rather than a control. */
+  #orientation { color: #9a9aa2; margin: 7px 0; }
+  #orientation .why { color: #6d6d76; }
 
   /* Presets and snapshots. A saved thing is a row: its name, wide and clickable,
      and a remove that stays out of the way until it is wanted. */
@@ -246,6 +250,7 @@
   </details>
 
   <details id="s-geometry"><summary>Geometry</summary>
+    <div id="orientation">upright</div>
     <label><span>Straighten</span>
       <input id="straighten" type="range" min="-15" max="15" step="0.1" value="0">
       <output id="straighten-value">0.0°</output></label>
@@ -542,6 +547,33 @@
     setSlider("temperature", temp ?? 5500, () => (temp === null ? "as shot" : `${temp | 0} K`));
   };
 
+  // ---- Which way up ---------------------------------------------------------
+  //
+  // Quarter-turns clockwise arrive as numbers; the words are made here, like
+  // every other readout in this panel.
+  const TURN = ["upright", "90° clockwise", "upside down", "90° anticlockwise"];
+  const orientationLine = document.getElementById("orientation");
+
+  const showOrientation = (o) => {
+    if (!o) return;
+    const yours = (o.effective - o.recorded + 4) % 4;
+    // The *effective* turn leads, because it is the thing on screen. Where it
+    // came from follows, quietly, and only when there is something to say: on a
+    // landscape frame nobody has touched, "upright" is the whole story.
+    let why = "";
+    if (o.recorded && yours) why = `camera ${TURN[o.recorded]}, then yours`;
+    else if (o.recorded) why = "as the camera recorded it";
+    else if (yours) why = "your turn";
+    orientationLine.innerHTML = "";
+    orientationLine.append(TURN[o.effective]);
+    if (why) {
+      const note = document.createElement("span");
+      note.className = "why";
+      note.textContent = ` · ${why}`;
+      orientationLine.append(note);
+    }
+  };
+
   // Polled rather than pushed, because the edit changes on the render loop's
   // schedule: a keypress leaves a request and the photograph is not loaded until
   // a frame or two later. Four times a second is far below anything a person
@@ -553,6 +585,11 @@
       seen = s.generation;
       sync(s.state);
     }
+    // Which way up, and why. Two facts rather than one: the camera's turn is
+    // not in the edit and cannot be — it is what the file recorded — so a
+    // photograph that opens sideways would otherwise be doing it for a reason
+    // nobody can see, which is the same as doing it for no reason.
+    showOrientation(s.orientation);
     // Not gated on the generation: a profile is not part of the edit, so
     // choosing one does not move it.
     const profile = s.profile ?? "camera matrix";

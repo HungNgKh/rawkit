@@ -531,6 +531,23 @@ impl Session {
         self.image
     }
 
+    /// What the camera said it takes to stand this frame upright.
+    ///
+    /// Exposed because an interface has to be able to *say* it: a photograph
+    /// that opens turned is doing so for a reason, and a reason the user cannot
+    /// see is indistinguishable from a bug. Read-only — it is not a decision, so
+    /// there is no command to change it, only [`Command::RotateBy`] on top.
+    pub fn recorded_orientation(&self) -> Orientation {
+        self.recorded
+    }
+
+    /// Which way up the frame actually comes out: the camera's turn and the
+    /// user's together. What a readout should show, because it is the thing the
+    /// person is looking at.
+    pub fn effective_orientation(&self) -> Orientation {
+        self.state.orientation.after(self.recorded)
+    }
+
     /// The photograph's size, after orientation and crop.
     ///
     /// What the viewport is measured in, and what a caller wanting to know "how
@@ -1079,6 +1096,40 @@ mod tests {
     /// A 24 MP frame, the size the design targets.
     const IMAGE: [u32; 2] = [6000, 4000];
     const TILE: u32 = 512;
+
+    fn portrait() -> Session {
+        let mut s = Session::new(IMAGE, TILE, EditState::default(), Orientation::Rotate90Cw);
+        s.apply(Command::Resize {
+            width: 1600,
+            height: 1000,
+        });
+        s
+    }
+
+    #[test]
+    fn a_turned_frame_reports_the_camera_turn_and_the_total() {
+        // What the readout is built from. The camera's turn is a fact the
+        // session reports and never changes; the effective one is what the
+        // person is looking at.
+        let mut s = portrait();
+        assert_eq!(s.recorded_orientation(), Orientation::Rotate90Cw);
+        assert_eq!(s.effective_orientation(), Orientation::Rotate90Cw);
+
+        s.apply(Command::RotateBy(1));
+        assert_eq!(
+            s.recorded_orientation(),
+            Orientation::Rotate90Cw,
+            "a user turn does not rewrite what the camera recorded"
+        );
+        assert_eq!(s.effective_orientation(), Orientation::Rotate180);
+
+        // And turning back a quarter lands on the sensor's own axes, which is a
+        // state the readout has to be able to describe: no turn in total, but
+        // not because nothing happened.
+        s.apply(Command::RotateBy(2));
+        assert_eq!(s.effective_orientation(), Orientation::AsShot);
+        assert_eq!(s.state().orientation, Orientation::Rotate270Cw);
+    }
 
     fn session() -> Session {
         let mut s = Session::new(IMAGE, TILE, EditState::default(), Orientation::AsShot);
