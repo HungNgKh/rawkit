@@ -77,6 +77,14 @@ use std::collections::HashMap;
 /// that the arithmetic stays meaningful.
 pub const TEMPERATURE_RANGE_K: std::ops::RangeInclusive<f32> = 1000.0..=50_000.0;
 
+/// How many points the edit history keeps.
+///
+/// An `EditState` is 84 bytes, so this is about seventeen kilobytes — the bound
+/// exists because an unbounded history in a long session grows without a limit,
+/// not because the memory is scarce. Two hundred steps is far more than a
+/// photograph accumulates in one sitting, and a drag is one of them.
+const MAX_STEPS: usize = 200;
+
 /// What the user asked for. The only way to change a [`Session`].
 ///
 /// One variant per thing the UI can do, rather than a generic patch, for the
@@ -127,6 +135,13 @@ pub enum Command {
     /// `commands_and_events_stay_small`.
     SetEditState(Box<EditState>),
 
+    /// Step the edit back to the previous point in the history, and forward
+    /// again. Commands rather than methods because they arrive over the same
+    /// bus as everything else, and because a refusal — "nothing to undo" — is
+    /// something the interface already knows how to show.
+    Undo,
+    Redo,
+
     /// Drag the image by a distance in *screen* pixels. Screen rather than image
     /// pixels because that is what a pointer produces, and converting at the
     /// boundary keeps the conversion in one place.
@@ -172,10 +187,58 @@ impl Command {
             Command::SetStraighten(_) => "set_straighten",
             Command::RotateBy(_) => "rotate_by",
             Command::SetEditState(_) => "set_edit_state",
+            Command::Undo => "undo",
+            Command::Redo => "redo",
             Command::Pan { .. } => "pan",
             Command::ZoomTo { .. } => "zoom_to",
             Command::Resize { .. } => "resize",
             Command::FitToView => "fit_to_view",
+        }
+    }
+
+    /// Whether a run of these should collapse into a single undo step.
+    ///
+    /// True for the continuous controls — the ones with a slider behind them,
+    /// which emit a command per pointer move. A drag that produced two hundred
+    /// steps would be a history nobody could navigate, and the state anyone
+    /// wants back is the one from before the drag began, not the one from two
+    /// pixels ago.
+    ///
+    /// False for the discrete ones. Four presses of the rotate key are four
+    /// decisions; collapsing them would make one press of undo discard all four.
+    ///
+    /// Matched exhaustively on purpose. A command added later should have to
+    /// state which kind it is rather than inherit an answer from a wildcard.
+    fn coalesces(&self) -> bool {
+        match self {
+            Command::SetExposure(_)
+            | Command::SetContrast(_)
+            | Command::SetHighlights(_)
+            | Command::SetShadows(_)
+            | Command::SetWhites(_)
+            | Command::SetBlacks(_)
+            | Command::SetTemperature(_)
+            | Command::SetTint(_)
+            | Command::SetSharpen(_)
+            | Command::SetSharpenRadius(_)
+            | Command::SetChromaNoise(_)
+            | Command::SetSaturation(_)
+            | Command::SetVibrance(_)
+            | Command::SetStraighten(_) => true,
+
+            Command::SetOrientation(_)
+            | Command::SetCrop(_)
+            | Command::RotateBy(_)
+            | Command::SetEditState(_) => false,
+
+            // Not edits at all, so they never reach the history and the answer
+            // does not matter — but it still has to be given.
+            Command::Pan { .. }
+            | Command::ZoomTo { .. }
+            | Command::Resize { .. }
+            | Command::FitToView
+            | Command::Undo
+            | Command::Redo => false,
         }
     }
 }
@@ -310,6 +373,17 @@ pub struct Session {
     state: EditState,
     viewport: Viewport,
     generation: u64,
+    /// States to step back to, oldest first. See [`Session::apply`] for what
+    /// counts as one step.
+    past: std::collections::VecDeque<EditState>,
+    /// States undo has taken back, newest last. Cleared by any fresh edit,
+    /// because redoing onto a history that has since branched would replay a
+    /// decision the user has already replaced.
+    future: Vec<EditState>,
+    /// The command that opened the step now on top of `past`, so a run of the
+    /// same control collapses into it. `None` means the next edit starts a new
+    /// step whatever it is.
+    step: Option<&'static str>,
     /// Tile → the edit generation it was last rendered at. A tile is fresh when
     /// that equals `generation`.
     ///
@@ -347,6 +421,9 @@ impl Session {
                 size: [0, 0],
             },
             generation: 1,
+            past: std::collections::VecDeque::new(),
+            future: Vec::new(),
+            step: None,
             rendered: HashMap::new(),
         };
         // Start fitted. A canvas of zero size shows nothing until the first
@@ -388,7 +465,65 @@ impl Session {
     }
 
     /// Apply one command. Never blocks and never renders.
+    ///
+    /// # What counts as one undo step
+    ///
+    /// A step is a control coming to rest. A drag emits a command per pointer
+    /// move, so a run of the *same* continuous control collapses into the state
+    /// from before the run began; a different control, or any discrete action,
+    /// opens a new one. See [`Command::coalesces`].
+    ///
+    /// The consequence worth stating: a slider dragged, released, and dragged
+    /// again is still one step, because nothing in a command says the pointer
+    /// was let go. Making that two steps would mean teaching the session about
+    /// pointer state or about time, and both are worse than the seam — a session
+    /// that took a clock could not be tested the way this one is.
     pub fn apply(&mut self, command: Command) -> Event {
+        let name = command.name();
+        let coalesces = command.coalesces();
+        // Undo and redo move *through* the history and must not be written into
+        // it, or stepping back would leave a step whose only content is that you
+        // stepped back.
+        let records = !matches!(command, Command::Undo | Command::Redo);
+        // Cloned for every command, including the view ones that will never use
+        // it. Eighty-four bytes against a list of which commands are edits —
+        // and that list is exactly the kind `edit_changed` already refuses to
+        // keep, because somebody eventually forgets to add to it.
+        let before = self.state.clone();
+
+        let event = self.dispatch(command);
+
+        // Only a change earns a step. A refused command left the state alone, so
+        // recording one would put a point in the history that undo could return
+        // to without anything visibly happening.
+        if records && matches!(event, Event::EditChanged { .. }) {
+            self.record(name, before, coalesces);
+        }
+        event
+    }
+
+    /// Replace the edit and forget the history, for a photograph being opened.
+    ///
+    /// Deliberately not [`Command::SetEditState`], and the difference is the
+    /// whole reason this exists: opening a photograph is not something the user
+    /// did *to* this photograph. Through the command bus, the first press of
+    /// undo after opening one would restore the **previous** image's edit — a
+    /// decision about a different picture, arriving as if it were yours.
+    pub fn load(&mut self, state: EditState) -> Event {
+        if let Err(e) = state.validate() {
+            return refused("load", e.to_string());
+        }
+        if !edit_is_finite(&state) {
+            return refused("load", "edit contains a non-finite value");
+        }
+        self.state = state;
+        self.past.clear();
+        self.future.clear();
+        self.step = None;
+        self.edit_changed()
+    }
+
+    fn dispatch(&mut self, command: Command) -> Event {
         // Taken before the match, because `SetEditState` moves its payload out
         // of `command` and the refusal path still needs the name.
         let name = command.name();
@@ -504,6 +639,9 @@ impl Session {
                 self.state = *next;
                 self.edit_changed()
             }
+
+            Command::Undo => self.step_back(),
+            Command::Redo => self.step_forward(),
 
             Command::Pan { dx, dy } => {
                 if !dx.is_finite() || !dy.is_finite() {
@@ -666,6 +804,44 @@ impl Session {
         self.edit_changed()
     }
 
+    /// Put `before` on the history, unless the same control is still moving.
+    fn record(&mut self, name: &'static str, before: EditState, coalesces: bool) {
+        // Any fresh edit branches away from whatever undo had taken back.
+        self.future.clear();
+        if coalesces && self.step == Some(name) {
+            return;
+        }
+        if self.past.len() == MAX_STEPS {
+            self.past.pop_front();
+        }
+        self.past.push_back(before);
+        // A discrete command leaves no step open, so whatever comes next starts
+        // its own — two rotates are two steps even though the name is the same.
+        self.step = coalesces.then_some(name);
+    }
+
+    fn step_back(&mut self) -> Event {
+        let Some(previous) = self.past.pop_back() else {
+            return refused("undo", "nothing to undo");
+        };
+        self.future
+            .push(std::mem::replace(&mut self.state, previous));
+        // The step that was open is now the one we just left, so an edit
+        // arriving next must not merge into it.
+        self.step = None;
+        self.edit_changed()
+    }
+
+    fn step_forward(&mut self) -> Event {
+        let Some(next) = self.future.pop() else {
+            return refused("redo", "nothing to redo");
+        };
+        self.past
+            .push_back(std::mem::replace(&mut self.state, next));
+        self.step = None;
+        self.edit_changed()
+    }
+
     fn edit_changed(&mut self) -> Event {
         self.generation += 1;
         // Orientation and crop change how big the photograph is, and a stale
@@ -773,6 +949,224 @@ mod tests {
             height: 1000,
         });
         s
+    }
+
+    #[test]
+    fn a_drag_is_one_step_and_not_two_hundred() {
+        // The whole reason coalescing exists. Without it, undoing a drag means
+        // pressing the key until your finger gets tired, and the user gave one
+        // instruction.
+        let mut s = session();
+        for i in 0..200 {
+            s.apply(Command::SetExposure(i as f32 / 100.0));
+        }
+        assert_eq!(s.state().tone.exposure_ev, 1.99);
+
+        assert!(matches!(s.apply(Command::Undo), Event::EditChanged { .. }));
+        assert_eq!(
+            s.state().tone.exposure_ev,
+            0.0,
+            "one press should undo the drag"
+        );
+        assert!(
+            matches!(s.apply(Command::Undo), Event::Refused { .. }),
+            "the drag left more than one step behind"
+        );
+    }
+
+    #[test]
+    fn moving_to_another_control_starts_a_new_step() {
+        let mut s = session();
+        s.apply(Command::SetExposure(1.0));
+        s.apply(Command::SetContrast(0.5));
+
+        s.apply(Command::Undo);
+        assert_eq!(s.state().tone.contrast, 0.0);
+        assert_eq!(
+            s.state().tone.exposure_ev,
+            1.0,
+            "undo took back both controls"
+        );
+
+        s.apply(Command::Undo);
+        assert_eq!(s.state().tone.exposure_ev, 0.0);
+    }
+
+    #[test]
+    fn going_back_to_a_control_does_not_merge_with_the_earlier_run() {
+        // exposure, contrast, exposure is three decisions, even though the first
+        // and last are the same slider.
+        let mut s = session();
+        s.apply(Command::SetExposure(1.0));
+        s.apply(Command::SetContrast(0.5));
+        s.apply(Command::SetExposure(2.0));
+
+        s.apply(Command::Undo);
+        assert_eq!(s.state().tone.exposure_ev, 1.0);
+        assert_eq!(s.state().tone.contrast, 0.5);
+    }
+
+    #[test]
+    fn each_rotate_is_its_own_step() {
+        // A discrete command must not coalesce with itself: four presses of the
+        // rotate key are four decisions, and collapsing them would make one
+        // press of undo throw all four away.
+        let mut s = session();
+        let start = s.state().orientation;
+        s.apply(Command::RotateBy(1));
+        s.apply(Command::RotateBy(1));
+        let turned = s.state().orientation;
+        assert_ne!(turned, start);
+
+        s.apply(Command::Undo);
+        assert_ne!(
+            s.state().orientation,
+            turned,
+            "both rotates went back at once"
+        );
+        s.apply(Command::Undo);
+        assert_eq!(s.state().orientation, start);
+    }
+
+    #[test]
+    fn redo_replays_what_undo_took_back() {
+        let mut s = session();
+        s.apply(Command::SetExposure(1.5));
+        s.apply(Command::Undo);
+        assert_eq!(s.state().tone.exposure_ev, 0.0);
+
+        assert!(matches!(s.apply(Command::Redo), Event::EditChanged { .. }));
+        assert_eq!(s.state().tone.exposure_ev, 1.5);
+        assert!(matches!(s.apply(Command::Redo), Event::Refused { .. }));
+    }
+
+    #[test]
+    fn a_fresh_edit_after_undo_abandons_the_redo() {
+        // Redoing onto a history that has since branched would replay a decision
+        // the user has already replaced.
+        let mut s = session();
+        s.apply(Command::SetExposure(1.5));
+        s.apply(Command::Undo);
+        s.apply(Command::SetContrast(0.25));
+
+        assert!(matches!(s.apply(Command::Redo), Event::Refused { .. }));
+        assert_eq!(s.state().tone.exposure_ev, 0.0);
+        assert_eq!(s.state().tone.contrast, 0.25);
+    }
+
+    #[test]
+    fn an_edit_after_undo_does_not_merge_into_the_step_that_was_undone() {
+        let mut s = session();
+        s.apply(Command::SetExposure(1.0));
+        s.apply(Command::Undo);
+        s.apply(Command::SetExposure(2.0));
+
+        s.apply(Command::Undo);
+        assert_eq!(
+            s.state().tone.exposure_ev,
+            0.0,
+            "the new drag was absorbed into the step undo had just left"
+        );
+    }
+
+    #[test]
+    fn opening_a_photograph_forgets_the_history() {
+        // The trap this exists to avoid: `load` rather than `SetEditState`, so
+        // the first undo after opening cannot restore the previous image's edit.
+        let mut s = session();
+        s.apply(Command::SetExposure(1.0));
+
+        let mut next = EditState::default();
+        next.tone.contrast = 0.4;
+        assert!(matches!(s.load(next), Event::EditChanged { .. }));
+
+        assert!(matches!(s.apply(Command::Undo), Event::Refused { .. }));
+        assert_eq!(
+            s.state().tone.exposure_ev,
+            0.0,
+            "the previous photograph's edit came back"
+        );
+        assert_eq!(s.state().tone.contrast, 0.4);
+    }
+
+    #[test]
+    fn pasting_an_edit_is_undoable_but_opening_one_is_not() {
+        // Two callers of what used to be the same command. Applying someone
+        // else's settings is a decision; opening a photograph is not.
+        let mut s = session();
+        let mut pasted = EditState::default();
+        pasted.tone.shadows = 0.6;
+        s.apply(Command::SetEditState(Box::new(pasted)));
+
+        s.apply(Command::Undo);
+        assert_eq!(s.state().tone.shadows, 0.0);
+    }
+
+    #[test]
+    fn a_refused_command_leaves_no_step_behind() {
+        // A step whose two ends are identical is one press of undo that appears
+        // to do nothing at all.
+        let mut s = session();
+        s.apply(Command::SetExposure(1.0));
+        assert!(matches!(
+            s.apply(Command::SetSharpen(99.0)),
+            Event::Refused { .. }
+        ));
+
+        s.apply(Command::Undo);
+        assert_eq!(s.state().tone.exposure_ev, 0.0);
+        assert!(matches!(s.apply(Command::Undo), Event::Refused { .. }));
+    }
+
+    #[test]
+    fn undo_with_nothing_behind_it_changes_nothing() {
+        let mut s = session();
+        let generation = s.generation();
+        assert!(matches!(s.apply(Command::Undo), Event::Refused { .. }));
+        assert!(matches!(s.apply(Command::Redo), Event::Refused { .. }));
+        assert_eq!(
+            s.generation(),
+            generation,
+            "a refusal still invalidated every tile"
+        );
+        assert_eq!(*s.state(), EditState::default());
+    }
+
+    #[test]
+    fn the_history_is_bounded_and_drops_the_oldest() {
+        let mut s = session();
+        // Alternating controls so nothing coalesces: each is its own step.
+        for i in 0..MAX_STEPS + 50 {
+            if i % 2 == 0 {
+                s.apply(Command::SetExposure(i as f32 / 1000.0));
+            } else {
+                s.apply(Command::SetContrast(i as f32 / 1000.0));
+            }
+        }
+        assert_eq!(s.past.len(), MAX_STEPS);
+
+        for _ in 0..MAX_STEPS {
+            assert!(matches!(s.apply(Command::Undo), Event::EditChanged { .. }));
+        }
+        assert!(matches!(s.apply(Command::Undo), Event::Refused { .. }));
+        // The oldest steps are gone, so this does *not* return to the default —
+        // which is the honest consequence of a bound and worth pinning.
+        assert_ne!(*s.state(), EditState::default());
+    }
+
+    #[test]
+    fn undo_and_redo_survive_a_json_round_trip() {
+        for command in [Command::Undo, Command::Redo] {
+            let json = serde_json::to_string(&command).expect("serialise");
+            assert_eq!(
+                serde_json::from_str::<Command>(&json).expect("deserialise"),
+                command
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&Command::Undo).expect("serialise"),
+            r#"{"command":"undo"}"#
+        );
     }
 
     #[test]

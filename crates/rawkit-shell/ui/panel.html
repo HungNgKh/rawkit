@@ -73,7 +73,7 @@
   <span id="label"></span>
   <span id="counts"></span>
   <span id="mode">loupe</span>
-  <span id="keys">G grid · E loupe · R crop · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · Z undo</span>
+  <span id="keys">G grid · E loupe · R crop · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · Z undo cull · ⌃Z undo edit</span>
 </div>
 <div id="scope">
   <canvas id="histogram" title="the developed photograph, in the values a file would carry"></canvas>
@@ -517,7 +517,23 @@
   }
 
   document.addEventListener("keydown", event => {
-    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    // Ctrl/Cmd+Z steps the *edit* back; shift, or Y, steps it forward. Bare Z
+    // stays with culling, which had it first.
+    //
+    // Two undo histories in one application, and the seam is worth stating
+    // rather than leaving someone to find: the develop controls and the
+    // judgements are undone separately, because nothing joins their timelines —
+    // the library outlives the session, and a session is rebuilt for every
+    // photograph. Merging them is a design decision, not a refactor.
+    if ((event.metaKey || event.ctrlKey) && !event.altKey) {
+      const held = event.key.toLowerCase();
+      if (held === "z" || held === "y") {
+        send({ command: held === "y" || event.shiftKey ? "redo" : "undo" });
+        event.preventDefault();
+      }
+      return;
+    }
+    if (event.altKey) return;
     const key = event.key;
     // A focused control owns its own keys. Without this, arrows move the slider
     // *and* the selection, and a digit rates the photograph while you are

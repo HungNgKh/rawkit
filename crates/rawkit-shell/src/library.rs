@@ -30,7 +30,7 @@ use rawkit_catalog::previews;
 use rawkit_editstate::EditState;
 use rawkit_engine::render::Level;
 use rawkit_engine::{BayerPhase, CameraProfile, Frame, Pyramid};
-use rawkit_session::{Command, Session};
+use rawkit_session::Session;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -816,13 +816,16 @@ impl Saver {
         match catalog_result {
             Ok(Some((version, saved))) => {
                 eprintln!("edit       : restored v{version} for image {id}");
-                session.apply(Command::SetEditState(Box::new(saved)));
+                // `load`, not a command: opening a photograph is not something
+                // the user did to it, and through the command bus the first
+                // press of undo would restore the *previous* image's edit.
+                session.load(saved);
             }
             Ok(None) => {
                 // A photograph nobody has edited opens as shot. Applying the
                 // default explicitly rather than assuming the session already
                 // holds it, because the previous image's edit is what it holds.
-                session.apply(Command::SetEditState(Box::default()));
+                session.load(EditState::default());
             }
             Err(e) => eprintln!("edit       : could not read: {e}"),
         }
@@ -986,6 +989,7 @@ mod saver_tests {
     use super::tests::{library_at, Scratch};
     use super::*;
     use rawkit_editstate::EditState;
+    use rawkit_session::Command;
 
     /// An edit made on one frame must not land on the next one.
     ///
@@ -998,6 +1002,42 @@ mod saver_tests {
     /// The symptom is nearly invisible: the next frame opens with the previous
     /// frame's edit applied, which looks like an edit being carried forward
     /// rather than like data going to the wrong row.
+    /// The seam between `Saver::restore` and the session's undo history.
+    ///
+    /// `restore` must not go through the command bus, or opening a photograph
+    /// becomes a step in *its* history — and the first press of undo hands the
+    /// user the previous picture's edit, which they never applied to this one
+    /// and cannot tell apart from their own work.
+    #[test]
+    fn opening_a_photograph_puts_the_previous_edit_out_of_undos_reach() {
+        let dir = Scratch::new("restore-undo");
+        let library = Arc::new(Mutex::new(library_at(&dir.0, 2)));
+        let session = Arc::new(Mutex::new(Session::new(
+            [100, 100],
+            64,
+            EditState::default(),
+        )));
+        let mut saver = Saver::new(Some(library.clone()), session.clone());
+        saver.restore(&mut session.lock().unwrap());
+
+        session.lock().unwrap().apply(Command::SetExposure(1.5));
+        library.lock().unwrap().act(CullAction::Next).unwrap();
+        library.lock().unwrap().take_request();
+        saver.flush();
+        saver.restore(&mut session.lock().unwrap());
+
+        assert_eq!(session.lock().unwrap().state().tone.exposure_ev, 0.0);
+        assert!(matches!(
+            session.lock().unwrap().apply(rawkit_session::Command::Undo),
+            rawkit_session::Event::Refused { .. }
+        ));
+        assert_eq!(
+            session.lock().unwrap().state().tone.exposure_ev,
+            0.0,
+            "undo handed back the previous photograph's edit"
+        );
+    }
+
     #[test]
     fn an_edit_is_written_to_the_photograph_it_was_made_on() {
         let dir = Scratch::new("saver");
