@@ -264,6 +264,81 @@ fn histogram(seen: Option<u64>) -> Option<serde_json::Value> {
     }))
 }
 
+/// Choose where an export goes, and leave it for the render loop to start.
+///
+/// Returns as soon as the dialog is open. The picker's own callback is what
+/// records the destination, so nothing here waits on a person — a command that
+/// blocked until someone had finished browsing their disk would hold a Tauri
+/// thread for as long as they took.
+#[tauri::command]
+fn export(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Shelf>,
+    scope: String,
+) -> Result<(), String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let Some(library) = state.0.clone() else {
+        return Err("no catalog is open, so there is nothing to export".into());
+    };
+    let (selection, name) = {
+        let library = library.lock().expect("library lock");
+        match scope.as_str() {
+            "current" => {
+                let current = library.current();
+                let stem = std::path::Path::new(&current.filename)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| current.filename.clone());
+                (
+                    rawkit_deliver::Selection::Image(current.id),
+                    Some(format!("{stem}.jpg")),
+                )
+            }
+            // Picks rather than the marked set: a pick is the culling verdict and
+            // it is stored, while marking is the transient "these ones" gesture
+            // that compare and paste already use. Delivering the keepers is what
+            // the flag is for.
+            "picks" => (rawkit_deliver::Selection::Picks, None),
+            other => return Err(format!("{other} is not something to export")),
+        }
+    };
+
+    // One photograph is saved as a file the user names; a set goes into a folder.
+    // The picker's own kind is what decides which, so the two cannot disagree.
+    let one_file = name.is_some();
+    let leave = move |chosen: Option<tauri_plugin_dialog::FilePath>| {
+        let Some(path) = chosen.and_then(|p| p.into_path().ok()) else {
+            return; // Cancelled, which is an answer and not an error.
+        };
+        let destination = if one_file {
+            rawkit_deliver::Destination::File(path)
+        } else {
+            rawkit_deliver::Destination::Folder(path)
+        };
+        *PENDING_EXPORT.lock().expect("export lock") = Some((selection, destination));
+    };
+    let dialog = app.dialog().clone();
+    match name {
+        Some(filename) => dialog.file().set_file_name(filename).save_file(leave),
+        None => dialog.file().pick_folder(leave),
+    }
+    Ok(())
+}
+
+/// How far along the export is, for the page to draw.
+#[tauri::command]
+fn export_progress() -> Option<serde_json::Value> {
+    let exporting = EXPORTING.lock().expect("export lock");
+    let exporting = exporting.as_ref()?;
+    Some(serde_json::json!({
+        "done": exporting.done,
+        "total": exporting.total,
+        "filename": exporting.filename,
+        "finished": exporting.finished,
+    }))
+}
+
 /// The open library, when a catalog was what was opened.
 ///
 /// Separate state from [`Shared`] because the two answer to different things: a
@@ -444,13 +519,16 @@ fn main() -> Result<()> {
     eprintln!("route      : {route:?}");
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             apply,
             snapshot,
             cull,
             cull_view,
             canvas_pointer,
-            histogram
+            histogram,
+            export,
+            export_progress
         ])
         .setup(move |app| {
             // The surface is created on the main thread because the raw window
@@ -503,6 +581,9 @@ fn main() -> Result<()> {
             app.manage(Shared(shared.clone()));
 
             let mut saver = Saver::new(library.clone(), shared.clone());
+            // For the export, which reads the catalog on this thread and writes
+            // on another.
+            let exporting_from = library.clone();
             // Whatever was last decided about this photograph, if anything was.
             saver.restore(&mut shared.lock().expect("session lock"));
 
@@ -703,6 +784,24 @@ fn main() -> Result<()> {
 
                 saver.tick();
 
+                // A destination the picker has already collected. Gathered here
+                // rather than in the command, because this is the thread that
+                // owns the saver: `flush` puts the edit you were making a moment
+                // ago into the catalog before anything reads it back out.
+                let chosen = PENDING_EXPORT.lock().expect("export lock").take();
+                if let Some((selection, destination)) = chosen {
+                    saver.flush();
+                    if let Err(e) = begin_export(exporting_from.as_ref(), selection, destination) {
+                        eprintln!("export     : {e:#}");
+                        *EXPORTING.lock().expect("export lock") = Some(Exporting {
+                            done: 0,
+                            total: 0,
+                            filename: String::new(),
+                            finished: Some(format!("export failed: {e}")),
+                        });
+                    }
+                }
+
                 // Does what is on disk still have enough pixels for what the view
                 // is showing? Zooming in past it is the one thing that makes a
                 // decode necessary, and it is also the one time it is worth it.
@@ -902,6 +1001,105 @@ fn main() -> Result<()> {
             Ok(())
         })
         .run(tauri::generate_context!())?;
+    Ok(())
+}
+
+/// Read the catalog for what was chosen, then hand the writing to a thread.
+///
+/// The split is the point. Gathering holds the library's lock, and holding it
+/// for a whole export would freeze navigation for as long as the export took;
+/// writing holds nothing, so the window stays live and you can carry on culling
+/// while files appear.
+fn begin_export(
+    library: Option<&Arc<Mutex<Library>>>,
+    selection: rawkit_deliver::Selection,
+    destination: rawkit_deliver::Destination,
+) -> Result<()> {
+    let library = library.ok_or_else(|| anyhow::anyhow!("no catalog is open"))?;
+    let chosen = {
+        let library = library.lock().expect("library lock");
+        rawkit_deliver::check_destination(library.catalog(), &destination)?;
+        rawkit_deliver::gather(library.catalog(), selection)?
+    };
+
+    let total = chosen.len();
+    *EXPORTING.lock().expect("export lock") = Some(Exporting {
+        done: 0,
+        total,
+        filename: String::new(),
+        finished: None,
+    });
+
+    // A file the user named through a save dialog has already been asked about,
+    // and answering that question twice — once in the dialog, once by silently
+    // skipping — would make the second answer a lie. Into a folder, an existing
+    // file is skipped and counted, because nothing asked.
+    let overwrite = matches!(destination, rawkit_deliver::Destination::File(_));
+    let where_to = match &destination {
+        rawkit_deliver::Destination::File(path) => path.display().to_string(),
+        rawkit_deliver::Destination::Folder(dir) => dir.display().to_string(),
+    };
+
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        // Full resolution, always. An export is a delivery, and the pyramid's
+        // averaging softens the edge of a blown highlight — acceptable in
+        // something you look at, not in something you send.
+        let outcome = rawkit_deliver::write(
+            &chosen,
+            &destination,
+            0,
+            overwrite,
+            EXPORT_JOBS,
+            |done, total, filename| {
+                *EXPORTING.lock().expect("export lock") = Some(Exporting {
+                    done,
+                    total,
+                    filename: filename.to_string(),
+                    finished: None,
+                });
+            },
+        );
+        let finished = match outcome {
+            Ok(report) => {
+                // No path in the readout. It is the longest part of the line
+                // and the least useful — the user chose it a moment ago — and
+                // on a narrow bar it pushed the key hints into a column ten
+                // lines deep. It goes to the log, where it can be as long as
+                // it likes.
+                eprintln!("export     : into {where_to}");
+                let mut line = format!(
+                    "exported {} file(s), {:.1} MB in {:.1}s",
+                    report.written,
+                    report.bytes as f64 / 1_000_000.0,
+                    started.elapsed().as_secs_f64()
+                );
+                if report.skipped > 0 {
+                    line += &format!(" · {} already there", report.skipped);
+                }
+                if !report.failed.is_empty() {
+                    line += &format!(" · {} failed", report.failed.len());
+                    for (name, why) in &report.failed {
+                        eprintln!("export     : {name}: {why}");
+                    }
+                }
+                line
+            }
+            Err(e) => {
+                eprintln!("export     : {e:#}");
+                format!("export failed: {e}")
+            }
+        };
+        eprintln!("export     : {finished}");
+        let mut state = EXPORTING.lock().expect("export lock");
+        let done = state.as_ref().map_or(total, |e| e.done);
+        *state = Some(Exporting {
+            done,
+            total,
+            filename: String::new(),
+            finished: Some(finished),
+        });
+    });
     Ok(())
 }
 
@@ -1184,6 +1382,40 @@ pub(crate) fn in_crop() -> bool {
 /// catches up, because the "is it stale" test stays true until a survey
 /// actually happens.
 const SURVEY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// An export the user has chosen a destination for, waiting for the render loop
+/// to pick it up.
+///
+/// The dialog runs on a Tauri thread and the catalog is read on the render
+/// loop's, and that split is not incidental: the loop owns the `Saver`, and the
+/// edit you were making a second ago is still sitting in its settle timer. An
+/// export that read the catalog without flushing first would deliver the
+/// photograph as it was *before* the last thing you did to it — which looks
+/// like the export ignoring your edit, and is really a race with a debounce.
+static PENDING_EXPORT: Mutex<Option<(rawkit_deliver::Selection, rawkit_deliver::Destination)>> =
+    Mutex::new(None);
+
+/// How far along an export is, for the page to show. `None` between exports.
+static EXPORTING: Mutex<Option<Exporting>> = Mutex::new(None);
+
+struct Exporting {
+    done: usize,
+    total: usize,
+    filename: String,
+    /// Set once, when there is nothing left to do. Kept rather than cleared so
+    /// the result stays on screen — an export that finished by the readout
+    /// simply vanishing tells you nothing about whether it worked.
+    finished: Option<String>,
+}
+
+/// How many photographs to render at once from the window.
+///
+/// The command line uses four, measured: 595 ms a photograph at one job, 218 at
+/// four. This is deliberately lower, and the trade is stated rather than
+/// measured — the window is still drawing while this runs, and an export that
+/// finishes a third sooner while the canvas stutters is the wrong way round for
+/// something you started and are now watching.
+const EXPORT_JOBS: usize = 2;
 
 /// The distribution of the photograph the render loop last developed.
 ///

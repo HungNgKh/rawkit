@@ -70,16 +70,43 @@ pub struct ExportReport {
     pub failed: Vec<(String, String)>,
 }
 
-/// Render and write every photograph the selection names.
-pub fn export(
-    catalog: &Catalog,
-    selection: Selection,
-    to: &Path,
-    max_dim: u32,
-    overwrite: bool,
-    jobs: usize,
-    mut progress: impl FnMut(usize, usize, &str),
-) -> Result<ExportReport> {
+/// One photograph and the edit it is to be rendered with.
+pub struct Chosen {
+    pub image: cull::LibraryImage,
+    pub state: EditState,
+}
+
+/// Where the files go.
+pub enum Destination {
+    /// A folder. Each photograph is named after its own file, as a JPEG — the
+    /// only sane naming for a batch, because the alternative is asking a
+    /// question once per photograph.
+    Folder(std::path::PathBuf),
+    /// One exact path, with the format taken from its extension. Refused for
+    /// more than one photograph: a single name cannot hold a set, and quietly
+    /// numbering them would invent a convention nobody asked for.
+    File(std::path::PathBuf),
+}
+
+impl Destination {
+    fn parent(&self) -> &Path {
+        match self {
+            Destination::Folder(dir) => dir,
+            // A file with no parent is a bare name in the working directory,
+            // which is somewhere, and `check_destination` can say so.
+            Destination::File(path) => path.parent().unwrap_or(Path::new(".")),
+        }
+    }
+}
+
+/// Which photographs the selection names, and what was decided about each.
+///
+/// Separate from [`write`] because it is the only half that touches the catalog,
+/// and the window holds its library behind a lock that a whole export must not
+/// keep. Reading first and writing from a list is also what makes the export
+/// consistent: photographs cannot be renamed or re-edited out from under it
+/// halfway through.
+pub fn gather(catalog: &Catalog, selection: Selection) -> Result<Vec<Chosen>> {
     let mut chosen = Vec::new();
     for image in cull::sequence(catalog)? {
         let judgement = cull::judgement(catalog, image.id)?;
@@ -96,13 +123,33 @@ pub fn export(
         let state = rawkit_catalog::edits::latest(catalog, image.id)?
             .map(|(_, state)| state)
             .unwrap_or_default();
-        chosen.push((image, state));
+        chosen.push(Chosen { image, state });
     }
     if chosen.is_empty() {
         bail!("nothing in the library matches that selection");
     }
+    Ok(chosen)
+}
 
-    std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
+/// Render and write what [`gather`] chose. Touches no catalog.
+pub fn write(
+    chosen: &[Chosen],
+    to: &Destination,
+    max_dim: u32,
+    overwrite: bool,
+    jobs: usize,
+    mut progress: impl FnMut(usize, usize, &str),
+) -> Result<ExportReport> {
+    if let (Destination::File(path), false) = (to, chosen.len() == 1) {
+        bail!(
+            "{} names one file, and {} photographs were chosen",
+            path.display(),
+            chosen.len()
+        );
+    }
+    if let Destination::Folder(dir) = to {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
 
     let mut report = ExportReport::default();
     let gpu = Gpu::new()?;
@@ -121,16 +168,19 @@ pub fn export(
             let (next, chosen, gpu, renderer) = (&next, &chosen, &gpu, &renderer);
             scope.spawn(move || loop {
                 let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some((image, state)) = chosen.get(index) else {
+                let Some(Chosen { image, state }) = chosen.get(index) else {
                     break;
                 };
-                let destination = to.join(format!(
-                    "{}.jpg",
-                    Path::new(&image.filename)
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| image.filename.clone())
-                ));
+                let destination = match to {
+                    Destination::Folder(dir) => dir.join(format!(
+                        "{}.jpg",
+                        Path::new(&image.filename)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| image.filename.clone())
+                    )),
+                    Destination::File(path) => path.clone(),
+                };
                 let outcome = if destination.exists() && !overwrite {
                     Ok(None)
                 } else {
@@ -152,7 +202,7 @@ pub fn export(
         drop(sender);
 
         for (done, (index, outcome)) in receiver.into_iter().enumerate() {
-            let (image, _) = &chosen[index];
+            let image = &chosen[index].image;
             progress(done, chosen.len(), &image.filename);
             match outcome {
                 Ok(Some(bytes)) => {
@@ -167,6 +217,27 @@ pub fn export(
 
     progress(chosen.len(), chosen.len(), "");
     Ok(report)
+}
+
+/// Gather and write in one call, into a folder. What the command line does.
+pub fn export(
+    catalog: &Catalog,
+    selection: Selection,
+    to: &Path,
+    max_dim: u32,
+    overwrite: bool,
+    jobs: usize,
+    progress: impl FnMut(usize, usize, &str),
+) -> Result<ExportReport> {
+    let chosen = gather(catalog, selection)?;
+    write(
+        &chosen,
+        &Destination::Folder(to.to_path_buf()),
+        max_dim,
+        overwrite,
+        jobs,
+        progress,
+    )
 }
 
 /// Decode, render with the stored edit, and write one file.
@@ -227,7 +298,8 @@ fn one(
 /// Never inside the previews or backups directories: those are rotated and swept
 /// by code that deletes, and a photograph in there would eventually be removed by
 /// something that had every right to.
-pub fn check_destination(catalog: &Catalog, to: &Path) -> Result<()> {
+pub fn check_destination(catalog: &Catalog, to: &Destination) -> Result<()> {
+    let to = to.parent();
     for reserved in [
         rawkit_catalog::previews::directory(catalog),
         catalog.backup_dir(),
@@ -253,6 +325,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn one_name_cannot_hold_a_set() {
+        // Refused rather than resolved. The tempting fix is to number them, but
+        // that invents a naming convention out of a mistake — and it does it
+        // silently, over files the caller believed they had named themselves.
+        //
+        // Checked before any GPU exists, which is also why this runs anywhere.
+        let chosen: Vec<Chosen> = (0..2)
+            .map(|i| Chosen {
+                image: cull::LibraryImage {
+                    id: i,
+                    path: format!("/nowhere/{i}.arw"),
+                    filename: format!("{i}.arw"),
+                },
+                state: EditState::default(),
+            })
+            .collect();
+        let refused = write(
+            &chosen,
+            &Destination::File(std::path::PathBuf::from("/nowhere/one.jpg")),
+            0,
+            false,
+            1,
+            |_, _, _| {},
+        )
+        .expect_err("two photographs asked to become one file");
+        assert!(
+            refused.to_string().contains("names one file"),
+            "refused for the wrong reason: {refused}"
+        );
+    }
+
+    #[test]
     fn a_destination_inside_the_catalogs_own_directories_is_refused() {
         // The rotation and the sweep both delete, and both are entitled to. A
         // photograph written in there would disappear later for a reason nobody
@@ -262,10 +366,16 @@ mod tests {
         let catalog = Catalog::open(&dir.join("lib.rawkit")).unwrap();
 
         let previews = rawkit_catalog::previews::directory(&catalog).unwrap();
-        assert!(check_destination(&catalog, &previews).is_err());
-        assert!(check_destination(&catalog, &previews.join("00")).is_err());
-        assert!(check_destination(&catalog, &catalog.backup_dir().unwrap()).is_err());
-        assert!(check_destination(&catalog, &dir.join("exports")).is_ok());
+        let folder = Destination::Folder;
+        assert!(check_destination(&catalog, &folder(previews.clone())).is_err());
+        assert!(check_destination(&catalog, &folder(previews.join("00"))).is_err());
+        assert!(check_destination(&catalog, &folder(catalog.backup_dir().unwrap())).is_err());
+        assert!(check_destination(&catalog, &folder(dir.join("exports"))).is_ok());
+
+        // A single file is judged by the folder it would land in, so saving one
+        // photograph into the previews directory is refused the same way.
+        assert!(check_destination(&catalog, &Destination::File(previews.join("one.jpg"))).is_err());
+        assert!(check_destination(&catalog, &Destination::File(dir.join("one.jpg"))).is_ok());
 
         drop(catalog);
         let _ = std::fs::remove_dir_all(&dir);

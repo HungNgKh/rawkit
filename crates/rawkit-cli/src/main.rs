@@ -404,7 +404,10 @@ fn main() -> Result<()> {
                 }
             };
             let catalog = rawkit_catalog::db::Catalog::open(&catalog)?;
-            rawkit_deliver::check_destination(&catalog, &to)?;
+            rawkit_deliver::check_destination(
+                &catalog,
+                &rawkit_deliver::Destination::Folder(to.clone()),
+            )?;
 
             let mut last = usize::MAX;
             let report = rawkit_deliver::export(

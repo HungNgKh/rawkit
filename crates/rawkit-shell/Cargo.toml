@@ -18,6 +18,8 @@ rawkit-catalog.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
+tauri-plugin-dialog.workspace = true
+rawkit-deliver.workspace = true
 anyhow.workspace = true
 wgpu.workspace = true
 

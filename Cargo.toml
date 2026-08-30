@@ -83,6 +83,11 @@ jpeg-decoder = "0.3"
 # notes in rawkit-shell.
 tauri = { version = "2", features = ["unstable", "macos-private-api"] }
 tauri-build = "2"
+# The native file picker, for export. A plugin rather than a hand-rolled dialog
+# because "where do these go" is a question the operating system already answers
+# in the way each user expects — and because a picker is the one piece of this
+# application that cannot be tested from Linux alone.
+tauri-plugin-dialog = "2"
 # Linux only, and pinned to the versions Tauri already links so the GTK types
 # are the same types. Used to pack a native widget beside the webview and hang
 # the GPU surface on its own X window — see crates/rawkit-shell/src/canvas.rs.

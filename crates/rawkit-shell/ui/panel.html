@@ -43,19 +43,32 @@
      separate elements rather than one that hides. */
   #bar { display: flex; align-items: center; gap: 18px; padding: 6px 18px;
          border-bottom: 1px solid #2c2c34; font-variant-numeric: tabular-nums; }
-  #cull { display: flex; align-items: baseline; gap: 18px; flex: 1; }
+  /* `min-width: 0` and `nowrap` together are what stop the bar from growing.
+     Without them a long readout squeezes this box, its spans wrap, and the bar
+     becomes ten lines tall — taking the height out of the photograph rather
+     than out of the text nobody was reading. */
+  #cull { display: flex; align-items: baseline; gap: 18px; flex: 1;
+          min-width: 0; white-space: nowrap; }
   #cull.hidden { display: none; }
   /* Pushed right whether or not the culling readout is showing, which is why
      the margin is here and not on the last thing inside `#cull`. */
-  #scope { display: flex; align-items: center; gap: 12px; margin-left: auto; }
+  #scope { display: flex; align-items: center; gap: 12px; margin-left: auto;
+           flex-shrink: 0; }
   #histogram { width: 256px; height: 40px; border-radius: 3px;
                background: #141418; display: block; }
   .clip { font-size: 11px; color: #56565e; }
   .clip.lit#clip-white { color: #e0705f; }
   .clip.lit#clip-black { color: #6f9ade; }
+  #export { color: #9a9aa2; font-size: 12px; margin-left: auto;
+            white-space: nowrap; flex-shrink: 0; }
+  #export.hidden { display: none; }
+  #export.failed { color: #e0705f; }
   #frame { font-weight: 600; }
   #position, #counts, #keys { color: #7d7d87; }
-  #keys { margin-left: auto; font-size: 11px; }
+  /* The first thing to give up space, and it truncates rather than wrapping:
+     hints are the least important thing in the bar. */
+  #keys { margin-left: auto; font-size: 11px;
+          min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   #stars { letter-spacing: 2px; color: #d8bf63; min-width: 62px; }
   #mode { color: #8e8e98; text-transform: uppercase; letter-spacing: .08em; font-size: 11px;
           border: 1px solid #3a3a44; border-radius: 3px; padding: 1px 6px; }
@@ -73,8 +86,9 @@
   <span id="label"></span>
   <span id="counts"></span>
   <span id="mode">loupe</span>
-  <span id="keys">G grid · E loupe · R crop · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · Z undo cull · ⌃Z undo edit</span>
+  <span id="keys">G grid · E loupe · R crop · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · Z undo cull · ⌃Z undo edit · ⌃E export</span>
 </div>
+<span id="export" class="hidden"></span>
 <div id="scope">
   <canvas id="histogram" title="the developed photograph, in the values a file would carry"></canvas>
   <span class="clip" id="clip-white" title="pixels with a channel at full scale">–</span>
@@ -402,12 +416,26 @@
   // Polled faster than the sliders are, and it costs nothing to do so: the
   // command returns nothing at all unless the generation it holds differs from
   // the one already drawn, so an idle editor pays a lock and a comparison.
+  const exportLine = document.getElementById("export");
   let drawn = null;
   setInterval(async () => {
     const data = await invoke("histogram", { seen: drawn });
-    if (!data) return;
-    drawn = data.generation;
-    drawScope(data);
+    if (data) {
+      drawn = data.generation;
+      drawScope(data);
+    }
+
+    // An export runs on its own thread and can outlive several photographs, so
+    // its progress is asked for rather than pushed. It stays on screen when it
+    // finishes: an export that ends by the readout disappearing tells you
+    // nothing about whether it worked.
+    const job = await invoke("export_progress");
+    exportLine.classList.toggle("hidden", !job);
+    if (!job) return;
+    exportLine.classList.toggle("failed", (job.finished ?? "").startsWith("export failed"));
+    exportLine.textContent = job.finished
+      ? job.finished
+      : `exporting ${job.done}/${job.total}` + (job.filename ? ` · ${job.filename}` : "");
   }, 100);
 
   // ---- Culling -------------------------------------------------------------
@@ -529,6 +557,16 @@
       const held = event.key.toLowerCase();
       if (held === "z" || held === "y") {
         send({ command: held === "y" || event.shiftKey ? "redo" : "undo" });
+        event.preventDefault();
+      }
+      // E for export, and shift for the whole cull rather than this one frame.
+      // The picker decides the rest: a name for one photograph, a folder for a
+      // set, so the two cannot be asked for the wrong thing.
+      if (held === "e") {
+        invoke("export", { scope: event.shiftKey ? "picks" : "current" }).catch(e => {
+          log.className = "refused";
+          log.textContent = String(e);
+        });
         event.preventDefault();
       }
       return;
