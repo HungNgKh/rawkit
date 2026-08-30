@@ -135,7 +135,7 @@ pub fn decode_file(path: &Path) -> Result<RawImage, DecodeError> {
             white: colour.maximum.min(u16::MAX as u32) as u16,
         },
         as_shot_neutral: colour.cam_mul,
-        cam_to_xyz: colour.cam_xyz,
+        xyz_to_camera: colour.cam_xyz,
         data: pixels,
     };
     image.validate()?;

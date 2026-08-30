@@ -93,7 +93,7 @@ pub fn render(
             }
             profile
         }
-        None => match rawkit_engine::render::single_illuminant_profile(&raw.cam_to_xyz) {
+        None => match rawkit_engine::render::single_illuminant_profile(&raw.xyz_to_camera) {
             Some(p) => {
                 eprintln!("colour     : decoder camera matrix, single illuminant (no DCP)");
                 p

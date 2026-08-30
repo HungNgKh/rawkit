@@ -80,15 +80,12 @@ impl Loaded {
                 // The decoder's own matrix, treated as a single D65 illuminant.
                 // Defensible and not accurate; a .dcp is what makes it accurate,
                 // and the shell has nowhere to ask for one yet.
-                let profile = if raw.cam_to_xyz.iter().flatten().all(|&v| v == 0.0) {
-                    CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY)
-                } else {
-                    CameraProfile::from_color_matrix([
-                        raw.cam_to_xyz[0],
-                        raw.cam_to_xyz[1],
-                        raw.cam_to_xyz[2],
-                    ])
-                };
+                //
+                // Through the engine rather than rebuilt here. This was the
+                // third place that read the matrix and decided what to do with
+                // an absent one, and a third reading is a third chance to read
+                // it backwards.
+                let profile = rawkit_engine::render::profile_for(&raw);
                 let wb = [
                     raw.as_shot_neutral[0],
                     raw.as_shot_neutral[1],

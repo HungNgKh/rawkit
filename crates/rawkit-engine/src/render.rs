@@ -1726,7 +1726,7 @@ fn gather_padded(
 /// LibRaw pads its matrix to four rows for four-colour sensors; we take the
 /// three that describe an RGB camera.
 pub fn profile_for(raw: &rawkit_decode::RawImage) -> CameraProfile {
-    single_illuminant_profile(&raw.cam_to_xyz)
+    single_illuminant_profile(&raw.xyz_to_camera)
         .unwrap_or_else(|| CameraProfile::from_color_matrix(crate::profile::IDENTITY))
 }
 

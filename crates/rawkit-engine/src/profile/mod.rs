@@ -224,6 +224,13 @@ impl CameraProfile {
     }
 
     /// A single-illuminant profile whose calibration temperature is known.
+    ///
+    /// The temperature is **recorded, not applied**. [`Self::xyz_to_camera`]
+    /// interpolates between calibrations, and with one there is nothing to
+    /// interpolate — so this matrix is used whatever the scene was lit by. That
+    /// is the single-illuminant limitation stated precisely: not that the
+    /// adaptation is approximate, but that there is no adaptation at all. The
+    /// value earns its keep only when a second calibration joins it.
     pub fn from_color_matrix_at(cct: f32, xyz_to_camera: Matrix3) -> Self {
         Self {
             calibrations: vec![Calibration { cct, xyz_to_camera }],

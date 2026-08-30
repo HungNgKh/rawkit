@@ -145,14 +145,26 @@ pub struct RawImage {
     /// As-shot white balance as per-channel multipliers, as the camera recorded
     /// them. `EditState::white_balance` being `None` (as-shot) resolves to this.
     pub as_shot_neutral: [f32; 4],
-    /// Camera native RGB to CIE XYZ, from the decoder's built-in camera table.
+    /// CIE XYZ to camera native RGB, from the decoder's built-in camera table.
+    ///
+    /// **That direction, not the other one.** This is LibRaw's `cam_xyz`, which
+    /// is the DNG `ColorMatrix` convention — XYZ in, camera out — and it is what
+    /// every consumer here passes to `CameraProfile::from_color_matrix`, whose
+    /// parameter is named `xyz_to_camera`.
+    ///
+    /// It was called `cam_to_xyz` until an audit of six real frames noticed the
+    /// name said the opposite of what it held. Nothing rendered wrongly, because
+    /// the only consumers used it correctly; the name was the hazard. The way to
+    /// tell them apart from the numbers alone: a *camera to XYZ* matrix has rows
+    /// summing to the white point, near `[0.95, 1.00, 1.09]`. This one, for an
+    /// ILCE-6400, sums to `[0.420, 1.027, 0.658]`.
     ///
     /// A stopgap, and labelled as one: the real colour path is a DCP profile
     /// with a forward matrix, an HSL look table and a tone curve. This is the
     /// matrix alone, which is enough to see whether an image is right and not
     /// enough to call the result colour-managed. All-zero when the decoder has
     /// no data for the body.
-    pub cam_to_xyz: [[f32; 3]; 4],
+    pub xyz_to_camera: [[f32; 3]; 4],
     pub data: Vec<u16>,
 }
 
@@ -191,7 +203,7 @@ mod tests {
                 white: 16383,
             },
             as_shot_neutral: [2.1, 1.0, 1.5, 1.0],
-            cam_to_xyz: [[0.0; 3]; 4],
+            xyz_to_camera: [[0.0; 3]; 4],
             data: vec![1000; (width * height) as usize],
         }
     }
