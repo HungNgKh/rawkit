@@ -568,6 +568,14 @@ pub struct EditFlags {
     /// Saturation, -1 to 1. Every colour equally.
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     saturation: f32,
+    /// The eight-band hue mixer, as `band:control=value` pairs separated by
+    /// commas — for example `orange:saturation=-0.4,blue:luminance=0.2`.
+    ///
+    /// Bands are red, orange, yellow, green, aqua, blue, purple and magenta;
+    /// controls are hue, saturation and luminance; every value runs -1 to 1. A
+    /// flag per number would be twenty-four flags.
+    #[arg(long)]
+    hsl: Option<String>,
     /// Vibrance, -1 to 1. Moves colours towards the middle of the range:
     /// positive lifts the flat ones, negative calms the vivid ones.
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
@@ -636,9 +644,62 @@ impl EditFlags {
                 saturation: self.saturation,
                 vibrance: self.vibrance,
             },
+            hsl: match self.hsl.as_deref() {
+                Some(text) => parse_hsl(text)?,
+                None => rawkit_editstate::Hsl::default(),
+            },
             ..Default::default()
         })
     }
+}
+
+/// `band:control=value` pairs, comma separated.
+///
+/// Names rather than positions, and parsed rather than clamped: a typo in a
+/// band name is a mistake worth being told about, not one to silently ignore in
+/// a command that then renders something almost right.
+fn parse_hsl(text: &str) -> anyhow::Result<rawkit_editstate::Hsl> {
+    use anyhow::{anyhow, Context};
+    use rawkit_editstate::{Band, BandControl};
+
+    let mut hsl = rawkit_editstate::Hsl::default();
+    for piece in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (target, value) = piece
+            .split_once('=')
+            .ok_or_else(|| anyhow!("`{piece}` is not `band:control=value`"))?;
+        let (band, control) = target
+            .split_once(':')
+            .ok_or_else(|| anyhow!("`{target}` is not `band:control`"))?;
+        let band = match band.trim().to_ascii_lowercase().as_str() {
+            "red" => Band::Red,
+            "orange" => Band::Orange,
+            "yellow" => Band::Yellow,
+            "green" => Band::Green,
+            "aqua" => Band::Aqua,
+            "blue" => Band::Blue,
+            "purple" => Band::Purple,
+            "magenta" => Band::Magenta,
+            other => bail!(
+                "`{other}` is not a band; they are red, orange, yellow, green, aqua, \
+                 blue, purple and magenta"
+            ),
+        };
+        let control = match control.trim().to_ascii_lowercase().as_str() {
+            "hue" => BandControl::Hue,
+            "saturation" | "sat" => BandControl::Saturation,
+            "luminance" | "lum" => BandControl::Luminance,
+            other => bail!("`{other}` is not a control; they are hue, saturation and luminance"),
+        };
+        let value: f32 = value
+            .trim()
+            .parse()
+            .with_context(|| format!("reading a number out of `{value}`"))?;
+        let mut mix = hsl.mix(band);
+        mix.set(control, value);
+        hsl.set(band, mix);
+    }
+    hsl.validate()?;
+    Ok(hsl)
 }
 
 /// `left,top,right,bottom`, each a fraction of the rotated frame.

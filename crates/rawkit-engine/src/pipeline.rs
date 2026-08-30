@@ -71,8 +71,8 @@ pub enum Stage {
     /// Contrast, highlights/shadows, capture sharpening, clarity, dehaze,
     /// texture.
     DisplayReferredOps,
-    /// Saturation and vibrance, and later the tone curve, HSL / colour mixer
-    /// and colour grading.
+    /// Saturation, vibrance and the eight-band hue mixer, and later the tone
+    /// curve and colour grading.
     ColourAdjustments,
     /// LUT / look application. v2's taste layer lands here.
     Look,

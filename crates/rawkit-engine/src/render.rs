@@ -219,8 +219,14 @@ struct Params {
     levels: [f32; 4],
     /// `[sharpen amount, sharpen radius, chroma noise, luminance noise]`.
     detail: [f32; 4],
-    /// `[saturation, vibrance, unused, unused]`.
+    /// `[saturation, vibrance, hue mixer active, unused]`.
     colour: [f32; 4],
+    /// The eight-band mixer, one control per array, two bands to a row: a
+    /// uniform array's stride is a `vec4` whatever it holds, so eight floats
+    /// occupy two of them.
+    hsl_hue: [[f32; 4]; 2],
+    hsl_saturation: [[f32; 4]; 2],
+    hsl_luminance: [[f32; 4]; 2],
     /// `[dest_x, dest_y, tile, halo]`. Rewritten per tile; everything above it
     /// moves only when the edit does, which is why this sits last and is
     /// patched in place rather than re-uploading the whole uniform.
@@ -234,6 +240,22 @@ struct Params {
     /// along the tile's x and y axes lands on the canvas. Identity when the
     /// photograph is not turned. Written with `present`, since both are per-tile.
     axes: [i32; 4],
+}
+
+/// One control across all eight bands, in `Band::ALL` order, laid out the way a
+/// uniform array wants it.
+///
+/// The order is the contract with `band_centre` in the shader, and
+/// `band_centres_match_the_shader` is what holds the two to it.
+fn pack_bands(
+    hsl: &rawkit_editstate::Hsl,
+    pick: impl Fn(rawkit_editstate::BandMix) -> f32,
+) -> [[f32; 4]; 2] {
+    let mut packed = [[0.0f32; 4]; 2];
+    for (i, band) in rawkit_editstate::Band::ALL.into_iter().enumerate() {
+        packed[i / 4][i % 4] = pick(hsl.mix(band));
+    }
+    packed
 }
 
 /// Byte offset of `Params::present`, for the per-tile partial write.
@@ -1149,7 +1171,18 @@ impl Renderer {
                 state.detail.chroma_noise,
                 state.detail.luminance_noise,
             ],
-            colour: [state.colour.saturation, state.colour.vibrance, 0.0, 0.0],
+            colour: [
+                state.colour.saturation,
+                state.colour.vibrance,
+                // A flag rather than a test in the shader: whether twenty-four
+                // numbers are all zero is a question to answer once per edit,
+                // not once per pixel.
+                if state.hsl.is_identity() { 0.0 } else { 1.0 },
+                0.0,
+            ],
+            hsl_hue: pack_bands(&state.hsl, |mix| mix.hue),
+            hsl_saturation: pack_bands(&state.hsl, |mix| mix.saturation),
+            hsl_luminance: pack_bands(&state.hsl, |mix| mix.luminance),
             // Per-tile, and rewritten before every present. The value here only
             // has to be something valid for the whole-image path, which never
             // rotates in the shader — geometry is applied to the finished frame.
@@ -1363,7 +1396,56 @@ impl Canvas {
 /// review (see `docs/licence-policy.md`).
 #[cfg(test)]
 mod half_tests {
-    use super::{f32_to_f16, half_to_f32};
+    use super::{f32_to_f16, half_to_f32, pack_bands};
+
+    #[test]
+    fn band_centres_match_the_shader() {
+        // The band centres exist twice — once as `Band::centre_deg`, once as
+        // `band_centre` in WGSL — and the weights are only a partition of the
+        // hue circle while the two agree. Drift here would not error: it would
+        // send a hue to a slider that is not the one under the pointer.
+        let wgsl = include_str!("../shaders/demosaic_rcd.wgsl");
+        let body = wgsl
+            .split_once("fn band_centre(i: i32) -> f32 {")
+            .expect("the shader has no band_centre")
+            .1
+            // A brace at the start of a line: every `if` inside the body has
+            // braces of its own, and splitting on the first of those found one
+            // centre and called the other seven missing.
+            .split_once("\n}")
+            .expect("band_centre is not closed")
+            .0;
+        let found: Vec<f32> = body
+            .split("return ")
+            .skip(1)
+            .filter_map(|tail| tail.split(';').next()?.trim().parse::<f32>().ok())
+            .collect();
+        let expected: Vec<f32> = rawkit_editstate::Band::ALL
+            .into_iter()
+            .map(|b| b.centre_deg())
+            .collect();
+        assert_eq!(found, expected, "the shader's band centres have drifted");
+
+        // And the shift range, for the same reason.
+        let range = wgsl
+            .lines()
+            .find(|l| l.trim_start().starts_with("const HSL_HUE_RANGE"))
+            .and_then(|l| l.rsplit('=').next())
+            .and_then(|tail| tail.trim().trim_end_matches(';').parse::<f32>().ok())
+            .expect("the shader has no HSL_HUE_RANGE");
+        assert_eq!(range, rawkit_editstate::MAX_HUE_SHIFT_DEG);
+    }
+
+    #[test]
+    fn a_band_is_packed_where_the_shader_looks_for_it() {
+        let mut hsl = rawkit_editstate::Hsl::default();
+        hsl.blue.saturation = 0.5;
+        let packed = pack_bands(&hsl, |mix| mix.saturation);
+        // Blue is the sixth band, so index 5: second row, second column.
+        assert_eq!(packed[1][1], 0.5);
+        assert_eq!(packed[0], [0.0; 4]);
+        assert_eq!(packed[1], [0.0, 0.5, 0.0, 0.0]);
+    }
 
     #[test]
     fn every_half_survives_a_round_trip() {

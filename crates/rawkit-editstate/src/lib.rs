@@ -51,6 +51,8 @@ pub enum EditStateError {
     InvalidDetail(String),
     #[error("colour is out of range: {0}")]
     InvalidColour(String),
+    #[error("hue mixer is out of range: {0}")]
+    InvalidHsl(String),
 }
 
 /// How the image should be rendered. `Default` is the identity edit: the photo
@@ -72,6 +74,8 @@ pub struct EditState {
     pub detail: Detail,
     #[serde(default)]
     pub colour: Colour,
+    #[serde(default)]
+    pub hsl: Hsl,
 }
 
 fn default_schema_version() -> u32 {
@@ -88,6 +92,7 @@ impl Default for EditState {
             crop: Crop::default(),
             detail: Detail::default(),
             colour: Colour::default(),
+            hsl: Hsl::default(),
         }
     }
 }
@@ -122,6 +127,7 @@ impl EditState {
         self.crop.validate()?;
         self.detail.validate()?;
         self.colour.validate()?;
+        self.hsl.validate()?;
         Ok(())
     }
 
@@ -428,6 +434,183 @@ impl Detail {
                 "luminance noise reduction is {}, and runs from 0 to 1",
                 self.luminance_noise
             )));
+        }
+        Ok(())
+    }
+}
+
+/// One of the eight hue bands the mixer divides the colour circle into.
+///
+/// Eight, at these centres, because that is the division every photographer
+/// already has in their hands — the same set and the same names Lightroom uses,
+/// so a person arriving with an idea of what "orange" means finds it here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Band {
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Aqua,
+    Blue,
+    Purple,
+    Magenta,
+}
+
+impl Band {
+    /// In the order they appear on the hue circle, which is also the order the
+    /// weights in the shader are indexed by. The two must agree, and
+    /// `the_bands_partition_the_hue_circle` is what notices if they stop.
+    pub const ALL: [Band; 8] = [
+        Band::Red,
+        Band::Orange,
+        Band::Yellow,
+        Band::Green,
+        Band::Aqua,
+        Band::Blue,
+        Band::Purple,
+        Band::Magenta,
+    ];
+
+    /// Where this band sits on the hue circle, in degrees.
+    ///
+    /// Unevenly spaced on purpose: there is far more of the spectrum a person
+    /// calls "green" than there is "orange", and evenly spaced centres would
+    /// give the greens one control between them and the warm tones three.
+    pub fn centre_deg(self) -> f32 {
+        match self {
+            Band::Red => 0.0,
+            Band::Orange => 30.0,
+            Band::Yellow => 60.0,
+            Band::Green => 120.0,
+            Band::Aqua => 180.0,
+            Band::Blue => 240.0,
+            Band::Purple => 280.0,
+            Band::Magenta => 320.0,
+        }
+    }
+
+    pub fn index(self) -> usize {
+        Band::ALL.iter().position(|b| *b == self).unwrap_or(0)
+    }
+}
+
+/// Which of a band's three numbers a command means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BandControl {
+    Hue,
+    Saturation,
+    Luminance,
+}
+
+/// The largest hue shift a band can be given, in degrees.
+///
+/// Thirty is a band's own width in the warm end of the circle, so at full
+/// deflection a colour lands on its neighbour's centre and no further. Enough to
+/// move a sky from cyan to blue; short of the range where a hue slider becomes a
+/// way to make a photograph of something else.
+pub const MAX_HUE_SHIFT_DEG: f32 = 30.0;
+
+/// What one band's colours are asked to do. All three are -1 to 1, and zero
+/// everywhere is the identity.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BandMix {
+    /// Rotation around the hue circle, scaled by [`MAX_HUE_SHIFT_DEG`].
+    pub hue: f32,
+    /// Distance from grey, scaled by `1 + saturation`. The same measure the
+    /// global saturation control uses, so the two compose predictably.
+    pub saturation: f32,
+    /// Brightness, scaled by `1 + luminance`, which leaves hue and saturation
+    /// exactly where they were.
+    pub luminance: f32,
+}
+
+impl BandMix {
+    pub fn get(&self, control: BandControl) -> f32 {
+        match control {
+            BandControl::Hue => self.hue,
+            BandControl::Saturation => self.saturation,
+            BandControl::Luminance => self.luminance,
+        }
+    }
+
+    pub fn set(&mut self, control: BandControl, value: f32) {
+        match control {
+            BandControl::Hue => self.hue = value,
+            BandControl::Saturation => self.saturation = value,
+            BandControl::Luminance => self.luminance = value,
+        }
+    }
+}
+
+/// The eight-band hue mixer.
+///
+/// Named fields rather than an array, for the same reason [`crate::Tone`] has
+/// them: a stored edit should be readable, and `{"orange":{"saturation":-0.4}}`
+/// says what was decided in a way `[[0,0,0],[0,-0.4,0]]` does not.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Hsl {
+    pub red: BandMix,
+    pub orange: BandMix,
+    pub yellow: BandMix,
+    pub green: BandMix,
+    pub aqua: BandMix,
+    pub blue: BandMix,
+    pub purple: BandMix,
+    pub magenta: BandMix,
+}
+
+impl Hsl {
+    pub fn mix(&self, band: Band) -> BandMix {
+        match band {
+            Band::Red => self.red,
+            Band::Orange => self.orange,
+            Band::Yellow => self.yellow,
+            Band::Green => self.green,
+            Band::Aqua => self.aqua,
+            Band::Blue => self.blue,
+            Band::Purple => self.purple,
+            Band::Magenta => self.magenta,
+        }
+    }
+
+    pub fn set(&mut self, band: Band, mix: BandMix) {
+        let slot = match band {
+            Band::Red => &mut self.red,
+            Band::Orange => &mut self.orange,
+            Band::Yellow => &mut self.yellow,
+            Band::Green => &mut self.green,
+            Band::Aqua => &mut self.aqua,
+            Band::Blue => &mut self.blue,
+            Band::Purple => &mut self.purple,
+            Band::Magenta => &mut self.magenta,
+        };
+        *slot = mix;
+    }
+
+    /// Whether every band is at zero, which lets the renderer skip the stage
+    /// rather than multiply by one twenty-four times a pixel.
+    pub fn is_identity(&self) -> bool {
+        *self == Hsl::default()
+    }
+
+    pub fn validate(&self) -> Result<(), EditStateError> {
+        for band in Band::ALL {
+            let mix = self.mix(band);
+            for (name, value) in [
+                ("hue", mix.hue),
+                ("saturation", mix.saturation),
+                ("luminance", mix.luminance),
+            ] {
+                if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
+                    return Err(EditStateError::InvalidHsl(format!(
+                        "{band:?} {name} is {value}, and runs from -1 to 1"
+                    )));
+                }
+            }
         }
         Ok(())
     }

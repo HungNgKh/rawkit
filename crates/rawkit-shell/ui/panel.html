@@ -74,6 +74,11 @@
   #histogram { width: 328px; height: 84px; border-radius: 3px;
                background: #141418; display: block; }
   #readout { display: flex; align-items: baseline; gap: 14px; margin-top: 7px; }
+  /* A swatch beside each band's name. The mixer is the one panel where the
+     control's *colour* is the thing being named, and eight words in a column
+     are much slower to scan than eight colours. */
+  .swatch { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+            margin-right: 7px; vertical-align: baseline; }
   .clip { font-size: 11px; color: #56565e; }
   .clip.lit#clip-white { color: #e0705f; }
   .clip.lit#clip-black { color: #6f9ade; }
@@ -220,6 +225,61 @@
   const invoke = window.__TAURI__.core.invoke;
   const log = document.getElementById("log");
 
+  // ---- The hue mixer's twenty-four controls --------------------------------
+  //
+  // Built rather than written out. Twenty-four near-identical blocks of markup
+  // is twenty-four chances to mistype a band name into the wrong group, and the
+  // list below says the same thing in eight lines that a reader can check
+  // against `Band::ALL` at a glance.
+  //
+  // Grouped by control rather than by band — all eight hues, then all eight
+  // saturations — because that is how the adjustment is actually made: the
+  // question is usually "which of these colours is too saturated", not "what
+  // shall I do to orange".
+  const BANDS = [
+    ["red", "Red", "#c8384a"],
+    ["orange", "Orange", "#c8813a"],
+    ["yellow", "Yellow", "#c2bb3d"],
+    ["green", "Green", "#4aa84a"],
+    ["aqua", "Aqua", "#3fb3b8"],
+    ["blue", "Blue", "#4a72c8"],
+    ["purple", "Purple", "#8a5ac8"],
+    ["magenta", "Magenta", "#c04a9e"],
+  ];
+  const HSL_CONTROLS = [
+    ["hue", "Hue"],
+    ["saturation", "Saturation"],
+    ["luminance", "Luminance"],
+  ];
+
+  // Reversed, because each is inserted directly after Colour: the last one
+  // inserted ends up first.
+  for (const [control, controlName] of [...HSL_CONTROLS].reverse()) {
+    const section = document.createElement("details");
+    section.id = `s-hsl-${control}`;
+    const summary = document.createElement("summary");
+    summary.textContent = `HSL · ${controlName}`;
+    section.append(summary);
+    for (const [band, bandName, colour] of BANDS) {
+      const label = document.createElement("label");
+      const name = document.createElement("span");
+      const swatch = document.createElement("i");
+      swatch.className = "swatch";
+      swatch.style.background = colour;
+      name.append(swatch, document.createTextNode(bandName));
+      const input = document.createElement("input");
+      Object.assign(input, { id: `hsl-${band}-${control}`, type: "range" });
+      Object.assign(input, { min: -1, max: 1, step: 0.01, value: 0 });
+      const readout = document.createElement("output");
+      readout.id = `${input.id}-value`;
+      readout.textContent = "0.00";
+      label.append(name, input, readout);
+      section.append(label);
+    }
+    // After Colour, which is what these refine.
+    document.getElementById("s-colour").after(section);
+  }
+
   let scale = 1;
 
   async function send(command) {
@@ -260,6 +320,15 @@
   slider("luminance_noise", v => ({ command: "set_luminance_noise", params: v }), v => v.toFixed(2));
   slider("saturation", v => ({ command: "set_saturation", params: v }), v => v.toFixed(2));
   slider("vibrance", v => ({ command: "set_vibrance", params: v }), v => v.toFixed(2));
+  for (const [band] of BANDS) {
+    for (const [control] of HSL_CONTROLS) {
+      slider(
+        `hsl-${band}-${control}`,
+        value => ({ command: "set_hsl", params: { band, control, value } }),
+        v => v.toFixed(2),
+      );
+    }
+  }
 
   for (const button of document.querySelectorAll("[data-rotate]")) {
     button.addEventListener("click", () =>
@@ -320,7 +389,8 @@
   // halves of one control disagreeing, which is worse than either being wrong.
   let dragging = null;
   const TONE = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"];
-  for (const id of [...TONE, "straighten", "sharpen", "sharpen_radius", "chroma_noise", "luminance_noise", "saturation", "vibrance", "temperature", "tint"]) {
+  for (const id of [...TONE, "straighten", "sharpen", "sharpen_radius", "chroma_noise", "luminance_noise", "saturation", "vibrance", "temperature", "tint",
+    ...BANDS.flatMap(([band]) => HSL_CONTROLS.map(([control]) => `hsl-${band}-${control}`))]) {
     document.getElementById(id).addEventListener("pointerdown", () => (dragging = id));
   }
   document.addEventListener("pointerup", () => (dragging = null));
@@ -342,6 +412,11 @@
     setSlider("luminance_noise", state.detail.luminance_noise, v => Number(v).toFixed(2));
     setSlider("saturation", state.colour.saturation, v => Number(v).toFixed(2));
     setSlider("vibrance", state.colour.vibrance, v => Number(v).toFixed(2));
+    for (const [band] of BANDS) {
+      for (const [control] of HSL_CONTROLS) {
+        setSlider(`hsl-${band}-${control}`, state.hsl[band][control], v => Number(v).toFixed(2));
+      }
+    }
     setSlider("tint", state.white_balance.tint, v => `${v | 0}`);
     const temp = state.white_balance.temperature_k;
     setSlider("temperature", temp ?? 5500, () => (temp === null ? "as shot" : `${temp | 0} K`));

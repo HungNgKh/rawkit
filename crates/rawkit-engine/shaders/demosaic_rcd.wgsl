@@ -76,8 +76,17 @@ struct Params {
     // `.x` is the sharpening amount, `.y` its radius in pixels, `.z` the chroma
     // noise reduction. `.w` unused.
     detail: vec4<f32>,
-    // `.x` is saturation and `.y` vibrance. `.zw` unused.
+    // `.x` is saturation, `.y` vibrance, `.z` whether the hue mixer does
+    // anything at all. `.w` unused.
     colour: vec4<f32>,
+    // Per-band hue shift, saturation and luminance: eight bands each, packed
+    // two to a row because a uniform array's stride is a `vec4` whatever is in
+    // it. Ordered exactly as `Params` in render.rs — the two are one memory
+    // layout described twice, and the colour tests are what noticed when they
+    // disagreed.
+    hsl_hue: array<vec4<f32>, 2>,
+    hsl_saturation: array<vec4<f32>, 2>,
+    hsl_luminance: array<vec4<f32>, 2>,
     // Where this tile lands in the canvas and how to trim it: `.xy` is the
     // destination pixel, `.z` the tile edge, `.w` the halo width. Rewritten per
     // tile, unlike everything above it, which moves only when the edit does.
@@ -534,7 +543,7 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
     // the tone curve is after the tone map: this is about the picture, not the
     // light. In scene-linear it would depend on exposure, and a colour that
     // changed when you brightened the frame is not a colour control.
-    rgba_out[p] = vec4<f32>(saturate_colour(shaped), 1.0);
+    rgba_out[p] = vec4<f32>(mix_bands(saturate_colour(shaped)), 1.0);
 }
 
 /// Saturation and vibrance.
@@ -566,6 +575,105 @@ fn saturate_colour(rgb: vec3<f32>) -> vec3<f32> {
     let weight = select(clamp(already, 0.0, 1.0), 1.0 - clamp(already, 0.0, 1.0), vibrance > 0.0);
     let scale = (1.0 + saturation) * (1.0 + vibrance * weight);
     return vec3<f32>(grey) + (rgb - vec3<f32>(grey)) * max(scale, 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// The eight-band hue mixer.
+//
+// A per-band hue shift, saturation and luminance, applied after the global
+// saturation and in the same display-referred light — the same reasoning: these
+// are decisions about the picture, and a colour that changed when the exposure
+// moved would not be a colour control.
+//
+// # The bands blend, and they blend exactly
+//
+// A pixel does not belong to a band; it lies *between* two of them. The
+// adjustment it receives is the linear blend of the two centres that bracket
+// its hue, which makes the weights sum to one everywhere by construction rather
+// than by tuning. That matters twice over: hue boundaries cannot band, and
+// setting all eight bands to the same value is exactly the global control at
+// that value — which is what `the_bands_partition_the_hue_circle` checks, by
+// comparing against a control this project already trusts.
+//
+// Falloff curves are the other way to do this and are the reason so many mixers
+// have seams: two Gaussians do not sum to one, so a hue halfway between their
+// centres receives less than either neighbour asked for.
+//
+// # The band comes from the colour that arrived
+//
+// Not from the colour that leaves. Shifting orange towards red does not hand it
+// over to the red slider — the pixel is still the orange you were adjusting, and
+// a control that changed which control owned it would be impossible to aim.
+// ---------------------------------------------------------------------------
+
+/// Band centres in degrees, matching `Band::centre_deg` in `rawkit-editstate`.
+/// The two are checked against each other by `band_centres_match_the_shader`.
+fn band_centre(i: i32) -> f32 {
+    if (i == 0) { return 0.0; }
+    if (i == 1) { return 30.0; }
+    if (i == 2) { return 60.0; }
+    if (i == 3) { return 120.0; }
+    if (i == 4) { return 180.0; }
+    if (i == 5) { return 240.0; }
+    if (i == 6) { return 280.0; }
+    return 320.0;
+}
+
+/// The largest hue shift a band can ask for. `MAX_HUE_SHIFT_DEG` in Rust.
+const HSL_HUE_RANGE: f32 = 30.0;
+
+fn band_mix(i: i32) -> vec3<f32> {
+    let row = i / 4;
+    let col = i % 4;
+    return vec3<f32>(
+        params.hsl_hue[row][col],
+        params.hsl_saturation[row][col],
+        params.hsl_luminance[row][col],
+    );
+}
+
+/// The two bands bracketing this hue, and how far between them it lies.
+fn band_span(hue: f32) -> vec3<f32> {
+    for (var i = 0; i < 8; i = i + 1) {
+        let lower = band_centre(i);
+        // Red again, a turn later: the last span closes the circle.
+        // (`from` and `to` are both reserved words in WGSL.)
+        let upper = select(band_centre(i + 1), 360.0, i == 7);
+        if (hue >= lower && hue < upper) {
+            return vec3<f32>(f32(i), f32((i + 1) % 8), (hue - lower) / (upper - lower));
+        }
+    }
+    // Unreachable for a hue in [0, 360), which is all `rgb_to_hsv` produces.
+    return vec3<f32>(0.0, 1.0, 0.0);
+}
+
+fn mix_bands(rgb: vec3<f32>) -> vec3<f32> {
+    // Set when any band is non-zero, so an untouched photograph does not pay
+    // for twenty-four multiplications by one.
+    if (params.colour.z < 0.5) {
+        return rgb;
+    }
+    let hsv = rgb_to_hsv(rgb);
+    // A grey has no hue to place, and `rgb_to_hsv` reports 0 for it — which
+    // would hand every neutral pixel to the red band.
+    if (hsv.y <= 0.0) {
+        return rgb;
+    }
+
+    let span = band_span(hsv.x);
+    let adjust = mix(band_mix(i32(span.x)), band_mix(i32(span.y)), span.z);
+
+    var hue = hsv.x + adjust.x * HSL_HUE_RANGE;
+    hue = hue - floor(hue / 360.0) * 360.0;
+    var out = hsv_to_rgb(vec3<f32>(hue, hsv.y, hsv.z));
+
+    // Distance from grey, on the same Rec. 709 measure `saturate_colour` uses,
+    // so a band and the global control compose the way a reader would expect.
+    let grey = dot(out, vec3<f32>(0.2126, 0.7152, 0.0722));
+    out = vec3<f32>(grey) + (out - vec3<f32>(grey)) * max(1.0 + adjust.y, 0.0);
+
+    // Scaling the triple leaves hue and saturation exactly where they were.
+    return out * max(1.0 + adjust.z, 0.0);
 }
 
 /// Mid-grey in the perceptual coordinate: `0.18^(1/2.2)`.

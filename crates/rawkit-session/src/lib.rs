@@ -124,6 +124,14 @@ pub enum Command {
     /// Every colour equally, and the one that spares the vivid ones.
     SetSaturation(f32),
     SetVibrance(f32),
+    /// One number of the eight-band hue mixer. A single command rather than
+    /// twenty-four, because the band and the control are data — but see
+    /// [`Command::coalesce_slot`] for what that costs the undo history.
+    SetHsl {
+        band: rawkit_editstate::Band,
+        control: rawkit_editstate::BandControl,
+        value: f32,
+    },
     /// Level a horizon, in degrees clockwise. Refused past the straighten range.
     SetStraighten(f32),
     /// Turn by this many quarter-turns clockwise, from wherever it is now.
@@ -188,6 +196,7 @@ impl Command {
             Command::SetLuminanceNoise(_) => "set_luminance_noise",
             Command::SetSaturation(_) => "set_saturation",
             Command::SetVibrance(_) => "set_vibrance",
+            Command::SetHsl { .. } => "set_hsl",
             Command::SetStraighten(_) => "set_straighten",
             Command::RotateBy(_) => "rotate_by",
             Command::SetEditState(_) => "set_edit_state",
@@ -213,6 +222,27 @@ impl Command {
     ///
     /// Matched exhaustively on purpose. A command added later should have to
     /// state which kind it is rather than inherit an answer from a wildcard.
+    /// Which control of its kind this is, for commands where the name alone
+    /// does not say.
+    ///
+    /// Every mixer command is called `set_hsl`, so a history keyed on the name
+    /// would fold a drag on red's saturation and a drag on blue's into a single
+    /// undo step — one press taking back two decisions about different colours.
+    /// The slot separates them, and `two_bands_are_two_steps` is what holds it.
+    fn coalesce_slot(&self) -> u8 {
+        match self {
+            Command::SetHsl { band, control, .. } => {
+                let control = match control {
+                    rawkit_editstate::BandControl::Hue => 0,
+                    rawkit_editstate::BandControl::Saturation => 1,
+                    rawkit_editstate::BandControl::Luminance => 2,
+                };
+                (band.index() as u8) * 3 + control
+            }
+            _ => 0,
+        }
+    }
+
     fn coalesces(&self) -> bool {
         match self {
             Command::SetExposure(_)
@@ -229,6 +259,7 @@ impl Command {
             | Command::SetLuminanceNoise(_)
             | Command::SetSaturation(_)
             | Command::SetVibrance(_)
+            | Command::SetHsl { .. }
             | Command::SetStraighten(_) => true,
 
             Command::SetOrientation(_)
@@ -385,10 +416,13 @@ pub struct Session {
     /// because redoing onto a history that has since branched would replay a
     /// decision the user has already replaced.
     future: Vec<EditState>,
-    /// The command that opened the step now on top of `past`, so a run of the
-    /// same control collapses into it. `None` means the next edit starts a new
-    /// step whatever it is.
-    step: Option<&'static str>,
+    /// The control that opened the step now on top of `past`, so a run of the
+    /// same one collapses into it. `None` means the next edit starts a new step
+    /// whatever it is.
+    ///
+    /// A name *and* a slot: twenty-four mixer controls share one command name,
+    /// and keying on the name alone would make two colours one decision.
+    step: Option<(&'static str, u8)>,
     /// Tile → the edit generation it was last rendered at. A tile is fresh when
     /// that equals `generation`.
     ///
@@ -486,6 +520,7 @@ impl Session {
     pub fn apply(&mut self, command: Command) -> Event {
         let name = command.name();
         let coalesces = command.coalesces();
+        let slot = command.coalesce_slot();
         // Undo and redo move *through* the history and must not be written into
         // it, or stepping back would leave a step whose only content is that you
         // stepped back.
@@ -502,7 +537,7 @@ impl Session {
         // recording one would put a point in the history that undo could return
         // to without anything visibly happening.
         if records && matches!(event, Event::EditChanged { .. }) {
-            self.record(name, before, coalesces);
+            self.record((name, slot), before, coalesces);
         }
         event
     }
@@ -599,6 +634,22 @@ impl Session {
                 let mut colour = self.state.colour;
                 colour.vibrance = v;
                 self.colour(name, colour)
+            }
+
+            Command::SetHsl {
+                band,
+                control,
+                value,
+            } => {
+                let mut hsl = self.state.hsl;
+                let mut mix = hsl.mix(band);
+                mix.set(control, value);
+                hsl.set(band, mix);
+                if let Err(e) = hsl.validate() {
+                    return refused(name, e.to_string());
+                }
+                self.state.hsl = hsl;
+                self.edit_changed()
             }
 
             Command::SetStraighten(degrees) => {
@@ -815,10 +866,10 @@ impl Session {
     }
 
     /// Put `before` on the history, unless the same control is still moving.
-    fn record(&mut self, name: &'static str, before: EditState, coalesces: bool) {
+    fn record(&mut self, control: (&'static str, u8), before: EditState, coalesces: bool) {
         // Any fresh edit branches away from whatever undo had taken back.
         self.future.clear();
-        if coalesces && self.step == Some(name) {
+        if coalesces && self.step == Some(control) {
             return;
         }
         if self.past.len() == MAX_STEPS {
@@ -827,7 +878,7 @@ impl Session {
         self.past.push_back(before);
         // A discrete command leaves no step open, so whatever comes next starts
         // its own — two rotates are two steps even though the name is the same.
-        self.step = coalesces.then_some(name);
+        self.step = coalesces.then_some(control);
     }
 
     fn step_back(&mut self) -> Event {
@@ -982,6 +1033,77 @@ mod tests {
             matches!(s.apply(Command::Undo), Event::Refused { .. }),
             "the drag left more than one step behind"
         );
+    }
+
+    #[test]
+    fn two_bands_are_two_steps() {
+        // Every mixer command is called `set_hsl`, so a history keyed on the
+        // name alone would fold a drag on one colour and a drag on another into
+        // one step — and one press of undo would take back a decision about a
+        // colour the user was not looking at.
+        use rawkit_editstate::{Band, BandControl};
+        let mut s = session();
+        for value in [0.1, 0.2, 0.3] {
+            s.apply(Command::SetHsl {
+                band: Band::Red,
+                control: BandControl::Saturation,
+                value,
+            });
+        }
+        s.apply(Command::SetHsl {
+            band: Band::Blue,
+            control: BandControl::Saturation,
+            value: 0.5,
+        });
+
+        s.apply(Command::Undo);
+        assert_eq!(s.state().hsl.blue.saturation, 0.0);
+        assert_eq!(s.state().hsl.red.saturation, 0.3, "red went back with blue");
+
+        s.apply(Command::Undo);
+        assert_eq!(s.state().hsl.red.saturation, 0.0);
+        assert!(
+            matches!(s.apply(Command::Undo), Event::Refused { .. }),
+            "the run of three on red left more than one step"
+        );
+    }
+
+    #[test]
+    fn two_controls_on_one_band_are_two_steps() {
+        // The other half of the same rule: same band, different slider.
+        use rawkit_editstate::{Band, BandControl};
+        let mut s = session();
+        s.apply(Command::SetHsl {
+            band: Band::Green,
+            control: BandControl::Hue,
+            value: 0.4,
+        });
+        s.apply(Command::SetHsl {
+            band: Band::Green,
+            control: BandControl::Luminance,
+            value: -0.2,
+        });
+
+        s.apply(Command::Undo);
+        assert_eq!(s.state().hsl.green.luminance, 0.0);
+        assert_eq!(s.state().hsl.green.hue, 0.4);
+    }
+
+    #[test]
+    fn a_mixer_value_out_of_range_is_refused_and_changes_nothing() {
+        use rawkit_editstate::{Band, BandControl};
+        let mut s = session();
+        let generation = s.generation();
+        assert!(matches!(
+            s.apply(Command::SetHsl {
+                band: Band::Aqua,
+                control: BandControl::Saturation,
+                value: 4.0,
+            }),
+            Event::Refused { .. }
+        ));
+        assert_eq!(s.state().hsl, rawkit_editstate::Hsl::default());
+        assert_eq!(s.generation(), generation);
     }
 
     #[test]
