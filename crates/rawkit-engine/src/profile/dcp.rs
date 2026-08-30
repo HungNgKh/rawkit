@@ -74,11 +74,25 @@ mod tag {
     /// light reads a different slice for almost every pixel.
     pub const PROFILE_LOOK_TABLE_ENCODING: u16 = 51108;
 
-    // Still read by no one, and still deliberately. The tone curve would have
-    // to displace ours rather than compose with it, and that is a larger
-    // decision than reading a tag.
+    // Still read by no one, and now for a measured reason rather than only a
+    // principled one.
+    //
+    // These two are one chain with Adobe's own rendering, and half of it is
+    // worse than none. `BaselineExposureOffset` was implemented and reverted:
+    // applying its -0.35 EV to a Camera Matching profile moved every frame
+    // *further* from the camera's own JPEG, in lightness as well as colour —
+    // |ΔL*| 21.0 to 24.9, 22.5 to 26.6, 22.1 to 26.7 across three frames, with
+    // the chromaticity gap worsening alongside. Our tone map is not Adobe's, so
+    // darkening to suit their curve without having their curve simply lands
+    // between the two.
+    //
+    // Adopting the curve is the other half, and it is a product decision rather
+    // than a parse: it would have to displace our tone map, which every tone
+    // control is built on.
     #[allow(dead_code)]
     pub const PROFILE_TONE_CURVE: u16 = 50940;
+    #[allow(dead_code)]
+    pub const BASELINE_EXPOSURE_OFFSET: u16 = 51109;
 }
 
 /// Parse a `.dcp` file.
