@@ -63,6 +63,16 @@ fn uniform_map(hue: u32, sat: u32, value: u32, delta: [f32; 3]) -> HueSatMap {
 /// which demosaics back to that colour exactly — isolating the develop stage
 /// from the interpolation.
 fn render_colour(gpu: &Gpu, profile: &CameraProfile, camera_rgb: [f32; 3]) -> [f32; 3] {
+    render_with(gpu, profile, camera_rgb, &EditState::default())
+}
+
+/// The same, with an edit of the caller's choosing.
+fn render_with(
+    gpu: &Gpu,
+    profile: &CameraProfile,
+    camera_rgb: [f32; 3],
+    state: &EditState,
+) -> [f32; 3] {
     let mut cfa = Vec::with_capacity((N * N) as usize);
     for y in 0..N {
         for x in 0..N {
@@ -88,7 +98,7 @@ fn render_colour(gpu: &Gpu, profile: &CameraProfile, camera_rgb: [f32; 3]) -> [f
                 clip_level: 1.0,
                 profile: profile.clone(),
             },
-            &EditState::default(),
+            state,
             Output::Display,
         )
         .expect("render failed")
@@ -103,6 +113,55 @@ fn profile_with_look(look: HueSatMap) -> CameraProfile {
     let mut profile = profile_with(None);
     profile.set_look_table(look);
     profile
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_hand_drawn_curve_shapes_what_the_tone_map_left() {
+    // The user's curve is the last of the tone controls and runs on the
+    // rendered picture, so a curve that flattens everything to one value must
+    // flatten the output — whatever the scene was.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let flat = EditState {
+        curve: rawkit_editstate::Curve {
+            points: vec![[0.0, 0.5], [1.0, 0.5]],
+        },
+        ..EditState::default()
+    };
+    let dark = render_with(&gpu, &profile_with(None), [0.05, 0.04, 0.03], &flat);
+    let bright = render_with(&gpu, &profile_with(None), [0.80, 0.70, 0.60], &flat);
+    for c in 0..3 {
+        assert!(
+            (dark[c] - bright[c]).abs() < 3e-3,
+            "channel {c} still varies with the scene: {} against {}",
+            dark[c],
+            bright[c]
+        );
+    }
+
+    // And a curve that lifts the middle renders brighter than one that does not,
+    // so the curve is read rather than merely accepted.
+    let lifted = EditState {
+        curve: rawkit_editstate::Curve {
+            points: vec![[0.0, 0.0], [0.4, 0.75], [1.0, 1.0]],
+        },
+        ..EditState::default()
+    };
+    let colour = [0.30, 0.28, 0.26];
+    let plain = render_with(&gpu, &profile_with(None), colour, &EditState::default());
+    let raised = render_with(&gpu, &profile_with(None), colour, &lifted);
+    let luma = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    println!(
+        "hand-drawn curve: {:.4} -> {:.4}",
+        luma(plain),
+        luma(raised)
+    );
+    assert!(
+        luma(raised) > luma(plain) * 1.5,
+        "the curve did not lift: {:.4} against {:.4}",
+        luma(raised),
+        luma(plain)
+    );
 }
 
 #[test]

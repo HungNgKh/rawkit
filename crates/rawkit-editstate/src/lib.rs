@@ -53,6 +53,8 @@ pub enum EditStateError {
     InvalidColour(String),
     #[error("hue mixer is out of range: {0}")]
     InvalidHsl(String),
+    #[error("tone curve is not usable: {0}")]
+    InvalidCurve(String),
 }
 
 /// How the image should be rendered. `Default` is the identity edit: the photo
@@ -76,6 +78,8 @@ pub struct EditState {
     pub colour: Colour,
     #[serde(default)]
     pub hsl: Hsl,
+    #[serde(default)]
+    pub curve: Curve,
 }
 
 fn default_schema_version() -> u32 {
@@ -93,6 +97,7 @@ impl Default for EditState {
             detail: Detail::default(),
             colour: Colour::default(),
             hsl: Hsl::default(),
+            curve: Curve::default(),
         }
     }
 }
@@ -128,6 +133,7 @@ impl EditState {
         self.detail.validate()?;
         self.colour.validate()?;
         self.hsl.validate()?;
+        self.curve.validate()?;
         Ok(())
     }
 
@@ -611,6 +617,87 @@ impl Hsl {
                     )));
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+/// The most control points a curve may carry.
+///
+/// A bound rather than a preference: the resampled curve rides in a GPU buffer
+/// sized when the photograph is opened, and an unbounded list would be an
+/// unbounded allocation driven by how many times somebody clicked. Sixteen is
+/// past the point where a tone curve is a curve rather than a drawing.
+pub const MAX_CURVE_POINTS: usize = 16;
+
+/// The user's tone curve: a hand-shaped mapping from what the tone map produced
+/// to what should be shown.
+///
+/// **Composite only** — one curve acting on all three channels together, so
+/// shaping tone cannot shift colour. Per-channel curves are the same widget with
+/// a channel selector and are not here yet.
+///
+/// Stored as control points rather than as a sampled curve, because the points
+/// are what a person edited and a resampling is a derived thing. Interpolation
+/// is the renderer's business; see `rawkit_engine::tone`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Curve {
+    /// `[input, output]` pairs in `0..=1`, ordered by input.
+    pub points: Vec<[f32; 2]>,
+}
+
+impl Default for Curve {
+    fn default() -> Self {
+        // The identity, written out rather than left empty: a curve editor needs
+        // two ends to drag, and "no points" and "a straight line" would be two
+        // representations of one thing.
+        Self {
+            points: vec![[0.0, 0.0], [1.0, 1.0]],
+        }
+    }
+}
+
+impl Curve {
+    /// Whether this curve changes anything, so the renderer can skip it.
+    pub fn is_identity(&self) -> bool {
+        *self == Curve::default()
+    }
+
+    /// Refused rather than repaired. A curve whose inputs do not increase has no
+    /// single answer at the repeated input, and quietly sorting somebody's
+    /// points would move a control they were dragging.
+    pub fn validate(&self) -> Result<(), EditStateError> {
+        if self.points.len() < 2 {
+            return Err(EditStateError::InvalidCurve(format!(
+                "a curve needs at least two points, and this has {}",
+                self.points.len()
+            )));
+        }
+        if self.points.len() > MAX_CURVE_POINTS {
+            return Err(EditStateError::InvalidCurve(format!(
+                "{} points, and the most a curve may carry is {MAX_CURVE_POINTS}",
+                self.points.len()
+            )));
+        }
+        let mut previous = f32::NEG_INFINITY;
+        for [x, y] in &self.points {
+            if !x.is_finite() || !y.is_finite() {
+                return Err(EditStateError::InvalidCurve(
+                    "a point is not a finite number".into(),
+                ));
+            }
+            if !(0.0..=1.0).contains(x) || !(0.0..=1.0).contains(y) {
+                return Err(EditStateError::InvalidCurve(format!(
+                    "({x}, {y}) is outside the unit square"
+                )));
+            }
+            if *x <= previous {
+                return Err(EditStateError::InvalidCurve(format!(
+                    "input {x} does not come after {previous}; points run left to right"
+                )));
+            }
+            previous = *x;
         }
         Ok(())
     }

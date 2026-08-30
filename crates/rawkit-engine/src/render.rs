@@ -185,6 +185,7 @@ impl Frame<'_> {
                 look,
                 look_is_srgb: self.profile.look_is_srgb,
                 tone: self.profile.tone_curve().map(|lut| lut.to_vec()),
+                user_curve: crate::tone::user_curve_lut(&state.curve),
             },
             // No forward matrix means no way to reach the space the tables were
             // authored in, so there is nothing to apply them to.
@@ -198,6 +199,7 @@ impl Frame<'_> {
                 // The curve needs no working space, so it survives the path
                 // that has no forward matrix to reach one.
                 tone: self.profile.tone_curve().map(|lut| lut.to_vec()),
+                user_curve: crate::tone::user_curve_lut(&state.curve),
             },
         })
     }
@@ -237,6 +239,13 @@ struct Params {
     /// `[offset, entries, active, unused]` for the profile's tone curve, in the
     /// same shared buffer.
     curve: [u32; 4],
+    /// The same, for the user's curve.
+    ///
+    /// Its slot in the buffer is reserved whatever the edit says, unlike the
+    /// profile's: a profile is fixed when a photograph opens and an edit is not,
+    /// so sizing this from the edit would mean a buffer that has to grow when
+    /// somebody adds a control point.
+    user_curve: [u32; 4],
     /// `[contrast exponent, highlights, shadows, active]` — see [`crate::tone`].
     tone: [f32; 4],
     /// `[black point, white point, unused, unused]`.
@@ -651,7 +660,9 @@ impl Renderer {
                 .tone_curve()
                 .map(|lut| lut.len())
                 .unwrap_or(1)
-                .max(1);
+                .max(1)
+            // The user's curve, whether or not there is one yet.
+            + crate::profile::TONE_LUT;
 
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rcd params"),
@@ -1182,6 +1193,7 @@ impl Renderer {
         // after it.
         let hsm_cells = hsm.map(|m| m.cell_count()).unwrap_or(1);
         let look_cells = colour.look.as_ref().map(|m| m.cell_count()).unwrap_or(1);
+        let tone_cells = colour.tone.as_ref().map(|lut| lut.len()).unwrap_or(1);
         let params = Params {
             width: padded,
             height: padded,
@@ -1257,6 +1269,13 @@ impl Renderer {
                 Some(lut) => [(hsm_cells + look_cells) as u32, lut.len() as u32, 1, 0],
                 None => [0, 1, 0, 0],
             },
+            user_curve: {
+                let at = (hsm_cells + look_cells + tone_cells) as u32;
+                match &colour.user_curve {
+                    Some(lut) => [at, lut.len() as u32, 1, 0],
+                    None => [at, 1, 0, 0],
+                }
+            },
             look_dims: match &colour.look {
                 Some(m) => [
                     m.hue_divisions,
@@ -1291,6 +1310,16 @@ impl Renderer {
             Some(lut) => table.extend(lut.iter().map(|v| [*v, 0.0, 0.0, 0.0])),
             None => table.push([0.0, 0.0, 0.0, 0.0]),
         }
+        // The user's curve last, and always the full length: its slot was
+        // reserved when the photograph opened, because the edit can grow a curve
+        // long after the buffers were sized.
+        let mut user = vec![[0.0f32; 4]; crate::profile::TONE_LUT];
+        if let Some(lut) = &colour.user_curve {
+            for (cell, value) in user.iter_mut().zip(lut) {
+                cell[0] = *value;
+            }
+        }
+        table.extend(user);
         if table.len() != buffers.table_cells {
             return Err(EngineError::DeviceRequest(format!(
                 "hue/sat table is {} cells but buffers were allocated for {}; \
@@ -1734,6 +1763,9 @@ struct Colour {
     look_is_srgb: bool,
     /// The profile's own tone curve, which *replaces* the built-in tone map.
     tone: Option<Vec<f32>>,
+    /// The user's hand-shaped curve, which is applied after everything the
+    /// profile does.
+    user_curve: Option<Vec<f32>>,
 }
 
 /// Fill `out` with the tile at `(ox, oy)` plus its halo, clamping at the image

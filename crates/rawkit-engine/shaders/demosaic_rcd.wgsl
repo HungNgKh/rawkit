@@ -77,6 +77,8 @@ struct Params {
     // `[offset, entries, active, unused]` for the profile's tone curve, in the
     // same buffer behind the two tables.
     curve: vec4<u32>,
+    // The same, for the user's own curve, behind the profile's.
+    user_curve: vec4<u32>,
     // The display-referred tone controls, already reduced to curve parameters
     // on the CPU: `.x` is the contrast exponent, `.y` highlights, `.z` shadows,
     // and `.w` is 1 when any of the five is off its default. See `tone_curve`.
@@ -551,26 +553,24 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
         );
     }
 
-    // Stage I -- display-referred ops. The five tone controls live here and not
-    // beside exposure, because the sigmoid is the boundary: exposure decides how
-    // much light there was, these decide what it should look like.
-    let shaped = vec3<f32>(
-        tone_curve(mapped.r),
-        tone_curve(mapped.g),
-        tone_curve(mapped.b),
-    );
     // The profile's look, applied here and not beside the hue/saturation
     // correction: a look is authored against a rendered picture. Round-tripped
     // through the profile's working space, because that is where its hue and
     // saturation axes were measured — applying a ProPhoto-authored table to
     // sRGB primaries would read the wrong cell for every colour that is not
     // grey.
-    var looked = shaped;
+    //
+    // **Before the user's controls, not after.** It used to be after, from
+    // reading the specification's "the look comes after the tone curve" as
+    // meaning *ours* — it means the profile's own. A look landing on top of
+    // somebody's tone adjustments partly undoes them; the profile's rendering
+    // finishes first and the person adjusts the result.
+    var looked = mapped;
     if (params.develop.w > 0.5) {
         let working = vec3<f32>(
-            dot(params.display_to_working[0].rgb, shaped),
-            dot(params.display_to_working[1].rgb, shaped),
-            dot(params.display_to_working[2].rgb, shaped),
+            dot(params.display_to_working[0].rgb, mapped),
+            dot(params.display_to_working[1].rgb, mapped),
+            dot(params.display_to_working[2].rgb, mapped),
         );
         let adjusted = apply_look(working);
         looked = vec3<f32>(
@@ -580,11 +580,28 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
         );
     }
 
+    // Stage I -- display-referred ops. The five tone controls live here and not
+    // beside exposure, because the sigmoid is the boundary: exposure decides how
+    // much light there was, these decide what it should look like.
+    var shaped = vec3<f32>(
+        tone_curve(looked.r),
+        tone_curve(looked.g),
+        tone_curve(looked.b),
+    );
+    // And the hand-drawn curve last of the tone controls, so it shapes what the
+    // sliders left rather than competing with them.
+    if (params.user_curve.z > 0u) {
+        shaped = vec3<f32>(
+            user_curve(shaped.r),
+            user_curve(shaped.g),
+            user_curve(shaped.b),
+        );
+    }
     // Stage J -- colour adjustments, after the tone curve for the same reason
     // the tone curve is after the tone map: this is about the picture, not the
     // light. In scene-linear it would depend on exposure, and a colour that
     // changed when you brightened the frame is not a colour control.
-    rgba_out[p] = vec4<f32>(mix_bands(saturate_colour(looked)), 1.0);
+    rgba_out[p] = vec4<f32>(mix_bands(saturate_colour(shaped)), 1.0);
 }
 
 /// Saturation and vibrance.
@@ -1032,11 +1049,25 @@ fn reconstruct_highlights(balanced: vec3<f32>) -> vec3<f32> {
 /// Clamped at one: a tone curve is defined over `[0, 1]` and anything brighter
 /// than white is white, which is the whole point of a shoulder.
 fn profile_tone(v: f32) -> f32 {
-    let last = params.curve.y - 1u;
+    return sample_curve(params.curve.x, params.curve.y, v);
+}
+
+/// The user's own curve, shaped by hand and applied after everything the profile
+/// does — the profile decides what the camera saw, the curve decides what to
+/// make of it, and the last word belongs to the person.
+fn user_curve(v: f32) -> f32 {
+    return sample_curve(params.user_curve.x, params.user_curve.y, v);
+}
+
+/// One curve lookup, linear between entries and clamped at both ends.
+///
+/// Clamping is right for a tone curve twice over: it is defined on `[0, 1]`, and
+/// anything brighter than white is white, which is what a shoulder is for.
+fn sample_curve(base: u32, entries: u32, v: f32) -> f32 {
+    let last = entries - 1u;
     let x = clamp(v, 0.0, 1.0) * f32(last);
     let i = min(u32(floor(x)), last);
     let j = min(i + 1u, last);
-    let base = params.curve.x;
     return mix(hue_sat_map[base + i].x, hue_sat_map[base + j].x, fract(x));
 }
 

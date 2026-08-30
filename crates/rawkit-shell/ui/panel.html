@@ -65,6 +65,11 @@
          overflow-wrap: anywhere; }
   #log.refused { color: #e0705f; }
   #keys { color: #7d7d87; font-size: 11px; line-height: 1.7; }
+  /* `touch-action: none` so a drag on the curve is a drag and not the column
+     deciding to scroll underneath it. */
+  #curve { width: 296px; height: 296px; margin: 8px 0 2px; border-radius: 3px;
+           background: #141418; display: block; cursor: crosshair;
+           touch-action: none; }
   /* The profile's own name, which can be long and is not ours to shorten. */
   #profile-name { color: #9a9aa2; overflow-wrap: anywhere; margin: 7px 0; }
 
@@ -152,6 +157,12 @@
     <label><span>Blacks</span>
       <input id="blacks" type="range" min="-1" max="1" step="0.01" value="0">
       <output id="blacks-value">0.00</output></label>
+  </details>
+
+  <details id="s-curve">
+    <summary>Tone curve</summary>
+    <canvas id="curve"></canvas>
+    <div class="row"><button id="curve-reset">Reset</button></div>
   </details>
 
   <details id="s-geometry"><summary>Geometry</summary>
@@ -423,6 +434,13 @@
     setSlider("luminance_noise", state.detail.luminance_noise, v => Number(v).toFixed(2));
     setSlider("saturation", state.colour.saturation, v => Number(v).toFixed(2));
     setSlider("vibrance", state.colour.vibrance, v => Number(v).toFixed(2));
+    // Not while a point is under the pointer: a sync mid-drag would yank it back
+    // to whatever the last command echoed, which is the slider-thumb problem in
+    // a shape that is harder to notice.
+    if (holding === null) {
+      curve = state.curve.points.map(p => p.slice());
+      drawCurve();
+    }
     for (const [band] of BANDS) {
       for (const [control] of HSL_CONTROLS) {
         setSlider(`hsl-${band}-${control}`, state.hsl[band][control], v => Number(v).toFixed(2));
@@ -556,6 +574,184 @@
     });
   document.getElementById("profile-choose").addEventListener("click", profileAction("choose_profile"));
   document.getElementById("profile-clear").addEventListener("click", profileAction("clear_profile"));
+
+  // ---- The tone curve ------------------------------------------------------
+  //
+  // Drawn with the same monotone cubic the renderer uses, because a curve editor
+  // that displayed one shape and applied another would be worse than no editor:
+  // you would correct the picture by fighting the drawing.
+  //
+  // Composite only — one curve on all three channels, so shaping tone cannot
+  // shift colour.
+  const CURVE_MAX = 16;
+  const curveCanvas = document.getElementById("curve");
+  const IDENTITY = [[0, 0], [1, 1]];
+  let curve = IDENTITY.map(p => p.slice());
+  let holding = null;
+
+  // Fritsch–Carlson, mirroring `user_curve_lut` in rawkit-engine. A plain cubic
+  // overshoots between points and a tone curve that runs backwards inverts local
+  // contrast.
+  const tangents = pts => {
+    const n = pts.length;
+    const secant = [];
+    for (let i = 0; i < n - 1; i++) {
+      const run = pts[i + 1][0] - pts[i][0];
+      secant.push(run <= 0 ? 0 : (pts[i + 1][1] - pts[i][1]) / run);
+    }
+    const m = new Array(n);
+    m[0] = secant[0];
+    m[n - 1] = secant[n - 2];
+    for (let i = 1; i < n - 1; i++) m[i] = (secant[i - 1] + secant[i]) / 2;
+    for (let i = 0; i < n - 1; i++) {
+      if (secant[i] === 0) { m[i] = 0; m[i + 1] = 0; continue; }
+      const a = m[i] / secant[i];
+      const b = m[i + 1] / secant[i];
+      const size = a * a + b * b;
+      if (size > 9) {
+        const k = 3 / Math.sqrt(size);
+        m[i] = k * a * secant[i];
+        m[i + 1] = k * b * secant[i];
+      }
+    }
+    return m;
+  };
+
+  const evaluate = (pts, m, x) => {
+    if (x <= pts[0][0]) return pts[0][1];
+    if (x >= pts[pts.length - 1][0]) return pts[pts.length - 1][1];
+    let i = 0;
+    while (i < pts.length - 2 && x > pts[i + 1][0]) i++;
+    const [x0, y0] = pts[i];
+    const [x1, y1] = pts[i + 1];
+    const h = x1 - x0;
+    if (h <= 0) return y1;
+    const t = (x - x0) / h, t2 = t * t, t3 = t2 * t;
+    return (2 * t3 - 3 * t2 + 1) * y0 + (t3 - 2 * t2 + t) * h * m[i]
+         + (-2 * t3 + 3 * t2) * y1 + (t3 - t2) * h * m[i + 1];
+  };
+
+  const drawCurve = () => {
+    const dpr = window.devicePixelRatio || 1;
+    const size = 296;
+    if (curveCanvas.width !== Math.round(size * dpr)) {
+      curveCanvas.width = Math.round(size * dpr);
+      curveCanvas.height = Math.round(size * dpr);
+    }
+    const ctx = curveCanvas.getContext("2d");
+    ctx.setTransform(curveCanvas.width / size, 0, 0, curveCanvas.height / size, 0, 0);
+    ctx.fillStyle = "#141418";
+    ctx.fillRect(0, 0, size, size);
+
+    // Quarters, and the diagonal the curve started as — both faint, because they
+    // are for orientation rather than for reading.
+    ctx.strokeStyle = "#26262e";
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 4; i++) {
+      const at = Math.round((size * i) / 4) + 0.5;
+      ctx.beginPath();
+      ctx.moveTo(at, 0); ctx.lineTo(at, size);
+      ctx.moveTo(0, at); ctx.lineTo(size, at);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = "#2f2f38";
+    ctx.beginPath();
+    ctx.moveTo(0, size); ctx.lineTo(size, 0);
+    ctx.stroke();
+
+    const m = tangents(curve);
+    ctx.strokeStyle = "#e8e8ea";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let px = 0; px <= size; px++) {
+      const y = Math.min(1, Math.max(0, evaluate(curve, m, px / size)));
+      const at = size - y * size;
+      if (px === 0) ctx.moveTo(px, at); else ctx.lineTo(px, at);
+    }
+    ctx.stroke();
+
+    for (const [x, y] of curve) {
+      ctx.beginPath();
+      ctx.arc(x * size, size - y * size, 4, 0, Math.PI * 2);
+      ctx.fillStyle = "#e8e8ea";
+      ctx.fill();
+    }
+  };
+
+  const curveAt = event => {
+    const box = curveCanvas.getBoundingClientRect();
+    return [(event.clientX - box.left) / box.width, 1 - (event.clientY - box.top) / box.height];
+  };
+
+  const pushCurve = point => send({ command: "set_curve", params: { points: curve, point } });
+
+  curveCanvas.addEventListener("pointerdown", event => {
+    const [x, y] = curveAt(event);
+    // The nearest point, if the pointer is close enough to mean it.
+    let near = -1;
+    let best = 0.05;
+    curve.forEach(([px, py], i) => {
+      const d = Math.hypot(px - x, py - y);
+      if (d < best) { best = d; near = i; }
+    });
+    if (near < 0) {
+      if (curve.length >= CURVE_MAX) return;
+      // A new point where the curve already is, so inserting one does not move
+      // the picture — it only gives you something to take hold of.
+      const m = tangents(curve);
+      const at = Math.min(1, Math.max(0, evaluate(curve, m, x)));
+      near = curve.findIndex(([px]) => px > x);
+      if (near <= 0) return;
+      curve.splice(near, 0, [x, at]);
+      // A point appearing is a discrete change, not part of a drag.
+      pushCurve(255);
+    }
+    holding = near;
+    curveCanvas.setPointerCapture(event.pointerId);
+    drawCurve();
+  });
+
+  curveCanvas.addEventListener("pointermove", event => {
+    if (holding === null) return;
+    const [x, y] = curveAt(event);
+    const last = curve.length - 1;
+    // The ends keep their input and only move up and down; the rest stay
+    // between their neighbours, because a curve whose inputs stop increasing
+    // has no single answer where they cross.
+    const gap = 0.01;
+    const nx = holding === 0 ? 0 : holding === last ? 1
+      : Math.min(curve[holding + 1][0] - gap, Math.max(curve[holding - 1][0] + gap, x));
+    curve[holding] = [nx, Math.min(1, Math.max(0, y))];
+    drawCurve();
+    pushCurve(holding);
+  });
+
+  const release = event => {
+    if (holding === null) return;
+    const [x, y] = curveAt(event);
+    // Dragged well outside the box: taken as throwing the point away, which is
+    // how every curve editor does it. Ends cannot be thrown away — a curve needs
+    // two of them.
+    const gone = x < -0.1 || x > 1.1 || y < -0.1 || y > 1.1;
+    if (gone && holding > 0 && holding < curve.length - 1) {
+      curve.splice(holding, 1);
+      holding = null;
+      drawCurve();
+      pushCurve(255);
+      return;
+    }
+    holding = null;
+  };
+  curveCanvas.addEventListener("pointerup", release);
+  curveCanvas.addEventListener("pointercancel", release);
+
+  document.getElementById("curve-reset").addEventListener("click", () => {
+    curve = IDENTITY.map(p => p.slice());
+    drawCurve();
+    pushCurve(255);
+  });
+
+  drawCurve();
 
   const exportLine = document.getElementById("export");
   let drawn = null;

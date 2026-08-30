@@ -124,6 +124,19 @@ pub enum Command {
     /// Every colour equally, and the one that spares the vivid ones.
     SetSaturation(f32),
     SetVibrance(f32),
+    /// Replace the hand-drawn tone curve.
+    ///
+    /// Carries the whole curve rather than one point, because inserting and
+    /// removing change the shape of the list and a per-point command would need
+    /// its own vocabulary for both. `point` is which control the user is
+    /// manipulating — not used to render anything, only to keep the undo
+    /// history honest: without it, dragging one point and then another would
+    /// fold into a single step. `u8::MAX` means a wholesale change, like a
+    /// reset, which always opens a step of its own.
+    SetCurve {
+        points: Vec<[f32; 2]>,
+        point: u8,
+    },
     /// One number of the eight-band hue mixer. A single command rather than
     /// twenty-four, because the band and the control are data — but see
     /// [`Command::coalesce_slot`] for what that costs the undo history.
@@ -197,6 +210,7 @@ impl Command {
             Command::SetSaturation(_) => "set_saturation",
             Command::SetVibrance(_) => "set_vibrance",
             Command::SetHsl { .. } => "set_hsl",
+            Command::SetCurve { .. } => "set_curve",
             Command::SetStraighten(_) => "set_straighten",
             Command::RotateBy(_) => "rotate_by",
             Command::SetEditState(_) => "set_edit_state",
@@ -231,6 +245,7 @@ impl Command {
     /// The slot separates them, and `two_bands_are_two_steps` is what holds it.
     fn coalesce_slot(&self) -> u8 {
         match self {
+            Command::SetCurve { point, .. } => *point,
             Command::SetHsl { band, control, .. } => {
                 let control = match control {
                     rawkit_editstate::BandControl::Hue => 0,
@@ -261,6 +276,11 @@ impl Command {
             | Command::SetVibrance(_)
             | Command::SetHsl { .. }
             | Command::SetStraighten(_) => true,
+
+            // Dragging one control point coalesces; a wholesale change — a
+            // reset, or a point appearing or disappearing — is a discrete act
+            // and opens a step of its own.
+            Command::SetCurve { point, .. } => *point != u8::MAX,
 
             Command::SetOrientation(_)
             | Command::SetCrop(_)
@@ -634,6 +654,15 @@ impl Session {
                 let mut colour = self.state.colour;
                 colour.vibrance = v;
                 self.colour(name, colour)
+            }
+
+            Command::SetCurve { points, .. } => {
+                let curve = rawkit_editstate::Curve { points };
+                if let Err(e) = curve.validate() {
+                    return refused(name, e.to_string());
+                }
+                self.state.curve = curve;
+                self.edit_changed()
             }
 
             Command::SetHsl {
@@ -1051,6 +1080,77 @@ mod tests {
             matches!(s.apply(Command::Undo), Event::Refused { .. }),
             "the drag left more than one step behind"
         );
+    }
+
+    #[test]
+    fn dragging_two_curve_points_is_two_steps() {
+        // Every curve command is called `set_curve` and carries the whole
+        // curve, so a history keyed on the name alone would fold a drag on one
+        // control point and a drag on another into a single step.
+        let mut s = session();
+        let line = |mid: f32| vec![[0.0, 0.0], [0.25, mid], [0.75, 0.8], [1.0, 1.0]];
+        for mid in [0.1, 0.2, 0.3] {
+            s.apply(Command::SetCurve {
+                points: line(mid),
+                point: 1,
+            });
+        }
+        s.apply(Command::SetCurve {
+            points: vec![[0.0, 0.0], [0.25, 0.3], [0.75, 0.9], [1.0, 1.0]],
+            point: 2,
+        });
+
+        s.apply(Command::Undo);
+        assert_eq!(
+            s.state().curve.points[2],
+            [0.75, 0.8],
+            "the second drag stayed"
+        );
+        assert_eq!(
+            s.state().curve.points[1],
+            [0.25, 0.3],
+            "the first drag went back too"
+        );
+
+        s.apply(Command::Undo);
+        assert!(
+            s.state().curve.is_identity(),
+            "the run of three left more than one step"
+        );
+    }
+
+    #[test]
+    fn a_reset_is_its_own_step_however_it_follows_a_drag() {
+        let mut s = session();
+        s.apply(Command::SetCurve {
+            points: vec![[0.0, 0.0], [0.5, 0.8], [1.0, 1.0]],
+            point: 1,
+        });
+        s.apply(Command::SetCurve {
+            points: rawkit_editstate::Curve::default().points,
+            point: u8::MAX,
+        });
+        s.apply(Command::Undo);
+        assert_eq!(
+            s.state().curve.points[1],
+            [0.5, 0.8],
+            "the reset merged into the drag it undid"
+        );
+    }
+
+    #[test]
+    fn a_curve_that_runs_backwards_is_refused() {
+        let mut s = session();
+        let generation = s.generation();
+        assert!(matches!(
+            s.apply(Command::SetCurve {
+                points: vec![[0.0, 0.0], [0.7, 0.5], [0.3, 0.9], [1.0, 1.0]],
+                point: 1,
+            }),
+            Event::Refused { .. }
+        ));
+        assert!(s.state().curve.is_identity());
+        assert_eq!(s.generation(), generation);
     }
 
     #[test]

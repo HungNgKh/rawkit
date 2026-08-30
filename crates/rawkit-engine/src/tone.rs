@@ -155,6 +155,105 @@ impl ToneCurve {
     }
 }
 
+/// The user's hand-shaped curve, resampled to a lookup the shader can index.
+///
+/// `None` when the curve is the identity, so an untouched photograph pays
+/// nothing and the buffer holding it stays one cell.
+///
+/// # Monotone cubic, not plain cubic
+///
+/// Fritsch–Carlson. A natural spline through the same points overshoots between
+/// them — put a point low and the next high and the curve dips *below* the first
+/// on its way up. In a tone curve that is not a cosmetic wobble: a segment that
+/// runs backwards inverts local contrast, and the result reads as a contour in a
+/// smooth sky rather than as a bug in an interpolator. The limiter is what makes
+/// "the curve you drew is the curve you get" true rather than nearly true.
+///
+/// Linear interpolation would also be monotone and is what the profile curve
+/// uses — but that one arrives with 128 points and this one with as few as two,
+/// where straight segments meeting at a corner are plainly visible.
+pub fn user_curve_lut(curve: &rawkit_editstate::Curve) -> Option<Vec<f32>> {
+    if curve.is_identity() || curve.validate().is_err() {
+        return None;
+    }
+    let points = &curve.points;
+    let n = points.len();
+
+    // Secants, and the tangents that start as their averages.
+    let secant: Vec<f32> = (0..n - 1)
+        .map(|i| {
+            let run = points[i + 1][0] - points[i][0];
+            if run <= 0.0 {
+                0.0
+            } else {
+                (points[i + 1][1] - points[i][1]) / run
+            }
+        })
+        .collect();
+    let mut tangent = vec![0.0f32; n];
+    tangent[0] = secant[0];
+    tangent[n - 1] = secant[n - 2];
+    for i in 1..n - 1 {
+        tangent[i] = (secant[i - 1] + secant[i]) / 2.0;
+    }
+
+    // The limiter. A flat segment pins both its tangents to zero, and anywhere
+    // the tangents are too steep for the secant they are scaled back onto the
+    // circle of radius three — which is the condition for the Hermite segment
+    // to stay monotone.
+    for i in 0..n - 1 {
+        if secant[i] == 0.0 {
+            tangent[i] = 0.0;
+            tangent[i + 1] = 0.0;
+            continue;
+        }
+        let alpha = tangent[i] / secant[i];
+        let beta = tangent[i + 1] / secant[i];
+        let size = alpha * alpha + beta * beta;
+        if size > 9.0 {
+            let scale = 3.0 / size.sqrt();
+            tangent[i] = scale * alpha * secant[i];
+            tangent[i + 1] = scale * beta * secant[i];
+        }
+    }
+
+    let at = |x: f32| -> f32 {
+        if x <= points[0][0] {
+            return points[0][1];
+        }
+        if x >= points[n - 1][0] {
+            return points[n - 1][1];
+        }
+        let i = points
+            .windows(2)
+            .position(|w| x >= w[0][0] && x <= w[1][0])
+            .unwrap_or(0);
+        let (x0, y0) = (points[i][0], points[i][1]);
+        let (x1, y1) = (points[i + 1][0], points[i + 1][1]);
+        let h = x1 - x0;
+        if h <= 0.0 {
+            return y1;
+        }
+        let t = (x - x0) / h;
+        let t2 = t * t;
+        let t3 = t2 * t;
+        // Hermite basis.
+        (2.0 * t3 - 3.0 * t2 + 1.0) * y0
+            + (t3 - 2.0 * t2 + t) * h * tangent[i]
+            + (-2.0 * t3 + 3.0 * t2) * y1
+            + (t3 - t2) * h * tangent[i + 1]
+    };
+
+    Some(
+        (0..crate::profile::TONE_LUT)
+            .map(|i| {
+                let x = i as f32 / (crate::profile::TONE_LUT - 1) as f32;
+                at(x).clamp(0.0, 1.0)
+            })
+            .collect(),
+    )
+}
+
 /// The curve the shader applies, in Rust.
 ///
 /// **This is a mirror, and mirrors drift**, so it earns its place only by what
@@ -193,6 +292,75 @@ fn curve(y: f32, c: &ToneCurve) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_straight_curve_through_extra_points_is_still_straight() {
+        // The identity is skipped by `is_identity`, so this is the identity
+        // written the long way — three points on the diagonal. Anything the
+        // interpolator adds here it would add to every curve.
+        let curve = rawkit_editstate::Curve {
+            points: vec![[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]],
+        };
+        let lut = super::user_curve_lut(&curve).expect("not the identity by value");
+        for (i, value) in lut.iter().enumerate() {
+            let x = i as f32 / (lut.len() - 1) as f32;
+            assert!((value - x).abs() < 1e-4, "at {x}: {value}");
+        }
+    }
+
+    #[test]
+    fn a_lifted_middle_lifts_the_middle_and_pins_the_ends() {
+        let curve = rawkit_editstate::Curve {
+            points: vec![[0.0, 0.0], [0.5, 0.7], [1.0, 1.0]],
+        };
+        let lut = super::user_curve_lut(&curve).expect("a curve");
+        let at = |x: f32| lut[(x * (lut.len() - 1) as f32).round() as usize];
+        assert!(
+            (at(0.0) - 0.0).abs() < 1e-4,
+            "the black end moved: {}",
+            at(0.0)
+        );
+        assert!(
+            (at(1.0) - 1.0).abs() < 1e-4,
+            "the white end moved: {}",
+            at(1.0)
+        );
+        // Three thousandths, because 0.5 falls between two entries of a
+        // 256-step lookup and the nearest one is a fifth of a percent along the
+        // curve from it. That is the grid, not the interpolator.
+        assert!((at(0.5) - 0.7).abs() < 3e-3, "the point moved: {}", at(0.5));
+    }
+
+    #[test]
+    fn a_curve_cannot_fold_back_however_it_is_drawn() {
+        // The property the monotone limiter exists for. A plain cubic through
+        // these points dips below its own starting value on the way up, and a
+        // tone curve that runs backwards inverts local contrast — which looks
+        // like a contour in a smooth sky rather than like a bug here.
+        for points in [
+            vec![[0.0, 0.0], [0.45, 0.05], [0.55, 0.95], [1.0, 1.0]],
+            vec![[0.0, 0.2], [0.2, 0.21], [0.8, 0.99], [1.0, 1.0]],
+            vec![[0.0, 0.0], [0.1, 0.9], [0.9, 0.95], [1.0, 1.0]],
+        ] {
+            let lut = super::user_curve_lut(&rawkit_editstate::Curve {
+                points: points.clone(),
+            })
+            .expect("a curve");
+            let mut previous = f32::NEG_INFINITY;
+            for (i, value) in lut.iter().enumerate() {
+                assert!(
+                    *value >= previous - 1e-6,
+                    "{points:?} folds back at entry {i}: {value} after {previous}"
+                );
+                previous = *value;
+            }
+        }
+    }
+
+    #[test]
+    fn the_identity_curve_costs_nothing() {
+        assert!(super::user_curve_lut(&rawkit_editstate::Curve::default()).is_none());
+    }
+
     use super::*;
 
     /// Every combination of the five controls at their extremes, plus the
