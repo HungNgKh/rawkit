@@ -195,7 +195,10 @@ const PANEL_WIDTH: f64 = 400.0;
 /// HWND, and those will bring their own geometry — but the constant is not
 /// gated, because a value only some platforms can see is how this file has
 /// broken the build four times.
-const PANEL_HEIGHT: i32 = 200;
+/// Grew from 200 when the histogram went into the bar: the widget is 40 logical
+/// pixels tall and the bar's padding adds twelve, and at 200 the bottom row of
+/// the tone controls was cut off by about that much.
+const PANEL_HEIGHT: i32 = 224;
 // Wide enough for the control sections to sit side by side. Each is 200 logical
 // pixels and the tone block is two of them, so five sections plus gaps need
 // about 1280 — at 1200 the last one was pushed off the edge.
@@ -229,6 +232,36 @@ fn snapshot(state: tauri::State<'_, Shared>) -> serde_json::Value {
         "image": session.image_size(),
         "generation": session.generation(),
     })
+}
+
+/// The distribution of the developed photograph, for the page to draw.
+///
+/// Counts rather than heights, and a peak to scale them by. Normalising here
+/// would be the interface's decision made in the wrong place: how a histogram is
+/// drawn — linear, square-root, clipped to a percentile — is a question about
+/// reading it, and the answer would then be baked into the only copy of the
+/// numbers.
+/// `seen` is the generation the caller already drew, and returning nothing for
+/// it is what makes this cheap to poll: the page can ask ten times a second and
+/// pay for a lock and a comparison until there is actually something new.
+#[tauri::command]
+fn histogram(seen: Option<u64>) -> Option<serde_json::Value> {
+    let scope = SCOPE.lock().expect("histogram lock");
+    let survey = scope.as_ref()?;
+    if seen == Some(survey.generation) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "generation": survey.generation,
+        "pixels": survey.histogram.pixels,
+        "peak": survey.histogram.peak(),
+        "clipped_white": survey.histogram.clipped_white,
+        "clipped_black": survey.histogram.clipped_black,
+        "red": &survey.histogram.red[..],
+        "green": &survey.histogram.green[..],
+        "blue": &survey.histogram.blue[..],
+        "luma": &survey.histogram.luma[..],
+    }))
 }
 
 /// The open library, when a catalog was what was opened.
@@ -416,7 +449,8 @@ fn main() -> Result<()> {
             snapshot,
             cull,
             cull_view,
-            canvas_pointer
+            canvas_pointer,
+            histogram
         ])
         .setup(move |app| {
             // The surface is created on the main thread because the raw window
@@ -550,6 +584,8 @@ fn main() -> Result<()> {
             // The rectangle the canvas currently carries, so a settled one is
             // not redrawn on every frame. See the crop block below.
             let mut last_marquee: Option<[f64; 4]> = None;
+            // When the histogram was last recomputed. See `SURVEY_INTERVAL`.
+            let mut last_survey: Option<std::time::Instant> = None;
             let mut tick = move || -> Result<()> {
                 let started = std::time::Instant::now();
 
@@ -765,6 +801,63 @@ fn main() -> Result<()> {
                     // into the canvas. One redraw takes it off; without this it
                     // stays until something else happens to move the view.
                     canvas_renderer.invalidate();
+                }
+                // Recomputed when the *edit* changes and not when the view
+                // does, because that is the difference between a histogram of
+                // the photograph and a histogram of the window. During a slider
+                // drag this runs at most once a frame however many commands
+                // arrived, for the same reason only the last command is drawn.
+                if let Some(loaded) = &showing.raw {
+                    let (generation, state) = {
+                        let session = shared.lock().expect("session lock");
+                        (session.generation(), session.state().clone())
+                    };
+                    let known = SCOPE
+                        .lock()
+                        .expect("histogram lock")
+                        .as_ref()
+                        .map(|survey| survey.generation);
+                    let due = last_survey
+                        .is_none_or(|at: std::time::Instant| at.elapsed() >= SURVEY_INTERVAL);
+                    if known != Some(generation) && due {
+                        let counting = std::time::Instant::now();
+                        last_survey = Some(counting);
+                        let counted = canvas_renderer
+                            .survey(&gpu, &loaded.frame(), &loaded.pyramid(), &state)
+                            .and_then(|developed| {
+                                let size = [developed.width, developed.height];
+                                rawkit_export::histogram::Histogram::of(
+                                    &developed.pixels,
+                                    developed.width,
+                                    developed.height,
+                                )
+                                .map(|histogram| (size, histogram))
+                                .map_err(anyhow::Error::from)
+                            });
+                        match counted {
+                            Ok(([width, height], histogram)) => {
+                                // Once, because the coarsest level is one tile
+                                // whatever the photograph is, so the second
+                                // measurement would say the same as the first.
+                                static REPORTED: std::sync::Once = std::sync::Once::new();
+                                REPORTED.call_once(|| {
+                                    eprintln!(
+                                        "histogram  : {width}x{height} in {:.1} ms",
+                                        counting.elapsed().as_secs_f64() * 1000.0
+                                    )
+                                });
+                                *SCOPE.lock().expect("histogram lock") = Some(Survey {
+                                    generation,
+                                    histogram,
+                                });
+                            }
+                            // Not fatal. The photograph is on screen; a missing
+                            // histogram is a missing readout, not a broken
+                            // editor, and stopping the frame loop over one would
+                            // take the picture away as well.
+                            Err(e) => eprintln!("histogram  : {e:#}"),
+                        }
+                    }
                 }
                 paint(
                     &gpu,
@@ -1076,6 +1169,38 @@ pub(crate) fn in_crop() -> bool {
 /// is drawn in; turning it into a crop needs the viewport, which lives in the
 /// render loop. Same division of labour as the grid's click: this widget reports
 /// where, and the loop works out what.
+/// How often the histogram is allowed to be recomputed.
+///
+/// It is not free and the reason is measured: developing the coarsest pyramid
+/// level takes about the same as a canvas tile, but unlike a canvas tile it has
+/// to be *read back*, which drains the queue and stalls the pipeline. On this
+/// machine that put a survey at 15–40 ms against a frame budget of 33.
+///
+/// So it runs at most ten times a second rather than once a frame. Ten is above
+/// the rate at which a changing readout stops looking like steps and starts
+/// looking like movement, so a slider drag still shows a histogram that follows
+/// the slider; what it no longer does is stall every frame to say something
+/// nobody could read that fast. A fast fling lags by up to this long and then
+/// catches up, because the "is it stale" test stays true until a survey
+/// actually happens.
+const SURVEY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The distribution of the photograph the render loop last developed.
+///
+/// A static for the same reason the marquee is one: the page asks for it over
+/// IPC, on a thread that has no GPU and must not wait for one. The loop leaves
+/// the answer here and the command reads whatever is there — which may be one
+/// edit behind, and that is the right failure. A histogram that blocked a
+/// keypress until a render finished would be worse than one that lags it.
+static SCOPE: Mutex<Option<Survey>> = Mutex::new(None);
+
+/// A histogram and the edit it describes, kept together so a stale one cannot
+/// be mistaken for a fresh one.
+struct Survey {
+    generation: u64,
+    histogram: rawkit_export::histogram::Histogram,
+}
+
 pub(crate) static CANVAS_MARQUEE: Mutex<Option<Marquee>> = Mutex::new(None);
 /// Set when the page asks for the rectangle to be taken.
 static CROP_COMMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

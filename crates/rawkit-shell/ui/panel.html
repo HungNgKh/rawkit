@@ -38,9 +38,21 @@
   #log { color: #7d7d87; margin-top: 12px; font-variant-numeric: tabular-nums; }
   #log.refused { color: #e0705f; }
 
-  #cull { display: flex; align-items: baseline; gap: 18px; padding: 8px 18px;
-          border-bottom: 1px solid #2c2c34; font-variant-numeric: tabular-nums; }
+  /* The bar is always there because the histogram is always there. What is
+     conditional is the culling readout inside it, which is why the two are
+     separate elements rather than one that hides. */
+  #bar { display: flex; align-items: center; gap: 18px; padding: 6px 18px;
+         border-bottom: 1px solid #2c2c34; font-variant-numeric: tabular-nums; }
+  #cull { display: flex; align-items: baseline; gap: 18px; flex: 1; }
   #cull.hidden { display: none; }
+  /* Pushed right whether or not the culling readout is showing, which is why
+     the margin is here and not on the last thing inside `#cull`. */
+  #scope { display: flex; align-items: center; gap: 12px; margin-left: auto; }
+  #histogram { width: 256px; height: 40px; border-radius: 3px;
+               background: #141418; display: block; }
+  .clip { font-size: 11px; color: #56565e; }
+  .clip.lit#clip-white { color: #e0705f; }
+  .clip.lit#clip-black { color: #6f9ade; }
   #frame { font-weight: 600; }
   #position, #counts, #keys { color: #7d7d87; }
   #keys { margin-left: auto; font-size: 11px; }
@@ -52,6 +64,7 @@
 </style>
 
 <div id="chrome">
+<div id="bar">
 <div id="cull" class="hidden">
   <span id="frame"></span>
   <span id="position"></span>
@@ -61,6 +74,12 @@
   <span id="counts"></span>
   <span id="mode">loupe</span>
   <span id="keys">G grid · E loupe · R crop · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · Z undo</span>
+</div>
+<div id="scope">
+  <canvas id="histogram" title="the developed photograph, in the values a file would carry"></canvas>
+  <span class="clip" id="clip-white" title="pixels with a channel at full scale">–</span>
+  <span class="clip" id="clip-black" title="pixels with nothing in any channel">–</span>
+</div>
 </div>
 
 <main>
@@ -299,6 +318,97 @@
     // clicks ago, which is a readout lying rather than merely lagging.
     show(await invoke("cull_view"));
   }, 250);
+
+  // ---- Histogram -----------------------------------------------------------
+  //
+  // The counts come from the render loop, which develops the whole photograph
+  // at its coarsest pyramid level and counts the eight-bit values an export
+  // would write. So this describes the picture rather than the window: panning
+  // and zooming do not change it, and cropping does.
+  //
+  // It is a survey of a reduced frame, which matters for one thing only. A
+  // handful of blown pixels average away when the mosaic is halved four times,
+  // so the clipping figures are a floor rather than an exact count — they
+  // under-report small clipped areas and are right about large ones.
+  const scope = document.getElementById("histogram");
+  const clipWhite = document.getElementById("clip-white");
+  const clipBlack = document.getElementById("clip-black");
+  const WIDE = 256;
+  const TALL = 40;
+
+  const drawScope = data => {
+    // Sized in device pixels so a bin is a whole pixel on a HiDPI screen. One
+    // bin per CSS pixel is exactly 256 wide, which is why the widget is that
+    // width and not a round number that would resample the bins.
+    const dpr = window.devicePixelRatio || 1;
+    if (scope.width !== WIDE * dpr) {
+      scope.width = WIDE * dpr;
+      scope.height = TALL * dpr;
+    }
+    const ctx = scope.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#141418";
+    ctx.fillRect(0, 0, WIDE, TALL);
+
+    // Square root rather than linear. A photograph's histogram is usually one
+    // tall spike and a long tail, and scaling to the peak linearly leaves the
+    // tail invisible — including the last few bins, which are the ones the
+    // clipping readout is about. Not logarithmic, which flattens the shape so
+    // far that two quite different exposures look alike.
+    const peak = Math.max(data.peak, 1);
+    const trace = (bins, colour) => {
+      ctx.fillStyle = colour;
+      for (let i = 0; i < bins.length; i++) {
+        if (bins[i] === 0) continue;
+        const height = Math.sqrt(bins[i] / peak) * TALL;
+        ctx.fillRect(i, TALL - height, 1, height);
+      }
+    };
+
+    // Pure primaries, added together. That is what makes the reading work: three
+    // channels that agree come to a neutral grey, so any colour left in the body
+    // is one channel out there on its own. Mixing a little of the other channels
+    // in to soften them — the first attempt — tints the whole body and destroys
+    // exactly that.
+    ctx.globalCompositeOperation = "lighter";
+    trace(data.red, "#b00000");
+    trace(data.green, "#00b000");
+    trace(data.blue, "#0000b0");
+    ctx.globalCompositeOperation = "source-over";
+
+    // Luminance as a line over the top rather than a fill underneath. Filled, it
+    // added to the three channels and the widget read as a white slab — losing
+    // the colour information the primaries were chosen to carry.
+    ctx.strokeStyle = "#d0d0d8";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 0; i < data.luma.length; i++) {
+      const y = TALL - Math.sqrt(data.luma[i] / peak) * TALL;
+      // Half a pixel across, or a one-pixel stroke straddles two rows and comes
+      // out two pixels wide and grey.
+      if (i === 0) ctx.moveTo(0.5, y + 0.5);
+      else ctx.lineTo(i + 0.5, y + 0.5);
+    }
+    ctx.stroke();
+
+    const share = n => (n === 0 ? "0%" : n / data.pixels < 0.0001 ? "<0.01%"
+                        : `${((n / data.pixels) * 100).toFixed(2)}%`);
+    clipWhite.textContent = `▲ ${share(data.clipped_white)}`;
+    clipBlack.textContent = `▼ ${share(data.clipped_black)}`;
+    clipWhite.classList.toggle("lit", data.clipped_white > 0);
+    clipBlack.classList.toggle("lit", data.clipped_black > 0);
+  };
+
+  // Polled faster than the sliders are, and it costs nothing to do so: the
+  // command returns nothing at all unless the generation it holds differs from
+  // the one already drawn, so an idle editor pays a lock and a comparison.
+  let drawn = null;
+  setInterval(async () => {
+    const data = await invoke("histogram", { seen: drawn });
+    if (!data) return;
+    drawn = data.generation;
+    drawScope(data);
+  }, 100);
 
   // ---- Culling -------------------------------------------------------------
   //

@@ -39,6 +39,7 @@
 use std::io::Cursor;
 
 pub mod display;
+pub mod histogram;
 
 #[derive(Debug, thiserror::Error)]
 
@@ -116,27 +117,11 @@ pub fn encode(
 
     match format {
         Format::Jpeg { quality } => {
-            let eight = match sampled {
-                Some(curves) => curves.to_eight(&rgb),
-                None => flatten(&transform::<[u8; 3]>(
-                    &source,
-                    &destination,
-                    &rgb,
-                    lcms2::PixelFormat::RGB_8,
-                )?),
-            };
+            let eight = to_eight_bit(&rgb)?;
             encode_jpeg(&eight, width, height, quality, &icc)
         }
         Format::Png8 => {
-            let eight = match sampled {
-                Some(curves) => curves.to_eight(&rgb),
-                None => flatten(&transform::<[u8; 3]>(
-                    &source,
-                    &destination,
-                    &rgb,
-                    lcms2::PixelFormat::RGB_8,
-                )?),
-            };
+            let eight = to_eight_bit(&rgb)?;
             encode_png(&eight, width, height, png::BitDepth::Eight, &icc)
         }
         Format::Png16 => {
@@ -152,6 +137,24 @@ pub fn encode(
             };
             encode_png(&bytes, width, height, png::BitDepth::Sixteen, &icc)
         }
+    }
+}
+
+/// Linear display-referred RGB to the eight-bit values a file would carry.
+///
+/// Extracted because two encoders wanted the same bytes, and then kept because
+/// a third caller wanted them for a different reason: [`crate::histogram`]
+/// counts what an export would write, and it can only say that truthfully if it
+/// asks the same function the export asks.
+pub(crate) fn to_eight_bit(rgb: &[[f32; 3]]) -> Result<Vec<u8>, ExportError> {
+    match sampled_transform() {
+        Some(curves) => Ok(curves.to_eight(rgb)),
+        None => Ok(flatten(&transform::<[u8; 3]>(
+            &linear_srgb_profile()?,
+            &lcms2::Profile::new_srgb(),
+            rgb,
+            lcms2::PixelFormat::RGB_8,
+        )?)),
     }
 }
 

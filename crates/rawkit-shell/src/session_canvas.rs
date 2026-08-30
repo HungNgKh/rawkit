@@ -103,6 +103,46 @@ impl CanvasRenderer {
         self.uploaded = None;
     }
 
+    /// The whole photograph, developed at its coarsest resolution.
+    ///
+    /// Deliberately not read back from the canvas, which holds whatever the
+    /// viewport is showing: a histogram that changed shape when you panned would
+    /// be describing the window rather than the photograph, and one taken at the
+    /// current zoom would change its own answer as you worked.
+    ///
+    /// The coarsest pyramid level is one tile by construction — that is what
+    /// "bottoms out when a tile covers the image" means — so this costs about
+    /// one tile, and it goes through [`Renderer::run`], which is the export's
+    /// own path. Crop, orientation and straightening are therefore applied by
+    /// the same code that applies them to a file, rather than by a second
+    /// implementation that could disagree with it about what is in the frame.
+    pub fn survey(
+        &self,
+        gpu: &Gpu,
+        frame: &Frame<'_>,
+        pyramid: &Pyramid<'_>,
+        state: &EditState,
+    ) -> Result<rawkit_engine::Rendered> {
+        // `levels()` is the coarsest level, not how many there are — reading it
+        // as a count surveys one octave too fine, which is four times the pixels
+        // and, measured, four times the cost.
+        let (data, width, height) = pyramid
+            .level(pyramid.levels())
+            .ok_or_else(|| anyhow::anyhow!("a pyramid with no levels"))?;
+        // A reduced mosaic is a mosaic: same phase, same profile, same clip
+        // level. Only the pixel count changes.
+        let level = Frame {
+            data,
+            width,
+            height,
+            phase: frame.phase,
+            as_shot_wb: frame.as_shot_wb,
+            clip_level: frame.clip_level,
+            profile: frame.profile.clone(),
+        };
+        Ok(self.renderer.run(gpu, &level, state, Output::Display)?)
+    }
+
     pub fn canvas(&self) -> &Canvas {
         &self.canvas
     }
