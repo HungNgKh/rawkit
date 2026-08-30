@@ -1143,6 +1143,9 @@ fn main() -> Result<()> {
             // the value is captured here rather than re-read so that nothing
             // half-handles it.
             let scale = window_handle.scale_factor()?;
+            // Only the native-child canvas has a window of its own to move; a
+            // cutout's surface is the toplevel's and the layout is all there is.
+            #[cfg(target_os = "linux")]
             let resizing = window_handle.clone();
 
             let mut tick = move || -> Result<()> {
@@ -1817,6 +1820,7 @@ fn build_window(
             // NSView, several hundred lines of FFI nobody here can run.
             let builder = builder.transparent(true);
             let window = builder.build()?;
+            place_window(&window.as_ref().window(), saved)?;
             let layout = Layout::for_window(route, window.inner_size()?, window.scale_factor()?);
             let (gpu, surface) = Gpu::with_surface(window.clone())?;
             let handle = window.as_ref().window();
@@ -1827,6 +1831,7 @@ fn build_window(
                 .title("rawkit")
                 .inner_size(width, height)
                 .build()?;
+            place_window(&window, saved)?;
             let panel = window.add_child(
                 WebviewBuilder::new("panel", WebviewUrl::App("panel.html".into())),
                 LogicalPosition::new(0.0, 0.0),
