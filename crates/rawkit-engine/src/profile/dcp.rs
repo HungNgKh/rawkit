@@ -59,17 +59,26 @@ mod tag {
     pub const PROFILE_HUE_SAT_MAP_DATA_1: u16 = 50938;
     pub const PROFILE_HUE_SAT_MAP_DATA_2: u16 = 50939;
 
-    // Read by no one, deliberately. These carry the profile's *look* — what
-    // Adobe thinks a photograph should look like — rather than what the sensor
-    // measured, and adopting a look would fork this product's rendering by
-    // whether a user happened to have Adobe software installed. Named rather
-    // than left as bare numbers so the omission is visibly a decision.
+    // The look table, which used to be skipped on the grounds that a look is
+    // Adobe's opinion rather than the sensor's measurement. Measurement changed
+    // the answer: a *Camera Matching* profile keeps almost nothing in its
+    // matrices and almost everything here, so reading its colorimetry and
+    // discarding its look rendered further from the camera's own JPEG than
+    // using no profile at all — 21 against 12, in Lab chromaticity. Skipping a
+    // look is defensible for a default; it is not defensible for a profile
+    // somebody explicitly chose.
+    pub const PROFILE_LOOK_TABLE_DIMS: u16 = 50981;
+    pub const PROFILE_LOOK_TABLE_DATA: u16 = 50982;
+    /// 0 for linear, 1 for sRGB. Which space the table's axes are in, and it is
+    /// not cosmetic: a table with sixteen value divisions indexed by linear
+    /// light reads a different slice for almost every pixel.
+    pub const PROFILE_LOOK_TABLE_ENCODING: u16 = 51108;
+
+    // Still read by no one, and still deliberately. The tone curve would have
+    // to displace ours rather than compose with it, and that is a larger
+    // decision than reading a tag.
     #[allow(dead_code)]
     pub const PROFILE_TONE_CURVE: u16 = 50940;
-    #[allow(dead_code)]
-    pub const PROFILE_LOOK_TABLE_DIMS: u16 = 50981;
-    #[allow(dead_code)]
-    pub const PROFILE_LOOK_TABLE_DATA: u16 = 50982;
 }
 
 /// Parse a `.dcp` file.
@@ -138,6 +147,30 @@ pub fn parse(bytes: &[u8]) -> Result<CameraProfile, DcpError> {
         if let Some(m) = build(tag::PROFILE_HUE_SAT_MAP_DATA_2) {
             profile.set_hue_sat_map(cct2, m);
         }
+    }
+
+    // The look table, which shares the hue/saturation table's format exactly —
+    // same triple, same ordering, same interpolation — and differs only in
+    // where it is applied. That is why one type serves both.
+    if let Some(dims) = find(tag::PROFILE_LOOK_TABLE_DIMS).and_then(|e| reader.longs(e, 3)) {
+        if let Some(floats) = find(tag::PROFILE_LOOK_TABLE_DATA).and_then(|e| reader.floats(e)) {
+            let map = HueSatMap {
+                hue_divisions: dims[0],
+                sat_divisions: dims[1],
+                value_divisions: dims[2],
+                deltas: floats.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect(),
+            };
+            if map.is_valid() {
+                // One table for both illuminants: unlike the hue/saturation
+                // correction, the specification gives a look a single table,
+                // because a look is not a characterisation of the sensor under
+                // a light.
+                profile.set_look_table(map);
+            }
+        }
+        profile.look_is_srgb = find(tag::PROFILE_LOOK_TABLE_ENCODING)
+            .and_then(|e| reader.longs(e, 1))
+            .is_some_and(|v| v[0] == 1);
     }
 
     profile.name = name;

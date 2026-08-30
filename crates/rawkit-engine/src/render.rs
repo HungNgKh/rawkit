@@ -167,23 +167,33 @@ impl Frame<'_> {
         // way.
         // Ask for the transform and the table together, so there is no way to
         // end up with one and not the other.
-        let with_table = self
-            .profile
-            .camera_to_working(temperature)
-            .zip(self.profile.hue_sat_map(temperature));
+        // The working-space hop is worth taking for *either* table. It used to
+        // be conditional on the hue/saturation correction alone, which meant a
+        // Camera Matching profile — which carries no such correction and keeps
+        // everything in its look — took the direct path and had its look
+        // discarded.
+        let working = self.profile.camera_to_working(temperature);
+        let hue_sat = self.profile.hue_sat_map(temperature);
+        let look = self.profile.look_table().cloned();
 
-        Ok(match with_table {
-            Some(((to_working, to_display), map)) => Colour {
+        Ok(match working {
+            Some((to_working, to_display)) if hue_sat.is_some() || look.is_some() => Colour {
                 multipliers,
                 cam_to_display: to_working,
                 working_to_display: to_display,
-                hue_sat: Some(map),
+                hue_sat,
+                look,
+                look_is_srgb: self.profile.look_is_srgb,
             },
-            None => Colour {
+            // No forward matrix means no way to reach the space the tables were
+            // authored in, so there is nothing to apply them to.
+            _ => Colour {
                 multipliers,
                 cam_to_display: self.profile.camera_to_display(temperature),
                 working_to_display: crate::profile::IDENTITY,
                 hue_sat: None,
+                look: None,
+                look_is_srgb: false,
             },
         })
     }
@@ -213,6 +223,13 @@ struct Params {
     working_to_display: [[f32; 4]; 3],
     develop: [f32; 4],
     hsm_dims: [u32; 4],
+    /// The display space back to the profile's working space, so the look can
+    /// be applied where it was authored. The inverse of `working_to_display`,
+    /// and only meaningful when a look is active.
+    display_to_working: [[f32; 4]; 3],
+    /// `[hue, saturation, value]` divisions of the look table, and `.w` its
+    /// offset in cells into the shared table buffer.
+    look_dims: [u32; 4],
     /// `[contrast exponent, highlights, shadows, active]` — see [`crate::tone`].
     tone: [f32; 4],
     /// `[black point, white point, unused, unused]`.
@@ -607,12 +624,21 @@ impl Renderer {
         // the edit, because its dimensions are a property of the file and only
         // its contents move with temperature. A bind group cannot have holes, so
         // a profile without a table still gets one identity cell.
+        // Room for both tables, since they share the buffer. A profile without
+        // one still gets a single identity cell, because a bind group cannot
+        // have holes.
         let table_cells = image
             .profile
             .hue_sat_map(5000.0)
-            .map(|m| (m.hue_divisions * m.sat_divisions * m.value_divisions) as usize)
+            .map(|m| m.cell_count())
             .unwrap_or(1)
-            .max(1);
+            .max(1)
+            + image
+                .profile
+                .look_table()
+                .map(|m| m.cell_count())
+                .unwrap_or(1)
+                .max(1);
 
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rcd params"),
@@ -1139,6 +1165,8 @@ impl Renderer {
         let (wb, m) = (colour.multipliers, colour.cam_to_display);
         let working = colour.working_to_display;
         let hsm = colour.hue_sat.as_ref();
+        // Where the look begins in the shared table buffer.
+        let hsm_cells = hsm.map(|m| m.cell_count()).unwrap_or(1);
         let params = Params {
             width: padded,
             height: padded,
@@ -1161,7 +1189,15 @@ impl Renderer {
                 crate::exposure_multiplier(state),
                 if hsm.is_some() { 1.0 } else { 0.0 },
                 image.clip_level,
-                0.0,
+                // 0 no look, 1 a look in linear light, 2 a look in sRGB-encoded
+                // light. The encoding is not cosmetic: a table with sixteen
+                // value divisions indexed the wrong way reads a different slice
+                // for almost every pixel.
+                match (&colour.look, colour.look_is_srgb) {
+                    (None, _) => 0.0,
+                    (Some(_), false) => 1.0,
+                    (Some(_), true) => 2.0,
+                },
             ],
             tone: tone.shape(),
             levels: tone.levels(),
@@ -1191,16 +1227,44 @@ impl Renderer {
                 Some(m) => [m.hue_divisions, m.sat_divisions, m.value_divisions, 0],
                 None => [1, 1, 1, 0],
             },
+            display_to_working: {
+                // Only reached when a look is active, and a look is only active
+                // when the working matrices are real — so an identity here is a
+                // matrix nobody consults rather than a silently wrong one.
+                let back = crate::profile::invert(&working).unwrap_or(crate::profile::IDENTITY);
+                [
+                    [back[0][0], back[0][1], back[0][2], 0.0],
+                    [back[1][0], back[1][1], back[1][2], 0.0],
+                    [back[2][0], back[2][1], back[2][2], 0.0],
+                ]
+            },
+            look_dims: match &colour.look {
+                Some(m) => [
+                    m.hue_divisions,
+                    m.sat_divisions,
+                    m.value_divisions,
+                    hsm_cells as u32,
+                ],
+                None => [1, 1, 1, hsm_cells as u32],
+            },
             present: [0, 0, self.tile as i32, HALO as i32],
             extent: [self.tile as i32, self.tile as i32, 0, 0],
         };
         gpu.queue
             .write_buffer(&buffers.params, 0, bytemuck::bytes_of(&params));
 
-        let table: Vec<[f32; 4]> = match hsm {
+        // Both tables in one buffer, the hue/saturation correction first and the
+        // look behind it. Not tidiness: WebGPU guarantees eight storage buffers
+        // per stage and this shader already uses all eight, so a second table
+        // had to go somewhere that was not a second binding.
+        let mut table: Vec<[f32; 4]> = match hsm {
             Some(m) => m.deltas.iter().map(|d| [d[0], d[1], d[2], 0.0]).collect(),
             None => vec![[0.0, 1.0, 1.0, 0.0]],
         };
+        match &colour.look {
+            Some(m) => table.extend(m.deltas.iter().map(|d| [d[0], d[1], d[2], 0.0])),
+            None => table.push([0.0, 1.0, 1.0, 0.0]),
+        }
         if table.len() != buffers.table_cells {
             return Err(EngineError::DeviceRequest(format!(
                 "hue/sat table is {} cells but buffers were allocated for {}; \
@@ -1639,6 +1703,9 @@ struct Colour {
     cam_to_display: Matrix3,
     working_to_display: Matrix3,
     hue_sat: Option<crate::profile::HueSatMap>,
+    /// The profile's look, applied after the tone curve rather than before it.
+    look: Option<crate::profile::HueSatMap>,
+    look_is_srgb: bool,
 }
 
 /// Fill `out` with the tile at `(ox, oy)` plus its halo, clamping at the image

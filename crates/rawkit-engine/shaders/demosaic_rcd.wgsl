@@ -67,6 +67,13 @@ struct Params {
     develop: vec4<f32>,
     // Hue, saturation and value divisions of the table. `.w` unused.
     hsm_dims: vec4<u32>,
+    // The display space back to the profile's working space, so the look is
+    // applied where it was authored. Ordered exactly as `Params` in render.rs:
+    // the two are one memory layout described twice.
+    display_to_working: array<vec4<f32>, 3>,
+    // `.xyz` the look table's divisions, `.w` where it starts in the shared
+    // table buffer.
+    look_dims: vec4<u32>,
     // The display-referred tone controls, already reduced to curve parameters
     // on the CPU: `.x` is the contrast exponent, `.y` highlights, `.z` shadows,
     // and `.w` is 1 when any of the five is off its default. See `tone_curve`.
@@ -539,11 +546,32 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
         tone_curve(mapped.g),
         tone_curve(mapped.b),
     );
+    // The profile's look, applied here and not beside the hue/saturation
+    // correction: a look is authored against a rendered picture. Round-tripped
+    // through the profile's working space, because that is where its hue and
+    // saturation axes were measured — applying a ProPhoto-authored table to
+    // sRGB primaries would read the wrong cell for every colour that is not
+    // grey.
+    var looked = shaped;
+    if (params.develop.w > 0.5) {
+        let working = vec3<f32>(
+            dot(params.display_to_working[0].rgb, shaped),
+            dot(params.display_to_working[1].rgb, shaped),
+            dot(params.display_to_working[2].rgb, shaped),
+        );
+        let adjusted = apply_look(working);
+        looked = vec3<f32>(
+            dot(params.working_to_display[0].rgb, adjusted),
+            dot(params.working_to_display[1].rgb, adjusted),
+            dot(params.working_to_display[2].rgb, adjusted),
+        );
+    }
+
     // Stage J -- colour adjustments, after the tone curve for the same reason
     // the tone curve is after the tone map: this is about the picture, not the
     // light. In scene-linear it would depend on exposure, and a colour that
     // changed when you brightened the frame is not a colour control.
-    rgba_out[p] = vec4<f32>(mix_bands(saturate_colour(shaped)), 1.0);
+    rgba_out[p] = vec4<f32>(mix_bands(saturate_colour(looked)), 1.0);
 }
 
 /// Saturation and vibrance.
@@ -790,6 +818,12 @@ fn hsv_to_rgb(hsv: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(v, p, q);
 }
 
+fn table_at(base: u32, dims: vec4<u32>, h: u32, s: u32, v: u32) -> vec4<f32> {
+    // DNG ordering: value outermost, then hue, then saturation innermost.
+    let index = (v * dims.x + h) * dims.y + s;
+    return hue_sat_map[base + index];
+}
+
 fn hsm_at(h: u32, s: u32, v: u32) -> vec4<f32> {
     // DNG ordering: value outermost, then hue, then saturation innermost.
     let index = (v * params.hsm_dims.x + h) * params.hsm_dims.y + s;
@@ -802,8 +836,50 @@ fn hsm_at(h: u32, s: u32, v: u32) -> vec4<f32> {
 /// wrap is not a detail: hue is circular, so a table sampled without it would
 /// produce a visible seam at 0 degrees — which lands squarely on reds.
 fn apply_hue_sat(rgb: vec3<f32>) -> vec3<f32> {
+    return apply_table(0u, params.hsm_dims, rgb);
+}
+
+/// The profile's look, which is the same table format applied somewhere else.
+///
+/// Somewhere else matters. A look is authored against a *rendered* picture, so
+/// its value axis is indexed by tone-mapped light — and with sixteen value
+/// divisions, indexing it with scene-linear light reads a different slice for
+/// almost every pixel. `params.develop.w` carries which encoding the table's
+/// axes are in, because the specification lets a profile choose and Adobe's
+/// camera-matching profiles choose sRGB.
+fn apply_look(rgb: vec3<f32>) -> vec3<f32> {
+    if (params.develop.w >= 1.5) {
+        // Encoded, converted, and decoded again, so the table sees the space it
+        // was built in.
+        let encoded = vec3<f32>(encode_srgb(rgb.r), encode_srgb(rgb.g), encode_srgb(rgb.b));
+        let out = apply_table(params.look_dims.w, params.look_dims, encoded);
+        return vec3<f32>(decode_srgb(out.r), decode_srgb(out.g), decode_srgb(out.b));
+    }
+    return apply_table(params.look_dims.w, params.look_dims, rgb);
+}
+
+/// The sRGB transfer function, for a look table whose axes are encoded.
+///
+/// Clamped below zero rather than mirrored: a negative value here is out of the
+/// space the table describes, and the table has nothing to say about it.
+fn encode_srgb(v: f32) -> f32 {
+    let x = max(v, 0.0);
+    if (x <= 0.0031308) {
+        return 12.92 * x;
+    }
+    return 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+}
+
+fn decode_srgb(v: f32) -> f32 {
+    let x = max(v, 0.0);
+    if (x <= 0.04045) {
+        return x / 12.92;
+    }
+    return pow((x + 0.055) / 1.055, 2.4);
+}
+
+fn apply_table(base: u32, dims: vec4<u32>, rgb: vec3<f32>) -> vec3<f32> {
     let hsv = rgb_to_hsv(rgb);
-    let dims = params.hsm_dims;
 
     // Hue spans the full circle across `hue_divisions` cells and wraps, so the
     // spacing is 360/divisions rather than 360/(divisions-1).
@@ -830,14 +906,14 @@ fn apply_hue_sat(rgb: vec3<f32>) -> vec3<f32> {
         vf = fract(val_pos);
     }
 
-    let c000 = hsm_at(h0, s0, v0);
-    let c100 = hsm_at(h1, s0, v0);
-    let c010 = hsm_at(h0, s1, v0);
-    let c110 = hsm_at(h1, s1, v0);
-    let c001 = hsm_at(h0, s0, v1);
-    let c101 = hsm_at(h1, s0, v1);
-    let c011 = hsm_at(h0, s1, v1);
-    let c111 = hsm_at(h1, s1, v1);
+    let c000 = table_at(base, dims, h0, s0, v0);
+    let c100 = table_at(base, dims, h1, s0, v0);
+    let c010 = table_at(base, dims, h0, s1, v0);
+    let c110 = table_at(base, dims, h1, s1, v0);
+    let c001 = table_at(base, dims, h0, s0, v1);
+    let c101 = table_at(base, dims, h1, s0, v1);
+    let c011 = table_at(base, dims, h0, s1, v1);
+    let c111 = table_at(base, dims, h1, s1, v1);
 
     let d00 = mix(c000, c100, hf);
     let d10 = mix(c010, c110, hf);

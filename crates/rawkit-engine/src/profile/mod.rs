@@ -205,6 +205,14 @@ pub struct CameraProfile {
     forward: Vec<Option<Matrix3>>,
     /// Hue/saturation correction per calibration illuminant.
     hue_sat: Vec<Option<HueSatMap>>,
+    /// The profile's look, when it has one. **One table, not one per
+    /// illuminant**: a look is somebody's opinion about how a photograph should
+    /// appear, not a characterisation of the sensor under a light, and the
+    /// specification gives it a single table accordingly.
+    look: Option<HueSatMap>,
+    /// Whether the look table's axes are in sRGB-encoded space rather than
+    /// linear. See [`Self::look_is_srgb`].
+    pub look_is_srgb: bool,
     /// What the profile calls itself, for a UI to show. `None` for a profile
     /// synthesised from a decoder table, which has no name to give.
     pub name: Option<String>,
@@ -236,6 +244,8 @@ impl CameraProfile {
             calibrations: vec![Calibration { cct, xyz_to_camera }],
             forward: vec![None],
             hue_sat: vec![None],
+            look: None,
+            look_is_srgb: false,
             name: None,
         }
     }
@@ -257,6 +267,8 @@ impl CameraProfile {
             calibrations,
             forward: vec![None, None],
             hue_sat: vec![None, None],
+            look: None,
+            look_is_srgb: false,
             name: None,
         }
     }
@@ -306,6 +318,19 @@ impl CameraProfile {
     /// `None` when the profile has none, when the two tables disagree about
     /// their dimensions, or — deliberately — when the profile has no forward
     /// matrix. See [`Self::camera_to_working`] for why that last one.
+    /// Give the profile a look table.
+    pub fn set_look_table(&mut self, map: HueSatMap) {
+        self.look = Some(map);
+    }
+
+    /// The look, if the profile brought one.
+    ///
+    /// Unlike [`Self::hue_sat_map`] this takes no temperature, and the absence
+    /// is the point: there is nothing to interpolate between.
+    pub fn look_table(&self) -> Option<&HueSatMap> {
+        self.look.as_ref()
+    }
+
     pub fn hue_sat_map(&self, cct: f32) -> Option<HueSatMap> {
         // Gated on the transform actually being available at *this*
         // temperature, not on the profile merely carrying one somewhere. The

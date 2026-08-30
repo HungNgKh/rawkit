@@ -1,8 +1,10 @@
 //! The profile's hue/saturation correction table, end to end through the GPU.
 //!
 //! The table is measurement, not taste — a profile carries one per calibration
-//! illuminant, and a look would not depend on the light. That is why this is
-//! adopted while `ProfileLookTable` and `ProfileToneCurve` are not.
+//! illuminant, and a look would not depend on the light. The **look** table is
+//! here too, and is the same format applied somewhere else: after the tone
+//! curve, because a look is authored against a rendered picture rather than
+//! against the light. `ProfileToneCurve` is still not adopted.
 //!
 //! `cargo test -p rawkit-engine --test hue_sat_map -- --ignored`
 
@@ -93,6 +95,66 @@ fn render_colour(gpu: &Gpu, profile: &CameraProfile, camera_rgb: [f32; 3]) -> [f
         .pixels;
     let i = ((N / 2 * N + N / 2) * 4) as usize;
     [out[i], out[i + 1], out[i + 2]]
+}
+
+/// A profile carrying only a look — no hue/saturation correction — which is
+/// exactly the shape of an Adobe *Camera Matching* profile.
+fn profile_with_look(look: HueSatMap) -> CameraProfile {
+    let mut profile = profile_with(None);
+    profile.set_look_table(look);
+    profile
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_look_is_applied_even_with_no_hue_saturation_table() {
+    // The regression this exists for. The working-space hop used to be taken
+    // only when a profile had a hue/saturation correction, so a Camera Matching
+    // profile — which has none and keeps everything in its look — had its look
+    // silently discarded. Measured against six real frames, that rendered
+    // *further* from the camera's own JPEG than using no profile at all.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let colour = [0.55, 0.30, 0.22];
+
+    let plain = render_colour(&gpu, &profile_with_look(identity_map(6, 4, 4)), colour);
+    // Two thirds of the saturation, everywhere in the table.
+    let calmed = render_colour(
+        &gpu,
+        &profile_with_look(uniform_map(6, 4, 4, [0.0, 0.667, 1.0])),
+        colour,
+    );
+
+    let distance = |c: [f32; 3]| {
+        let grey = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        ((c[0] - grey).powi(2) + (c[1] - grey).powi(2) + (c[2] - grey).powi(2)).sqrt()
+    };
+    let ratio = distance(calmed) / distance(plain);
+    println!("look table took saturation to {ratio:.3} of what it was");
+    assert!(
+        ratio < 0.85,
+        "the look table did nothing: saturation is {ratio:.3} of what it was"
+    );
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn an_identity_look_changes_nothing() {
+    // The same argument as the identity hue/saturation table, for the other
+    // table: an identity look still takes the hop into the working space and
+    // back, so an asymmetric round trip shows up here with nothing to blame it
+    // on.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let colour = [0.55, 0.30, 0.22];
+    let without = render_colour(&gpu, &profile_with(None), colour);
+    let with = render_colour(&gpu, &profile_with_look(identity_map(8, 4, 4)), colour);
+    for c in 0..3 {
+        assert!(
+            (without[c] - with[c]).abs() < 2e-3,
+            "an identity look moved channel {c}: {} against {}",
+            with[c],
+            without[c]
+        );
+    }
 }
 
 #[test]
