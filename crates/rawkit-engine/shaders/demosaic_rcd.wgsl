@@ -1078,53 +1078,88 @@ fn apply_table(base: u32, dims: vec4<u32>, rgb: vec3<f32>) -> vec3<f32> {
 /// Without a run-up, reconstruction switches on at a hard boundary and leaves a
 /// visible edge around every highlight — which is a worse artefact than the one
 /// being fixed, and harder to explain.
-const CLIP_RUNUP: f32 = 0.02;
-
-/// Estimate what a clipped channel should have been.
 ///
-/// # Why blown highlights go magenta without this
+/// Widened from 0.02 when the coloured arcs came off `DSC01588.ARW` and left a
+/// hard white contour behind them: two per cent of a channel's range is a very
+/// narrow band of scene brightness, and across a gentle sky gradient it lands as
+/// a line. At 0.25 the roll is smooth and the blown region blends into the sky.
+///
+/// The width is free where nothing is blown, which is what makes it safe to
+/// spend: rendered against the 0.02 version, three unclipped frames came back at
+/// a mean absolute difference of **0.000/255** with under 0.005% of channels
+/// moving by even one step — the only pixels that move at all are the ones
+/// already within a quarter-stop of saturating.
+const CLIP_RUNUP: f32 = 0.25;
+
+/// Roll a blown highlight toward white instead of toward a colour.
+///
+/// # Why blown highlights take a colour without this
 ///
 /// The sensor saturates in its own units, and white balance then scales the
-/// channels apart. For a daylight scene green carries the most signal, so green
-/// saturates first: its true value might be 1.5 but it records 1.0. Red is
-/// nowhere near its own limit and records correctly, then gets multiplied up.
-/// The result is a pixel where red and blue exceed green — magenta — in the one
-/// part of the picture the eye most expects to be white.
+/// channels apart. Green is the reference the other two are divided by, so
+/// green's ceiling in balanced space is the *lowest* of the three and green
+/// clips first — whatever colour the subject is. Its true value might be 1.5 but
+/// it records 1.0. Red is nowhere near its own limit, records correctly, and is
+/// then multiplied up. Left alone, the result is a pixel where red and blue
+/// exceed green — magenta — in the part of the picture the eye most expects to
+/// be white.
 ///
-/// # What this does, and what it does not
+/// # Why the whole pixel moves, and not just the channel that clipped
 ///
-/// A channel we no longer believe is raised to the brightest channel we do
-/// believe, which restores neutrality and keeps whatever structure the surviving
-/// channels still carry. When nothing is left to believe, the only defensible
-/// estimate is neutral at the highest clip point.
+/// The obvious repair is to raise the missing channel to the brightest one still
+/// believed. That is right for a neutral subject, where the survivors agree and
+/// their common level is the answer. It is wrong for every other subject,
+/// because when the survivors *disagree* the brightest one is a choice, and the
+/// pixel comes out wearing that channel's colour.
 ///
-/// This is **not** colour propagation. The strong version of this algorithm
-/// borrows the ratio between channels from unclipped neighbours, so a blown red
-/// flower stays red instead of being pulled toward white; that needs a
-/// neighbourhood search, its own halo, and its own pass. What is here is the
-/// local approximation: right for specular highlights, skies and light sources,
-/// which is most of what actually blows out, and wrong in the direction of white
-/// for a saturated subject that clips.
+/// `DSC01588.ARW` is what proved it: a blown sky behind a tree came out with a
+/// mint-green arc across it, measured at green 0.6086 sitting exactly on blue
+/// 0.6086 with red left behind at 0.5015 — green raised to meet blue, and a
+/// highlight *more* saturated than the sky it interrupted. The camera's own JPEG
+/// has no such arc. `a_blue_subject_does_not_turn_cyan_when_green_clips` is that
+/// pixel.
+///
+/// The reasoning that led there was that the surviving channels are real
+/// measured data and should be kept. They are — but a *colour* is the ratio
+/// between three channels, and once one of them is missing the ratio is not
+/// known. Keeping two exactly and inventing the third does not preserve the
+/// colour; it invents a different one. So the honest local answer is that a
+/// blown pixel has no colour we can name, and it is taken to neutral at its own
+/// brightest channel, in proportion to how far into clipping it is.
+///
+/// One consequence worth stating: this begins whitening as soon as the *first*
+/// channel goes, rather than waiting for the last. That is deliberate — the
+/// first channel going is the moment the colour stops being known — and it is
+/// what removes the ring artefacts, which were the three channels each clipping
+/// at their own brightness with a separate contour for every one.
+///
+/// This is **not** colour propagation. The strong version borrows the ratio
+/// between channels from unclipped neighbours, so a blown red flower stays red
+/// instead of being pulled toward white; that needs a neighbourhood search, its
+/// own halo, and its own pass. What is here is the local approximation: right
+/// for specular highlights, skies and light sources, which is most of what
+/// actually blows out, and wrong in the direction of white — uniformly white,
+/// now — for a saturated subject that clips.
 fn reconstruct_highlights(balanced: vec3<f32>) -> vec3<f32> {
     // The sensor clips at one value in its own space; white balance moves that
     // to a different height per channel, which is why the threshold is a vector.
     let thresholds = params.wb.rgb * params.develop.z;
     let clipped = smoothstep(thresholds * (1.0 - CLIP_RUNUP), thresholds, balanced);
 
-    // The brightest channel still below its own limit.
-    let believable = balanced * (1.0 - clipped);
-    let brightest = max(believable.r, max(believable.g, believable.b));
+    // How far this pixel is a blown highlight at all. The *first* channel to go
+    // drives it, because that is when the colour stops being known.
+    let blown = max(clipped.r, max(clipped.g, clipped.b));
 
-    // Everything clipped: nothing survives to take a level from, so aim for
-    // neutral at the highest clip point rather than leaving the channels at
-    // their own limits, which is the colour of the white balance itself.
-    let all_clipped = min(clipped.r, min(clipped.g, clipped.b));
-    let neutral = max(thresholds.r, max(thresholds.g, thresholds.b));
-    let level = mix(brightest, neutral, all_clipped);
+    // Neutral at the pixel's own brightest channel — which for a fully clipped
+    // pixel is the highest threshold, so the "nothing left to believe" case
+    // needs no branch of its own. Never below any channel, so this can only
+    // raise: a highlight that could darken would grow a dark rim where the
+    // run-up begins.
+    let level = max(balanced.r, max(balanced.g, balanced.b));
 
-    // `clipped` is exactly zero below the run-up, so an unclipped pixel comes
+    // `blown` is exactly zero below the run-up, so an unclipped pixel comes
     // through this untouched rather than merely almost untouched.
-    return mix(balanced, max(balanced, vec3<f32>(level)), clipped);
+    return mix(balanced, vec3<f32>(level), blown);
 }
 
 /// Fixed sigmoid roll-off, applied per channel.

@@ -114,17 +114,64 @@ fn a_clipped_green_channel_no_longer_goes_magenta() {
         cast(fixed)
     );
 
-    // Note what is *not* asserted: that the result is neutral. Blue here is
-    // below its own limit, so it is real measured data and the spread it
-    // creates is real scene colour. Forcing the pixel all the way to grey would
-    // be discarding a channel we have every reason to believe — the opposite
-    // mistake to the one being fixed, and just as wrong.
+    // This comment used to argue the opposite of what it now says, and the
+    // photograph is why. It read: do not force the pixel to neutral, because
+    // blue is below its own limit and so is real measured data whose spread is
+    // real scene colour. That is true of blue on its own and false of the pixel:
+    // a colour is the ratio between three channels, and with one of them missing
+    // the ratio is not known. Keeping two exactly and inventing the third
+    // preserves nothing — it picks a different colour and renders it confidently.
+    // See `a_blue_subject_does_not_turn_cyan_when_green_clips`, which is the
+    // frame that settled it.
     //
-    // What must be true is that green is no longer the channel left behind,
-    // because that deficiency is an artefact of the sensor and nothing else.
+    // So neutral *is* the answer, and green being no longer the channel left
+    // behind follows from it rather than being the whole of it.
     assert!(
         fixed[1] >= fixed[0] * 0.99,
         "green is still short of red after reconstruction: {fixed:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_blue_subject_does_not_turn_cyan_when_green_clips() {
+    // The failure `DSC01588.ARW` found: a bright blue sky with the sun behind a
+    // tree, rendered with a mint-green arc across it that the camera's own JPEG
+    // does not have.
+    //
+    // Green's threshold in balanced space is the *lowest* of the three — white
+    // balance divides by it — so green clips first whatever colour the subject
+    // is. On a neutral subject the survivors agree and raising green to them is
+    // right. On a blue one they do not agree, and raising green to the brighter
+    // of the two hands the pixel that channel's colour: green meets blue, red is
+    // left behind, and the highlight comes out cyan and *more* saturated than
+    // the sky it interrupts.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    // Balanced: (0.83, 1.00, 1.28) against thresholds (2.75, 1.00, 1.70) — only
+    // green is gone, and the two survivors disagree by half a stop.
+    let blue_sky = [0.30, 1.0, 0.75];
+
+    let raw = render(&gpu, blue_sky, DAYLIGHT_WB, f32::INFINITY);
+    let fixed = render(&gpu, blue_sky, DAYLIGHT_WB, 1.0);
+
+    println!("without reconstruction: {raw:?} cast {:.3}", cast(raw));
+    println!("with reconstruction   : {fixed:?} cast {:.3}", cast(fixed));
+
+    assert!(
+        cast(raw) > 0.15,
+        "the test case does not actually produce a cast: {raw:?}"
+    );
+    assert!(
+        cast(fixed) < cast(raw) * 0.5,
+        "a clipped blue sky kept its cast: {:.3} -> {:.3} ({fixed:?})",
+        cast(raw),
+        cast(fixed)
+    );
+    // The specific shape of the artefact, named so a future change that brings
+    // it back says which one it is: green arriving at blue while red stays put.
+    assert!(
+        (fixed[1] - fixed[2]).abs() > 0.02 || (fixed[0] - fixed[1]).abs() < 0.02,
+        "green met blue and left red behind — the cyan arc is back: {fixed:?}"
     );
 }
 
@@ -141,8 +188,10 @@ fn an_unclipped_pixel_is_untouched() {
         [0.10, 0.20, 0.15],
         [0.30, 0.42, 0.25],
         [0.05, 0.08, 0.06],
-        // Right below the run-up: green at 0.97 against a threshold of 1.0.
-        [0.20, 0.97, 0.30],
+        // Right below the run-up: green at 0.74 against a threshold of 1.0,
+        // which `CLIP_RUNUP` puts the lower edge at 0.75. Tied to that constant
+        // on purpose — the probe is only meaningful while it sits just outside.
+        [0.20, 0.74, 0.30],
     ] {
         let off = render(&gpu, colour, DAYLIGHT_WB, f32::INFINITY);
         let on = render(&gpu, colour, DAYLIGHT_WB, 1.0);
