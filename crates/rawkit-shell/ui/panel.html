@@ -4,101 +4,126 @@
 <style>
   :root { color-scheme: dark; }
   html, body { margin: 0; height: 100%; background: #1e1e22; color: #e8e8ea;
-               font: 13px/1.4 system-ui, sans-serif; }
+               font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
   /* Under a transparent cutout the page covers the whole window and the GPU
-     surface is behind it, so everything below the chrome has to paint nothing
-     at all — an opaque pixel here is a pixel of photograph nobody can see.
+     surface is behind it, so everything outside the chrome has to paint nothing
+     at all — an opaque pixel there is a pixel of photograph nobody can see.
      Route 3 gives the canvas its own window and never sets this, which is why
      it is a class rather than the default. */
   body.cutout { background: transparent; }
   body.cutout #chrome { background: #1e1e22; }
-  main { padding: 14px 18px; display: flex; gap: 24px; align-items: flex-start; }
-  section { min-width: 168px; }
-  /* Six tone controls in one column would need a taller panel, and the panel is
-     chrome sitting on top of the photograph. Two columns instead: same height,
-     same single "Tone" heading, no canvas surrendered. */
-  /* Fixed columns, and a width that matches them: with `1fr` the grid sized
-     itself past the section's box and drew over the section beside it. */
-  section.split { display: grid; grid-template-columns: repeat(2, 168px);
-                  grid-template-rows: repeat(4, auto); grid-auto-flow: column;
-                  column-gap: 24px; min-width: 360px; }
-  section.split h1 { grid-column: 1 / -1; grid-row: 1; }
-  h1 { font-size: 13px; font-weight: 600; margin: 0 0 10px; letter-spacing: .02em; }
+
+  /* A column on the right rather than a strip across the top. A landscape
+     photograph is limited by its short edge and a strip takes from exactly
+     that edge — the same 3:2 frame goes from 864x576 to 1080x720 by moving the
+     controls sideways. The width is `PANEL_WIDTH` in main.rs and the two have
+     to agree: the canvas is a separate window placed at that boundary, so a
+     disagreement is a strip of photograph behind the panel or a strip of
+     desktop beside it. */
+  #chrome { position: fixed; top: 0; right: 0; bottom: 0; width: 360px;
+            display: flex; flex-direction: column; background: #1e1e22;
+            border-left: 1px solid #2c2c34; }
+
+  /* The only thing that scrolls, which is the whole point of a column: the
+     sections can outgrow the window and nothing has to be taken away to make
+     room for the next one. */
+  main { flex: 1; overflow-y: auto; overscroll-behavior: contain;
+         padding: 4px 16px 20px; }
+
+  details { border-bottom: 1px solid #26262e; }
+  details:last-child { border-bottom: 0; }
+  summary { font-size: 13px; font-weight: 600; letter-spacing: .02em;
+            padding: 10px 0 10px 16px; cursor: pointer; position: relative;
+            list-style: none; user-select: none; }
+  summary::-webkit-details-marker { display: none; }
+  /* Drawn rather than relying on the engine's own marker, which differs between
+     WebKitGTK, WKWebView and WebView2 — three platforms showing three shapes
+     for the same control is exactly the kind of thing nobody notices until a
+     screenshot from someone else's machine looks wrong. */
+  summary::before { content: "▸"; position: absolute; left: 0; color: #7d7d87;
+                    transition: transform .12s ease; display: inline-block; }
+  details[open] > summary::before { transform: rotate(90deg); }
+  summary:hover { color: #ffffff; }
+  details > *:last-child { margin-bottom: 12px; }
+
   label { display: flex; align-items: center; gap: 10px; margin: 7px 0; }
-  label span:first-child { width: 58px; color: #9a9aa2; }
+  label span:first-child { width: 58px; color: #9a9aa2; flex-shrink: 0; }
   /* `min-width: 0` because a range input has an intrinsic minimum of its own,
      and without it flex refuses to shrink one — which pushed the readout out of
-     its column and over the label beside it. */
+     the column and over the label beside it. */
   input[type=range] { flex: 1; min-width: 0; }
-  output { width: 44px; text-align: right; font-variant-numeric: tabular-nums; }
+  output { width: 44px; text-align: right; font-variant-numeric: tabular-nums;
+           flex-shrink: 0; }
   button { background: #303038; color: inherit; border: 1px solid #45454f;
            border-radius: 5px; padding: 4px 11px; font: inherit; cursor: pointer; }
   button:hover { background: #3a3a44; }
-  .row { display: flex; gap: 7px; margin-top: 10px; }
-  #log { color: #7d7d87; margin-top: 12px; font-variant-numeric: tabular-nums; }
+  .row { display: flex; gap: 7px; margin-top: 10px; flex-wrap: wrap; }
+  #log { color: #7d7d87; margin-top: 12px; font-variant-numeric: tabular-nums;
+         overflow-wrap: anywhere; }
   #log.refused { color: #e0705f; }
+  #keys { color: #7d7d87; font-size: 11px; line-height: 1.7; }
 
-  /* The bar is always there because the histogram is always there. What is
-     conditional is the culling readout inside it, which is why the two are
-     separate elements rather than one that hides. */
-  #bar { display: flex; align-items: center; gap: 18px; padding: 6px 18px;
-         border-bottom: 1px solid #2c2c34; font-variant-numeric: tabular-nums; }
-  /* `min-width: 0` and `nowrap` together are what stop the bar from growing.
-     Without them a long readout squeezes this box, its spans wrap, and the bar
-     becomes ten lines tall — taking the height out of the photograph rather
-     than out of the text nobody was reading. */
-  #cull { display: flex; align-items: baseline; gap: 18px; flex: 1;
-          min-width: 0; white-space: nowrap; }
-  #cull.hidden { display: none; }
-  /* Pushed right whether or not the culling readout is showing, which is why
-     the margin is here and not on the last thing inside `#cull`. */
-  #scope { display: flex; align-items: center; gap: 12px; margin-left: auto;
-           flex-shrink: 0; }
-  #histogram { width: 256px; height: 40px; border-radius: 3px;
+  /* The histogram sits at the top of the column, above everything it describes.
+     Fixed height, so a long export line or a wrapping status block can never
+     take its space. */
+  #bar { padding: 12px 16px 10px; border-bottom: 1px solid #2c2c34;
+         font-variant-numeric: tabular-nums; flex-shrink: 0; }
+  #histogram { width: 328px; height: 84px; border-radius: 3px;
                background: #141418; display: block; }
+  #readout { display: flex; align-items: baseline; gap: 14px; margin-top: 7px; }
   .clip { font-size: 11px; color: #56565e; }
   .clip.lit#clip-white { color: #e0705f; }
   .clip.lit#clip-black { color: #6f9ade; }
-  #export { color: #9a9aa2; font-size: 12px; margin-left: auto;
-            white-space: nowrap; flex-shrink: 0; }
+  #export { color: #9a9aa2; font-size: 11px; margin-left: auto;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #export.hidden { display: none; }
   #export.failed { color: #e0705f; }
-  #frame { font-weight: 600; }
-  #position, #counts, #keys { color: #7d7d87; }
-  /* The first thing to give up space, and it truncates rather than wrapping:
-     hints are the least important thing in the bar. */
-  #keys { margin-left: auto; font-size: 11px;
-          min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-  #stars { letter-spacing: 2px; color: #d8bf63; min-width: 62px; }
+
+  /* The culling readout, stacked rather than strung along a bar. In a column
+     there is no room for a row, and there is no need for one either. */
+  #cull { padding: 10px 16px; border-bottom: 1px solid #2c2c34;
+          font-variant-numeric: tabular-nums; flex-shrink: 0; }
+  #cull.hidden { display: none; }
+  #cull .line { display: flex; align-items: baseline; gap: 10px; }
+  #cull .line + .line { margin-top: 5px; }
+  #frame { font-weight: 600; overflow: hidden; text-overflow: ellipsis;
+           white-space: nowrap; }
+  #position, #counts { color: #7d7d87; font-size: 11px; }
+  #counts { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #stars { letter-spacing: 2px; color: #d8bf63; margin-left: auto; flex-shrink: 0; }
   #mode { color: #8e8e98; text-transform: uppercase; letter-spacing: .08em; font-size: 11px;
-          border: 1px solid #3a3a44; border-radius: 3px; padding: 1px 6px; }
+          border: 1px solid #3a3a44; border-radius: 3px; padding: 1px 6px; flex-shrink: 0; }
   #flag.pick { color: #6fc27a; }
   #flag.reject { color: #e0705f; }
 </style>
 
 <div id="chrome">
 <div id="bar">
-<div id="cull" class="hidden">
-  <span id="frame"></span>
-  <span id="position"></span>
-  <span id="stars"></span>
-  <span id="flag"></span>
-  <span id="label"></span>
-  <span id="counts"></span>
-  <span id="mode">loupe</span>
-  <span id="keys">G grid · E loupe · R crop · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · Z undo cull · ⌃Z undo edit · ⌃E export</span>
-</div>
-<span id="export" class="hidden"></span>
-<div id="scope">
   <canvas id="histogram" title="the developed photograph, in the values a file would carry"></canvas>
-  <span class="clip" id="clip-white" title="pixels with a channel at full scale">–</span>
-  <span class="clip" id="clip-black" title="pixels with nothing in any channel">–</span>
+  <div id="readout">
+    <span class="clip" id="clip-white" title="pixels with a channel at full scale">–</span>
+    <span class="clip" id="clip-black" title="pixels with nothing in any channel">–</span>
+    <span id="export" class="hidden"></span>
+  </div>
 </div>
+<div id="cull" class="hidden">
+  <div class="line">
+    <span id="frame"></span>
+    <span id="stars"></span>
+  </div>
+  <div class="line">
+    <span id="position"></span>
+    <span id="flag"></span>
+    <span id="label"></span>
+    <span id="mode">loupe</span>
+  </div>
+  <div class="line">
+    <span id="counts"></span>
+  </div>
 </div>
 
 <main>
-  <section class="split">
-    <h1>Tone</h1>
+  <details id="s-tone" open><summary>Tone</summary>
     <label><span>Exposure</span>
       <input id="exposure" type="range" min="-4" max="4" step="0.01" value="0">
       <output id="exposure-value">0.00</output></label>
@@ -117,10 +142,9 @@
     <label><span>Blacks</span>
       <input id="blacks" type="range" min="-1" max="1" step="0.01" value="0">
       <output id="blacks-value">0.00</output></label>
-  </section>
+  </details>
 
-  <section>
-    <h1>Geometry</h1>
+  <details id="s-geometry"><summary>Geometry</summary>
     <label><span>Straighten</span>
       <input id="straighten" type="range" min="-15" max="15" step="0.1" value="0">
       <output id="straighten-value">0.0°</output></label>
@@ -128,20 +152,18 @@
       <button data-rotate="-1">↺</button>
       <button data-rotate="1">↻</button>
     </div>
-  </section>
+  </details>
 
-  <section>
-    <h1>Colour</h1>
+  <details id="s-colour"><summary>Colour</summary>
     <label><span>Saturation</span>
       <input id="saturation" type="range" min="-1" max="1" step="0.01" value="0">
       <output id="saturation-value">0.00</output></label>
     <label><span>Vibrance</span>
       <input id="vibrance" type="range" min="-1" max="1" step="0.01" value="0">
       <output id="vibrance-value">0.00</output></label>
-  </section>
+  </details>
 
-  <section>
-    <h1>Detail</h1>
+  <details id="s-detail"><summary>Detail</summary>
     <label><span>Sharpen</span>
       <input id="sharpen" type="range" min="0" max="1" step="0.01" value="0.4">
       <output id="sharpen-value">0.40</output></label>
@@ -151,10 +173,9 @@
     <label><span>Colour NR</span>
       <input id="chroma_noise" type="range" min="0" max="1" step="0.01" value="0.5">
       <output id="chroma_noise-value">0.50</output></label>
-  </section>
+  </details>
 
-  <section>
-    <h1>White balance</h1>
+  <details id="s-white-balance"><summary>White balance</summary>
     <label><span>Temp</span>
       <input id="temperature" type="range" min="2000" max="12000" step="10" value="5500">
       <output id="temperature-value">as shot</output></label>
@@ -162,10 +183,9 @@
       <input id="tint" type="range" min="-100" max="100" step="1" value="0">
       <output id="tint-value">0</output></label>
     <div class="row"><button id="as-shot">As shot</button></div>
-  </section>
+  </details>
 
-  <section>
-    <h1>View</h1>
+  <details id="s-view"><summary>View</summary>
     <div class="row">
       <button data-zoom="0.5">−</button>
       <button data-fit>Fit</button>
@@ -179,7 +199,11 @@
       <button data-pan="200,0">→</button>
     </div>
     <div id="log">ready</div>
-  </section>
+  </details>
+  <details id="s-keys">
+    <summary>Keys</summary>
+    <div id="keys">G grid · E loupe · R crop · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · Z undo cull · ⌃Z undo edit · ⌃E export</div>
+  </details>
 </main>
 </div>
 
@@ -347,22 +371,28 @@
   const scope = document.getElementById("histogram");
   const clipWhite = document.getElementById("clip-white");
   const clipBlack = document.getElementById("clip-black");
-  const WIDE = 256;
-  const TALL = 40;
+  // Drawn in a 256-unit space — one unit a bin — and stretched to the column's
+  // width by the transform. A bin is no longer a whole pixel, which mattered
+  // when the widget was exactly 256 across and does not now: the channels are
+  // composited additively, so two adjacent fills sharing a fractional edge sum
+  // to full coverage instead of leaving the seam a source-over blend would.
+  const BINS = 256;
+  const WIDE = 328;
+  const TALL = 84;
 
   const drawScope = data => {
     // Sized in device pixels so a bin is a whole pixel on a HiDPI screen. One
     // bin per CSS pixel is exactly 256 wide, which is why the widget is that
     // width and not a round number that would resample the bins.
     const dpr = window.devicePixelRatio || 1;
-    if (scope.width !== WIDE * dpr) {
-      scope.width = WIDE * dpr;
-      scope.height = TALL * dpr;
+    if (scope.width !== Math.round(WIDE * dpr)) {
+      scope.width = Math.round(WIDE * dpr);
+      scope.height = Math.round(TALL * dpr);
     }
     const ctx = scope.getContext("2d");
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.setTransform(scope.width / BINS, 0, 0, scope.height / TALL, 0, 0);
     ctx.fillStyle = "#141418";
-    ctx.fillRect(0, 0, WIDE, TALL);
+    ctx.fillRect(0, 0, BINS, TALL);
 
     // Square root rather than linear. A photograph's histogram is usually one
     // tall spike and a long tail, and scaling to the peak linearly leaves the
@@ -394,7 +424,9 @@
     // added to the three channels and the widget read as a white slab — losing
     // the colour information the primaries were chosen to carry.
     ctx.strokeStyle = "#d0d0d8";
-    ctx.lineWidth = 1;
+    // In drawing units, so the line comes out about one device pixel however
+    // wide the column and whatever the screen's scale.
+    ctx.lineWidth = BINS / scope.width;
     ctx.beginPath();
     for (let i = 0; i < data.luma.length; i++) {
       const y = TALL - Math.sqrt(data.luma[i] / peak) * TALL;
@@ -438,6 +470,26 @@
       : `exporting ${job.done}/${job.total}` + (job.filename ? ` · ${job.filename}` : "");
   }, 100);
 
+  // ---- Sections ------------------------------------------------------------
+  //
+  // Which ones you left open, kept between sessions. The alternative is deciding
+  // for you every time a photograph opens, and the set of controls somebody
+  // works with is theirs rather than ours.
+  //
+  // Every read and write is guarded: a webview with site data turned off throws
+  // on the accessor itself rather than returning null, and a panel that failed
+  // to draw because it could not remember a heading would be a poor trade.
+  for (const section of document.querySelectorAll("details")) {
+    const key = `open:${section.id}`;
+    try {
+      const saved = localStorage.getItem(key);
+      if (saved !== null) section.open = saved === "1";
+    } catch (e) { /* no storage; the markup's own defaults stand */ }
+    section.addEventListener("toggle", () => {
+      try { localStorage.setItem(key, section.open ? "1" : "0"); } catch (e) {}
+    });
+  }
+
   // ---- Culling -------------------------------------------------------------
   //
   // Keys are handled here rather than natively because a keyboard is the one
@@ -480,14 +532,19 @@
   // without a round trip, and both paths end in the same router, so a drag
   // means the same thing either way.
   if (cutout) {
-    const chromeHeight = () =>
-      document.getElementById("chrome").getBoundingClientRect().height;
+    const chromeLeft = () =>
+      document.getElementById("chrome").getBoundingClientRect().left;
     // Canvas pixels: the session works in the surface's own coordinates, and
     // the page is the only place that knows the device ratio.
+    //
+    // The test is horizontal now, and there is nothing to subtract: the
+    // photograph starts at the window's origin, so a pointer is over it exactly
+    // when it is left of the chrome.
     const at = event => {
       const dpr = window.devicePixelRatio || 1;
-      const y = event.clientY - chromeHeight();
-      return y < 0 ? null : { x: event.clientX * dpr, y: y * dpr };
+      return event.clientX >= chromeLeft()
+        ? null
+        : { x: event.clientX * dpr, y: event.clientY * dpr };
     };
     // Not `send`, which is already the command bus in this scope; this is the
     // other direction of traffic and shadowing it would be a trap.

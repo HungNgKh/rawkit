@@ -186,22 +186,32 @@ enum Route {
     NativeChild,
 }
 
-/// Width of the chrome in route 2, in logical pixels.
-const PANEL_WIDTH: f64 = 400.0;
-/// Height the chrome keeps in route 3. `default_vbox` is a vertical box, and two
-/// disjoint rectangles is what the arrangement needs.
+/// Width of the chrome, in logical pixels.
+///
+/// A column rather than a strip, and the reason is arithmetic as much as taste.
+/// In a 1440x800 window a top strip left the photograph 1440x576, and a 3:2
+/// frame fitted to that is 864x576; a 360-wide column leaves 1080x800, and the
+/// same frame comes out 1080x720. **Half again as much photograph**, because a
+/// landscape picture is limited by its short edge and a strip takes from
+/// exactly that edge.
+///
+/// It also scales, which a strip does not: a column scrolls, so the per-band
+/// mixer's two dozen controls and whatever a mask list turns out to need have
+/// somewhere to go.
+///
+/// 360 rather than less: a control is a 58px label, a readout, and a slider,
+/// and below about 280 the slider is too short to place a value on.
+const PANEL_WIDTH: f64 = 360.0;
+/// The same width where a platform wants whole pixels.
 ///
 /// The equivalents on macOS and Windows will be a child NSView and a child
 /// HWND, and those will bring their own geometry — but the constant is not
 /// gated, because a value only some platforms can see is how this file has
 /// broken the build four times.
-/// Grew from 200 when the histogram went into the bar: the widget is 40 logical
-/// pixels tall and the bar's padding adds twelve, and at 200 the bottom row of
-/// the tone controls was cut off by about that much.
-const PANEL_HEIGHT: i32 = 224;
-// Wide enough for the control sections to sit side by side. Each is 200 logical
-// pixels and the tone block is two of them, so five sections plus gaps need
-// about 1280 — at 1200 the last one was pushed off the edge.
+const PANEL_PIXELS: i32 = PANEL_WIDTH as i32;
+// The sections used to sit side by side and needed about 1280 between them.
+// They are a column now, so this is only what a photograph wants: 1080 of
+// canvas beside the chrome, which shows a 3:2 frame at 1080x720.
 const WINDOW: (f64, f64) = (1440.0, 800.0);
 
 /// The session, shared between the page's commands and the render loop.
@@ -545,10 +555,10 @@ fn main() -> Result<()> {
                 "surface    : {:?} {}x{}",
                 config.format, layout.surface.width, layout.surface.height
             );
-            if layout.top > 0 {
+            if layout.canvas != layout.surface {
                 eprintln!(
-                    "canvas     : {}x{} at y={} (the chrome floats over the surface)",
-                    layout.canvas.width, layout.canvas.height, layout.top
+                    "canvas     : {}x{} (the chrome floats over the rest of the surface)",
+                    layout.canvas.width, layout.canvas.height
                 );
             }
             surface.configure(&gpu.device, &config);
@@ -587,10 +597,10 @@ fn main() -> Result<()> {
             // Whatever was last decided about this photograph, if anything was.
             saver.restore(&mut shared.lock().expect("session lock"));
 
-            // Routes 1 and 2 put the canvas over the whole window; route 3
-            // reserves a strip for the chrome.
+            // Routes 1 and 2 put the canvas over the whole window; route 3 gives
+            // it a window of its own, ending where the chrome begins.
             let panel = if route == Route::NativeChild {
-                PANEL_HEIGHT
+                PANEL_PIXELS
             } else {
                 0
             };
@@ -659,7 +669,10 @@ fn main() -> Result<()> {
             let surface_size = [layout.canvas.width, layout.canvas.height];
             // Where the photograph goes inside the swapchain. Under route 3 that
             // is all of it; under a cutout it starts below the chrome.
-            let canvas_rect = [0, layout.top, layout.canvas.width, layout.canvas.height];
+            // The origin under every route now: the chrome is a column beside
+            // the photograph rather than a strip above it, so there is nothing
+            // to push it down past.
+            let canvas_rect = [0, 0, layout.canvas.width, layout.canvas.height];
             let mut stats = FrameStats::default();
             let navigating = library.clone();
             // The rectangle the canvas currently carries, so a settled one is
@@ -1136,16 +1149,16 @@ fn display_profile() -> Option<Vec<u8>> {
 #[cfg(target_os = "linux")]
 fn attach_input(
     window: &tauri::Window,
-    panel_height: i32,
+    panel_width: i32,
     session: Arc<Mutex<Session>>,
 ) -> Result<()> {
-    canvas::attach_input(window, panel_height, session)
+    canvas::attach_input(window, panel_width, session)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn attach_input(
     _window: &tauri::Window,
-    _panel_height: i32,
+    _panel_width: i32,
     _session: Arc<Mutex<Session>>,
 ) -> Result<()> {
     // Nothing to attach *to*: under a cutout the canvas has no window of its
@@ -1163,16 +1176,16 @@ fn attach_input(
 ///
 /// The same rectangle only when the canvas has a window of its own. Under a
 /// transparent cutout the swapchain is the whole window and the chrome floats
-/// over the top of it, so the photograph has to be told to stay below the
-/// chrome — otherwise its top strip is behind the panel and simply not visible.
+/// over the right of it, so the photograph has to be told to stop where the
+/// chrome starts — otherwise its right edge is behind the panel and not
+/// visible.
 #[derive(Debug, Clone, Copy)]
 struct Layout {
     /// What the surface is configured at: always the window.
     surface: tauri::PhysicalSize<u32>,
-    /// The photograph's rectangle within it.
+    /// The photograph's rectangle within it, which starts at the origin — the
+    /// chrome is to the right of it, so there is no offset to carry.
     canvas: tauri::PhysicalSize<u32>,
-    /// How far down that rectangle starts, in surface pixels.
-    top: u32,
 }
 
 /// Build the window for the chosen arrangement and put a surface on it.
@@ -1199,7 +1212,7 @@ fn build_window(
             let window = builder.build()?;
             let surface_size = window.inner_size()?;
             let scale = window.scale_factor()?;
-            let top = (PANEL_HEIGHT as f64 * scale) as u32;
+            let panel = (PANEL_WIDTH * scale) as u32;
             let (gpu, surface) = Gpu::with_surface(window.clone())?;
             let handle = window.as_ref().window();
             Ok((
@@ -1208,10 +1221,9 @@ fn build_window(
                 Layout {
                     surface: surface_size,
                     canvas: tauri::PhysicalSize::new(
-                        surface_size.width,
-                        surface_size.height.saturating_sub(top).max(1),
+                        surface_size.width.saturating_sub(panel).max(1),
+                        surface_size.height,
                     ),
-                    top,
                 },
                 handle,
             ))
@@ -1243,7 +1255,6 @@ fn build_window(
                 Layout {
                     surface: size,
                     canvas: size,
-                    top: 0,
                 },
                 window,
             ))
@@ -1255,13 +1266,13 @@ fn build_window(
                     .title("rawkit")
                     .inner_size(WINDOW.0, WINDOW.1)
                     .build()?;
-            let canvas = canvas::attach(&window.as_ref().window(), PANEL_HEIGHT)?;
+            let canvas = canvas::attach(&window.as_ref().window(), PANEL_PIXELS)?;
             eprintln!("canvas     : X window {canvas:?}");
             let outer = window.inner_size()?;
             let scale = window.scale_factor()?;
-            let panel = (PANEL_HEIGHT as f64 * scale) as u32;
+            let panel = (PANEL_WIDTH * scale) as u32;
             let size =
-                tauri::PhysicalSize::new(outer.width, outer.height.saturating_sub(panel).max(1));
+                tauri::PhysicalSize::new(outer.width.saturating_sub(panel).max(1), outer.height);
             let (gpu, surface) = Gpu::with_surface(canvas)?;
             let handle = window.as_ref().window();
             // The canvas has a window of its own, so the surface *is* the
@@ -1272,7 +1283,6 @@ fn build_window(
                 Layout {
                     surface: size,
                     canvas: size,
-                    top: 0,
                 },
                 handle,
             ))

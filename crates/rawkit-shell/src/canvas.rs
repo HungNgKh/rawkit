@@ -78,9 +78,14 @@ impl rwh::HasDisplayHandle for CanvasWindow {
 /// Pack a canvas widget into the window, beside whatever webview is already
 /// there, and return handles to its X window.
 ///
-/// `panel_height` is how much of the window the webview keeps. The split is
-/// vertical because `default_vbox` is a vertical box and the probe only needs
-/// two disjoint rectangles, not the final layout.
+/// `panel_width` is how much of the window the chrome keeps, on the right. The
+/// split is horizontal because a landscape photograph is limited by its short
+/// edge, and a strip across the top takes from exactly that edge — the same
+/// frame is half again as large beside a column as it is beneath a strip.
+///
+/// The canvas is not laid out by `default_vbox` at all: it is a child X window
+/// with explicit geometry, which is why the split can be whichever way suits
+/// the picture rather than whichever way the box packs.
 ///
 /// No size comes back: at this point the widget has an X window but GTK has not
 /// laid the toplevel out, so it measures 2x2 and would be a trap to trust.
@@ -124,18 +129,21 @@ pub fn init_threads() {
 /// lays it out and never paints it, and X clips the toplevel's own drawing to
 /// exclude it. The cost is that nothing moves or resizes it for us — which for a
 /// canvas is control rather than a chore.
-pub fn attach(window: &tauri::Window, panel_height: i32) -> Result<CanvasWindow> {
+pub fn attach(window: &tauri::Window, panel_width: i32) -> Result<CanvasWindow> {
     let gtk_window = window.gtk_window()?;
     let parent = gtk_window
         .window()
         .ok_or_else(|| anyhow!("the toplevel has no X window yet"))?;
 
     let (width, height) = (gtk_window.allocated_width(), gtk_window.allocated_height());
+    // At the origin, ending where the chrome begins. The photograph takes the
+    // left of the window and the controls the right, which is also why nothing
+    // downstream carries an offset any more.
     let attributes = gdk::WindowAttr {
         x: Some(0),
-        y: Some(panel_height),
-        width: width.max(1),
-        height: (height - panel_height).max(1),
+        y: Some(0),
+        width: (width - panel_width).max(1),
+        height: height.max(1),
         window_type: gdk::WindowType::Child,
         wclass: gdk::WindowWindowClass::InputOutput,
         // The parent's visual, so the child is the same depth as the surface
@@ -193,10 +201,10 @@ pub fn attach(window: &tauri::Window, panel_height: i32) -> Result<CanvasWindow>
 ///
 /// So the handlers below see pointer events over the canvas as if they happened
 /// on the window, in the window's coordinates, and the only thing to do is
-/// notice which side of the panel they fall on.
+/// notice which side of the chrome they fall on.
 pub fn attach_input(
     window: &tauri::Window,
-    panel_height: i32,
+    panel_width: i32,
     session: std::sync::Arc<std::sync::Mutex<rawkit_session::Session>>,
 ) -> Result<()> {
     use gtk::gdk::EventMask;
@@ -213,9 +221,13 @@ pub fn attach_input(
     // Logical coordinates from GTK, physical everywhere in the session and the
     // surface. Converting here means the rest of the shell never has to know
     // which it is holding.
+    // The canvas starts at the window's origin and stops where the chrome
+    // begins, so a pointer is over the photograph exactly when it is left of
+    // that edge. No offset to subtract — the previous strip layout needed one
+    // and getting it wrong put every click a chrome's height out.
+    let edge = (gtk_window.allocated_width() - panel_width) as f64;
     let to_canvas = move |(x, y): (f64, f64)| -> Option<[f64; 2]> {
-        let y = y - panel_height as f64;
-        (y >= 0.0).then_some([x * scale, y * scale])
+        (x < edge).then_some([x * scale, y * scale])
     };
 
     // GTK's job here is to say *where*, in canvas pixels. What the event means
