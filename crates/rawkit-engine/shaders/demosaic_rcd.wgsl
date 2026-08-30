@@ -77,6 +77,11 @@ struct Params {
     // `[offset, entries, active, unused]` for the profile's tone curve, in the
     // same buffer behind the two tables.
     curve: vec4<u32>,
+    // `[hue, saturation, luminance, unused]` for the shadows, midtones and
+    // highlights, in that order. Ordered exactly as `Params` in render.rs.
+    grade: array<vec4<f32>, 3>,
+    // `[blending, balance, active, unused]`.
+    grade_shape: vec4<f32>,
     // The same, for the user's own curve, behind the profile's.
     user_curve: vec4<u32>,
     // The display-referred tone controls, already reduced to curve parameters
@@ -601,7 +606,8 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
     // the tone curve is after the tone map: this is about the picture, not the
     // light. In scene-linear it would depend on exposure, and a colour that
     // changed when you brightened the frame is not a colour control.
-    rgba_out[p] = vec4<f32>(mix_bands(saturate_colour(shaped)), 1.0);
+    // Stage K -- the look, and the last thing that touches colour.
+    rgba_out[p] = vec4<f32>(grade_colour(mix_bands(saturate_colour(shaped))), 1.0);
 }
 
 /// Saturation and vibrance.
@@ -732,6 +738,111 @@ fn mix_bands(rgb: vec3<f32>) -> vec3<f32> {
 
     // Scaling the triple leaves hue and saturation exactly where they were.
     return out * max(1.0 + adjust.z, 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// Stage K -- colour grading: a different tint for the shadows, the midtones and
+// the highlights.
+//
+// # The three ranges partition the picture
+//
+// A pixel does not belong to a range; it lies between two of them, and the
+// weights sum to one everywhere by construction rather than by tuning — the
+// same argument as the hue mixer's bands, and it buys the same property:
+// **setting all three to one colour is a uniform tint**, which is what makes the
+// control predictable and is the test that proves it.
+//
+// Overlapping curves chosen by feel are the other way to do this, and they are
+// why a grading control can brighten a picture when you only meant to tint it:
+// weights that sum to more than one at some luminance add colour twice there.
+//
+// # Balance and blending
+//
+// Balance moves where the midtones sit. Blending is the *steepness* of the two
+// transitions, through `w = t^g / (t^g + (1-t)^g)` — an S whose sharpness is `g`
+// and which sums to one with its own complement for any `g`, so the partition
+// survives the control rather than being restored afterwards.
+// ---------------------------------------------------------------------------
+
+/// The transition shape: 0 at `t = 0`, 1 at `t = 1`, and `w(t) + w(1-t) = 1`.
+fn grade_ramp(t: f32, steepness: f32) -> f32 {
+    let x = clamp(t, 0.0, 1.0);
+    let a = pow(x, steepness);
+    let b = pow(1.0 - x, steepness);
+    let total = a + b;
+    // Both ends are zero only if the exponent has underflowed them, in which
+    // case the midpoint is as good an answer as any.
+    if (total <= 1e-12) {
+        return 0.5;
+    }
+    return a / total;
+}
+
+/// One range's colour, at the pixel's own brightness.
+fn grade_tint(rgb: vec3<f32>, tint: vec4<f32>, weight: f32) -> vec3<f32> {
+    var out = rgb;
+    if (tint.y > 0.0) {
+        // `target` is a reserved word in WGSL.
+        let wanted = hsv_to_rgb(vec3<f32>(tint.x, 1.0, 1.0));
+        let here = dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let there = dot(wanted, vec3<f32>(0.2126, 0.7152, 0.0722));
+        // The tint carried to this pixel's brightness, so grading colours the
+        // picture rather than lightening the parts it colours.
+        let matched = wanted * (here / max(there, 1e-4));
+        out = mix(out, matched, clamp(weight * tint.y * GRADE_REACH, 0.0, 1.0));
+    }
+    // A multiply rather than an offset: it keeps the hue and cannot lift black
+    // off the floor, which an addition does and which reads as a veil.
+    return out * max(1.0 + weight * tint.z * GRADE_LIFT, 0.0);
+}
+
+/// How far a fully saturated tint carries. Short of 1, deliberately: at 1 the
+/// control replaces the colour outright rather than grading it, and every
+/// setting near the top of the range would look the same.
+const GRADE_REACH: f32 = 0.5;
+/// How much a range's luminance control may brighten or darken it.
+const GRADE_LIFT: f32 = 0.5;
+
+fn grade_colour(rgb: vec3<f32>) -> vec3<f32> {
+    if (params.grade_shape.z < 0.5) {
+        return rgb;
+    }
+    // Encoded, not linear, and the difference is the whole control. In linear
+    // light a mid-grey sits at 0.18 — barely a third of the way to a midpoint at
+    // 0.5 — so most of a photograph would count as *shadow* and a highlight tint
+    // would reach almost nothing. "Shadows" has to mean what looks dark, and
+    // what looks dark is a perceptual quantity.
+    //
+    // Found by grading a real photograph: teal in the shadows and orange in the
+    // highlights came out uniformly teal, because the highlights the control
+    // named were only the last few percent of the scale.
+    let linear = clamp(dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+    let luma = encode_srgb(linear);
+
+    // Where the midtones sit, and how abruptly the ranges give way. Blending at
+    // one is a straight ramp and maximal overlap; at zero the transitions are
+    // steep and the ranges stay distinct.
+    let pivot = clamp(0.5 + params.grade_shape.y * 0.35, 0.05, 0.95);
+    let steepness = 1.0 + (1.0 - clamp(params.grade_shape.x, 0.0, 1.0)) * 4.0;
+
+    var shadows = 0.0;
+    var midtones = 0.0;
+    var highlights = 0.0;
+    if (luma < pivot) {
+        let w = grade_ramp(luma / pivot, steepness);
+        shadows = 1.0 - w;
+        midtones = w;
+    } else {
+        let w = grade_ramp((luma - pivot) / max(1.0 - pivot, 1e-4), steepness);
+        midtones = 1.0 - w;
+        highlights = w;
+    }
+
+    var out = rgb;
+    out = grade_tint(out, params.grade[0], shadows);
+    out = grade_tint(out, params.grade[1], midtones);
+    out = grade_tint(out, params.grade[2], highlights);
+    return out;
 }
 
 /// Mid-grey in the perceptual coordinate: `0.18^(1/2.2)`.

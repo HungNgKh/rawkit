@@ -239,6 +239,11 @@ struct Params {
     /// `[offset, entries, active, unused]` for the profile's tone curve, in the
     /// same shared buffer.
     curve: [u32; 4],
+    /// `[hue, saturation, luminance, unused]` for the shadows, midtones and
+    /// highlights in that order.
+    grade: [[f32; 4]; 3],
+    /// `[blending, balance, active, unused]`.
+    grade_shape: [f32; 4],
     /// The same, for the user's curve.
     ///
     /// Its slot in the buffer is reserved whatever the edit says, unlike the
@@ -1241,6 +1246,20 @@ impl Renderer {
                 // numbers are all zero is a question to answer once per edit,
                 // not once per pixel.
                 if state.hsl.is_identity() { 0.0 } else { 1.0 },
+                0.0,
+            ],
+            grade: {
+                let tint = |t: rawkit_editstate::Tint| [t.hue, t.saturation, t.luminance, 0.0];
+                [
+                    tint(state.grade.shadows),
+                    tint(state.grade.midtones),
+                    tint(state.grade.highlights),
+                ]
+            },
+            grade_shape: [
+                state.grade.blending,
+                state.grade.balance,
+                if state.grade.is_identity() { 0.0 } else { 1.0 },
                 0.0,
             ],
             hsl_hue: pack_bands(&state.hsl, |mix| mix.hue),

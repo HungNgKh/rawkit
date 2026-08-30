@@ -55,6 +55,8 @@ pub enum EditStateError {
     InvalidHsl(String),
     #[error("tone curve is not usable: {0}")]
     InvalidCurve(String),
+    #[error("colour grading is out of range: {0}")]
+    InvalidGrade(String),
 }
 
 /// How the image should be rendered. `Default` is the identity edit: the photo
@@ -80,6 +82,8 @@ pub struct EditState {
     pub hsl: Hsl,
     #[serde(default)]
     pub curve: Curve,
+    #[serde(default)]
+    pub grade: Grade,
 }
 
 fn default_schema_version() -> u32 {
@@ -98,6 +102,7 @@ impl Default for EditState {
             colour: Colour::default(),
             hsl: Hsl::default(),
             curve: Curve::default(),
+            grade: Grade::default(),
         }
     }
 }
@@ -134,6 +139,7 @@ impl EditState {
         self.colour.validate()?;
         self.hsl.validate()?;
         self.curve.validate()?;
+        self.grade.validate()?;
         Ok(())
     }
 
@@ -617,6 +623,104 @@ impl Hsl {
                     )));
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+/// One range's colour, as a hue and how much of it.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Tint {
+    /// Degrees around the colour circle. Meaningless at zero saturation, and
+    /// kept anyway so that turning saturation back up returns the hue you had
+    /// rather than red.
+    pub hue: f32,
+    /// How far towards that hue, 0 to 1.
+    pub saturation: f32,
+    /// Brightness for this range alone, -1 to 1.
+    pub luminance: f32,
+}
+
+/// Colour grading: a different tint for the shadows, the midtones and the
+/// highlights.
+///
+/// The three weights **partition the luminance range** rather than overlapping
+/// by taste — setting all three to one colour is a uniform tint by construction,
+/// which is both the property that makes the control predictable and the test
+/// that proves it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Grade {
+    pub shadows: Tint,
+    pub midtones: Tint,
+    pub highlights: Tint,
+    /// How gradually one range gives way to the next. 0 keeps them distinct,
+    /// 1 lets them overlap broadly.
+    pub blending: f32,
+    /// Where the midtones sit between black and white, -1 to 1. Negative moves
+    /// the midpoint down, so more of the picture counts as highlight.
+    pub balance: f32,
+}
+
+impl Default for Grade {
+    fn default() -> Self {
+        Self {
+            shadows: Tint::default(),
+            midtones: Tint::default(),
+            highlights: Tint::default(),
+            blending: 0.5,
+            balance: 0.0,
+        }
+    }
+}
+
+impl Grade {
+    /// Whether anything is actually tinted. Blending and balance shape *where*
+    /// the ranges are and mean nothing on their own, so a grade with no colour
+    /// and no luminance offset is the identity whatever they say.
+    pub fn is_identity(&self) -> bool {
+        [self.shadows, self.midtones, self.highlights]
+            .iter()
+            .all(|t| t.saturation == 0.0 && t.luminance == 0.0)
+    }
+
+    pub fn validate(&self) -> Result<(), EditStateError> {
+        for (name, tint) in [
+            ("shadows", self.shadows),
+            ("midtones", self.midtones),
+            ("highlights", self.highlights),
+        ] {
+            if !tint.hue.is_finite() || !(0.0..=360.0).contains(&tint.hue) {
+                return Err(EditStateError::InvalidGrade(format!(
+                    "{name} hue is {}, and runs from 0 to 360 degrees",
+                    tint.hue
+                )));
+            }
+            if !tint.saturation.is_finite() || !(0.0..=1.0).contains(&tint.saturation) {
+                return Err(EditStateError::InvalidGrade(format!(
+                    "{name} saturation is {}, and runs from 0 to 1",
+                    tint.saturation
+                )));
+            }
+            if !tint.luminance.is_finite() || !(-1.0..=1.0).contains(&tint.luminance) {
+                return Err(EditStateError::InvalidGrade(format!(
+                    "{name} luminance is {}, and runs from -1 to 1",
+                    tint.luminance
+                )));
+            }
+        }
+        if !self.blending.is_finite() || !(0.0..=1.0).contains(&self.blending) {
+            return Err(EditStateError::InvalidGrade(format!(
+                "blending is {}, and runs from 0 to 1",
+                self.blending
+            )));
+        }
+        if !self.balance.is_finite() || !(-1.0..=1.0).contains(&self.balance) {
+            return Err(EditStateError::InvalidGrade(format!(
+                "balance is {}, and runs from -1 to 1",
+                self.balance
+            )));
         }
         Ok(())
     }

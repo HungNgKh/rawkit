@@ -67,6 +67,14 @@
   #keys { color: #7d7d87; font-size: 11px; line-height: 1.7; }
   /* `touch-action: none` so a drag on the curve is a drag and not the column
      deciding to scroll underneath it. */
+  #wheels { display: flex; gap: 12px; margin: 8px 0 4px; }
+  .wheel-group { width: 92px; text-align: center; }
+  .wheel-group canvas { width: 92px; height: 92px; display: block; cursor: crosshair;
+                        touch-action: none; border-radius: 50%; }
+  .wheel-group span { display: block; font-size: 11px; color: #9a9aa2; margin: 5px 0 2px; }
+  /* Full width of its own group, so the slider reads as belonging to the wheel
+     above it rather than to the row of them. */
+  .wheel-group input[type=range] { width: 92px; }
   #curve { width: 296px; height: 296px; margin: 8px 0 2px; border-radius: 3px;
            background: #141418; display: block; cursor: crosshair;
            touch-action: none; }
@@ -157,6 +165,31 @@
     <label><span>Blacks</span>
       <input id="blacks" type="range" min="-1" max="1" step="0.01" value="0">
       <output id="blacks-value">0.00</output></label>
+  </details>
+
+  <details id="s-grade">
+    <summary>Colour grading</summary>
+    <div id="wheels">
+      <div class="wheel-group"><canvas class="wheel" data-range="shadows"></canvas>
+        <span>Shadows</span>
+        <input id="grade-shadows" type="range" min="-1" max="1" step="0.01" value="0"
+               title="brightness of the shadows"></div>
+      <div class="wheel-group"><canvas class="wheel" data-range="midtones"></canvas>
+        <span>Midtones</span>
+        <input id="grade-midtones" type="range" min="-1" max="1" step="0.01" value="0"
+               title="brightness of the midtones"></div>
+      <div class="wheel-group"><canvas class="wheel" data-range="highlights"></canvas>
+        <span>Highlights</span>
+        <input id="grade-highlights" type="range" min="-1" max="1" step="0.01" value="0"
+               title="brightness of the highlights"></div>
+    </div>
+    <label><span>Blending</span>
+      <input id="grade-blending" type="range" min="0" max="1" step="0.01" value="0.5">
+      <output id="grade-blending-value">0.50</output></label>
+    <label><span>Balance</span>
+      <input id="grade-balance" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="grade-balance-value">0.00</output></label>
+    <div class="row"><button id="grade-reset">Reset</button></div>
   </details>
 
   <details id="s-curve">
@@ -412,6 +445,7 @@
   let dragging = null;
   const TONE = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"];
   for (const id of [...TONE, "straighten", "sharpen", "sharpen_radius", "chroma_noise", "luminance_noise", "saturation", "vibrance", "temperature", "tint",
+    "grade-shadows", "grade-midtones", "grade-highlights", "grade-blending", "grade-balance",
     ...BANDS.flatMap(([band]) => HSL_CONTROLS.map(([control]) => `hsl-${band}-${control}`))]) {
     document.getElementById(id).addEventListener("pointerdown", () => (dragging = id));
   }
@@ -434,6 +468,16 @@
     setSlider("luminance_noise", state.detail.luminance_noise, v => Number(v).toFixed(2));
     setSlider("saturation", state.colour.saturation, v => Number(v).toFixed(2));
     setSlider("vibrance", state.colour.vibrance, v => Number(v).toFixed(2));
+    // The wheels, unless one is being turned — the slider-thumb rule again.
+    if (turning === null) {
+      grade = JSON.parse(JSON.stringify(state.grade));
+      drawWheels();
+      for (const range of RANGES) {
+        setSlider(`grade-${range}`, state.grade[range].luminance, v => Number(v).toFixed(2));
+      }
+    }
+    setSlider("grade-blending", state.grade.blending, v => Number(v).toFixed(2));
+    setSlider("grade-balance", state.grade.balance, v => Number(v).toFixed(2));
     // Not while a point is under the pointer: a sync mid-drag would yank it back
     // to whatever the last command echoed, which is the slider-thumb problem in
     // a shape that is harder to notice.
@@ -574,6 +618,153 @@
     });
   document.getElementById("profile-choose").addEventListener("click", profileAction("choose_profile"));
   document.getElementById("profile-clear").addEventListener("click", profileAction("clear_profile"));
+
+  // ---- Colour grading ------------------------------------------------------
+  //
+  // Three wheels, one per luminance range. Hue is the angle and saturation the
+  // radius, so one gesture sets both — which is the point of a wheel over two
+  // sliders, and why the three sit in a row: grading is about how the ranges
+  // relate, and that has to be visible at a glance.
+  const RANGES = ["shadows", "midtones", "highlights"];
+  const WHEEL = 92;
+  let grade = {
+    shadows: { hue: 0, saturation: 0, luminance: 0 },
+    midtones: { hue: 0, saturation: 0, luminance: 0 },
+    highlights: { hue: 0, saturation: 0, luminance: 0 },
+    blending: 0.5,
+    balance: 0,
+  };
+  let turning = null;
+
+  // The disc is the same for all three, so it is drawn once and blitted. Per
+  // pixel in JavaScript is slow enough to notice if it happens on every drag.
+  const disc = (() => {
+    const dpr = window.devicePixelRatio || 1;
+    const size = Math.round(WHEEL * dpr);
+    const off = document.createElement("canvas");
+    off.width = size;
+    off.height = size;
+    const ctx = off.getContext("2d");
+    const image = ctx.createImageData(size, size);
+    const mid = (size - 1) / 2;
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const dx = (x - mid) / mid;
+        const dy = (y - mid) / mid;
+        const r = Math.hypot(dx, dy);
+        const at = (y * size + x) * 4;
+        if (r > 1) continue;
+        // Angle anticlockwise from the right, so red sits at 0° as everywhere
+        // else in this application.
+        const hue = ((Math.atan2(-dy, dx) * 180) / Math.PI + 360) % 360;
+        const [red, green, blue] = hsvToRgb(hue, Math.min(1, r), 1);
+        image.data[at] = red * 255;
+        image.data[at + 1] = green * 255;
+        image.data[at + 2] = blue * 255;
+        // A soft edge, so the disc does not alias into a cog.
+        image.data[at + 3] = 255 * Math.min(1, (1 - r) * mid);
+      }
+    }
+    ctx.putImageData(image, 0, 0);
+    return off;
+  })();
+
+  function hsvToRgb(h, s, v) {
+    const sector = h / 60;
+    const i = Math.floor(sector);
+    const f = sector - i;
+    const [p, q, t] = [v * (1 - s), v * (1 - s * f), v * (1 - s * (1 - f))];
+    return [[v, t, p], [q, v, p], [p, v, t], [p, q, v], [t, p, v], [v, p, q]][
+      ((i % 6) + 6) % 6
+    ];
+  }
+
+  const drawWheel = canvas => {
+    const dpr = window.devicePixelRatio || 1;
+    const size = Math.round(WHEEL * dpr);
+    if (canvas.width !== size) {
+      canvas.width = size;
+      canvas.height = size;
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, size, size);
+    ctx.drawImage(disc, 0, 0);
+    const tint = grade[canvas.dataset.range];
+    const mid = size / 2;
+    const angle = (tint.hue * Math.PI) / 180;
+    const x = mid + Math.cos(angle) * tint.saturation * mid;
+    const y = mid - Math.sin(angle) * tint.saturation * mid;
+    // Drawn twice, dark under light, so the marker is visible against every
+    // colour on the disc including white at the centre.
+    for (const [colour, radius] of [["#000000", 5.5 * dpr], ["#ffffff", 4 * dpr]]) {
+      ctx.beginPath();
+      ctx.arc(x, y, radius, 0, Math.PI * 2);
+      ctx.strokeStyle = colour;
+      ctx.lineWidth = 1.5 * dpr;
+      ctx.stroke();
+    }
+  };
+
+  const drawWheels = () => document.querySelectorAll(".wheel").forEach(drawWheel);
+  const pushGrade = control => send({ command: "set_grade", params: { grade, control } });
+
+  document.querySelectorAll(".wheel").forEach((canvas, index) => {
+    const aim = event => {
+      const box = canvas.getBoundingClientRect();
+      const dx = (event.clientX - box.left) / box.width * 2 - 1;
+      const dy = 1 - (event.clientY - box.top) / box.height * 2;
+      const tint = grade[canvas.dataset.range];
+      tint.saturation = Math.min(1, Math.hypot(dx, dy));
+      // Outside the disc the radius is clamped but the angle still means
+      // something, so a drag that leaves the wheel keeps setting the hue.
+      if (tint.saturation > 0.02) {
+        tint.hue = ((Math.atan2(dy, dx) * 180) / Math.PI + 360) % 360;
+      }
+      drawWheel(canvas);
+      pushGrade(index);
+    };
+    canvas.addEventListener("pointerdown", event => {
+      turning = index;
+      canvas.setPointerCapture(event.pointerId);
+      aim(event);
+    });
+    canvas.addEventListener("pointermove", event => {
+      if (turning === index) aim(event);
+    });
+    const stop = () => { if (turning === index) turning = null; };
+    canvas.addEventListener("pointerup", stop);
+    canvas.addEventListener("pointercancel", stop);
+  });
+
+  RANGES.forEach((range, index) => {
+    const input = document.getElementById(`grade-${range}`);
+    input.addEventListener("input", () => {
+      grade[range].luminance = parseFloat(input.value);
+      pushGrade(3 + index);
+    });
+  });
+  for (const [name, slot] of [["blending", 6], ["balance", 7]]) {
+    const input = document.getElementById(`grade-${name}`);
+    const out = document.getElementById(`grade-${name}-value`);
+    input.addEventListener("input", () => {
+      grade[name] = parseFloat(input.value);
+      out.textContent = grade[name].toFixed(2);
+      pushGrade(slot);
+    });
+  }
+  document.getElementById("grade-reset").addEventListener("click", () => {
+    grade = {
+      shadows: { hue: 0, saturation: 0, luminance: 0 },
+      midtones: { hue: 0, saturation: 0, luminance: 0 },
+      highlights: { hue: 0, saturation: 0, luminance: 0 },
+      blending: 0.5,
+      balance: 0,
+    };
+    drawWheels();
+    pushGrade(255);
+  });
+
+  drawWheels();
 
   // ---- The tone curve ------------------------------------------------------
   //

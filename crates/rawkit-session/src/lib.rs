@@ -124,6 +124,16 @@ pub enum Command {
     /// Every colour equally, and the one that spares the vivid ones.
     SetSaturation(f32),
     SetVibrance(f32),
+    /// Replace the colour grading.
+    ///
+    /// The whole thing at once, like the curve and for the same reason: a wheel
+    /// sets hue and saturation together, and splitting them would make one
+    /// gesture two commands. `control` says which of the eight is being moved,
+    /// so the undo history can tell one drag from the next.
+    SetGrade {
+        grade: Box<rawkit_editstate::Grade>,
+        control: u8,
+    },
     /// Replace the hand-drawn tone curve.
     ///
     /// Carries the whole curve rather than one point, because inserting and
@@ -211,6 +221,7 @@ impl Command {
             Command::SetVibrance(_) => "set_vibrance",
             Command::SetHsl { .. } => "set_hsl",
             Command::SetCurve { .. } => "set_curve",
+            Command::SetGrade { .. } => "set_grade",
             Command::SetStraighten(_) => "set_straighten",
             Command::RotateBy(_) => "rotate_by",
             Command::SetEditState(_) => "set_edit_state",
@@ -246,6 +257,7 @@ impl Command {
     fn coalesce_slot(&self) -> u8 {
         match self {
             Command::SetCurve { point, .. } => *point,
+            Command::SetGrade { control, .. } => *control,
             Command::SetHsl { band, control, .. } => {
                 let control = match control {
                     rawkit_editstate::BandControl::Hue => 0,
@@ -281,6 +293,7 @@ impl Command {
             // reset, or a point appearing or disappearing — is a discrete act
             // and opens a step of its own.
             Command::SetCurve { point, .. } => *point != u8::MAX,
+            Command::SetGrade { control, .. } => *control != u8::MAX,
 
             Command::SetOrientation(_)
             | Command::SetCrop(_)
@@ -654,6 +667,14 @@ impl Session {
                 let mut colour = self.state.colour;
                 colour.vibrance = v;
                 self.colour(name, colour)
+            }
+
+            Command::SetGrade { grade, .. } => {
+                if let Err(e) = grade.validate() {
+                    return refused(name, e.to_string());
+                }
+                self.state.grade = *grade;
+                self.edit_changed()
             }
 
             Command::SetCurve { points, .. } => {
