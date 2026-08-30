@@ -217,7 +217,7 @@ struct Params {
     tone: [f32; 4],
     /// `[black point, white point, unused, unused]`.
     levels: [f32; 4],
-    /// `[sharpen amount, sharpen radius, unused, unused]`.
+    /// `[sharpen amount, sharpen radius, chroma noise, unused]`.
     detail: [f32; 4],
     /// `[dest_x, dest_y, tile, halo]`. Rewritten per tile; everything above it
     /// moves only when the edit does, which is why this sits last and is
@@ -303,12 +303,14 @@ pub enum Output {
     Display,
 }
 
-const STAGES: [&str; 8] = [
+const STAGES: [&str; 10] = [
     "conv",
     "green_at_rb",
     "rb_at_br",
     "rb_at_g",
     "pack",
+    "chroma_blur",
+    "chroma_mix",
     "develop",
     "luma",
     "sharpen",
@@ -319,7 +321,7 @@ const STAGES: [&str; 8] = [
 /// Named rather than counted back from the end: it used to be `len() - 1`, which
 /// was right only while `develop` was last and would have silently started
 /// returning sharpened pixels the moment anything was appended.
-const SCENE_LINEAR_STAGES: usize = 5;
+const SCENE_LINEAR_STAGES: usize = 7;
 
 /// How far outside a tile the kernel reaches, in pixels.
 ///
@@ -333,17 +335,19 @@ const SCENE_LINEAR_STAGES: usize = 5;
 /// | `rb_at_br` | `pq` ±1, green ±3 (itself reach 5) | 8 |
 /// | `rb_at_g` | chroma ±3 (itself reach 8) | 11 |
 ///
-/// | `sharpen` | `vh` ±2 (itself the developed value, reach 11) | 13 |
+/// | `chroma_blur` | RGB ±2 (itself reach 11) | 13 |
+/// | `sharpen` | `vh` ±2 (itself the denoised value, reach 13) | 15 |
 ///
-/// Rounded up to 14 to keep it **even**, which is not cosmetic: an odd halo
+/// Rounded up to 16 to keep it **even**, which is not cosmetic: an odd halo
 /// shifts the CFA phase inside the tile, and every pixel would come out the
 /// wrong colour.
 ///
-/// It was 12 before capture sharpening, whose blur reaches two pixels further.
+/// It was 12 before capture sharpening and 14 before chroma noise reduction,
+/// each of whose blurs reaches two pixels further than what feeds it.
 /// Get this wrong and the symptom is a faint grid at the tile boundaries on
 /// detailed frames — which is why `a_level_zero_tile_is_identical_to_the_whole_image_render`
 /// is the test that guards it rather than anything that looks at a photograph.
-pub const HALO: u32 = 14;
+pub const HALO: u32 = 16;
 
 /// Tile edge in pixels, excluding halo. 512 keeps every buffer far inside
 /// WebGPU's default limits while leaving the halo a small fraction of the work
@@ -1136,7 +1140,7 @@ impl Renderer {
             detail: [
                 state.detail.sharpen_amount,
                 state.detail.sharpen_radius,
-                0.0,
+                state.detail.chroma_noise,
                 0.0,
             ],
             // Per-tile, and rewritten before every present. The value here only

@@ -108,6 +108,8 @@ pub enum Command {
     /// that is wrong at a tile edge — a faint grid, not an obvious failure.
     SetSharpen(f32),
     SetSharpenRadius(f32),
+    /// Smooth colour without touching luminance.
+    SetChromaNoise(f32),
     /// Level a horizon, in degrees clockwise. Refused past the straighten range.
     SetStraighten(f32),
     /// Turn by this many quarter-turns clockwise, from wherever it is now.
@@ -161,6 +163,7 @@ impl Command {
             Command::SetCrop(_) => "set_crop",
             Command::SetSharpen(_) => "set_sharpen",
             Command::SetSharpenRadius(_) => "set_sharpen_radius",
+            Command::SetChromaNoise(_) => "set_chroma_noise",
             Command::SetStraighten(_) => "set_straighten",
             Command::RotateBy(_) => "rotate_by",
             Command::SetEditState(_) => "set_edit_state",
@@ -428,6 +431,12 @@ impl Session {
             Command::SetSharpenRadius(radius) => {
                 let mut detail = self.state.detail;
                 detail.sharpen_radius = radius;
+                self.detail(name, detail)
+            }
+
+            Command::SetChromaNoise(amount) => {
+                let mut detail = self.state.detail;
+                detail.chroma_noise = amount;
                 self.detail(name, detail)
             }
 

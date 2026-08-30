@@ -73,7 +73,8 @@ struct Params {
     tone: vec4<f32>,
     // `.xy` are the black and white points. `.zw` unused.
     levels: vec4<f32>,
-    // `.x` is the sharpening amount and `.y` its radius in pixels. `.zw` unused.
+    // `.x` is the sharpening amount, `.y` its radius in pixels, `.z` the chroma
+    // noise reduction. `.w` unused.
     detail: vec4<f32>,
     // Where this tile lands in the canvas and how to trim it: `.xy` is the
     // destination pixel, `.z` the tile edge, `.w` the halo width. Rewritten per
@@ -900,4 +901,85 @@ fn sharpen(@builtin(global_invocation_id) gid: vec3<u32>) {
     // axis, so an edge gains contrast without gaining colour.
     let correction = amount * (vh[p] - blurred / total);
     rgba_out[p] = vec4<f32>(rgba_out[p].rgb + vec3<f32>(correction), 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Stage F' -- chroma noise reduction, in scene-linear light because that is
+// where the noise is.
+//
+// Colour blotches in the shadows are the kind of noise that survives being
+// printed and that no amount of exposure fixes. Smoothing *colour* removes them
+// and costs nothing visible, because the eye takes its detail from luminance —
+// so each pixel's own brightness is put back exactly, and only the hue and
+// saturation are borrowed from the neighbourhood.
+//
+// Exactly, in *this* space. The colour matrix downstream mixes channels, so
+// changing a pixel's colour does move its final luminance a little; that is the
+// profile's arithmetic, not this stage's, and on a real frame it came to about
+// one percent while the colour noise halved.
+//
+// Two passes for the same reason sharpening needs two: a neighbourhood
+// operation cannot read the buffer it is writing. The blurred colour goes into
+// the three channel planes the demosaic has finished with, and the second pass
+// reads its own pixel from each. No aliasing, and no buffer that did not exist.
+// ---------------------------------------------------------------------------
+
+/// How far the chroma blur reaches. Folded into `HALO` in `render.rs`.
+const CHROMA_REACH: i32 = 2;
+
+@compute @workgroup_size(8, 8)
+fn chroma_blur(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    if (x >= i32(params.width) || y >= i32(params.height)) {
+        return;
+    }
+    var sum = vec3<f32>(0.0);
+    var total = 0.0;
+    for (var j = -CHROMA_REACH; j <= CHROMA_REACH; j = j + 1) {
+        for (var i = -CHROMA_REACH; i <= CHROMA_REACH; i = i + 1) {
+            let sx = clamp(x + i, 0, i32(params.width) - 1);
+            let sy = clamp(y + j, 0, i32(params.height) - 1);
+            sum = sum + rgba_out[idx(sx, sy)].rgb;
+            total = total + 1.0;
+        }
+    }
+    let p = idx(x, y);
+    let mean = sum / total;
+    ch_r[p] = mean.r;
+    ch_g[p] = mean.g;
+    ch_b[p] = mean.b;
+}
+
+@compute @workgroup_size(8, 8)
+fn chroma_mix(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let amount = params.detail.z;
+    // Exactly zero changes exactly nothing, which is what lets a stored edit
+    // turn this off rather than nearly off.
+    if (amount <= 0.0) {
+        return;
+    }
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    if (x >= i32(params.width) || y >= i32(params.height)) {
+        return;
+    }
+    let p = idx(x, y);
+    let original = rgba_out[p].rgb;
+    let blurred = vec3<f32>(ch_r[p], ch_g[p], ch_b[p]);
+
+    // Camera-space weights would need the profile; an unweighted mean is enough
+    // to say "how bright is this" for the purpose of putting the brightness
+    // back, and it cannot go negative on a wide-gamut primary the way Rec. 709
+    // weights can.
+    let was = (original.r + original.g + original.b) / 3.0;
+    let now = (blurred.r + blurred.g + blurred.b) / 3.0;
+    // A black pixel has no colour to borrow and dividing by its brightness is
+    // how a denoiser produces fireflies.
+    if (now <= 1e-6) {
+        return;
+    }
+    // The neighbourhood's colour at this pixel's own brightness.
+    let recoloured = blurred * (was / now);
+    rgba_out[p] = vec4<f32>(mix(original, recoloured, amount), 1.0);
 }

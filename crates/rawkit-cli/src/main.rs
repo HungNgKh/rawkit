@@ -554,6 +554,10 @@ pub struct EditFlags {
     /// The sharpening radius in pixels, 0.1 to 2.
     #[arg(long, default_value_t = rawkit_editstate::Detail::default().sharpen_radius)]
     sharpen_radius: f32,
+    /// Chroma noise reduction, 0 to 1. Smooths colour and leaves luminance
+    /// exactly as it was, so it costs no detail.
+    #[arg(long, default_value_t = rawkit_editstate::Detail::default().chroma_noise)]
+    chroma_noise: f32,
 }
 
 impl EditFlags {
@@ -611,6 +615,7 @@ impl EditFlags {
             detail: rawkit_editstate::Detail {
                 sharpen_amount: self.sharpen,
                 sharpen_radius: self.sharpen_radius,
+                chroma_noise: self.chroma_noise,
             },
             ..Default::default()
         })

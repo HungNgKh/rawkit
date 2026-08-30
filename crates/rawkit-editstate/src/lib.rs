@@ -305,6 +305,15 @@ pub struct Detail {
     /// values sharpen texture; large ones sharpen shapes and start to look like
     /// clarity.
     pub sharpen_radius: f32,
+    /// How far to smooth *colour* while leaving luminance alone. 0 is off.
+    ///
+    /// Chroma noise is the ugly kind: coloured blotches in the shadows that no
+    /// amount of exposure fixes and that survive being printed. Smoothing colour
+    /// costs nothing visible, because the eye takes its detail from luminance —
+    /// which is why this has a default and luminance noise reduction does not
+    /// exist here yet. That one trades detail for smoothness, and a converter
+    /// that makes that trade for you without asking is one you cannot undo.
+    pub chroma_noise: f32,
 }
 
 impl Default for Detail {
@@ -315,6 +324,9 @@ impl Default for Detail {
             // themselves.
             sharpen_amount: 0.4,
             sharpen_radius: 1.0,
+            // Modest, and safe to have on: it removes blotches and takes no
+            // detail with them.
+            chroma_noise: 0.5,
         }
     }
 }
@@ -344,6 +356,12 @@ impl Detail {
             return Err(EditStateError::InvalidDetail(format!(
                 "sharpen radius is {} pixels, and runs from 0.1 to {MAX_SHARPEN_RADIUS}",
                 self.sharpen_radius
+            )));
+        }
+        if !self.chroma_noise.is_finite() || !(0.0..=1.0).contains(&self.chroma_noise) {
+            return Err(EditStateError::InvalidDetail(format!(
+                "chroma noise reduction is {}, and runs from 0 to 1",
+                self.chroma_noise
             )));
         }
         Ok(())
