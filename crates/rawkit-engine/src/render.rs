@@ -219,6 +219,8 @@ struct Params {
     levels: [f32; 4],
     /// `[sharpen amount, sharpen radius, chroma noise, unused]`.
     detail: [f32; 4],
+    /// `[saturation, vibrance, unused, unused]`.
+    colour: [f32; 4],
     /// `[dest_x, dest_y, tile, halo]`. Rewritten per tile; everything above it
     /// moves only when the edit does, which is why this sits last and is
     /// patched in place rather than re-uploading the whole uniform.
@@ -1143,6 +1145,7 @@ impl Renderer {
                 state.detail.chroma_noise,
                 0.0,
             ],
+            colour: [state.colour.saturation, state.colour.vibrance, 0.0, 0.0],
             // Per-tile, and rewritten before every present. The value here only
             // has to be something valid for the whole-image path, which never
             // rotates in the shader — geometry is applied to the finished frame.

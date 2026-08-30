@@ -558,6 +558,13 @@ pub struct EditFlags {
     /// exactly as it was, so it costs no detail.
     #[arg(long, default_value_t = rawkit_editstate::Detail::default().chroma_noise)]
     chroma_noise: f32,
+    /// Saturation, -1 to 1. Every colour equally.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    saturation: f32,
+    /// Vibrance, -1 to 1. Moves colours towards the middle of the range:
+    /// positive lifts the flat ones, negative calms the vivid ones.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    vibrance: f32,
 }
 
 impl EditFlags {
@@ -616,6 +623,10 @@ impl EditFlags {
                 sharpen_amount: self.sharpen,
                 sharpen_radius: self.sharpen_radius,
                 chroma_noise: self.chroma_noise,
+            },
+            colour: rawkit_editstate::Colour {
+                saturation: self.saturation,
+                vibrance: self.vibrance,
             },
             ..Default::default()
         })

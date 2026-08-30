@@ -68,9 +68,11 @@ pub enum Stage {
     LocalAdjustments,
     /// Fixed sigmoid. The boundary.
     ToneMap,
-    /// Contrast, highlights/shadows, clarity, dehaze, texture.
+    /// Contrast, highlights/shadows, capture sharpening, clarity, dehaze,
+    /// texture.
     DisplayReferredOps,
-    /// Tone curve, HSL / colour mixer, colour grading.
+    /// Saturation and vibrance, and later the tone curve, HSL / colour mixer
+    /// and colour grading.
     ColourAdjustments,
     /// LUT / look application. v2's taste layer lands here.
     Look,

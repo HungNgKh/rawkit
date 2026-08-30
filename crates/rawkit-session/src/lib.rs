@@ -110,6 +110,9 @@ pub enum Command {
     SetSharpenRadius(f32),
     /// Smooth colour without touching luminance.
     SetChromaNoise(f32),
+    /// Every colour equally, and the one that spares the vivid ones.
+    SetSaturation(f32),
+    SetVibrance(f32),
     /// Level a horizon, in degrees clockwise. Refused past the straighten range.
     SetStraighten(f32),
     /// Turn by this many quarter-turns clockwise, from wherever it is now.
@@ -164,6 +167,8 @@ impl Command {
             Command::SetSharpen(_) => "set_sharpen",
             Command::SetSharpenRadius(_) => "set_sharpen_radius",
             Command::SetChromaNoise(_) => "set_chroma_noise",
+            Command::SetSaturation(_) => "set_saturation",
+            Command::SetVibrance(_) => "set_vibrance",
             Command::SetStraighten(_) => "set_straighten",
             Command::RotateBy(_) => "rotate_by",
             Command::SetEditState(_) => "set_edit_state",
@@ -440,6 +445,17 @@ impl Session {
                 self.detail(name, detail)
             }
 
+            Command::SetSaturation(v) => {
+                let mut colour = self.state.colour;
+                colour.saturation = v;
+                self.colour(name, colour)
+            }
+            Command::SetVibrance(v) => {
+                let mut colour = self.state.colour;
+                colour.vibrance = v;
+                self.colour(name, colour)
+            }
+
             Command::SetStraighten(degrees) => {
                 // Through `Crop`, so the range and the refusal are stated in one
                 // place rather than once per caller.
@@ -638,6 +654,15 @@ impl Session {
             return refused(name, e.to_string());
         }
         self.state.detail = detail;
+        self.edit_changed()
+    }
+
+    /// Through `Colour::validate`, so the range is stated once.
+    fn colour(&mut self, name: &'static str, colour: rawkit_editstate::Colour) -> Event {
+        if let Err(e) = colour.validate() {
+            return refused(name, e.to_string());
+        }
+        self.state.colour = colour;
         self.edit_changed()
     }
 

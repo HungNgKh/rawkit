@@ -13,24 +13,24 @@
   body.cutout { background: transparent; }
   body.cutout #chrome { background: #1e1e22; }
   main { padding: 14px 18px; display: flex; gap: 24px; align-items: flex-start; }
-  section { min-width: 200px; }
+  section { min-width: 168px; }
   /* Six tone controls in one column would need a taller panel, and the panel is
      chrome sitting on top of the photograph. Two columns instead: same height,
      same single "Tone" heading, no canvas surrendered. */
   /* Fixed columns, and a width that matches them: with `1fr` the grid sized
      itself past the section's box and drew over the section beside it. */
-  section.split { display: grid; grid-template-columns: repeat(2, 200px);
+  section.split { display: grid; grid-template-columns: repeat(2, 168px);
                   grid-template-rows: repeat(4, auto); grid-auto-flow: column;
-                  column-gap: 28px; min-width: 428px; }
+                  column-gap: 24px; min-width: 360px; }
   section.split h1 { grid-column: 1 / -1; grid-row: 1; }
   h1 { font-size: 13px; font-weight: 600; margin: 0 0 10px; letter-spacing: .02em; }
   label { display: flex; align-items: center; gap: 10px; margin: 7px 0; }
-  label span:first-child { width: 66px; color: #9a9aa2; }
+  label span:first-child { width: 58px; color: #9a9aa2; }
   /* `min-width: 0` because a range input has an intrinsic minimum of its own,
      and without it flex refuses to shrink one — which pushed the readout out of
      its column and over the label beside it. */
   input[type=range] { flex: 1; min-width: 0; }
-  output { width: 48px; text-align: right; font-variant-numeric: tabular-nums; }
+  output { width: 44px; text-align: right; font-variant-numeric: tabular-nums; }
   button { background: #303038; color: inherit; border: 1px solid #45454f;
            border-radius: 5px; padding: 4px 11px; font: inherit; cursor: pointer; }
   button:hover { background: #3a3a44; }
@@ -95,6 +95,16 @@
       <button data-rotate="-1">↺</button>
       <button data-rotate="1">↻</button>
     </div>
+  </section>
+
+  <section>
+    <h1>Colour</h1>
+    <label><span>Saturation</span>
+      <input id="saturation" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="saturation-value">0.00</output></label>
+    <label><span>Vibrance</span>
+      <input id="vibrance" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="vibrance-value">0.00</output></label>
   </section>
 
   <section>
@@ -184,6 +194,8 @@
   slider("sharpen", v => ({ command: "set_sharpen", params: v }), v => v.toFixed(2));
   slider("sharpen_radius", v => ({ command: "set_sharpen_radius", params: v }), v => v.toFixed(2));
   slider("chroma_noise", v => ({ command: "set_chroma_noise", params: v }), v => v.toFixed(2));
+  slider("saturation", v => ({ command: "set_saturation", params: v }), v => v.toFixed(2));
+  slider("vibrance", v => ({ command: "set_vibrance", params: v }), v => v.toFixed(2));
 
   for (const button of document.querySelectorAll("[data-rotate]")) {
     button.addEventListener("click", () =>
@@ -244,7 +256,7 @@
   // halves of one control disagreeing, which is worse than either being wrong.
   let dragging = null;
   const TONE = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"];
-  for (const id of [...TONE, "straighten", "sharpen", "sharpen_radius", "chroma_noise", "temperature", "tint"]) {
+  for (const id of [...TONE, "straighten", "sharpen", "sharpen_radius", "chroma_noise", "saturation", "vibrance", "temperature", "tint"]) {
     document.getElementById(id).addEventListener("pointerdown", () => (dragging = id));
   }
   document.addEventListener("pointerup", () => (dragging = null));
@@ -263,6 +275,8 @@
     setSlider("sharpen", state.detail.sharpen_amount, v => Number(v).toFixed(2));
     setSlider("sharpen_radius", state.detail.sharpen_radius, v => Number(v).toFixed(2));
     setSlider("chroma_noise", state.detail.chroma_noise, v => Number(v).toFixed(2));
+    setSlider("saturation", state.colour.saturation, v => Number(v).toFixed(2));
+    setSlider("vibrance", state.colour.vibrance, v => Number(v).toFixed(2));
     setSlider("tint", state.white_balance.tint, v => `${v | 0}`);
     const temp = state.white_balance.temperature_k;
     setSlider("temperature", temp ?? 5500, () => (temp === null ? "as shot" : `${temp | 0} K`));

@@ -76,6 +76,8 @@ struct Params {
     // `.x` is the sharpening amount, `.y` its radius in pixels, `.z` the chroma
     // noise reduction. `.w` unused.
     detail: vec4<f32>,
+    // `.x` is saturation and `.y` vibrance. `.zw` unused.
+    colour: vec4<f32>,
     // Where this tile lands in the canvas and how to trim it: `.xy` is the
     // destination pixel, `.z` the tile edge, `.w` the halo width. Rewritten per
     // tile, unlike everything above it, which moves only when the edit does.
@@ -523,14 +525,47 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Stage I -- display-referred ops. The five tone controls live here and not
     // beside exposure, because the sigmoid is the boundary: exposure decides how
     // much light there was, these decide what it should look like.
-    rgba_out[p] = vec4<f32>(
-        vec3<f32>(
-            tone_curve(mapped.r),
-            tone_curve(mapped.g),
-            tone_curve(mapped.b),
-        ),
-        1.0,
+    let shaped = vec3<f32>(
+        tone_curve(mapped.r),
+        tone_curve(mapped.g),
+        tone_curve(mapped.b),
     );
+    // Stage J -- colour adjustments, after the tone curve for the same reason
+    // the tone curve is after the tone map: this is about the picture, not the
+    // light. In scene-linear it would depend on exposure, and a colour that
+    // changed when you brightened the frame is not a colour control.
+    rgba_out[p] = vec4<f32>(saturate_colour(shaped), 1.0);
+}
+
+/// Saturation and vibrance.
+///
+/// Vibrance is not a weaker saturation: it moves colours **towards the middle of
+/// the range**. Positive lifts the flat ones and leaves the vivid alone;
+/// negative pulls the vivid back and leaves the flat alone. That is what lets a
+/// sky come up without the one red jacket in the frame turning to poster paint.
+fn saturate_colour(rgb: vec3<f32>) -> vec3<f32> {
+    let saturation = params.colour.x;
+    let vibrance = params.colour.y;
+    if (saturation == 0.0 && vibrance == 0.0) {
+        return rgb;
+    }
+    // The grey this colour is a departure from. Rec. 709, matching what the
+    // values are in by this point, so a fully desaturated frame has the
+    // brightness the eye expects rather than the average of three channels.
+    let grey = dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+
+    // How saturated it already is, on the HSV definition: nothing to do with
+    // how bright it is, which is what makes it the right weight for vibrance.
+    let top = max(rgb.r, max(rgb.g, rgb.b));
+    let bottom = min(rgb.r, min(rgb.g, rgb.b));
+    let already = select(0.0, (top - bottom) / max(top, 1e-6), top > 1e-6);
+
+    // Which end vibrance is working from: lifting the flat, or calming the
+    // vivid. One expression rather than a branch, because both are the same
+    // idea seen from opposite sides.
+    let weight = select(clamp(already, 0.0, 1.0), 1.0 - clamp(already, 0.0, 1.0), vibrance > 0.0);
+    let scale = (1.0 + saturation) * (1.0 + vibrance * weight);
+    return vec3<f32>(grey) + (rgb - vec3<f32>(grey)) * max(scale, 0.0);
 }
 
 /// Mid-grey in the perceptual coordinate: `0.18^(1/2.2)`.

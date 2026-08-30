@@ -49,6 +49,8 @@ pub enum EditStateError {
     InvalidCrop(String),
     #[error("detail is out of range: {0}")]
     InvalidDetail(String),
+    #[error("colour is out of range: {0}")]
+    InvalidColour(String),
 }
 
 /// How the image should be rendered. `Default` is the identity edit: the photo
@@ -68,6 +70,8 @@ pub struct EditState {
     pub crop: Crop,
     #[serde(default)]
     pub detail: Detail,
+    #[serde(default)]
+    pub colour: Colour,
 }
 
 fn default_schema_version() -> u32 {
@@ -83,6 +87,7 @@ impl Default for EditState {
             orientation: Orientation::default(),
             crop: Crop::default(),
             detail: Detail::default(),
+            colour: Colour::default(),
         }
     }
 }
@@ -116,6 +121,7 @@ impl EditState {
         }
         self.crop.validate()?;
         self.detail.validate()?;
+        self.colour.validate()?;
         Ok(())
     }
 
@@ -273,6 +279,47 @@ impl Crop {
                 "left {} must be less than right {}, and top {} less than bottom {}",
                 self.left, self.right, self.top, self.bottom
             )));
+        }
+        Ok(())
+    }
+}
+
+/// How saturated the photograph is, in two controls that are not the same knob.
+///
+/// Both run after the tone map, in `Stage::ColourAdjustments`, because
+/// saturation is about the picture rather than about the light: doing it in
+/// scene-linear would make the effect depend on exposure, and a colour that
+/// changed when you brightened the frame is not a colour control.
+///
+/// Unlike sharpening, both default to zero. A demosaiced frame is soft as a
+/// matter of physics and needs answering; there is no equivalent reason a
+/// photograph arrives under-saturated, and a converter that quietly adds colour
+/// is one whose output cannot be compared with anything.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Colour {
+    /// Every colour, equally. -1 is grey; 1 is twice as far from it.
+    pub saturation: f32,
+    /// Saturation that moves colours **towards the middle of the range**:
+    /// positive lifts the flat ones and leaves the vivid alone, negative pulls
+    /// the vivid back and leaves the flat alone.
+    ///
+    /// That is what makes it usable where plain saturation is not — a sky can
+    /// come up without the one red jacket in the frame turning to poster paint.
+    /// Weighted by how saturated each pixel already is, which protects skin
+    /// partly and by accident; protecting it *by hue* belongs with the per-band
+    /// mixer, where the bands exist to be reasoned about.
+    pub vibrance: f32,
+}
+
+impl Colour {
+    pub fn validate(&self) -> Result<(), EditStateError> {
+        for (name, value) in [("saturation", self.saturation), ("vibrance", self.vibrance)] {
+            if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
+                return Err(EditStateError::InvalidColour(format!(
+                    "{name} is {value}, and runs from -1 to 1"
+                )));
+            }
         }
         Ok(())
     }
