@@ -98,6 +98,16 @@
   </section>
 
   <section>
+    <h1>Detail</h1>
+    <label><span>Sharpen</span>
+      <input id="sharpen" type="range" min="0" max="1" step="0.01" value="0.4">
+      <output id="sharpen-value">0.40</output></label>
+    <label><span>Radius</span>
+      <input id="sharpen_radius" type="range" min="0.1" max="2" step="0.05" value="1">
+      <output id="sharpen_radius-value">1.00</output></label>
+  </section>
+
+  <section>
     <h1>White balance</h1>
     <label><span>Temp</span>
       <input id="temperature" type="range" min="2000" max="12000" step="10" value="5500">
@@ -168,6 +178,8 @@
   slider("whites", v => ({ command: "set_whites", params: v }), v => v.toFixed(2));
   slider("blacks", v => ({ command: "set_blacks", params: v }), v => v.toFixed(2));
   slider("straighten", v => ({ command: "set_straighten", params: v }), v => `${v.toFixed(1)}°`);
+  slider("sharpen", v => ({ command: "set_sharpen", params: v }), v => v.toFixed(2));
+  slider("sharpen_radius", v => ({ command: "set_sharpen_radius", params: v }), v => v.toFixed(2));
 
   for (const button of document.querySelectorAll("[data-rotate]")) {
     button.addEventListener("click", () =>
@@ -228,7 +240,7 @@
   // halves of one control disagreeing, which is worse than either being wrong.
   let dragging = null;
   const TONE = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"];
-  for (const id of [...TONE, "straighten", "temperature", "tint"]) {
+  for (const id of [...TONE, "straighten", "sharpen", "sharpen_radius", "temperature", "tint"]) {
     document.getElementById(id).addEventListener("pointerdown", () => (dragging = id));
   }
   document.addEventListener("pointerup", () => (dragging = null));
@@ -244,6 +256,8 @@
       setSlider(id, state.tone[id], v => Number(v).toFixed(2));
     }
     setSlider("straighten", state.crop.angle_deg, v => `${Number(v).toFixed(1)}°`);
+    setSlider("sharpen", state.detail.sharpen_amount, v => Number(v).toFixed(2));
+    setSlider("sharpen_radius", state.detail.sharpen_radius, v => Number(v).toFixed(2));
     setSlider("tint", state.white_balance.tint, v => `${v | 0}`);
     const temp = state.white_balance.temperature_k;
     setSlider("temperature", temp ?? 5500, () => (temp === null ? "as shot" : `${temp | 0} K`));

@@ -217,6 +217,8 @@ struct Params {
     tone: [f32; 4],
     /// `[black point, white point, unused, unused]`.
     levels: [f32; 4],
+    /// `[sharpen amount, sharpen radius, unused, unused]`.
+    detail: [f32; 4],
     /// `[dest_x, dest_y, tile, halo]`. Rewritten per tile; everything above it
     /// moves only when the edit does, which is why this sits last and is
     /// patched in place rather than re-uploading the whole uniform.
@@ -301,14 +303,23 @@ pub enum Output {
     Display,
 }
 
-const STAGES: [&str; 6] = [
+const STAGES: [&str; 8] = [
     "conv",
     "green_at_rb",
     "rb_at_br",
     "rb_at_g",
     "pack",
     "develop",
+    "luma",
+    "sharpen",
 ];
+
+/// How many of those stages leave the frame in scene-linear light.
+///
+/// Named rather than counted back from the end: it used to be `len() - 1`, which
+/// was right only while `develop` was last and would have silently started
+/// returning sharpened pixels the moment anything was appended.
+const SCENE_LINEAR_STAGES: usize = 5;
 
 /// How far outside a tile the kernel reaches, in pixels.
 ///
@@ -322,10 +333,17 @@ const STAGES: [&str; 6] = [
 /// | `rb_at_br` | `pq` ±1, green ±3 (itself reach 5) | 8 |
 /// | `rb_at_g` | chroma ±3 (itself reach 8) | 11 |
 ///
-/// Rounded up to 12 to keep it **even**, which is not cosmetic: an odd halo
+/// | `sharpen` | `vh` ±2 (itself the developed value, reach 11) | 13 |
+///
+/// Rounded up to 14 to keep it **even**, which is not cosmetic: an odd halo
 /// shifts the CFA phase inside the tile, and every pixel would come out the
 /// wrong colour.
-pub const HALO: u32 = 12;
+///
+/// It was 12 before capture sharpening, whose blur reaches two pixels further.
+/// Get this wrong and the symptom is a faint grid at the tile boundaries on
+/// detailed frames — which is why `a_level_zero_tile_is_identical_to_the_whole_image_render`
+/// is the test that guards it rather than anything that looks at a photograph.
+pub const HALO: u32 = 14;
 
 /// Tile edge in pixels, excluding halo. 512 keeps every buffer far inside
 /// WebGPU's default limits while leaving the halo a small fraction of the work
@@ -822,7 +840,7 @@ impl Renderer {
         intent: Output,
     ) {
         let stages = match intent {
-            Output::SceneLinear => &self.pipelines[..STAGES.len() - 1],
+            Output::SceneLinear => &self.pipelines[..SCENE_LINEAR_STAGES],
             Output::Display => &self.pipelines[..],
         };
         let groups = buffers.padded.div_ceil(8);
@@ -1115,6 +1133,12 @@ impl Renderer {
             ],
             tone: tone.shape(),
             levels: tone.levels(),
+            detail: [
+                state.detail.sharpen_amount,
+                state.detail.sharpen_radius,
+                0.0,
+                0.0,
+            ],
             // Per-tile, and rewritten before every present. The value here only
             // has to be something valid for the whole-image path, which never
             // rotates in the shader — geometry is applied to the finished frame.

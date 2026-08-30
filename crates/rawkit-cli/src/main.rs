@@ -544,6 +544,16 @@ pub struct EditFlags {
     /// This is the only operation in the pipeline that resamples.
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     straighten: f32,
+    /// Capture sharpening, 0 to 1. Zero turns it off entirely.
+    ///
+    /// A demosaiced frame is soft by construction, so this has a non-zero
+    /// default like every other raw converter's. It is applied to luminance
+    /// only, so it cannot put a colour fringe on an edge.
+    #[arg(long, default_value_t = rawkit_editstate::Detail::default().sharpen_amount)]
+    sharpen: f32,
+    /// The sharpening radius in pixels, 0.1 to 2.
+    #[arg(long, default_value_t = rawkit_editstate::Detail::default().sharpen_radius)]
+    sharpen_radius: f32,
 }
 
 impl EditFlags {
@@ -598,6 +608,10 @@ impl EditFlags {
             },
             orientation,
             crop,
+            detail: rawkit_editstate::Detail {
+                sharpen_amount: self.sharpen,
+                sharpen_radius: self.sharpen_radius,
+            },
             ..Default::default()
         })
     }

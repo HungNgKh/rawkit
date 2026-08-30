@@ -196,7 +196,10 @@ const PANEL_WIDTH: f64 = 400.0;
 /// gated, because a value only some platforms can see is how this file has
 /// broken the build four times.
 const PANEL_HEIGHT: i32 = 200;
-const WINDOW: (f64, f64) = (1200.0, 800.0);
+// Wide enough for the control sections to sit side by side. Each is 200 logical
+// pixels and the tone block is two of them, so five sections plus gaps need
+// about 1280 — at 1200 the last one was pushed off the edge.
+const WINDOW: (f64, f64) = (1440.0, 800.0);
 
 /// The session, shared between the page's commands and the render loop.
 ///

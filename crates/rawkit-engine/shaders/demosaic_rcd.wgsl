@@ -73,6 +73,8 @@ struct Params {
     tone: vec4<f32>,
     // `.xy` are the black and white points. `.zw` unused.
     levels: vec4<f32>,
+    // `.x` is the sharpening amount and `.y` its radius in pixels. `.zw` unused.
+    detail: vec4<f32>,
     // Where this tile lands in the canvas and how to trim it: `.xy` is the
     // destination pixel, `.z` the tile edge, `.w` the halo width. Rewritten per
     // tile, unlike everything above it, which moves only when the edit does.
@@ -827,4 +829,75 @@ fn present(@builtin(global_invocation_id) gid: vec3<u32>) {
     let halo = params.present.w;
     let src = idx(i32(gid.x) + halo, i32(gid.y) + halo);
     textureStore(canvas, vec2<u32>(dest), rgba_out[src]);
+}
+
+// ---------------------------------------------------------------------------
+// Stage J -- capture sharpening.
+//
+// A demosaiced frame is soft by construction: two thirds of every pixel was
+// interpolated. This is the unsharp mask that answers that, and it is two
+// passes rather than one because a neighbourhood operation cannot read the
+// buffer it is writing -- the neighbours would be a mixture of sharpened and
+// unsharpened values, and which is which depends on the order the GPU happened
+// to run in.
+//
+// So `luma` writes the developed luminance into `vh`, a plane the demosaic has
+// finished with, and `sharpen` reads *that* neighbourhood and adds the result
+// to its own pixel only. No aliasing, and no buffer that did not already exist.
+//
+// Luminance rather than colour, so an edge cannot pick up a fringe: the same
+// correction is added to all three channels, which moves the pixel along the
+// grey axis and leaves its hue where it was.
+// ---------------------------------------------------------------------------
+@compute @workgroup_size(8, 8)
+fn luma(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    if (x >= i32(params.width) || y >= i32(params.height)) {
+        return;
+    }
+    let p = idx(x, y);
+    // Rec. 709, which is what the display-referred values are in by this point.
+    vh[p] = dot(rgba_out[p].rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+/// How far the blur reaches, in pixels. The tile halo is sized to cover it --
+/// see `HALO` in `render.rs`, which carries the arithmetic.
+const SHARPEN_REACH: i32 = 2;
+
+@compute @workgroup_size(8, 8)
+fn sharpen(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let amount = params.detail.x;
+    // Exactly zero has to change exactly nothing: it is the claim that lets a
+    // stored edit turn this off completely rather than nearly.
+    if (amount <= 0.0) {
+        return;
+    }
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    if (x >= i32(params.width) || y >= i32(params.height)) {
+        return;
+    }
+
+    // A Gaussian whose sigma is the radius. Normalised by the weight actually
+    // used rather than by a constant, so a tap clamped at the edge of the tile
+    // does not darken the blur and turn the border into a bright line.
+    let sigma = max(params.detail.y, 0.05);
+    let falloff = -0.5 / (sigma * sigma);
+    var blurred = 0.0;
+    var total = 0.0;
+    for (var j = -SHARPEN_REACH; j <= SHARPEN_REACH; j = j + 1) {
+        for (var i = -SHARPEN_REACH; i <= SHARPEN_REACH; i = i + 1) {
+            let sx = clamp(x + i, 0, i32(params.width) - 1);
+            let sy = clamp(y + j, 0, i32(params.height) - 1);
+            let weight = exp(f32(i * i + j * j) * falloff);
+            blurred = blurred + vh[idx(sx, sy)] * weight;
+            total = total + weight;
+        }
+    }
+    let p = idx(x, y);
+    // The same amount added to every channel: the pixel moves along the grey
+    // axis, so an edge gains contrast without gaining colour.
+    let correction = amount * (vh[p] - blurred / total);
+    rgba_out[p] = vec4<f32>(rgba_out[p].rgb + vec3<f32>(correction), 1.0);
 }

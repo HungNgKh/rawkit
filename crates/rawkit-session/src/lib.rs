@@ -103,6 +103,11 @@ pub enum Command {
     SetOrientation(Orientation),
     /// The visible rectangle, as fractions of the oriented frame.
     SetCrop(Crop),
+    /// Capture sharpening, and how wide its blur is. Refused out of range,
+    /// because a radius past what the tile halo covers reads demosaic output
+    /// that is wrong at a tile edge — a faint grid, not an obvious failure.
+    SetSharpen(f32),
+    SetSharpenRadius(f32),
     /// Level a horizon, in degrees clockwise. Refused past the straighten range.
     SetStraighten(f32),
     /// Turn by this many quarter-turns clockwise, from wherever it is now.
@@ -154,6 +159,8 @@ impl Command {
             Command::SetTint(_) => "set_tint",
             Command::SetOrientation(_) => "set_orientation",
             Command::SetCrop(_) => "set_crop",
+            Command::SetSharpen(_) => "set_sharpen",
+            Command::SetSharpenRadius(_) => "set_sharpen_radius",
             Command::SetStraighten(_) => "set_straighten",
             Command::RotateBy(_) => "rotate_by",
             Command::SetEditState(_) => "set_edit_state",
@@ -413,6 +420,17 @@ impl Session {
                 self.edit_changed()
             }
 
+            Command::SetSharpen(amount) => {
+                let mut detail = self.state.detail;
+                detail.sharpen_amount = amount;
+                self.detail(name, detail)
+            }
+            Command::SetSharpenRadius(radius) => {
+                let mut detail = self.state.detail;
+                detail.sharpen_radius = radius;
+                self.detail(name, detail)
+            }
+
             Command::SetStraighten(degrees) => {
                 // Through `Crop`, so the range and the refusal are stated in one
                 // place rather than once per caller.
@@ -601,6 +619,16 @@ impl Session {
             return refused(name, "value must be a finite number");
         }
         set(&mut self.state, value);
+        self.edit_changed()
+    }
+
+    /// Through `Detail::validate`, so the range and the refusal are stated once
+    /// rather than once per control.
+    fn detail(&mut self, name: &'static str, detail: rawkit_editstate::Detail) -> Event {
+        if let Err(e) = detail.validate() {
+            return refused(name, e.to_string());
+        }
+        self.state.detail = detail;
         self.edit_changed()
     }
 
@@ -1207,5 +1235,30 @@ mod tests {
         let event = s.apply(Command::SetStraighten(30.0));
         assert!(matches!(event, Event::Refused { .. }), "{event:?}");
         assert_eq!(s.developed_size(), after, "a refusal changes nothing");
+    }
+
+    #[test]
+    fn sharpening_past_what_the_halo_covers_is_refused() {
+        // Not clamped: a radius wider than the tile halo reads demosaic output
+        // that is wrong near a tile edge, and the result is a faint grid on
+        // detailed frames rather than anything that looks like a bad setting.
+        let mut s = session();
+        let event = s.apply(Command::SetSharpenRadius(9.0));
+        assert!(matches!(event, Event::Refused { .. }), "{event:?}");
+        assert_eq!(
+            s.state().detail,
+            rawkit_editstate::Detail::default(),
+            "a refusal changes nothing"
+        );
+
+        assert!(matches!(
+            s.apply(Command::SetSharpen(0.0)),
+            Event::EditChanged { .. }
+        ));
+        assert_eq!(
+            s.state().detail.sharpen_amount,
+            0.0,
+            "off is a legal setting"
+        );
     }
 }

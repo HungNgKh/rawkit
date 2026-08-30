@@ -47,6 +47,8 @@ pub enum EditStateError {
     Serde(#[from] serde_json::Error),
     #[error("crop is not a rectangle: {0}")]
     InvalidCrop(String),
+    #[error("detail is out of range: {0}")]
+    InvalidDetail(String),
 }
 
 /// How the image should be rendered. `Default` is the identity edit: the photo
@@ -64,6 +66,8 @@ pub struct EditState {
     pub orientation: Orientation,
     #[serde(default)]
     pub crop: Crop,
+    #[serde(default)]
+    pub detail: Detail,
 }
 
 fn default_schema_version() -> u32 {
@@ -78,6 +82,7 @@ impl Default for EditState {
             tone: Tone::default(),
             orientation: Orientation::default(),
             crop: Crop::default(),
+            detail: Detail::default(),
         }
     }
 }
@@ -110,6 +115,7 @@ impl EditState {
             });
         }
         self.crop.validate()?;
+        self.detail.validate()?;
         Ok(())
     }
 
@@ -266,6 +272,78 @@ impl Crop {
             return Err(EditStateError::InvalidCrop(format!(
                 "left {} must be less than right {}, and top {} less than bottom {}",
                 self.left, self.right, self.top, self.bottom
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Sharpening.
+///
+/// # Why this has a non-zero default
+///
+/// A demosaiced frame is soft by construction: two thirds of every pixel was
+/// interpolated. Every raw converter answers that with capture sharpening, and
+/// one that does not looks worse than its neighbours for a reason the user
+/// cannot see and would not guess at. So the default is a real number, and
+/// opening a photograph shows something worth looking at rather than something
+/// that needs a slider found first.
+///
+/// **The cost is deliberate and worth naming**: `EditState::default()` is no
+/// longer the identity, so a render of an unedited file is not the demosaic's
+/// own output any more. The golden references were re-blessed once for it. What
+/// remains true is the narrower claim that matters — `sharpen_amount` of zero
+/// changes nothing at all, and the shader returns before touching a pixel.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Detail {
+    /// How much of the difference between the image and its blur to add back.
+    /// 0 is off; 1 is strong. Applied to luminance only, so it cannot introduce
+    /// colour fringing along an edge.
+    pub sharpen_amount: f32,
+    /// The blur's radius in pixels, which sets what counts as detail. Small
+    /// values sharpen texture; large ones sharpen shapes and start to look like
+    /// clarity.
+    pub sharpen_radius: f32,
+}
+
+impl Default for Detail {
+    fn default() -> Self {
+        Self {
+            // Modest. Enough that a raw looks like a photograph rather than a
+            // scan, and short of the amount that makes edges announce
+            // themselves.
+            sharpen_amount: 0.4,
+            sharpen_radius: 1.0,
+        }
+    }
+}
+
+/// The largest sharpening radius the renderer will honour, in pixels.
+///
+/// The tile halo is sized for it: a neighbourhood operation inside a tile can
+/// only read as far as the halo makes correct, so this number and `HALO` in the
+/// engine move together.
+pub const MAX_SHARPEN_RADIUS: f32 = 2.0;
+
+impl Detail {
+    /// Refused rather than clamped, like a crop and unlike a tone slider: a
+    /// radius past what the halo covers would read demosaic output that is
+    /// wrong near a tile edge, and the result is a faint grid nobody would
+    /// attribute to sharpening.
+    pub fn validate(&self) -> Result<(), EditStateError> {
+        if !self.sharpen_amount.is_finite() || !(0.0..=1.0).contains(&self.sharpen_amount) {
+            return Err(EditStateError::InvalidDetail(format!(
+                "sharpen amount is {}, and runs from 0 to 1",
+                self.sharpen_amount
+            )));
+        }
+        if !self.sharpen_radius.is_finite()
+            || !(0.1..=MAX_SHARPEN_RADIUS).contains(&self.sharpen_radius)
+        {
+            return Err(EditStateError::InvalidDetail(format!(
+                "sharpen radius is {} pixels, and runs from 0.1 to {MAX_SHARPEN_RADIUS}",
+                self.sharpen_radius
             )));
         }
         Ok(())

@@ -61,16 +61,19 @@ struct Case {
 }
 
 const CASES: &[Case] = &[
-    // The baseline: what the camera saw, with the identity edit.
+    // The baseline: what the camera saw, developed with the default edit —
+    // which is no longer the identity, because capture sharpening has a
+    // non-zero default. `sharpen_amount` of zero still changes nothing, and
+    // that is the claim the engine's own tests hold.
     Case {
-        name: "chirp_rggb_identity",
+        name: "chirp_rggb_default",
         phase: BayerPhase::Rggb,
         state: EditState::default,
     },
     // A different CFA phase must survive the whole pipeline, not just the
     // demosaic — the phase offset reaches into the packed helper buffers.
     Case {
-        name: "chirp_bggr_identity",
+        name: "chirp_bggr_default",
         phase: BayerPhase::Bggr,
         state: EditState::default,
     },

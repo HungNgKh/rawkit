@@ -17,6 +17,19 @@ use rawkit_engine::{BayerPhase, CameraProfile, Frame, Gpu, Output, Renderer};
 
 const N: u32 = 64;
 
+/// The default edit with capture sharpening turned off.
+///
+/// This measures highlight reconstruction, and sharpening is a different stage
+/// three steps later: it moves a channel by a millionth, which is nothing to a
+/// photograph and enough to fail "reconstruction never darkens a channel". The
+/// same reason `pyramid.rs` renders with clipping disabled — a test should not
+/// be measuring the stage it did not name.
+fn unsharpened() -> EditState {
+    let mut state = EditState::default();
+    state.detail.sharpen_amount = 0.0;
+    state
+}
+
 /// Sony ILCE-6400 daylight multipliers, which are what make green clip first.
 const DAYLIGHT_WB: [f32; 3] = [2.75, 1.0, 1.70];
 
@@ -53,7 +66,7 @@ fn render(gpu: &Gpu, camera: [f32; 3], wb: [f32; 3], clip: f32) -> [f32; 3] {
                 clip_level: clip,
                 profile: neutral_profile(),
             },
-            &EditState::default(),
+            &unsharpened(),
             Output::Display,
         )
         .expect("render failed")
