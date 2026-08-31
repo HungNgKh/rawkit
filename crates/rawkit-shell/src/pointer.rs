@@ -15,7 +15,10 @@
 //! coordinates, and converting at each boundary keeps the conversion where the
 //! scale factor is known rather than passing a scale around.
 
-use crate::{in_crop, in_grid, Marquee, CANVAS_CLICK, CANVAS_MARQUEE, CANVAS_SCROLL};
+use crate::{
+    in_crop, in_grid, targeting, Aim, Marquee, CANVAS_CLICK, CANVAS_MARQUEE, CANVAS_SCROLL,
+    TARGET_AIM, TARGET_RANGE_PX,
+};
 use rawkit_session::{Command, Session};
 use std::sync::{Arc, Mutex};
 
@@ -43,6 +46,41 @@ pub(crate) enum Pointer {
 /// thread: GTK's handlers run on the main loop and Tauri's commands do not.
 static DRAG: Mutex<Option<[f64; 2]>> = Mutex::new(None);
 
+/// Move the two bands the sampled colour lies between, in the proportion the
+/// renderer will weight them by.
+///
+/// Both, and by those weights, because that is the entire point: pointing at a
+/// lawn and dragging up moves Yellow by 0.69 of the gesture and Green by 0.31,
+/// which is what makes the lawn receive all of it. Moving the nearest band alone
+/// would give roughly two-thirds of the effect — the problem the tool exists to
+/// remove, arrived at from the other side.
+///
+/// Deltas are from where the sliders were when the hand went down, so a slow
+/// drag does not compound and a drag back to the start returns the values it
+/// started from.
+fn aim(at: [f64; 2], control: rawkit_editstate::BandControl, session: &Arc<Mutex<Session>>) {
+    let aim = TARGET_AIM.lock().expect("aim lock");
+    let Some(aim) = aim.as_ref() else { return };
+    // Still waiting for the render loop to say what colour this is. A frame at
+    // most, and moving in the meantime would adjust a band nobody aimed at.
+    let Some((bands, start)) = aim.picked else {
+        return;
+    };
+    // Up is more, which is the way every drag-adjust in every editor works and
+    // the opposite of the y axis.
+    let moved = (aim.at[1] - at[1]) / TARGET_RANGE_PX;
+
+    let mut session = session.lock().expect("session lock");
+    for (index, (band, weight)) in bands.iter().enumerate() {
+        let value = (start[index] + moved as f32 * weight).clamp(-1.0, 1.0);
+        session.apply(Command::SetHsl {
+            band: *band,
+            control,
+            value,
+        });
+    }
+}
+
 /// How much one wheel notch zooms. 1.15 is about a sixth of a stop of scale —
 /// small enough that a notch feels like a nudge rather than a jump.
 const ZOOM_STEP: f64 = 1.15;
@@ -50,6 +88,13 @@ const ZOOM_STEP: f64 = 1.15;
 pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
     match event {
         Pointer::Press { at, double } => {
+            // Aiming takes the press before anything else, and does not fall
+            // through to `DRAG`: a targeted drag must not also pan the
+            // photograph out from under the colour it is adjusting.
+            if targeting().is_some() && !in_grid() {
+                *TARGET_AIM.lock().expect("aim lock") = Some(Aim { at, picked: None });
+                return;
+            }
             if in_grid() {
                 // The grid works out *which cell* this is, because it is the
                 // only place that knows the layout. Everything here does is say
@@ -65,6 +110,10 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
         }
 
         Pointer::Motion { at } => {
+            if let Some(control) = targeting() {
+                aim(at, control, session);
+                return;
+            }
             let previous = *DRAG.lock().expect("drag lock");
             let Some(previous) = previous else { return };
             if in_crop() {
@@ -88,7 +137,10 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
         // Letting go is the whole of it. In crop the rectangle stays on screen
         // until Enter takes it or Escape throws it away, so a drag that came out
         // wrong can be redrawn.
-        Pointer::Release => *DRAG.lock().expect("drag lock") = None,
+        Pointer::Release => {
+            *DRAG.lock().expect("drag lock") = None;
+            *TARGET_AIM.lock().expect("aim lock") = None;
+        }
 
         Pointer::Scroll { at, notches } => {
             if in_grid() {

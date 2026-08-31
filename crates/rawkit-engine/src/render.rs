@@ -1435,6 +1435,108 @@ impl Canvas {
         self.size
     }
 
+    /// The average colour of a small square, as linear RGB.
+    ///
+    /// For pointing at the photograph and asking what is there — a targeted
+    /// adjustment, and later an eyedropper. A square rather than a single pixel
+    /// because one pixel of a demosaiced photograph is partly its neighbours
+    /// anyway, and a small average is what makes the answer stable when the hand
+    /// moves by one.
+    ///
+    /// This synchronises, like [`read_back`](Self::read_back) and for the same
+    /// reason — but it copies a few hundred bytes rather than the canvas, and it
+    /// happens once when a gesture starts rather than once a frame. See the
+    /// module note on when a caller reads back: the wait is for the queue, so
+    /// this is cheap only because nothing much is in it at that moment.
+    ///
+    /// `None` when the square falls entirely outside the canvas, which is what a
+    /// click on the letterbox around a fitted photograph is.
+    pub fn sample(
+        &self,
+        gpu: &Gpu,
+        at: [u32; 2],
+        span: u32,
+    ) -> Result<Option<[f32; 3]>, EngineError> {
+        const BYTES_PER_PIXEL: u32 = 8;
+        let [w, h] = self.size;
+        let half = span / 2;
+        let x0 = at[0].saturating_sub(half).min(w.saturating_sub(1));
+        let y0 = at[1].saturating_sub(half).min(h.saturating_sub(1));
+        let width = span.min(w - x0).max(1);
+        let height = span.min(h - y0).max(1);
+        if at[0] >= w || at[1] >= h {
+            return Ok(None);
+        }
+
+        let padded_row = (width * BYTES_PER_PIXEL).div_ceil(256) * 256;
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("canvas sample"),
+            size: (padded_row * height) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("canvas sample"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: x0, y: y0, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        gpu.queue.submit([encoder.finish()]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| EngineError::DeviceRequest(e.to_string()))?;
+        rx.recv()
+            .map_err(|_| EngineError::DeviceRequest("sample never completed".into()))?
+            .map_err(|e| EngineError::DeviceRequest(e.to_string()))?;
+
+        let mut total = [0.0f64; 3];
+        {
+            let view = staging.slice(..).get_mapped_range();
+            for row in 0..height as usize {
+                let start = row * padded_row as usize;
+                let halves: &[u16] =
+                    bytemuck::cast_slice(&view[start..start + (width * BYTES_PER_PIXEL) as usize]);
+                for pixel in halves.chunks_exact(4) {
+                    for (c, total) in total.iter_mut().enumerate() {
+                        *total += half_to_f32(pixel[c]) as f64;
+                    }
+                }
+            }
+        }
+        staging.unmap();
+        let n = (width * height) as f64;
+        Ok(Some([
+            (total[0] / n) as f32,
+            (total[1] / n) as f32,
+            (total[2] / n) as f32,
+        ]))
+    }
+
     /// Pull the canvas back to the CPU as interleaved RGBA.
     ///
     /// For tests and for anything offline. Deliberately *not* part of drawing a

@@ -114,6 +114,56 @@ fn pixel(pixels: &[f32], i: usize) -> [f32; 3] {
 
 #[test]
 #[ignore = "requires a GPU adapter"]
+fn the_rust_weights_match_the_shader() {
+    // `Band::spanning` exists so the shell can distribute a targeted adjustment
+    // across the two bands a colour lies between. It is a second implementation
+    // of `band_span` in WGSL, written in Rust, and two implementations of one
+    // rule is exactly the arrangement that quietly stops agreeing.
+    //
+    // Checked through the *hue* control because it is the linear one: a band at
+    // full deflection turns a pixel by `weight * MAX_HUE_SHIFT_DEG`, so the
+    // measured rotation is the weight in degrees and nothing has to be inferred
+    // from a saturation curve.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let cfa = sweep();
+    let plain = render(&gpu, &cfa, &EditState::default());
+
+    for band in Band::ALL {
+        let mut state = EditState::default();
+        let mut mix = state.hsl.mix(band);
+        mix.hue = 1.0;
+        state.hsl.set(band, mix);
+        let shifted = render(&gpu, &cfa, &state);
+
+        // A row across the sweep, skipping the ends where the demosaic has less
+        // to work with, and any grey the mixer deliberately leaves alone.
+        for x in (8..W as usize - 8).step_by(5) {
+            let i = (H as usize / 2) * W as usize + x;
+            let before = pixel(&plain, i);
+            if chroma(before) < 0.02 {
+                continue;
+            }
+            let hue = rgb_to_hue(before);
+            let expected = Band::spanning(hue)
+                .iter()
+                .find(|(b, _)| *b == band)
+                .map(|(_, w)| *w)
+                .unwrap_or(0.0)
+                * rawkit_editstate::MAX_HUE_SHIFT_DEG;
+
+            let after = rgb_to_hue(pixel(&shifted, i));
+            let moved = (after - hue + 540.0) % 360.0 - 180.0;
+            assert!(
+                (moved - expected).abs() < 1.2,
+                "{band:?} at hue {hue:.1}: shader moved it {moved:.2}, \
+                 Band::spanning says {expected:.2}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
 fn the_bands_partition_the_hue_circle() {
     let gpu = match Gpu::new() {
         Ok(gpu) => gpu,

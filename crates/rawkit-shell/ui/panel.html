@@ -128,6 +128,16 @@
   #histogram { width: 100%; height: 84px; border-radius: 3px;
                background: #141418; display: block; }
   #readout { display: flex; align-items: baseline; gap: 14px; margin-top: 7px; }
+  /* The targeted-adjustment button, on the right of its section heading. A
+     summary is a flex row for this reason alone. */
+  summary { display: flex; align-items: center; }
+  .target { margin-left: auto; padding: 0 7px; line-height: 1.5;
+            color: #8e8e98; background: transparent; border-color: transparent; }
+  .target:hover { color: #e8e8ea; background: #303038; border-color: #45454f; }
+  .target.armed { color: #1e1e22; background: #d8bf63; border-color: #d8bf63; }
+  /* While something is armed the photograph is a target, not a hand. */
+  body.aiming { cursor: crosshair; }
+
   /* A swatch beside each band's name. The mixer is the one panel where the
      control's *colour* is the thing being named, and eight words in a column
      are much slower to scan than eight colours. */
@@ -382,6 +392,16 @@
     section.id = `s-hsl-${control}`;
     const summary = document.createElement("summary");
     summary.textContent = `HSL · ${controlName}`;
+    // The targeted adjustment. Armed per control rather than as one mode with
+    // modifiers, so which of the three a drag will move is on screen — the whole
+    // difficulty of a hue mixer is not knowing what you are aiming at, and a
+    // tool that hid its own aim would be an odd answer to that.
+    const target = document.createElement("button");
+    target.className = "target";
+    target.dataset.control = control;
+    target.textContent = "◎";
+    target.title = `drag on the photograph to set ${controlName.toLowerCase()} for the colour you point at`;
+    summary.append(target);
     section.append(summary);
     for (const [band, bandName, colour] of BANDS) {
       const label = document.createElement("label");
@@ -521,7 +541,15 @@
 
   const setSlider = (id, value, format) => {
     if (dragging !== id) document.getElementById(id).value = value;
-    document.getElementById(id + "-value").textContent = format(value);
+    // Not every slider has a number beside it: the three under the grading
+    // wheels show their value on the wheel instead. Assuming one existed threw
+    // here, and because the throw happened inside a polling callback nobody saw
+    // it — so from the day grading landed, everything `sync` touches *after*
+    // the wheels was never synced at all: the tone curve, all twenty-four mixer
+    // sliders, and white balance. Which is the exact failure this function was
+    // written to prevent, arriving through the function itself.
+    const readout = document.getElementById(id + "-value");
+    if (readout) readout.textContent = format(value);
   };
 
   const sync = state => {
@@ -599,7 +627,9 @@
     const s = await invoke("snapshot");
     if (s.generation !== seen) {
       seen = s.generation;
-      sync(s.state);
+      // Reported rather than swallowed. A throw in here is invisible — there is
+      // no console to watch — and one lived for a whole slice because of that.
+      try { sync(s.state); } catch (e) { say(`sync: ${e && e.message || e}`); }
     }
     // The panel's width is the shell's answer, not ours: a window too narrow
     // for the width someone chose gets less, and the page finds out here.
@@ -1261,6 +1291,36 @@
     if (button && event.detail > 0) button.blur();
   });
 
+  // ---- Targeted adjustment -------------------------------------------------
+  //
+  // Point at the photograph, drag up or down, and the two bands that colour
+  // lies between move in the proportion the renderer weights them by. The shell
+  // does the sampling and the arithmetic; all this owns is which of the three
+  // controls is armed, and saying so.
+  //
+  // Clicking the arm again disarms, and so does Escape — a mode you cannot see
+  // your way out of is worse than no mode.
+
+  let armed = null;
+  const arm = (control) => {
+    armed = control;
+    for (const button of document.querySelectorAll(".target")) {
+      button.classList.toggle("armed", button.dataset.control === control);
+    }
+    document.body.classList.toggle("aiming", control !== null);
+    invoke("arm_target", { control }).catch(say);
+  };
+
+  for (const button of document.querySelectorAll(".target")) {
+    button.addEventListener("click", event => {
+      // The button lives inside a <summary>, which would otherwise open and
+      // close the section every time the tool is picked up.
+      event.preventDefault();
+      event.stopPropagation();
+      arm(armed === button.dataset.control ? null : button.dataset.control);
+    });
+  }
+
   // ---- The divider ---------------------------------------------------------
   //
   // The page owns the gesture; the shell owns the consequence. On Linux the
@@ -1517,6 +1577,10 @@
         if (document.getElementById("mode").textContent === "crop") { act("crop_apply"); break; }
         act("loupe"); break;
       case "escape":
+        // Putting the targeted tool down comes first: it is the mode most
+        // recently picked up, and leaving crop as well would be two answers to
+        // one key.
+        if (armed !== null) { arm(null); break; }
         if (document.getElementById("mode").textContent === "crop") { act("crop_cancel"); break; }
         act("loupe"); break;
       case "e": act("loupe"); break;

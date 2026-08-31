@@ -944,7 +944,8 @@ fn main() -> Result<()> {
             forget_snapshot,
             set_panel_width,
             panel_width,
-            toggle_fullscreen
+            toggle_fullscreen,
+            arm_target
         ])
         .setup(move |app| {
             // The surface is created on the main thread because the raw window
@@ -1415,6 +1416,48 @@ fn main() -> Result<()> {
                         }
                         session.level() != session.viewport().level(session.max_level())
                     };
+
+                // An aim taken but not yet resolved: the press said where, and
+                // this is the only place that holds the canvas and can say what
+                // colour is there. One small readback per gesture, not per
+                // frame, and taken here — before the canvas pass — for the same
+                // reason the survey is: a poll waits for the queue.
+                if let Some(control) = targeting() {
+                    let pending = {
+                        let aim = TARGET_AIM.lock().expect("aim lock");
+                        aim.as_ref().filter(|a| a.picked.is_none()).map(|a| a.at)
+                    };
+                    if let Some(at) = pending {
+                        let sampled = canvas_renderer.canvas().sample(
+                            &gpu,
+                            [at[0].max(0.0) as u32, at[1].max(0.0) as u32],
+                            TARGET_SAMPLE,
+                        )?;
+                        // A grey has no hue to aim by, and the mixer leaves it
+                        // alone in any case — so pointing at one arms nothing
+                        // rather than handing the gesture to red.
+                        let picked = sampled.and_then(hue_of).map(|hue| {
+                            let bands = rawkit_editstate::Band::spanning(hue);
+                            let session = shared.lock().expect("session lock");
+                            let hsl = &session.state().hsl;
+                            let start = [
+                                hsl.mix(bands[0].0).get(control),
+                                hsl.mix(bands[1].0).get(control),
+                            ];
+                            (bands, start)
+                        });
+                        match picked {
+                            Some(picked) => {
+                                if let Some(aim) = TARGET_AIM.lock().expect("aim lock").as_mut() {
+                                    aim.picked = Some(picked);
+                                }
+                            }
+                            // Nothing to aim at, so the gesture ends rather than
+                            // waiting for a colour that is not coming.
+                            None => *TARGET_AIM.lock().expect("aim lock") = None,
+                        }
+                    }
+                }
 
                 // The survey goes *before* the canvas, and the order is the
                 // whole cost of it.
@@ -1984,6 +2027,113 @@ static GRID_CELL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::n
 /// that is** is worked out by the render loop, which is the only place that knows
 /// the layout. Publishing the column count and pitch instead would put the same
 /// arithmetic in two files and let them disagree.
+/// Which HSL control a drag on the photograph is currently aiming, if any.
+///
+/// 0 is off; otherwise it is a [`BandControl`] by index. An atomic rather than a
+/// mode, because targeting is *orthogonal* to loupe and crop — it is a thing the
+/// pointer means while a control is armed, and the view underneath does not
+/// change.
+static TARGET: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn targeting() -> Option<rawkit_editstate::BandControl> {
+    match TARGET.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(rawkit_editstate::BandControl::Hue),
+        2 => Some(rawkit_editstate::BandControl::Saturation),
+        3 => Some(rawkit_editstate::BandControl::Luminance),
+        _ => None,
+    }
+}
+
+/// A drag that is adjusting the colour it was started on.
+///
+/// The press records where; the render loop, which is the only thing holding the
+/// canvas, turns that into *which colour* and therefore which two bands. So the
+/// gesture begins un-aimed and acquires its aim a frame later, which is
+/// invisible at sixty frames a second and is why `picked` is an `Option` rather
+/// than the press doing the sampling itself.
+/// The two bands a sampled colour lies between with their weights, and what
+/// those bands read when the hand went down.
+pub(crate) type Aimed = ([(rawkit_editstate::Band, f32); 2], [f32; 2]);
+
+pub(crate) struct Aim {
+    pub at: [f64; 2],
+    /// The two bands the sampled colour lies between with their weights, and
+    /// what those bands read before the drag started. Both are needed: the
+    /// deltas are relative to where the sliders were when the hand went down,
+    /// not to where they are now, or a slow drag would compound.
+    pub picked: Option<Aimed>,
+}
+
+pub(crate) static TARGET_AIM: Mutex<Option<Aim>> = Mutex::new(None);
+
+/// Canvas pixels of vertical drag for the full range of a control.
+///
+/// In canvas pixels rather than logical ones because that is what the pointer
+/// delivers — which does mean the gesture is twice as fine on a HiDPI screen,
+/// and that is the right way round: a display with more pixels can aim better.
+pub(crate) const TARGET_RANGE_PX: f64 = 400.0;
+
+/// The square averaged when picking a colour, in canvas pixels.
+///
+/// Small enough to be *this* leaf rather than the hedge, large enough that the
+/// answer does not change when the hand moves by one — and a demosaiced pixel is
+/// partly its neighbours anyway, so a single one would be a false precision.
+pub(crate) const TARGET_SAMPLE: u32 = 9;
+
+/// The hue of a colour, in degrees, or `None` for a grey.
+///
+/// The same measure the shader takes: `mix_bands` reads `rgb_to_hsv` on
+/// display-referred values, which is what the canvas holds, so a hue read here
+/// names the band the renderer would have used.
+///
+/// One caveat, and it is inherent rather than an oversight: the canvas has
+/// already been through the mixer, so a colour the user has *already* shifted is
+/// sampled where it now is rather than where it came from. Shifts are capped at
+/// thirty degrees and the bands are thirty to sixty apart, so this can only
+/// mis-aim after a large existing adjustment to the very band being aimed at.
+pub(crate) fn hue_of(rgb: [f32; 3]) -> Option<f32> {
+    let high = rgb[0].max(rgb[1]).max(rgb[2]);
+    let low = rgb[0].min(rgb[1]).min(rgb[2]);
+    let chroma = high - low;
+    if chroma <= 1e-4 || high <= 0.0 {
+        return None;
+    }
+    let hue = if high == rgb[0] {
+        60.0 * (((rgb[1] - rgb[2]) / chroma) % 6.0)
+    } else if high == rgb[1] {
+        60.0 * ((rgb[2] - rgb[0]) / chroma + 2.0)
+    } else {
+        60.0 * ((rgb[0] - rgb[1]) / chroma + 4.0)
+    };
+    Some(hue.rem_euclid(360.0))
+}
+
+/// Point at the photograph to move the sliders for the colour under the pointer.
+///
+/// The mixer's difficulty is not the arithmetic, it is aiming: a lawn is about
+/// 69% Yellow and 31% Green, and nothing on screen says so. Armed, a vertical
+/// drag distributes the change over exactly those two weights, so the colour
+/// under the pointer receives all of it and the sliders show where it went.
+#[tauri::command]
+fn arm_target(control: Option<String>) -> Result<u8, String> {
+    let armed = match control.as_deref() {
+        None | Some("") => 0,
+        Some("hue") => 1,
+        Some("saturation") => 2,
+        Some("luminance") => 3,
+        Some(other) => {
+            return Err(format!(
+                "{other:?} is not one of the mixer's three controls"
+            ))
+        }
+    };
+    TARGET.store(armed, std::sync::atomic::Ordering::Relaxed);
+    if armed == 0 {
+        *TARGET_AIM.lock().expect("aim lock") = None;
+    }
+    Ok(armed)
+}
+
 pub(crate) static CANVAS_CLICK: Mutex<Option<([f64; 2], bool)>> = Mutex::new(None);
 /// Wheel notches since the last frame, positive downwards.
 pub(crate) static CANVAS_SCROLL: std::sync::atomic::AtomicI32 =

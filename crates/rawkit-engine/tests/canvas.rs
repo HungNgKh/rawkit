@@ -65,6 +65,81 @@ fn frame(cfa: &[f32]) -> Frame<'_> {
 
 #[test]
 #[ignore = "requires a GPU adapter"]
+fn a_sample_is_the_average_of_the_square_it_names() {
+    // What a targeted adjustment points at. The whole canvas is read back and
+    // the square averaged on the CPU, then compared with what `sample` returns —
+    // so the test measures the *copy*, which is where an origin or a row stride
+    // goes wrong, rather than re-deriving the pixels a second way.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let cfa = mosaic();
+    let image = frame(&cfa);
+    let state = EditState::default();
+    let renderer = Renderer::with_tile_size(&gpu, TILE);
+    let pyramid = Pyramid::build(&image, TILE);
+    let buffers = renderer.allocate(&gpu, &image);
+    renderer
+        .set_edit(&gpu, &buffers, &image, &state)
+        .expect("upload edit");
+    let canvas = renderer.create_canvas(&gpu, TILE, TILE);
+    renderer
+        .draw_tile(
+            &gpu,
+            &buffers,
+            &canvas,
+            &pyramid,
+            0,
+            2,
+            1,
+            [0, 0],
+            [[1, 0], [0, 1]],
+            Output::Display,
+        )
+        .expect("draw");
+
+    let all = canvas.read_back(&gpu).expect("canvas readback");
+    let [w, _] = canvas.size();
+    const SPAN: u32 = 8;
+    for at in [[40u32, 40], [7, 3], [TILE - 2, TILE - 2]] {
+        let sampled = canvas
+            .sample(&gpu, at, SPAN)
+            .expect("sample")
+            .expect("inside the canvas");
+
+        let half = SPAN / 2;
+        let x0 = at[0].saturating_sub(half).min(TILE - 1);
+        let y0 = at[1].saturating_sub(half).min(TILE - 1);
+        let mut total = [0.0f64; 3];
+        let mut n = 0.0;
+        for y in y0..(y0 + SPAN).min(TILE) {
+            for x in x0..(x0 + SPAN).min(TILE) {
+                let i = (y as usize * w as usize + x as usize) * 4;
+                for (c, total) in total.iter_mut().enumerate() {
+                    *total += all[i + c] as f64;
+                }
+                n += 1.0;
+            }
+        }
+        for c in 0..3 {
+            let expected = (total[c] / n) as f32;
+            assert!(
+                (sampled[c] - expected).abs() < 1e-4,
+                "at {at:?} channel {c}: sampled {}, expected {expected}",
+                sampled[c]
+            );
+        }
+    }
+
+    // Outside is an answer, not an error: a click on the letterbox around a
+    // fitted photograph lands there, and refusing would make the caller decide
+    // what a failure means.
+    assert!(canvas
+        .sample(&gpu, [TILE + 4, 4], SPAN)
+        .expect("sample")
+        .is_none());
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
 fn a_tile_drawn_to_the_canvas_is_the_tile_read_back() {
     let gpu = Gpu::new().expect("no usable GPU adapter");
     let cfa = mosaic();

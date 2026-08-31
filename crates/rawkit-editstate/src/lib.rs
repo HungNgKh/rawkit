@@ -504,6 +504,35 @@ impl Band {
         }
     }
 
+    /// The two bands a hue lies between, and how much of each applies to it.
+    ///
+    /// The mirror of `band_span` in the shader, and it has to stay one: a
+    /// targeted adjustment distributes a change across these weights so that the
+    /// colour under the pointer receives all of it, and weights that disagreed
+    /// with the renderer's would move the wrong sliders by the wrong amounts.
+    /// `the_rust_weights_match_the_shader` is what holds them together.
+    ///
+    /// Weights sum to one by construction — the same partition property that
+    /// makes the eight sliders seamless.
+    pub fn spanning(hue_deg: f32) -> [(Band, f32); 2] {
+        let hue = hue_deg.rem_euclid(360.0);
+        for (index, &band) in Band::ALL.iter().enumerate() {
+            let lower = band.centre_deg();
+            // Red again, a turn later: the last span closes the circle.
+            let upper = if index == 7 {
+                360.0
+            } else {
+                Band::ALL[index + 1].centre_deg()
+            };
+            if hue >= lower && hue < upper {
+                let t = (hue - lower) / (upper - lower);
+                return [(band, 1.0 - t), (Band::ALL[(index + 1) % 8], t)];
+            }
+        }
+        // Unreachable for a hue in [0, 360), which `rem_euclid` guarantees.
+        [(Band::Red, 1.0), (Band::Orange, 0.0)]
+    }
+
     pub fn index(self) -> usize {
         Band::ALL.iter().position(|b| *b == self).unwrap_or(0)
     }
@@ -872,6 +901,52 @@ pub enum EditSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hue_is_shared_between_the_two_bands_it_lies_between() {
+        // The number this exists for, measured off a photograph before the
+        // function did: the lawn in `ILCE-6400_DSC00087.ARW` sits at 78.8
+        // degrees, which is mostly Yellow and not, whatever it is called, Green.
+        let [(first, a), (second, b)] = Band::spanning(78.8);
+        assert_eq!(first, Band::Yellow);
+        assert_eq!(second, Band::Green);
+        assert!(
+            (a - 0.687).abs() < 0.002,
+            "the lawn should be about 69% yellow, got {a}"
+        );
+        assert!((a + b - 1.0).abs() < 1e-6, "the weights must partition");
+    }
+
+    #[test]
+    fn every_hue_is_fully_accounted_for() {
+        // The partition, across the whole circle including the seam at red.
+        for step in 0..720 {
+            let hue = step as f32 * 0.5;
+            let [(_, a), (_, b)] = Band::spanning(hue);
+            assert!(
+                (a + b - 1.0).abs() < 1e-5,
+                "hue {hue} splits {a} + {b}, which is not one"
+            );
+            assert!(a >= 0.0 && b >= 0.0, "hue {hue} gave a negative weight");
+        }
+    }
+
+    #[test]
+    fn a_hue_on_a_centre_belongs_wholly_to_that_band() {
+        for band in Band::ALL {
+            let [(first, weight), _] = Band::spanning(band.centre_deg());
+            assert_eq!(first, band);
+            assert!((weight - 1.0).abs() < 1e-6, "{band:?} got {weight}");
+        }
+    }
+
+    #[test]
+    fn a_hue_outside_the_circle_is_brought_back_onto_it() {
+        // Hue arithmetic wraps, and a caller that has added a shift may hand
+        // over 370 or -10 rather than normalising first.
+        assert_eq!(Band::spanning(370.0), Band::spanning(10.0));
+        assert_eq!(Band::spanning(-10.0), Band::spanning(350.0));
+    }
 
     #[test]
     fn default_is_the_identity_edit() {
