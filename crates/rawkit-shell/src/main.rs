@@ -1138,6 +1138,18 @@ fn main() -> Result<()> {
             let mut last_marquee: Option<[f64; 4]> = None;
             // When the histogram was last recomputed. See `SURVEY_INTERVAL`.
             let mut last_survey: Option<std::time::Instant> = None;
+            // What the coarse-while-dragging decision is made from: the edit
+            // generation last seen and when it changed, and how long the last
+            // frame that actually drew tiles took.
+            //
+            // The decision is taken once, when a gesture *starts*, and held for
+            // its duration. Re-deciding every frame is the obvious way and the
+            // wrong one: going coarse makes frames fast, fast frames say full
+            // resolution would be fine, and the picture oscillates between sharp
+            // and soft for as long as the slider is moving.
+            let mut seen_generation = 0u64;
+            let mut edited_at: Option<std::time::Instant> = None;
+            let mut last_draw = std::time::Duration::ZERO;
             // Read once. Following a window onto a monitor with a different
             // HiDPI factor is a separate problem and deliberately not this one;
             // the value is captured here rather than re-read so that nothing
@@ -1367,6 +1379,44 @@ fn main() -> Result<()> {
                     );
                 }
 
+                // Coarse while the edit is moving, but only when full
+                // resolution is not keeping up — measured from the last frame
+                // that actually drew something, not assumed.
+                let hurrying =
+                    {
+                        let mut session = shared.lock().expect("session lock");
+                        let generation = session.generation();
+                        let moving =
+                            if generation != seen_generation {
+                                let starting = edited_at.is_none_or(|at: std::time::Instant| {
+                                    at.elapsed() >= EDIT_SETTLES
+                                });
+                                seen_generation = generation;
+                                edited_at = Some(std::time::Instant::now());
+                                // The decision, taken once per gesture. Between the
+                                // first change and the settle it is simply held.
+                                if starting && session.set_haste(last_draw > FRAME_BUDGET) {
+                                    eprintln!(
+                                "haste      : {} (a full-resolution pass last took {:.0} ms)",
+                                if last_draw > FRAME_BUDGET { "coarse" } else { "sharp" },
+                                last_draw.as_secs_f64() * 1000.0
+                            );
+                                }
+                                true
+                            } else {
+                                edited_at.is_some_and(|at| at.elapsed() < EDIT_SETTLES)
+                            };
+                        // Settled: back to the level the zoom asked for, which makes
+                        // the fine tiles stale and renders them over the next frame
+                        // or two. That is the sharpening-up, and it is the whole
+                        // reason the coarse pass is allowed to be soft.
+                        if !moving {
+                            session.set_haste(false);
+                        }
+                        session.level() != session.viewport().level(session.max_level())
+                    };
+
+                let rendering = std::time::Instant::now();
                 let drawn = match (&showing.raw, &showing.preview) {
                     (Some(loaded), _) => {
                         let mut session = shared.lock().expect("session lock");
@@ -1395,6 +1445,7 @@ fn main() -> Result<()> {
                     // ever stops being true.
                     (None, None) => 0,
                 };
+                let drawing = rendering.elapsed();
                 // The outline goes on after the tiles, into the same canvas, and
                 // the canvas is only written where a tile landed — so a moving
                 // rectangle would leave its previous position behind. Redrawing
@@ -1504,7 +1555,29 @@ fn main() -> Result<()> {
                     canvas_renderer.canvas(),
                     canvas_rect,
                 )?;
-                stats.record(drawn, started.elapsed());
+                let cost = started.elapsed();
+                // Only frames that drew tiles say anything about what rendering
+                // costs; an idle frame is a lock and a blit, and letting one
+                // reset the estimate would tell the next gesture that full
+                // resolution is cheap.
+                //
+                // The *tiles*, timed on their own rather than the whole frame.
+                // A frame also surveys the histogram and presents, and neither
+                // gets cheaper at a coarser level — including them would have
+                // the decision react to costs it cannot do anything about.
+                // Only a *full-resolution* pass says what full resolution costs.
+                //
+                // Measuring a coarse frame here is how the decision eats itself:
+                // going coarse makes the pass cheap, the next gesture reads that
+                // as "sharp would be fine", renders sharp, and the drag stutters
+                // — which is exactly what the latch was supposed to prevent, and
+                // it happened anyway until this line asked which level the
+                // number came from. `haste : sharp (last tile pass 27 ms)` in the
+                // log, with 27 ms being the coarse pass it had just made cheap.
+                if drawn > 0 && !hurrying {
+                    last_draw = drawing;
+                }
+                stats.record(drawn, cost);
                 Ok(())
             };
 
@@ -1977,6 +2050,28 @@ pub(crate) fn in_crop() -> bool {
 /// catches up, because the "is it stale" test stays true until a survey
 /// actually happens.
 const SURVEY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The frame time above which an edit in flight renders a level coarser.
+///
+/// Twenty frames a second, measured on the tile pass alone — the only part a
+/// coarser level makes cheaper.
+///
+/// The threshold is a judgement; what is measured is whether a given window on a
+/// given machine crosses it. On this one a full-resolution pass takes **38 ms**
+/// windowed and **138 ms** at full screen, so a windowed drag stays sharp and a
+/// full-screen one does not — which is the intent, since softening a drag that
+/// was already tracking trades sharpness for speed nobody asked for. On faster
+/// hardware neither would engage, and that is the point of deciding it here
+/// rather than once, in a constant, for every machine.
+const FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How long after the last change an edit counts as finished.
+///
+/// Short enough that the sharp pass feels like part of the same gesture, long
+/// enough that the gap between two slider positions does not read as the end of
+/// one drag and the start of another — which would sharpen and re-soften
+/// repeatedly through a single movement.
+const EDIT_SETTLES: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// The body of the photograph on screen, so the picker knows which camera it is
 /// choosing a profile for. `None` before anything is open, and for the

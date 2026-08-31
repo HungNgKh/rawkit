@@ -160,7 +160,10 @@ impl CanvasRenderer {
     /// does not rebuild it and does not change what the presenter sees.
     fn fit_canvas(&mut self, gpu: &Gpu, session: &Session, surface: [u32; 2]) -> u8 {
         let viewport = session.viewport();
-        let level = viewport.level(session.max_level());
+        // The session's, not this crate's arithmetic: the tile job is chosen at
+        // the same level, and a canvas sized from a second computation of it is
+        // one refactor away from disagreeing with the tiles that go into it.
+        let level = session.level();
         let scale = viewport.scale * (1u32 << level) as f64;
 
         // A canvas only ever gets written where the photograph is, so when the

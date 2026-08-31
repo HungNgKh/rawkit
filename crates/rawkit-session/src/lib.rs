@@ -465,6 +465,14 @@ pub struct Session {
     /// window that grows keeps showing the whole photograph and one that was
     /// left at 1:1 stays at 1:1.
     fitted: bool,
+    /// Render one level coarser than the zoom asks for, because an edit is in
+    /// flight and full resolution is not keeping up.
+    ///
+    /// A quarter of the pixels, so a frame that took 115 ms takes about 30. The
+    /// cost is that the photograph is visibly softer until the edit settles,
+    /// which is the trade every editor makes and the reason this is a *decision*
+    /// the shell makes from a measurement rather than something on by default.
+    haste: bool,
     /// The control that opened the step now on top of `past`, so a run of the
     /// same one collapses into it. `None` means the next edit starts a new step
     /// whatever it is.
@@ -502,6 +510,7 @@ impl Session {
             // `fit_to_view` below sets it; declared here because a struct
             // literal has to name every field.
             fitted: false,
+            haste: false,
             recorded,
             developed,
             tile,
@@ -540,6 +549,33 @@ impl Session {
     /// The image size this session was opened with.
     pub fn image_size(&self) -> [u32; 2] {
         self.image
+    }
+
+    /// The level everything renders at.
+    ///
+    /// One accessor rather than two calls to `Viewport::level`, which is what it
+    /// used to be: the canvas sized itself from one and the tile job came from
+    /// the other, and two computations of one number is an invitation for them
+    /// to stop agreeing. They cannot now.
+    pub fn level(&self) -> u8 {
+        let level = self.viewport.level(self.max_level);
+        if self.haste {
+            level.saturating_add(1).min(self.max_level)
+        } else {
+            level
+        }
+    }
+
+    /// Render coarse until told otherwise. Returns whether anything changed, so
+    /// a caller can avoid announcing a decision it did not make.
+    ///
+    /// Not inferred here: deciding *when* needs a clock and a measurement of how
+    /// long the last frame took, and the session has neither. It has the level,
+    /// which is the part that belongs to it.
+    pub fn set_haste(&mut self, haste: bool) -> bool {
+        let changed = self.haste != haste;
+        self.haste = haste;
+        changed
     }
 
     /// What the camera said it takes to stand this frame upright.
@@ -865,7 +901,7 @@ impl Session {
     /// been rendered yet. It is the render loop, not this call, that decides how
     /// much of the job to do per frame.
     pub fn pending_work(&self) -> RenderJob {
-        let level = self.viewport.level(self.max_level);
+        let level = self.level();
         let mut tiles = self.visible_tiles(level);
         tiles.retain(|t| self.rendered.get(t) != Some(&self.generation));
 
@@ -1129,6 +1165,68 @@ mod tests {
             height: 1000,
         });
         s
+    }
+
+    #[test]
+    fn haste_renders_a_level_coarser_and_less_of_it() {
+        // The whole mechanism: a quarter of the pixels, so a frame that was not
+        // keeping up gets about four times the headroom.
+        let mut s = session();
+        s.apply(Command::ZoomTo {
+            scale: 1.0,
+            anchor: [800.0, 500.0],
+        });
+        assert_eq!(s.level(), 0, "1:1 is full resolution");
+        let fine = s.pending_work().tiles.len();
+
+        assert!(s.set_haste(true), "turning it on is a change");
+        assert!(!s.set_haste(true), "and turning it on again is not");
+        assert_eq!(s.level(), 1);
+        let coarse = s.pending_work().tiles.len();
+        println!("tiles: fine {fine}, coarse {coarse}");
+        assert!(
+            coarse * 2 < fine,
+            "a level coarser should be much less work: {fine} -> {coarse}"
+        );
+    }
+
+    #[test]
+    fn haste_cannot_go_coarser_than_the_pyramid() {
+        // Zoomed out far enough there is no coarser level to drop to, and asking
+        // for one would index past the pyramid.
+        // A photograph one tile across has no coarser level to go to.
+        let mut s = Session::new([400, 300], TILE, EditState::default(), Orientation::AsShot);
+        s.apply(Command::Resize {
+            width: 1600,
+            height: 1000,
+        });
+        assert_eq!(s.max_level(), 0, "the fixture has only one level");
+        s.set_haste(true);
+        assert_eq!(s.level(), 0, "haste must not index past the pyramid");
+    }
+
+    #[test]
+    fn settling_asks_for_the_sharp_tiles_again() {
+        // The sharpen-up. Without this the coarse pass would simply be the
+        // render, and the softness permanent.
+        let mut s = session();
+        s.apply(Command::ZoomTo {
+            scale: 1.0,
+            anchor: [800.0, 500.0],
+        });
+        s.set_haste(true);
+
+        let job = s.pending_work();
+        for tile in &job.tiles {
+            s.tile_rendered(*tile, job.generation);
+        }
+        assert!(s.pending_work().is_empty(), "the coarse pass finished");
+
+        assert!(s.set_haste(false));
+        assert!(
+            !s.pending_work().is_empty(),
+            "settling must ask for the tiles the zoom actually wanted"
+        );
     }
 
     #[test]
