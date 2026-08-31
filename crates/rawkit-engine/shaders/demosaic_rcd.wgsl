@@ -1428,11 +1428,18 @@ fn reconstruct_highlights(balanced: vec3<f32>, ixy: vec2<f32>) -> vec3<f32> {
     let scale = dot(survives, balanced * reference)
         / max(dot(survives, reference * reference), EPS);
 
-    // Never below where a channel clipped: a clipped channel is known to be at
-    // least its threshold, and a reference cooler than this pixel would
-    // otherwise reconstruct it *downwards* into a value the sensor has already
-    // ruled out.
-    let inferred = max(reference * scale, thresholds);
+    // Never below what the sensor actually recorded. A clipped channel sits at
+    // its threshold and its true value is at least that, so the physical bound
+    // is kept -- but the floor is the *measurement* and not the threshold, and
+    // the difference between those two is a bug this had.
+    //
+    // The run-up begins a quarter below the threshold, so a channel measured at
+    // 0.9 of it is inside the blend while still being an honest number. Floored
+    // at the threshold it was inflated to 1.0 and partly mixed in: green rises,
+    // red and blue do not, and every cloud edge in a blue sky grows a cyan rim.
+    // That is the same artefact this whole function exists to remove, arriving
+    // through the clamp meant to make it safe.
+    let inferred = max(reference * scale, balanced);
     // Per channel, by how far that channel has gone. A channel still in the
     // clear keeps its measurement exactly; one inside the run-up crosses over
     // smoothly, which is what keeps the boundary of a highlight invisible.

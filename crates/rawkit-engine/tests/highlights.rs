@@ -555,3 +555,73 @@ fn reconstruction_is_never_more_saturated_than_its_surroundings() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_sky_keeps_its_colour_all_the_way_into_clipping() {
+    // The test this suite did not have, written after the artefact came back.
+    //
+    // A blue sky brightening towards the sun: one chromaticity throughout, so
+    // whatever the renderer does to it, the *hue* has one right answer. Green's
+    // threshold is the lowest of the three, so it saturates first and the
+    // reconstruction takes over — and the failure mode is that it hands green
+    // more than the sky's share and the highlight comes out cyan.
+    //
+    // That is exactly what shipped: the reconstruction floored every channel at
+    // its *threshold* rather than at what the sensor measured, so a green read
+    // at 0.9 of its limit — still an honest number, and inside the run-up that
+    // begins a quarter below — was inflated to the limit and blended in. Green
+    // rose, red and blue did not, and every cloud edge in a blue sky grew a cyan
+    // rim.
+    //
+    // The suite passed anyway, because the saturation bound it did have is
+    // satisfied by a hue that swings without growing.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    const SKY: [f32; 3] = [0.30, 1.0, 0.75];
+    // Left to right, from well under the limit to over it. The sensor clips,
+    // which is the whole point, so the mosaic is what a sensor would record.
+    let brightness = |x: u32| 0.45 + 0.85 * x as f32 / (BLOWN - 1) as f32;
+    let scene = |x: u32, _y: u32| {
+        let k = brightness(x);
+        [
+            (SKY[0] * k).min(1.0),
+            (SKY[1] * k).min(1.0),
+            (SKY[2] * k).min(1.0),
+        ]
+    };
+
+    let sample = |x: u32| {
+        let rgb = render_field(&gpu, BLOWN, scene, DAYLIGHT_WB, 1.0, (x, BLOWN / 2, 8));
+        (hue(rgb), cast(rgb), rgb)
+    };
+
+    // Where nothing has clipped yet: the sky's own hue, and the answer every
+    // brighter column should still be giving.
+    let (truth, _, plain) = sample(60);
+    println!("unclipped sky {plain:?} hue {truth:.0}");
+    let mut worst: (f32, u32) = (0.0, 0);
+    for x in (60..BLOWN - 60).step_by(40) {
+        let (h, saturation, rgb) = sample(x);
+        let turn = (h - truth + 540.0).rem_euclid(360.0) - 180.0;
+        println!(
+            "  k={:.2} raw green {:.2}  hue {h:5.0} ({turn:+5.1})  cast {saturation:.3}  {rgb:?}",
+            brightness(x),
+            (SKY[1] * brightness(x)).min(1.0)
+        );
+        // A pixel with no colour left has no hue to be wrong about.
+        if saturation > 0.03 && turn.abs() > worst.0 {
+            worst = (turn.abs(), x);
+        }
+    }
+    println!("worst turn {:.1} degrees at x={}", worst.0, worst.1);
+    assert!(
+        worst.0 < 8.0,
+        "the sky turned {:.1} degrees on its way into clipping, at x={} — \
+         which is the cyan rim, whatever it is called this time",
+        worst.0,
+        worst.1
+    );
+}
