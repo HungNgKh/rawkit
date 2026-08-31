@@ -242,3 +242,107 @@ fn two_masks_both_apply_where_they_overlap() {
         "the second mask did nothing where the two overlap: {middle_one:.4} then {middle_both:.4}"
     );
 }
+
+/// An ellipse in the middle of the frame.
+fn in_the_middle(exposure_ev: f32) -> Mask {
+    Mask {
+        shape: MaskShape::Radial {
+            centre: [0.5, 0.5],
+            radii: [0.2, 0.2],
+            feather: 0.4,
+        },
+        exposure_ev,
+        ..Mask::default()
+    }
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_radial_lifts_what_is_inside_it() {
+    // The second mask source, and the whole return on building stage G around a
+    // texture: this needed a rasteriser and nothing in the shader at all.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    let plain = render(&gpu, &EditState::default());
+    let lifted = render(
+        &gpu,
+        &EditState {
+            masks: vec![in_the_middle(1.0)],
+            ..EditState::default()
+        },
+    );
+
+    let middle = (luma(&lifted, W / 2, H / 2), luma(&plain, W / 2, H / 2));
+    println!("middle {:.4} against {:.4}", middle.0, middle.1);
+    assert!(
+        middle.0 > middle.1 * 1.3,
+        "a stop up did not reach the middle: {:.4} against {:.4}",
+        middle.0,
+        middle.1
+    );
+    for corner in [(6, 6), (W - 6, 6), (6, H - 6), (W - 6, H - 6)] {
+        assert_eq!(
+            luma(&lifted, corner.0, corner.1),
+            luma(&plain, corner.0, corner.1),
+            "the ellipse reached the corner at {corner:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn inverting_a_radial_makes_it_a_vignette() {
+    // Where the plain one lifts, the inverted one must not, and the other way
+    // round — checked as a *complement* rather than as two separate facts,
+    // because a mask that changed both would pass two looser assertions.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    let plain = render(&gpu, &EditState::default());
+    let spotlight = render(
+        &gpu,
+        &EditState {
+            masks: vec![in_the_middle(1.0)],
+            ..EditState::default()
+        },
+    );
+    let vignette = render(
+        &gpu,
+        &EditState {
+            masks: vec![Mask {
+                invert: true,
+                ..in_the_middle(1.0)
+            }],
+            ..EditState::default()
+        },
+    );
+
+    let at = |p: &[f32], x, y| luma(p, x, y);
+    println!(
+        "middle: plain {:.4} spotlight {:.4} vignette {:.4}\n\
+         corner: plain {:.4} spotlight {:.4} vignette {:.4}",
+        at(&plain, W / 2, H / 2),
+        at(&spotlight, W / 2, H / 2),
+        at(&vignette, W / 2, H / 2),
+        at(&plain, 6, 6),
+        at(&spotlight, 6, 6),
+        at(&vignette, 6, 6)
+    );
+    assert_eq!(
+        at(&vignette, W / 2, H / 2),
+        at(&plain, W / 2, H / 2),
+        "the inverted ellipse still reaches its own middle"
+    );
+    assert!(
+        at(&vignette, 6, 6) > at(&plain, 6, 6) * 1.3,
+        "the inverted ellipse did not reach the corner"
+    );
+    assert_eq!(
+        at(&spotlight, 6, 6),
+        at(&plain, 6, 6),
+        "the plain ellipse reached the corner"
+    );
+}

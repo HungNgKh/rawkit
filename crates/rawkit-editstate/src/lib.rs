@@ -232,6 +232,20 @@ pub enum MaskShape {
     /// gradient covers the whole frame rather than a band across the middle of
     /// it — which is what a graduated filter in front of a lens does.
     Linear { from: [f32; 2], to: [f32; 2] },
+    /// An ellipse: full effect inside, fading to none at its edge.
+    ///
+    /// `centre` and `radii` are fractions of the same sensor frame, and the two
+    /// radii are independent — so a circle drawn on a 3:2 photograph is stored
+    /// as two *different* fractions, which is what makes it come back a circle
+    /// rather than an egg.
+    ///
+    /// `feather` is how much of the radius the fade occupies, from 0 for a hard
+    /// edge to 1 for a falloff that begins at the very centre.
+    Radial {
+        centre: [f32; 2],
+        radii: [f32; 2],
+        feather: f32,
+    },
 }
 
 /// One local adjustment: a region, and what to do inside it.
@@ -244,6 +258,15 @@ pub enum MaskShape {
 #[serde(deny_unknown_fields)]
 pub struct Mask {
     pub shape: MaskShape,
+    /// Swap what the mask covers for what it does not.
+    ///
+    /// On the mask rather than on the shape, deliberately. It is a fact about
+    /// the *weight*, so one rule serves every source: it turns a radial into a
+    /// vignette, reverses a gradient, and one day will take the background of a
+    /// segmentation matte instead of its subject. A shape-specific "outside"
+    /// flag would have to be invented again for each of those.
+    #[serde(default)]
+    pub invert: bool,
     /// Stops, inside the mask.
     pub exposure_ev: f32,
     /// Warm or cool, -1 to 1. See [`LOCAL_MIRED_REACH`].
@@ -263,6 +286,7 @@ impl Default for Mask {
                 from: [0.5, 0.0],
                 to: [0.5, 0.35],
             },
+            invert: false,
             exposure_ev: 0.0,
             warmth: 0.0,
             tint: 0.0,
@@ -286,16 +310,40 @@ impl Mask {
 
     fn validate(&self) -> Result<(), EditStateError> {
         let finite = |v: f32| v.is_finite();
-        let MaskShape::Linear { from, to } = self.shape;
-        if !from.iter().chain(&to).copied().all(finite) {
-            return Err(EditStateError::InvalidMask(format!(
-                "a gradient runs from {from:?} to {to:?}, which is not a place"
-            )));
-        }
-        if from == to {
-            return Err(EditStateError::InvalidMask(
-                "a gradient whose ends are the same point has no direction".into(),
-            ));
+        match self.shape {
+            MaskShape::Linear { from, to } => {
+                if !from.iter().chain(&to).copied().all(finite) {
+                    return Err(EditStateError::InvalidMask(format!(
+                        "a gradient runs from {from:?} to {to:?}, which is not a place"
+                    )));
+                }
+                if from == to {
+                    return Err(EditStateError::InvalidMask(
+                        "a gradient whose ends are the same point has no direction".into(),
+                    ));
+                }
+            }
+            MaskShape::Radial {
+                centre,
+                radii,
+                feather,
+            } => {
+                if !centre.iter().chain(&radii).copied().all(finite) || !finite(feather) {
+                    return Err(EditStateError::InvalidMask(format!(
+                        "an ellipse at {centre:?} of {radii:?} is not a shape"
+                    )));
+                }
+                if radii[0] <= 0.0 || radii[1] <= 0.0 {
+                    return Err(EditStateError::InvalidMask(format!(
+                        "an ellipse needs two radii above zero, not {radii:?}"
+                    )));
+                }
+                if !(0.0..=1.0).contains(&feather) {
+                    return Err(EditStateError::InvalidMask(format!(
+                        "feather is {feather}, and runs from 0 to 1"
+                    )));
+                }
+            }
         }
         if !finite(self.exposure_ev) || self.exposure_ev.abs() > Self::EXPOSURE_REACH {
             return Err(EditStateError::InvalidMask(format!(

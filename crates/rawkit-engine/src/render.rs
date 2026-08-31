@@ -1541,11 +1541,14 @@ impl Renderer {
         let [mask_w, mask_h] = buffers.mask_size;
         let mut scratch = buffers.mask_scratch.borrow_mut();
         for (slot, mask) in live.iter().enumerate() {
-            // The shape decides the texels; everything else about a mask lives
-            // in the uniform, so only a shape that moved needs repainting.
+            // The shape and the inversion decide the texels; everything else
+            // about a mask lives in the uniform, so a slider that moves neither
+            // repaints nothing. Both, not just the shape: inverting is done to
+            // the raster, so leaving it out here would show a vignette as a
+            // spotlight until something else happened to move the mask.
             if uploaded
                 .get(slot)
-                .is_some_and(|old| old.shape == mask.shape)
+                .is_some_and(|old| old.shape == mask.shape && old.invert == mask.invert)
             {
                 continue;
             }

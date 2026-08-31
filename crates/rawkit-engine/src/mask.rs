@@ -54,7 +54,20 @@ pub fn dimensions(width: u32, height: u32) -> (u32, u32) {
 pub fn rasterise(mask: &Mask, width: u32, height: u32, out: &mut [f32]) {
     let (w, h) = dimensions(width, height);
     debug_assert!(out.len() >= (w * h) as usize);
-    match mask.shape {
+    draw(&mask.shape, w, h, out);
+    if mask.invert {
+        // Applied to the finished weight rather than inside each shape, so it
+        // means the same thing for every source there will ever be — and so the
+        // shader stays a thing that composites a picture without knowing what
+        // made it.
+        for v in &mut out[..(w * h) as usize] {
+            *v = 1.0 - *v;
+        }
+    }
+}
+
+fn draw(shape: &MaskShape, w: u32, h: u32, out: &mut [f32]) {
+    match *shape {
         MaskShape::Linear { from, to } => {
             // Distance along the gradient's axis, as a fraction of its length.
             // Everything is done in the *frame's* proportions rather than in
@@ -78,6 +91,43 @@ pub fn rasterise(mask: &Mask, width: u32, height: u32, out: &mut [f32]) {
                     // clear sky is exactly the kind of edge the eye finds.
                     let s = t.clamp(0.0, 1.0);
                     out[(y * w + x) as usize] = 1.0 - s * s * (3.0 - 2.0 * s);
+                }
+            }
+        }
+
+        MaskShape::Radial {
+            centre,
+            radii,
+            feather,
+        } => {
+            if radii[0] <= 0.0 || radii[1] <= 0.0 {
+                out[..(w * h) as usize].fill(0.0);
+                return;
+            }
+            // The two radii are separate fractions, so an ellipse drawn as a
+            // circle on the photograph comes back a circle: the frame's own
+            // proportions are already in the numbers.
+            let inner = (1.0 - feather).clamp(0.0, 1.0);
+            for y in 0..h {
+                let v = ((y as f32 + 0.5) / h as f32 - centre[1]) / radii[1];
+                for x in 0..w {
+                    let u = ((x as f32 + 0.5) / w as f32 - centre[0]) / radii[0];
+                    // One at the centre, one at the edge of the ellipse, so the
+                    // feather is a fraction of the radius wherever it is
+                    // measured — which is what keeps the falloff even round an
+                    // ellipse rather than pinched at its narrow ends.
+                    let d = (u * u + v * v).sqrt();
+                    // A feather of zero puts `inner` at 1, so the two ends meet
+                    // and the ramp never runs: the hard edge falls out of the
+                    // same expression rather than needing a case of its own.
+                    out[(y * w + x) as usize] = if d <= inner {
+                        1.0
+                    } else if d >= 1.0 {
+                        0.0
+                    } else {
+                        let s = (d - inner) / (1.0 - inner);
+                        1.0 - s * s * (3.0 - 2.0 * s)
+                    };
                 }
             }
         }
@@ -179,6 +229,116 @@ mod tests {
             assert!(gw <= MAX_EDGE && gh <= MAX_EDGE, "{w}x{h} exceeded the cap");
             assert!(gw <= w && gh <= h, "{w}x{h} was enlarged to {gw}x{gh}");
         }
+    }
+
+    fn ellipse(centre: [f32; 2], radii: [f32; 2], feather: f32) -> Mask {
+        Mask {
+            shape: MaskShape::Radial {
+                centre,
+                radii,
+                feather,
+            },
+            ..Mask::default()
+        }
+    }
+
+    #[test]
+    fn a_radial_is_whole_in_the_middle_and_gone_outside() {
+        let mask = ellipse([0.5, 0.5], [0.25, 0.25], 0.4);
+        let (pixels, w, h) = draw(&mask, 800, 800);
+        assert_eq!(
+            at(&pixels, w, w / 2, h / 2),
+            1.0,
+            "the middle is not covered"
+        );
+        assert_eq!(at(&pixels, w, 2, 2), 0.0, "the corner is not clear");
+        // On the ellipse itself the effect has just run out.
+        let edge = at(&pixels, w, w / 2 + (0.25 * w as f32) as u32 - 1, h / 2);
+        assert!(
+            edge < 0.02,
+            "the edge of the ellipse still covers: {edge:.3}"
+        );
+    }
+
+    #[test]
+    fn a_circle_on_the_photograph_is_a_circle_and_not_an_egg() {
+        // The two radii are separate fractions precisely so that a circle drawn
+        // on a 3:2 frame survives being stored in a space where the axes are not
+        // the same length. Checked by walking out from the centre along both
+        // axes *in pixels* and finding the effect ends at the same distance.
+        let (iw, ih) = (1500u32, 1000u32);
+        // A quarter of the shorter edge, expressed in each axis's fraction.
+        let radius = 0.25 * ih as f32;
+        let mask = ellipse([0.5, 0.5], [radius / iw as f32, radius / ih as f32], 0.0);
+        let (pixels, w, h) = draw(&mask, iw, ih);
+        let along = |dx: i32, dy: i32| {
+            let mut steps = 0;
+            loop {
+                let x = (w as i32 / 2 + dx * steps) as u32;
+                let y = (h as i32 / 2 + dy * steps) as u32;
+                if x >= w || y >= h || at(&pixels, w, x, y) < 0.5 {
+                    // Back into the *frame's* own pixels, so the two directions
+                    // are compared in the units a photographer sees.
+                    return steps as f32
+                        * if dx != 0 {
+                            iw as f32 / w as f32
+                        } else {
+                            ih as f32 / h as f32
+                        };
+                }
+                steps += 1;
+            }
+        };
+        let (across, down) = (along(1, 0), along(0, 1));
+        println!("reaches {across:.1} px across and {down:.1} px down");
+        assert!(
+            (across - down).abs() < 0.03 * across,
+            "the circle came out {across:.1} by {down:.1} pixels"
+        );
+    }
+
+    #[test]
+    fn feather_decides_how_wide_the_falloff_is() {
+        // Zero is a hard edge, and the ramp has to actually widen with the
+        // number rather than merely existing.
+        let width = |feather: f32| {
+            let (pixels, w, h) = draw(&ellipse([0.5, 0.5], [0.3, 0.3], feather), 800, 800);
+            let row: Vec<f32> = (w / 2..w).map(|x| at(&pixels, w, x, h / 2)).collect();
+            row.iter().filter(|v| **v > 0.01 && **v < 0.99).count()
+        };
+        let (hard, soft, softest) = (width(0.0), width(0.3), width(0.9));
+        println!("falloff spans {hard}, {soft} and {softest} texels");
+        assert!(
+            hard <= 2,
+            "a feather of zero is not a hard edge: {hard} texels"
+        );
+        assert!(soft > hard + 10, "a feather of 0.3 barely softened: {soft}");
+        assert!(
+            softest > soft + 10,
+            "feather does not widen: {soft} then {softest}"
+        );
+    }
+
+    #[test]
+    fn inverting_swaps_what_is_covered_for_what_is_not() {
+        // The vignette, and the one rule that will serve every mask source
+        // there ever is: it is a fact about the weight, not about the shape.
+        let mut mask = ellipse([0.5, 0.5], [0.25, 0.25], 0.3);
+        let (plain, w, h) = draw(&mask, 600, 600);
+        mask.invert = true;
+        let (turned, _, _) = draw(&mask, 600, 600);
+        for (i, (a, b)) in plain.iter().zip(&turned).enumerate() {
+            assert!(
+                (a + b - 1.0).abs() < 1e-6,
+                "texel {i} reads {a} and {b}, which do not make a whole"
+            );
+        }
+        assert_eq!(
+            at(&turned, w, w / 2, h / 2),
+            0.0,
+            "the middle is still covered"
+        );
+        assert_eq!(at(&turned, w, 2, 2), 1.0, "the corner is still clear");
     }
 
     #[test]

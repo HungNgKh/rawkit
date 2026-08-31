@@ -333,12 +333,19 @@
   <details id="s-masks"><summary>Local adjustments</summary>
     <div class="row">
       <button id="mask-add">Add gradient</button>
+      <button id="mask-add-radial">Add radial</button>
       <button id="mask-remove">Remove</button>
     </div>
     <div class="row" id="mask-list"></div>
     <p class="empty" id="mask-empty">Nothing local yet.</p>
     <div id="mask-controls" hidden>
-      <button id="mask-place" class="target">Redraw on the photograph</button>
+      <div class="row">
+        <button id="mask-place" class="target">Redraw on the photograph</button>
+        <button id="mask-invert">Invert</button>
+      </div>
+      <label id="mask-feather-row"><span>Feather</span>
+        <input id="mask-feather" type="range" min="0" max="1" step="0.01" value="0.5">
+        <output id="mask-feather-value">0.50</output></label>
       <label><span>Exposure</span>
         <input id="mask-exposure" type="range" min="-4" max="4" step="0.01" value="0">
         <output id="mask-exposure-value">0.00</output></label>
@@ -564,7 +571,7 @@
   let dragging = null;
   const TONE = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"];
   for (const id of [...TONE, "straighten", "sharpen", "sharpen_radius", "chroma_noise", "luminance_noise", "saturation", "vibrance", "temperature", "tint",
-    "mask-exposure", "mask-warmth", "mask-tint",
+    "mask-exposure", "mask-warmth", "mask-tint", "mask-feather",
     "grade-shadows", "grade-midtones", "grade-highlights", "grade-blending", "grade-balance",
     ...BANDS.flatMap(([band]) => HSL_CONTROLS.map(([control]) => `hsl-${band}-${control}`))]) {
     document.getElementById(id).addEventListener("pointerdown", () => (dragging = id));
@@ -1387,6 +1394,7 @@
 
   let selected = null;
   let placing = false;
+  let inverted = false;
   let shownMasks = null;
 
   const place = (on) => {
@@ -1420,17 +1428,31 @@
         v => `${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(2)}`);
       setSlider("mask-warmth", mask.warmth, v => Number(v).toFixed(2));
       setSlider("mask-tint", mask.tint, v => Number(v).toFixed(2));
+      inverted = !!mask.invert;
+      document.getElementById("mask-invert").classList.toggle("armed", inverted);
+      // A gradient's feather is the distance between its two ends, so there is
+      // no separate number to show — the row goes rather than sitting there
+      // greyed out with nothing to say.
+      const radial = mask.shape && mask.shape.kind === "radial";
+      document.getElementById("mask-feather-row").hidden = !radial;
+      if (radial) setSlider("mask-feather", mask.shape.feather, v => Number(v).toFixed(2));
     }
   };
 
-  const addMask = () => {
+  const addMask = (kind) => {
     if (armed !== null) arm(null);
     if (picking) pickWb(false);
-    invoke("add_mask")
+    invoke("add_mask", { kind })
       .then(() => { placing = true; say("drag across the photograph to place it"); })
       .catch(say);
   };
-  document.getElementById("mask-add").addEventListener("click", addMask);
+  document.getElementById("mask-add").addEventListener("click", () => addMask("gradient"));
+  document.getElementById("mask-add-radial").addEventListener("click", () => addMask("radial"));
+  document.getElementById("mask-invert").addEventListener("click", () => {
+    if (selected === null) return say("nothing selected to invert");
+    invoke("set_mask", { index: selected, control: "invert", value: inverted ? 0 : 1 })
+      .catch(say);
+  });
   document.getElementById("mask-remove").addEventListener("click", () => {
     if (selected === null) return say("nothing selected to remove");
     invoke("remove_mask", { index: selected }).catch(say);
@@ -1445,6 +1467,7 @@
     ["mask-exposure", "exposure"],
     ["mask-warmth", "warmth"],
     ["mask-tint", "tint"],
+    ["mask-feather", "feather"],
   ]) {
     document.getElementById(id).addEventListener("input", (e) => {
       if (selected === null) return;
@@ -1722,10 +1745,11 @@
       case "r": act("crop"); break;
       case "[": send({ command: "rotate_by", params: -1 }); break;
       case "]": send({ command: "rotate_by", params: 1 }); break;
-      // L adds a local adjustment and arms the drag that places it. Lightroom
-      // puts its graduated filter on M; M sets a frame aside here and had it
-      // first, which is the same reason bare Z stayed with culling.
-      case "l": addMask(); break;
+      // L adds a graduated local adjustment and arms the drag that places it;
+      // shift makes it a radial, which is the pairing Lightroom uses for its
+      // two. Lightroom puts them on M and shift-M; M sets a frame aside here
+      // and had it first, which is the same reason bare Z stayed with culling.
+      case "l": addMask(event.shiftKey ? "radial" : "gradient"); break;
       // M sets a frame aside, C compares what you set aside.
       case "m": act("mark"); break;
       case "c": act("survey"); break;

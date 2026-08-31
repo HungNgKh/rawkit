@@ -92,7 +92,7 @@ Keys, most of them Lightroom's, so the hands already know them:
 | `[` `]` | rotate a quarter turn |
 | `⌃Z` `⌃⇧Z` | undo and redo the edit (`⌘` on macOS) |
 | `Z` | undo a culling judgement — a separate history |
-| `L` | add a graduated local adjustment, then drag across the photograph to place it |
+| `L` / `⇧L` | add a graduated or radial local adjustment, then drag on the photograph to place it |
 | `⌃E` / `⌃⇧E` | export this photograph / export the picks |
 
 The develop controls live in the column on the right, and the sections you

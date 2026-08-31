@@ -1482,7 +1482,14 @@ fn main() -> Result<()> {
                     let moved = (to[0] - from[0]).hypot(to[1] - from[1]);
                     if moved > 4.0 {
                         let mut session = shared.lock().expect("session lock");
-                        let shape = gradient_between(
+                        let existing = session.state().masks.get(index).map(|m| m.shape).unwrap_or(
+                            rawkit_editstate::MaskShape::Linear {
+                                from: [0.5, 0.0],
+                                to: [0.5, 0.35],
+                            },
+                        );
+                        let shape = shape_from_drag(
+                            existing,
                             from,
                             to,
                             session.viewport(),
@@ -1497,7 +1504,7 @@ fn main() -> Result<()> {
                                     masks,
                                     // The shape, of this mask. A drag is one
                                     // undo step however many frames it spans.
-                                    control: (index as u8) * 4,
+                                    control: (index as u8) * 8,
                                 });
                             }
                         }
@@ -2302,15 +2309,19 @@ pub(crate) fn notice(what: impl Into<String>) {
     *NOTICE.lock().expect("notice lock") = Some(what.into());
 }
 
-/// Two canvas positions to the gradient they describe.
+/// Two canvas positions to the shape they describe, in the kind already there.
 ///
 /// The result is in fractions of the **sensor**, which is the frame that does
-/// not move when the picture is turned or trimmed — so a gradient drawn across
-/// the sky stays across the sky afterwards, rather than sliding as soon as
-/// somebody adjusts the crop. Getting that wrong is invisible while the frame is
-/// upright and uncropped, which is most of the time and none of the interesting
-/// cases.
-fn gradient_between(
+/// not move when the picture is turned or trimmed — so a mask drawn across the
+/// sky stays across the sky afterwards, rather than sliding as soon as somebody
+/// adjusts the crop. Getting that wrong is invisible while the frame is upright
+/// and uncropped, which is most of the time and none of the interesting cases.
+///
+/// The existing shape decides what the drag *means*: a gradient runs from where
+/// the hand went down to where it let go, and an ellipse grows out of it. One
+/// gesture, read two ways, rather than two modes to be in.
+fn shape_from_drag(
+    existing: rawkit_editstate::MaskShape,
     from: [f64; 2],
     to: [f64; 2],
     viewport: rawkit_session::Viewport,
@@ -2329,9 +2340,26 @@ fn gradient_between(
             (r[1] / size[1] as f64) as f32,
         ]
     };
-    rawkit_editstate::MaskShape::Linear {
-        from: sensor(from),
-        to: sensor(to),
+    let (a, b) = (sensor(from), sensor(to));
+    match existing {
+        rawkit_editstate::MaskShape::Linear { .. } => {
+            rawkit_editstate::MaskShape::Linear { from: a, to: b }
+        }
+        // Out from the centre, and the two radii follow the drag's own width and
+        // height — so one drag gives any aspect of ellipse, and a circle drawn
+        // on the photograph is stored as the two different fractions that make
+        // it come back a circle.
+        //
+        // A floor on each radius rather than a refusal: a press that barely
+        // moves is a slip, and leaving an ellipse a few pixels across is kinder
+        // than leaving the previous one and looking broken.
+        rawkit_editstate::MaskShape::Radial { feather, .. } => {
+            rawkit_editstate::MaskShape::Radial {
+                centre: a,
+                radii: [(b[0] - a[0]).abs().max(1e-3), (b[1] - a[1]).abs().max(1e-3)],
+                feather,
+            }
+        }
     }
 }
 
@@ -2370,7 +2398,18 @@ pub(crate) static MASK_DRAG: Mutex<Option<([f64; 2], [f64; 2])>> = Mutex::new(No
 /// into position is a thing nobody can place — so the first press already shows
 /// where it is, and the sliders take it from there.
 #[tauri::command]
-fn add_mask(state: tauri::State<'_, Shared>) -> Result<usize, String> {
+fn add_mask(kind: Option<String>, state: tauri::State<'_, Shared>) -> Result<usize, String> {
+    let shape = match kind.as_deref() {
+        None | Some("") | Some("gradient") => rawkit_editstate::Mask::default().shape,
+        // Middle of the frame, a third across. Visible, and clear of the edges
+        // where a drag to reposition it would be awkward.
+        Some("radial") => rawkit_editstate::MaskShape::Radial {
+            centre: [0.5, 0.5],
+            radii: [0.2, 0.3],
+            feather: 0.5,
+        },
+        Some(other) => return Err(format!("{other:?} is not a kind of local adjustment")),
+    };
     let mut session = state.0.lock().expect("session lock");
     let mut masks = session.state().masks.clone();
     if masks.len() >= rawkit_editstate::MAX_MASKS {
@@ -2380,6 +2419,7 @@ fn add_mask(state: tauri::State<'_, Shared>) -> Result<usize, String> {
         ));
     }
     masks.push(rawkit_editstate::Mask {
+        shape,
         exposure_ev: -1.0,
         ..rawkit_editstate::Mask::default()
     });
@@ -2470,13 +2510,32 @@ fn set_mask(
             mask.tint = value;
             3
         }
+        "feather" => match &mut mask.shape {
+            rawkit_editstate::MaskShape::Radial { feather, .. } => {
+                *feather = value;
+                4
+            }
+            // A gradient's feather is the distance between its two ends, so
+            // there is no separate number to move — said rather than ignored.
+            _ => return Err("a gradient is feathered by where you drew it".into()),
+        },
+        // Not coalesced with anything: a tick is a discrete act, and folding it
+        // into whichever slider moved last would make one undo take both.
+        "invert" => {
+            mask.invert = value != 0.0;
+            u8::MAX
+        }
         other => return Err(format!("{other:?} is not one of a mask's controls")),
     };
     session.apply(Command::SetMasks {
         masks,
         // Which control of which mask, so dragging exposure on one and then on
         // another opens two undo steps rather than folding into one.
-        control: (index as u8) * 4 + slot,
+        control: if slot == u8::MAX {
+            u8::MAX
+        } else {
+            (index as u8) * 8 + slot
+        },
     });
     Ok(())
 }
@@ -3304,15 +3363,23 @@ mod gradient_tests {
         session
     }
 
+    const GRADIENT: MaskShape = MaskShape::Linear {
+        from: [0.5, 0.0],
+        to: [0.5, 0.35],
+    };
+
     fn drawn(session: &Session, from: [f64; 2], to: [f64; 2]) -> ([f32; 2], [f32; 2]) {
-        let MaskShape::Linear { from, to } = gradient_between(
+        match shape_from_drag(
+            GRADIENT,
             from,
             to,
             session.viewport(),
             &session.geometry(),
             session.image_size(),
-        );
-        (from, to)
+        ) {
+            MaskShape::Linear { from, to } => (from, to),
+            other => panic!("a gradient drag produced {other:?}"),
+        }
     }
 
     /// Where the photograph sits inside the window, so a drag can be aimed at
@@ -3424,7 +3491,8 @@ mod gradient_tests {
             control: u8::MAX,
         });
         let [x0, y0, x1, y1] = frame(&session);
-        let shape = gradient_between(
+        let shape = shape_from_drag(
+            GRADIENT,
             [(x0 + x1) / 2.0, y0 + 1.0],
             [(x0 + x1) / 2.0, (y0 + y1) / 2.0],
             session.viewport(),
@@ -3443,5 +3511,149 @@ mod gradient_tests {
             session.state().validate().is_ok(),
             "a placement the window can make is not a state the catalog will hold"
         );
+    }
+}
+
+#[cfg(test)]
+mod radial_tests {
+    use super::*;
+    use rawkit_editstate::{EditState, MaskShape, Orientation};
+    use rawkit_session::{Command, Session};
+
+    const SENSOR: [u32; 2] = [6000, 4000];
+
+    const ELLIPSE: MaskShape = MaskShape::Radial {
+        centre: [0.5, 0.5],
+        radii: [0.2, 0.3],
+        feather: 0.5,
+    };
+
+    fn fitted() -> Session {
+        let mut session = Session::new(SENSOR, 512, EditState::default(), Orientation::AsShot);
+        session.apply(Command::Resize {
+            width: 1200,
+            height: 800,
+        });
+        session
+    }
+
+    fn dragged(session: &Session, from: [f64; 2], to: [f64; 2]) -> ([f32; 2], [f32; 2], f32) {
+        match shape_from_drag(
+            ELLIPSE,
+            from,
+            to,
+            session.viewport(),
+            &session.geometry(),
+            session.image_size(),
+        ) {
+            MaskShape::Radial {
+                centre,
+                radii,
+                feather,
+            } => (centre, radii, feather),
+            other => panic!("a radial drag produced {other:?}"),
+        }
+    }
+
+    /// Canvas positions of the displayed frame's corners. `Viewport` maps canvas
+    /// to image and not back, so this inverts it by probing an affine map.
+    fn frame(session: &Session) -> [f64; 4] {
+        let view = session.viewport();
+        let origin = view.image_at([0.0, 0.0]);
+        let step = view.image_at([1.0, 1.0]);
+        let canvas = |image: [f64; 2]| {
+            [
+                (image[0] - origin[0]) / (step[0] - origin[0]),
+                (image[1] - origin[1]) / (step[1] - origin[1]),
+            ]
+        };
+        let size = session.geometry().output_size(session.image_size());
+        let a = canvas([0.0, 0.0]);
+        let b = canvas([size[0] as f64, size[1] as f64]);
+        [a[0], a[1], b[0], b[1]]
+    }
+
+    #[test]
+    fn an_ellipse_grows_out_of_where_the_hand_went_down() {
+        let session = fitted();
+        let [x0, y0, x1, y1] = frame(&session);
+        let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+        // Out to a quarter of the frame's width and an eighth of its height.
+        let (centre, radii, feather) = dragged(
+            &session,
+            [cx, cy],
+            [cx + (x1 - x0) / 4.0, cy + (y1 - y0) / 8.0],
+        );
+        println!("centre {centre:?} radii {radii:?}");
+        assert!(
+            (centre[0] - 0.5).abs() < 0.01 && (centre[1] - 0.5).abs() < 0.01,
+            "the ellipse is not centred where the press was: {centre:?}"
+        );
+        assert!(
+            (radii[0] - 0.25).abs() < 0.01,
+            "the horizontal radius is {}, not a quarter of the frame",
+            radii[0]
+        );
+        assert!(
+            (radii[1] - 0.125).abs() < 0.01,
+            "the vertical radius is {}, not an eighth of the frame",
+            radii[1]
+        );
+        assert_eq!(feather, 0.5, "the drag changed the feather");
+    }
+
+    #[test]
+    fn a_drag_that_barely_moves_still_leaves_an_ellipse() {
+        // A slip is not a shape, and a radius of zero is a state the catalog
+        // refuses — so the floor is here rather than an error the window would
+        // have to explain.
+        let session = fitted();
+        let [x0, y0, ..] = frame(&session);
+        let (_, radii, _) = dragged(&session, [x0 + 400.0, y0 + 300.0], [x0 + 400.0, y0 + 300.0]);
+        assert!(
+            radii[0] > 0.0 && radii[1] > 0.0,
+            "a press with no travel left an ellipse with no size: {radii:?}"
+        );
+        let mut session = fitted();
+        session.apply(Command::SetMasks {
+            masks: vec![rawkit_editstate::Mask {
+                shape: MaskShape::Radial {
+                    centre: [0.5, 0.5],
+                    radii,
+                    feather: 0.5,
+                },
+                ..rawkit_editstate::Mask::default()
+            }],
+            control: u8::MAX,
+        });
+        assert!(
+            session.state().validate().is_ok(),
+            "the floor is not high enough for the state layer to accept it"
+        );
+    }
+
+    #[test]
+    fn the_drag_is_read_as_whatever_kind_is_already_there() {
+        // One gesture, two meanings, decided by the mask being placed rather
+        // than by a mode the window has to be in — and getting that backwards
+        // would turn every radial into a gradient the moment it was redrawn.
+        let session = fitted();
+        let [x0, y0, x1, y1] = frame(&session);
+        let (a, b) = ([(x0 + x1) / 2.0, (y0 + y1) / 2.0], [x1 - 10.0, y1 - 10.0]);
+        let size = session.image_size();
+        let linear = shape_from_drag(
+            MaskShape::Linear {
+                from: [0.0, 0.0],
+                to: [1.0, 1.0],
+            },
+            a,
+            b,
+            session.viewport(),
+            &session.geometry(),
+            size,
+        );
+        let radial = shape_from_drag(ELLIPSE, a, b, session.viewport(), &session.geometry(), size);
+        assert!(matches!(linear, MaskShape::Linear { .. }), "{linear:?}");
+        assert!(matches!(radial, MaskShape::Radial { .. }), "{radial:?}");
     }
 }
