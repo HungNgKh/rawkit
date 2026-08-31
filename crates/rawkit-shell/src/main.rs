@@ -1416,6 +1416,81 @@ fn main() -> Result<()> {
                         session.level() != session.viewport().level(session.max_level())
                     };
 
+                // The survey goes *before* the canvas, and the order is the
+                // whole cost of it.
+                //
+                // Surveying ends in a blocking device poll, and a poll waits for
+                // everything already queued — so behind a full canvas pass it was
+                // mostly waiting for tiles it had nothing to do with. Measured on
+                // the same drag: **33-45 ms after the canvas, 6-9 ms before it**,
+                // with the render itself unchanged at around 94,000 pixels. The
+                // placement used to be incidental; it is not any more, and moving
+                // it back would quietly cost four times as much.
+                //
+                // Recomputed when the *edit* changes and not when the view
+                // does, because that is the difference between a histogram of
+                // the photograph and a histogram of the window. During a slider
+                // drag this runs at most once a frame however many commands
+                // arrived, for the same reason only the last command is drawn.
+                if let Some(loaded) = &showing.raw {
+                    let (generation, state) = {
+                        let session = shared.lock().expect("session lock");
+                        (session.generation(), session.state().clone())
+                    };
+                    let known = SCOPE
+                        .lock()
+                        .expect("histogram lock")
+                        .as_ref()
+                        .map(|survey| survey.generation);
+                    let due = last_survey
+                        .is_none_or(|at: std::time::Instant| at.elapsed() >= SURVEY_INTERVAL);
+                    if known != Some(generation) && due {
+                        let counting = std::time::Instant::now();
+                        last_survey = Some(counting);
+                        let counted = canvas_renderer
+                            .survey(&gpu, &loaded.frame(), &loaded.pyramid(), &state)
+                            .and_then(|developed| {
+                                let size = [developed.width, developed.height];
+                                rawkit_export::histogram::Histogram::of(
+                                    &developed.pixels,
+                                    developed.width,
+                                    developed.height,
+                                )
+                                .map(|histogram| (size, histogram))
+                                .map_err(anyhow::Error::from)
+                            });
+                        match counted {
+                            Ok(([width, height], histogram)) => {
+                                // Once, because the coarsest level is one tile
+                                // whatever the photograph is, so the second
+                                // measurement would say the same as the first.
+                                static REPORTED: std::sync::Once = std::sync::Once::new();
+                                REPORTED.call_once(|| {
+                                    eprintln!(
+                                        "histogram  : {width}x{height} in {:.1} ms",
+                                        counting.elapsed().as_secs_f64() * 1000.0
+                                    )
+                                });
+                                *SCOPE.lock().expect("histogram lock") = Some(Survey {
+                                    generation,
+                                    histogram,
+                                });
+                            }
+                            // Not fatal. The photograph is on screen; a missing
+                            // histogram is a missing readout, not a broken
+                            // editor, and stopping the frame loop over one would
+                            // take the picture away as well.
+                            Err(e) => eprintln!("histogram  : {e:#}"),
+                        }
+                    }
+                }
+                paint(
+                    &gpu,
+                    &surface,
+                    canvas_renderer.presenter(),
+                    canvas_renderer.canvas(),
+                    canvas_rect,
+                )?;
                 let rendering = std::time::Instant::now();
                 let drawn = match (&showing.raw, &showing.preview) {
                     (Some(loaded), _) => {
@@ -1491,70 +1566,6 @@ fn main() -> Result<()> {
                     // stays until something else happens to move the view.
                     canvas_renderer.invalidate();
                 }
-                // Recomputed when the *edit* changes and not when the view
-                // does, because that is the difference between a histogram of
-                // the photograph and a histogram of the window. During a slider
-                // drag this runs at most once a frame however many commands
-                // arrived, for the same reason only the last command is drawn.
-                if let Some(loaded) = &showing.raw {
-                    let (generation, state) = {
-                        let session = shared.lock().expect("session lock");
-                        (session.generation(), session.state().clone())
-                    };
-                    let known = SCOPE
-                        .lock()
-                        .expect("histogram lock")
-                        .as_ref()
-                        .map(|survey| survey.generation);
-                    let due = last_survey
-                        .is_none_or(|at: std::time::Instant| at.elapsed() >= SURVEY_INTERVAL);
-                    if known != Some(generation) && due {
-                        let counting = std::time::Instant::now();
-                        last_survey = Some(counting);
-                        let counted = canvas_renderer
-                            .survey(&gpu, &loaded.frame(), &loaded.pyramid(), &state)
-                            .and_then(|developed| {
-                                let size = [developed.width, developed.height];
-                                rawkit_export::histogram::Histogram::of(
-                                    &developed.pixels,
-                                    developed.width,
-                                    developed.height,
-                                )
-                                .map(|histogram| (size, histogram))
-                                .map_err(anyhow::Error::from)
-                            });
-                        match counted {
-                            Ok(([width, height], histogram)) => {
-                                // Once, because the coarsest level is one tile
-                                // whatever the photograph is, so the second
-                                // measurement would say the same as the first.
-                                static REPORTED: std::sync::Once = std::sync::Once::new();
-                                REPORTED.call_once(|| {
-                                    eprintln!(
-                                        "histogram  : {width}x{height} in {:.1} ms",
-                                        counting.elapsed().as_secs_f64() * 1000.0
-                                    )
-                                });
-                                *SCOPE.lock().expect("histogram lock") = Some(Survey {
-                                    generation,
-                                    histogram,
-                                });
-                            }
-                            // Not fatal. The photograph is on screen; a missing
-                            // histogram is a missing readout, not a broken
-                            // editor, and stopping the frame loop over one would
-                            // take the picture away as well.
-                            Err(e) => eprintln!("histogram  : {e:#}"),
-                        }
-                    }
-                }
-                paint(
-                    &gpu,
-                    &surface,
-                    canvas_renderer.presenter(),
-                    canvas_renderer.canvas(),
-                    canvas_rect,
-                )?;
                 let cost = started.elapsed();
                 // Only frames that drew tiles say anything about what rendering
                 // costs; an idle frame is a lock and a blit, and letting one

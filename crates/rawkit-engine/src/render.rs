@@ -39,6 +39,13 @@
 //! dozen stalls a frame, which no amount of tiling or level selection recovers
 //! from.
 //!
+//! **A poll waits for the whole queue, not for this caller's work.** So the cost
+//! of a small readback depends on what was submitted before it, and *when* a
+//! caller reads back matters as much as how much it reads. The shell's histogram
+//! survey is 94,000 pixels either way and took 33-45 ms behind a canvas pass
+//! against 6-9 ms in front of one. Anything that reads pixels back while a
+//! canvas is being drawn is paying for the canvas.
+//!
 //! [`Renderer::draw_tile`] writes into a [`Canvas`] texture and returns. Nothing
 //! synchronises; the frame becomes visible when the surface is presented, which
 //! is the one place a frame should wait. The two paths share every kernel, and
