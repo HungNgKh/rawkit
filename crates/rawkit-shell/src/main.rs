@@ -1755,12 +1755,13 @@ fn begin_export(
             rawkit_deliver::Delivery {
                 max_dim: 0,
                 // Nothing was resized, so there is nothing for output
-                // sharpening to restore. The window has no control for it yet;
-                // when it grows one, it belongs beside the size, not beside the
-                // edit.
+                // sharpening to restore. The window has no control for it yet,
+                // nor for the file format; when it grows them, they belong
+                // beside the size, not beside the edit.
                 sharpening: rawkit_deliver::OutputSharpening::None,
                 overwrite,
                 jobs: EXPORT_JOBS,
+                ..Default::default()
             },
             |done, total, filename| {
                 *EXPORTING.lock().expect("export lock") = Some(Exporting {

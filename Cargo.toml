@@ -67,6 +67,9 @@ bytemuck = { version = "1", features = ["derive"] }
 # Golden-test references are 16-bit PNGs so a reviewer can look at what changed;
 # the export pipeline uses the same crate. Pure Rust, MIT/Apache-2.0.
 png = "0.17"
+# Deflate for the TIFF writer. Already in the tree behind `png`, so this
+# declares what was being used transitively rather than adding anything new.
+flate2 = "1"
 # Little CMS, statically linked. The transform and the profile we embed then
 # come from one source, so they cannot describe different things.
 lcms2 = { version = "6", default-features = false, features = ["static"] }

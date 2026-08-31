@@ -3066,6 +3066,7 @@ dependencies = [
 name = "rawkit-export"
 version = "0.0.1"
 dependencies = [
+ "flate2",
  "jpeg-decoder",
  "jpeg-encoder",
  "lcms2",

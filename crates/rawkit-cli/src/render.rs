@@ -209,13 +209,13 @@ fn write_image(path: &Path, rgba: &[f32], width: u32, height: u32) -> Result<()>
             }
         }
         std::fs::write(path, buf).with_context(|| format!("writing {}", path.display()))?;
-        eprintln!("note       : PPM carries no profile; use .jpg or .png to export");
+        eprintln!("note       : PPM carries no profile; use .jpg, .png or .tif to export");
         return Ok(());
     }
 
     let format = rawkit_export::Format::from_extension(&extension).ok_or_else(|| {
         anyhow::anyhow!(
-            "do not know how to write {:?}; try .jpg, .png or .ppm",
+            "do not know how to write {:?}; try .jpg, .png, .tif or .ppm",
             extension
         )
     })?;

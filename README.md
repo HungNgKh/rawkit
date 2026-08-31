@@ -40,7 +40,7 @@ by operating system is not a look. Golden render tests run on all three in CI.
 | `rawkit-decode` | RAW file → sensor mosaic. The one crate allowed to link CDDL code, and the boundary that keeps it contained |
 | `rawkit-engine` | `EditState` → pixels. Pipeline stage order, WGSL kernels, wgpu device |
 | `rawkit-catalog` | SQLite schema, forward-only migrations, volume identity |
-| `rawkit-export` | Pixels to a colour-managed file. The only crate that knows about image formats |
+| `rawkit-export` | Pixels to a colour-managed file. The only crate that knows about image formats — JPEG, PNG and a 16-bit TIFF writer of its own |
 | `rawkit-session` | The command bus. An editing session as a pure state machine: decides which tiles need rendering, and holds no pixels so it cannot send any |
 | `rawkit-shell` | The desktop shell — window, surface, event loop. The only crate that knows Tauri exists |
 | `rawkit-cli` | Headless entry point for CI, the golden harness and scripting |
@@ -126,6 +126,11 @@ cargo run --release -p rawkit-cli -- render photo.ARW -o out.jpg --profile camer
 # `--max-dim 0` writes full resolution; nothing is ever enlarged.
 cargo run --release -p rawkit-cli -- render photo.ARW -o out.jpg \
     --max-dim 2000 --output-sharpen standard
+
+# 16-bit TIFF, for handing a frame to another program and taking it back.
+# Deflate with horizontal differencing: about three quarters of the plain size.
+cargo run --release -p rawkit-cli -- render photo.ARW -o out.tif
+cargo run --release -p rawkit-cli -- export library.rawkit --to ~/out --picks --format tif
 ```
 
 `--output-sharpen` is not `--sharpen`. The latter is capture sharpening, which

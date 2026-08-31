@@ -14,6 +14,13 @@ use rawkit_catalog::previews::Level as PreviewLevel;
 use rawkit_engine::sharpen::OutputSharpening;
 use std::path::PathBuf;
 
+/// The same, for the file an export writes. Named by extension, because that is
+/// the vocabulary the user already has for it.
+fn parse_format(name: &str) -> Result<rawkit_export::Format, String> {
+    rawkit_export::Format::from_extension(name)
+        .ok_or_else(|| "expected jpg, png or tif".to_string())
+}
+
 /// Clap cannot parse an enum it has never heard of, and a bare string argument
 /// would push the mistake past the parser and into the export.
 fn parse_sharpening(name: &str) -> Result<OutputSharpening, String> {
@@ -148,6 +155,11 @@ enum Command {
         /// see the `sharpen` module in the engine for which is which.
         #[arg(long, default_value = "none", value_parser = parse_sharpening)]
         output_sharpen: OutputSharpening,
+        /// What to write: `jpg`, `png` or `tif`. PNG and TIFF are sixteen bits
+        /// and lossless; TIFF is the one to hand to another program and take
+        /// back again.
+        #[arg(long, default_value = "jpg", value_parser = parse_format)]
+        format: rawkit_export::Format,
         /// Replace files that are already there. Off by default: an export is
         /// the one thing here that writes outside the catalog's own directory.
         #[arg(long)]
@@ -423,6 +435,7 @@ fn main() -> Result<()> {
             all,
             max_dim,
             output_sharpen,
+            format,
             overwrite,
             jobs,
         } => {
@@ -449,6 +462,7 @@ fn main() -> Result<()> {
                 rawkit_deliver::Delivery {
                     max_dim,
                     sharpening: output_sharpen,
+                    format,
                     overwrite,
                     jobs,
                 },

@@ -47,6 +47,8 @@ use rawkit_engine::{render::DEFAULT_TILE, BayerPhase, Frame, Gpu, Output, Render
 /// Re-exported so a caller configuring an export does not also have to name the
 /// engine: the setting is part of this crate's vocabulary, not the renderer's.
 pub use rawkit_engine::sharpen::OutputSharpening;
+/// Likewise: which file an export makes is part of configuring one.
+pub use rawkit_export::Format;
 use std::path::Path;
 
 /// Quality for a delivered file. Higher than a preview's 85: this one is looked
@@ -184,6 +186,9 @@ pub struct Delivery {
     /// sharpening stored with the edit. See [`OutputSharpening`] for why this
     /// lives here and not in the `EditState`.
     pub sharpening: OutputSharpening,
+    /// What kind of file to write, which also decides the extension when the
+    /// destination is a folder rather than a named file.
+    pub format: Format,
     /// Replace files that are already there.
     pub overwrite: bool,
     /// How many photographs to render at once.
@@ -197,6 +202,9 @@ impl Default for Delivery {
             // choices that lose nothing the caller did not ask to lose.
             max_dim: 0,
             sharpening: OutputSharpening::None,
+            format: Format::Jpeg {
+                quality: EXPORT_QUALITY,
+            },
             overwrite: false,
             jobs: 1,
         }
@@ -248,11 +256,12 @@ pub fn write(
                 };
                 let destination = match to {
                     Destination::Folder(dir) => dir.join(format!(
-                        "{}.jpg",
+                        "{}.{}",
                         Path::new(&image.filename)
                             .file_stem()
                             .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| image.filename.clone())
+                            .unwrap_or_else(|| image.filename.clone()),
+                        delivery.format.extension()
                     )),
                     Destination::File(path) => path.clone(),
                 };
@@ -359,14 +368,7 @@ fn one(
     // After the resize and never before it: sharpening detail that is about to
     // be thrown away costs time and leaves the halo without the edge.
     rawkit_engine::sharpen::sharpen(&mut scaled, width, height, delivery.sharpening);
-    let bytes = rawkit_export::encode(
-        &scaled,
-        width,
-        height,
-        rawkit_export::Format::Jpeg {
-            quality: EXPORT_QUALITY,
-        },
-    )?;
+    let bytes = rawkit_export::encode(&scaled, width, height, delivery.format)?;
     std::fs::write(destination, &bytes)
         .with_context(|| format!("writing {}", destination.display()))?;
     Ok(bytes.len() as u64)

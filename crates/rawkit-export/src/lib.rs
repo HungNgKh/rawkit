@@ -40,6 +40,7 @@ use std::io::Cursor;
 
 pub mod display;
 pub mod histogram;
+pub mod tiff;
 
 #[derive(Debug, thiserror::Error)]
 
@@ -68,6 +69,12 @@ pub enum Format {
     Png8,
     /// Lossless, sixteen bits.
     Png16,
+    /// Lossless, sixteen bits, in the format a specialist tool will open.
+    ///
+    /// This is the round trip: out to something that denoises or sharpens
+    /// better than this project intends to, and back. Sixteen bits is the whole
+    /// point of it — see [`crate::tiff`].
+    Tiff16,
 }
 
 impl Format {
@@ -77,7 +84,17 @@ impl Format {
         match extension.to_ascii_lowercase().as_str() {
             "jpg" | "jpeg" => Some(Format::Jpeg { quality: 92 }),
             "png" => Some(Format::Png16),
+            "tif" | "tiff" => Some(Format::Tiff16),
             _ => None,
+        }
+    }
+
+    /// The extension a file of this format is given when nobody named one.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Format::Jpeg { .. } => "jpg",
+            Format::Png8 | Format::Png16 => "png",
+            Format::Tiff16 => "tif",
         }
     }
 }
@@ -111,10 +128,6 @@ pub fn encode(
         .map_err(|e| ExportError::Colour(format!("serialising the sRGB profile: {e}")))?;
     let source = linear_srgb_profile()?;
 
-    // Sampled once per process; `None` means the transform is not separable and
-    // every pixel goes through Little CMS as it always did.
-    let sampled = sampled_transform();
-
     match format {
         Format::Jpeg { quality } => {
             let eight = to_eight_bit(&rgb)?;
@@ -125,18 +138,39 @@ pub fn encode(
             encode_png(&eight, width, height, png::BitDepth::Eight, &icc)
         }
         Format::Png16 => {
-            let bytes = match sampled {
-                Some(curves) => curves.to_sixteen(&rgb),
-                None => {
-                    transform::<[u16; 3]>(&source, &destination, &rgb, lcms2::PixelFormat::RGB_16)?
-                        .iter()
-                        .flatten()
-                        .flat_map(|v| v.to_be_bytes())
-                        .collect()
-                }
-            };
+            let bytes = sixteen_bit(&rgb, &source, &destination)?;
             encode_png(&bytes, width, height, png::BitDepth::Sixteen, &icc)
         }
+        Format::Tiff16 => tiff::encode(
+            &sixteen_bit(&rgb, &source, &destination)?,
+            width,
+            height,
+            &icc,
+        ),
+    }
+}
+
+/// Linear display-referred RGB to the big-endian sixteen-bit samples a file
+/// would carry.
+///
+/// Shared by the two sixteen-bit formats, and shared deliberately: they must
+/// not be able to disagree about what the numbers in a file mean.
+fn sixteen_bit(
+    rgb: &[[f32; 3]],
+    source: &lcms2::Profile,
+    destination: &lcms2::Profile,
+) -> Result<Vec<u8>, ExportError> {
+    // Sampled once per process; `None` means the transform is not separable and
+    // every pixel goes through Little CMS as it always did.
+    match sampled_transform() {
+        Some(curves) => Ok(curves.to_sixteen(rgb)),
+        None => Ok(
+            transform::<[u16; 3]>(source, destination, rgb, lcms2::PixelFormat::RGB_16)?
+                .iter()
+                .flatten()
+                .flat_map(|v| v.to_be_bytes())
+                .collect(),
+        ),
     }
 }
 
@@ -774,6 +808,37 @@ mod tests {
             Some(Format::Jpeg { .. })
         ));
         assert_eq!(Format::from_extension("png"), Some(Format::Png16));
-        assert_eq!(Format::from_extension("tif"), None);
+        assert_eq!(Format::from_extension("TIFF"), Some(Format::Tiff16));
+        assert_eq!(Format::from_extension("bmp"), None);
+    }
+
+    #[test]
+    fn every_format_names_an_extension_that_finds_it_again() {
+        // `extension` decides what a folder export calls its files, and
+        // `from_extension` decides what a named file becomes. The two are used
+        // at opposite ends of the same journey — write `photo.tif`, open
+        // `photo.tif` — and a format whose extension did not lead back to it
+        // would export files this crate could not itself identify.
+        for format in [Format::Jpeg { quality: 92 }, Format::Png16, Format::Tiff16] {
+            let found = Format::from_extension(format.extension());
+            assert!(
+                found.is_some(),
+                "{format:?} writes .{} and nothing reads it back",
+                format.extension()
+            );
+            assert_eq!(
+                std::mem::discriminant(&found.unwrap()),
+                std::mem::discriminant(&format),
+                "{format:?} writes .{} which comes back as {:?}",
+                format.extension(),
+                found.unwrap()
+            );
+        }
+        // Png8 is the exception, and deliberately: it shares an extension with
+        // Png16, and a `.png` a user names should be the sixteen-bit one.
+        assert_eq!(
+            Format::from_extension(Format::Png8.extension()),
+            Some(Format::Png16)
+        );
     }
 }
