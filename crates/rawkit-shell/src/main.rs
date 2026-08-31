@@ -300,6 +300,9 @@ fn snapshot(state: tauri::State<'_, Shared>) -> serde_json::Value {
         // said, not what anyone decided. It is here so the panel can *say* why
         // a photograph opened turned — a reason the user cannot see is
         // indistinguishable from a bug.
+        // A one-shot line from the render loop, which has no command to return
+        // a refusal through.
+        "notice": NOTICE.lock().expect("notice lock").take(),
         // What the panel is actually being given. Polled rather than pushed
         // because the window can narrow without the page doing anything, and a
         // stylesheet that has not heard draws a column wider than the canvas
@@ -945,7 +948,8 @@ fn main() -> Result<()> {
             set_panel_width,
             panel_width,
             toggle_fullscreen,
-            arm_target
+            arm_target,
+            pick_white_balance
         ])
         .setup(move |app| {
             // The surface is created on the main thread because the raw window
@@ -1416,6 +1420,40 @@ fn main() -> Result<()> {
                         }
                         session.level() != session.viewport().level(session.max_level())
                     };
+
+                // A white-balance pick. Resolved here because turning a canvas
+                // position into a rectangle of *sensor* needs the viewport, the
+                // geometry and the mosaic, and this is where all three meet.
+                if let (Some(at), Some(loaded)) = (
+                    WB_PICK.lock().expect("pick lock").take(),
+                    showing.raw.as_ref(),
+                ) {
+                    let rect = {
+                        let session = shared.lock().expect("session lock");
+                        let half = WB_SAMPLE / 2.0;
+                        let a = session.viewport().image_at([at[0] - half, at[1] - half]);
+                        let b = session.viewport().image_at([at[0] + half, at[1] + half]);
+                        // Through the geometry, so a rotated or straightened
+                        // frame picks the photosites actually under the pointer
+                        // rather than the ones that would have been there before
+                        // the frame was turned.
+                        session
+                            .geometry()
+                            .sensor_rect([a[0], a[1], b[0], b[1]], session.image_size())
+                    };
+                    match loaded.channels_over(rect) {
+                        None => notice("that is outside the photograph"),
+                        Some(camera) => match neutralising(camera, loaded.profile()) {
+                            Err(why) => notice(why),
+                            Ok((kelvin, tint)) => {
+                                let mut session = shared.lock().expect("session lock");
+                                session.apply(Command::SetTemperature(Some(kelvin)));
+                                session.apply(Command::SetTint(tint));
+                                notice(format!("white balance {kelvin:.0} K, tint {tint:.0}"));
+                            }
+                        },
+                    }
+                }
 
                 // An aim taken but not yet resolved: the press said where, and
                 // this is the only place that holds the canvas and can say what
@@ -2132,6 +2170,89 @@ fn arm_target(control: Option<String>) -> Result<u8, String> {
         *TARGET_AIM.lock().expect("aim lock") = None;
     }
     Ok(armed)
+}
+
+/// Whether the next click on the photograph sets the white balance from what it
+/// lands on.
+static PICKING_WB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn picking_wb() -> bool {
+    PICKING_WB.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A click awaiting the render loop, which is the only place that can turn a
+/// canvas position into a rectangle of sensor.
+pub(crate) static WB_PICK: Mutex<Option<[f64; 2]>> = Mutex::new(None);
+
+/// Something the shell needs to say, for the page to show once.
+///
+/// The status line is fed by the events commands return, and a refusal decided
+/// in the render loop has no command to return through. Taken rather than read,
+/// so a message appears once and does not sit there describing a click from two
+/// photographs ago.
+pub(crate) static NOTICE: Mutex<Option<String>> = Mutex::new(None);
+
+/// The square a pick averages, in canvas pixels.
+///
+/// Larger than the mixer's nine, because this one is asking about *noise*: a
+/// white balance derived from a handful of photosites moves with the grain, and
+/// a patch a user thinks of as "that grey card" is far bigger than a pixel.
+pub(crate) const WB_SAMPLE: f64 = 21.0;
+
+/// The temperature and tint that would render this camera-space patch neutral,
+/// or why it cannot mean anything.
+///
+/// Refusals rather than a clamped answer, because every one of these is a
+/// plausible-looking number with no relationship to the light: the commonest way
+/// to misuse an eyedropper is to click the brightest thing in the frame, and a
+/// blown highlight's ratios are the sensor's ceiling rather than the scene's
+/// colour.
+pub(crate) fn neutralising(
+    camera: [f32; 3],
+    profile: &rawkit_engine::CameraProfile,
+) -> Result<(f32, f32), String> {
+    let high = camera[0].max(camera[1]).max(camera[2]);
+    let low = camera[0].min(camera[1]).min(camera[2]);
+    // `normalise` puts the sensor's white level at 1.0.
+    if high >= 0.98 {
+        return Err(
+            "that patch is blown — its channels are at the sensor's limit, \
+                    not the light's colour"
+                .into(),
+        );
+    }
+    if high < 0.02 || low <= 0.0 {
+        return Err("that patch is too dark to say anything about the light".into());
+    }
+
+    // Green-referenced, like every other multiplier in this project: the numbers
+    // that would make the three channels equal.
+    let multipliers = [camera[1] / camera[0], 1.0, camera[1] / camera[2]];
+    let (kelvin, tint) = profile.temperature_from_multipliers(multipliers);
+    // The inverse clamps to the locus it can describe, so landing on an end is
+    // not a temperature — it is the answer running out.
+    if kelvin <= rawkit_engine::profile::MIN_TEMPERATURE + 1.0
+        || kelvin >= rawkit_engine::profile::MAX_TEMPERATURE - 1.0
+    {
+        return Err(format!(
+            "no daylight-locus temperature makes that neutral ({kelvin:.0} K is the end of the scale)"
+        ));
+    }
+    Ok((kelvin, tint))
+}
+
+pub(crate) fn notice(what: impl Into<String>) {
+    *NOTICE.lock().expect("notice lock") = Some(what.into());
+}
+
+/// Set the white balance from a patch that ought to be neutral.
+#[tauri::command]
+fn pick_white_balance(armed: bool) -> bool {
+    PICKING_WB.store(armed, std::sync::atomic::Ordering::Relaxed);
+    if !armed {
+        *WB_PICK.lock().expect("pick lock") = None;
+    }
+    armed
 }
 
 pub(crate) static CANVAS_CLICK: Mutex<Option<([f64; 2], bool)>> = Mutex::new(None);
@@ -2863,4 +2984,68 @@ fn crop_from(session: &Session, marquee: &Marquee) -> Option<rawkit_editstate::C
         ..rawkit_editstate::Crop::default()
     };
     crop.validate().ok().map(|()| crop)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A camera whose primaries are XYZ's, so the profile stage contributes
+    /// nothing and what is measured is the eyedropper's own arithmetic.
+    fn plain() -> rawkit_engine::CameraProfile {
+        rawkit_engine::CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY)
+    }
+
+    #[test]
+    fn a_blown_patch_is_refused_rather_than_answered() {
+        // The commonest way to misuse an eyedropper is to click the brightest
+        // thing in the frame. Its channels are the sensor's ceiling, so their
+        // ratios describe the limit rather than the light — and a temperature
+        // derived from them looks exactly like a good one.
+        let refused = neutralising([0.99, 1.0, 0.985], &plain());
+        assert!(refused.is_err(), "a blown patch gave {refused:?}");
+        assert!(refused.unwrap_err().contains("blown"));
+    }
+
+    #[test]
+    fn a_patch_with_nothing_in_it_is_refused() {
+        assert!(neutralising([0.001, 0.002, 0.0015], &plain()).is_err());
+        // Zero in one channel would divide by nothing a moment later.
+        assert!(neutralising([0.4, 0.4, 0.0], &plain()).is_err());
+    }
+
+    #[test]
+    fn a_neutral_patch_asks_for_no_correction() {
+        // Equal channels are already balanced, so whatever temperature comes
+        // back must be the one whose multipliers are all one — which is the
+        // round trip this leans on, checked from the eyedropper's side.
+        let (kelvin, tint) = neutralising([0.4, 0.4, 0.4], &plain()).expect("a usable patch");
+        // With the tint it came back with, not zero: equal camera channels are
+        // equal *XYZ* under this profile, and the equal-energy white point is
+        // not on the Planckian locus — so a grey legitimately carries a tint,
+        // and asking for the multipliers without it is asking a different
+        // question. (This test failed that way first.)
+        let multipliers = plain().multipliers_for(kelvin, tint);
+        for m in multipliers {
+            assert!(
+                (m - 1.0).abs() < 0.05,
+                "a grey asked for {multipliers:?}, which is not no correction"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bluer_patch_asks_for_a_warmer_render() {
+        // The direction, which is the half a sign error would get wrong: a patch
+        // the sensor saw as blue is under blue light, so making it neutral means
+        // rendering the whole frame warmer — a higher colour temperature.
+        let grey = neutralising([0.4, 0.4, 0.4], &plain()).expect("grey");
+        let blue = neutralising([0.3, 0.4, 0.55], &plain()).expect("a blue patch");
+        assert!(
+            blue.0 > grey.0,
+            "a blue patch gave {:.0} K against a grey's {:.0} K",
+            blue.0,
+            grey.0
+        );
+    }
 }

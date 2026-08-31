@@ -133,6 +133,13 @@
   summary { display: flex; align-items: center; }
   .target { margin-left: auto; padding: 0 7px; line-height: 1.5;
             color: #8e8e98; background: transparent; border-color: transparent; }
+  /* The eyedropper sits in a row of ordinary buttons rather than on a heading,
+     so it keeps a button's shape and only borrows the armed state. */
+  #pick-wb { margin-left: 0; padding: 4px 11px; color: inherit;
+             background: #303038; border-color: #45454f; }
+  /* After the rule above, and by id, because `.target.armed` loses to `#pick-wb`
+     on specificity — which showed up as a button that armed and did not say so. */
+  #pick-wb.armed { color: #1e1e22; background: #d8bf63; border-color: #d8bf63; }
   .target:hover { color: #e8e8ea; background: #303038; border-color: #45454f; }
   .target.armed { color: #1e1e22; background: #d8bf63; border-color: #d8bf63; }
   /* While something is armed the photograph is a target, not a hand. */
@@ -317,7 +324,10 @@
     <label><span>Tint</span>
       <input id="tint" type="range" min="-100" max="100" step="1" value="0">
       <output id="tint-value">0</output></label>
-    <div class="row"><button id="as-shot">As shot</button></div>
+    <div class="row">
+      <button id="as-shot">As shot</button>
+      <button id="pick-wb" class="target">Pick neutral</button>
+    </div>
   </details>
 
   <details id="s-profile">
@@ -642,6 +652,8 @@
     // not in the edit and cannot be — it is what the file recorded — so a
     // photograph that opens sideways would otherwise be doing it for a reason
     // nobody can see, which is the same as doing it for no reason.
+    // Anything the render loop needed to say — a refused pick, most often.
+    if (s.notice) { log.className = ""; log.textContent = s.notice; }
     showOrientation(s.orientation);
     // Not gated on the generation: a profile is not part of the edit, so
     // choosing one does not move it.
@@ -1303,11 +1315,12 @@
 
   let armed = null;
   const arm = (control) => {
+    if (control !== null && picking) pickWb(false);
     armed = control;
     for (const button of document.querySelectorAll(".target")) {
       button.classList.toggle("armed", button.dataset.control === control);
     }
-    document.body.classList.toggle("aiming", control !== null);
+    document.body.classList.toggle("aiming", control !== null || picking);
     invoke("arm_target", { control }).catch(say);
   };
 
@@ -1320,6 +1333,25 @@
       arm(armed === button.dataset.control ? null : button.dataset.control);
     });
   }
+
+  // ---- The white-balance eyedropper ----------------------------------------
+  //
+  // The same arming as the mixer's target, because it is the same gesture: a
+  // click on the photograph that means something other than "pan". Only one of
+  // the two can be armed — two tools waiting for the same click is a coin toss.
+
+  const dropper = document.getElementById("pick-wb");
+  let picking = false;
+  const pickWb = (on) => {
+    picking = on;
+    dropper.classList.toggle("armed", on);
+    document.body.classList.toggle("aiming", on || armed !== null);
+    invoke("pick_white_balance", { armed: on }).catch(say);
+  };
+  dropper.addEventListener("click", () => {
+    if (!picking && armed !== null) arm(null);
+    pickWb(!picking);
+  });
 
   // ---- The divider ---------------------------------------------------------
   //
@@ -1581,6 +1613,7 @@
         // recently picked up, and leaving crop as well would be two answers to
         // one key.
         if (armed !== null) { arm(null); break; }
+        if (picking) { pickWb(false); break; }
         if (document.getElementById("mode").textContent === "crop") { act("crop_cancel"); break; }
         act("loupe"); break;
       case "e": act("loupe"); break;

@@ -160,6 +160,64 @@ impl Loaded {
         }
     }
 
+    /// The average of each colour-filter channel over a rectangle of the sensor.
+    ///
+    /// For the white-balance eyedropper, and taken from the *mosaic* rather than
+    /// from the canvas on purpose: white balance is a statement about what the
+    /// sensor recorded, and `temperature_from_multipliers` is defined on camera
+    /// values. Sampling the rendered picture would ask the question one
+    /// transform too late, and a profile with a look table would answer it
+    /// differently again.
+    ///
+    /// No demosaic: the two greens of each quad are averaged with the rest, and
+    /// over a patch large enough to matter that is what a demosaic would have
+    /// produced anyway, without inventing detail to then average away.
+    ///
+    /// `None` when the rectangle falls outside the sensor or holds no whole
+    /// Bayer quad — a click on the letterbox, or one so zoomed in that the
+    /// square covers fewer than four photosites.
+    /// The colour profile this frame renders with, for anything that has to
+    /// invert what the renderer does — the eyedropper turning camera values back
+    /// into a temperature, for one.
+    pub fn profile(&self) -> &CameraProfile {
+        &self.profile
+    }
+
+    pub fn channels_over(&self, rect: [f64; 4]) -> Option<[f32; 3]> {
+        let [w, h] = self.size;
+        let x0 = rect[0].floor().max(0.0) as u32;
+        let y0 = rect[1].floor().max(0.0) as u32;
+        let x1 = (rect[2].ceil() as i64).clamp(0, w as i64) as u32;
+        let y1 = (rect[3].ceil() as i64).clamp(0, h as i64) as u32;
+        if x1 <= x0 + 1 || y1 <= y0 + 1 {
+            return None;
+        }
+
+        let mut total = [0.0f64; 3];
+        let mut counts = [0u32; 3];
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let channel = match (self.phase, x % 2 == 0, y % 2 == 0) {
+                    (BayerPhase::Rggb, true, true) | (BayerPhase::Bggr, false, false) => 0,
+                    (BayerPhase::Rggb, false, false) | (BayerPhase::Bggr, true, true) => 2,
+                    (BayerPhase::Grbg, false, true) | (BayerPhase::Gbrg, true, false) => 0,
+                    (BayerPhase::Grbg, true, false) | (BayerPhase::Gbrg, false, true) => 2,
+                    _ => 1,
+                };
+                total[channel] += self.mosaic[(y as usize) * (w as usize) + x as usize] as f64;
+                counts[channel] += 1;
+            }
+        }
+        if counts.contains(&0) {
+            return None;
+        }
+        Some([
+            (total[0] / counts[0] as f64) as f32,
+            (total[1] / counts[1] as f64) as f32,
+            (total[2] / counts[2] as f64) as f32,
+        ])
+    }
+
     pub fn pyramid(&self) -> Pyramid<'_> {
         Pyramid::from_levels(&self.mosaic, (self.size[0], self.size[1]), &self.levels)
     }

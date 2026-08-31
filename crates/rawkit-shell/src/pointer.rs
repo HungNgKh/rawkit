@@ -16,8 +16,8 @@
 //! scale factor is known rather than passing a scale around.
 
 use crate::{
-    in_crop, in_grid, targeting, Aim, Marquee, CANVAS_CLICK, CANVAS_MARQUEE, CANVAS_SCROLL,
-    TARGET_AIM, TARGET_RANGE_PX,
+    in_crop, in_grid, picking_wb, targeting, Aim, Marquee, CANVAS_CLICK, CANVAS_MARQUEE,
+    CANVAS_SCROLL, TARGET_AIM, TARGET_RANGE_PX, WB_PICK,
 };
 use rawkit_session::{Command, Session};
 use std::sync::{Arc, Mutex};
@@ -88,6 +88,12 @@ const ZOOM_STEP: f64 = 1.15;
 pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
     match event {
         Pointer::Press { at, double } => {
+            // A white-balance pick is a click rather than a drag: it takes the
+            // press, resolves on the next frame, and does not start a pan.
+            if picking_wb() && !in_grid() {
+                *WB_PICK.lock().expect("pick lock") = Some(at);
+                return;
+            }
             // Aiming takes the press before anything else, and does not fall
             // through to `DRAG`: a targeted drag must not also pan the
             // photograph out from under the colour it is adjusting.
