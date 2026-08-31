@@ -80,7 +80,11 @@ pub fn build(
 ) -> Result<BuildReport> {
     let dir =
         previews::directory(catalog).context("an in-memory catalog has nowhere to put previews")?;
-    let outstanding = previews::outstanding(catalog, levels)?;
+    // Computed once and used for both halves: what counts as stale, and what
+    // gets stamped on what is written. Two calls to `renderer_version` would be
+    // the same string today and an invitation to stop being so.
+    let stamp = rawkit_engine::renderer_version(&rawkit_decode::decoder_version());
+    let outstanding = previews::outstanding(catalog, levels, &stamp)?;
     let mut report = BuildReport {
         images: outstanding.len(),
         ..BuildReport::default()
@@ -105,8 +109,8 @@ pub fn build(
     std::thread::scope(|scope| -> Result<()> {
         for _ in 0..workers {
             let sender = sender.clone();
-            let (next, outstanding, gpu, renderer, dir) =
-                (&next, &outstanding, &gpu, &renderer, &dir);
+            let (next, outstanding, gpu, renderer, dir, stamp) =
+                (&next, &outstanding, &gpu, &renderer, &dir, stamp.as_str());
             scope.spawn(move || loop {
                 let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(wanted) = outstanding.get(index) else {
@@ -121,6 +125,7 @@ pub fn build(
                     &wanted.state,
                     &wanted.edit_state_hash,
                     &wanted.missing,
+                    stamp,
                 );
                 // A closed channel means this thread's work is no longer wanted.
                 if sender.send((index, built)).is_err() {
@@ -164,6 +169,8 @@ fn one(
     state: &EditState,
     edit_state_hash: &str,
     levels: &[Level],
+    // Which build is writing these, from `rawkit_engine::renderer_version`.
+    stamp: &str,
 ) -> Result<Vec<Preview>> {
     // Where a build's time actually goes. Set `RAWKIT_TIME_PREVIEWS=1` before
     // optimising anything here — the tile work taught this project that the
@@ -263,6 +270,10 @@ fn one(
             level: wanted,
             path: relative,
             edit_state_hash: edit_state_hash.to_string(),
+            // Stamped as it is written, from the build doing the writing. Read
+            // back on every lookup, so a later build that would render these
+            // pixels differently declines them instead of showing them.
+            renderer: stamp.to_string(),
             width: w,
             height: h,
             bytes: bytes.len() as u64,

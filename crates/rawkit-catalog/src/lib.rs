@@ -43,7 +43,7 @@ pub mod volume;
 /// The schema version this build expects, and the last entry in [`MIGRATIONS`].
 /// A catalog reporting anything higher was written by a newer build and is
 /// refused rather than half-understood.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -114,6 +114,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "presets-and-snapshots",
         sql: include_str!("../migrations/004-presets-and-snapshots.sql"),
+    },
+    Migration {
+        version: 5,
+        name: "preview-renderer",
+        sql: include_str!("../migrations/005-preview-renderer.sql"),
     },
 ];
 

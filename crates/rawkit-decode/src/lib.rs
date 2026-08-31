@@ -189,6 +189,26 @@ pub struct RawImage {
     pub data: Vec<u16>,
 }
 
+/// Which decoder produced these pixels.
+///
+/// Not diagnostics. A LibRaw upgrade changes the pixels it hands back for the
+/// same file — demosaic-adjacent fixes, a corrected black level, a new camera
+/// table — so anything caching rendered output has to know which one it was
+/// rendered by, exactly as it has to know which shader. Asked of the library at
+/// runtime rather than read from the crate version, because the crate wraps a
+/// vendored C library and the two are free to disagree.
+pub fn decoder_version() -> String {
+    // SAFETY: `libraw_version` returns a pointer to a static string inside the
+    // library, valid for the life of the process and not owned by us.
+    let raw = unsafe { libraw_sys::libraw_version() };
+    if raw.is_null() {
+        return "unknown".into();
+    }
+    unsafe { std::ffi::CStr::from_ptr(raw) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Translate dcraw's `flip` encoding, which LibRaw inherits, into ours.
 ///
 /// dcraw stores orientation as three independent bits rather than as a rotation:

@@ -1,0 +1,19 @@
+-- Which build rendered a preview.
+--
+-- `edit_state_hash` answers "has the user changed anything since". It does not
+-- answer "would this build still produce these pixels", and every engine change
+-- makes every stored preview wrong in a way that looks exactly like being right:
+-- the thumbnail is simply not what the photograph renders as any more, and
+-- nothing about it says so. Three engine changes shipped on the day this column
+-- was added, two of which moved pixels.
+--
+-- The value is opaque here on purpose. It is produced by
+-- `rawkit_engine::renderer_version` — a digest of the engine's own source, taken
+-- at build time, joined with the decoder's version — and the catalog's only job
+-- is to store it and compare it for equality. Putting any structure in it here
+-- would be this table having an opinion about how the renderer is identified.
+--
+-- Existing rows get the empty string, which matches no real version, so every
+-- preview built before this column existed is treated as being from an unknown
+-- build. That is exactly what it is.
+ALTER TABLE previews ADD COLUMN renderer TEXT NOT NULL DEFAULT '';

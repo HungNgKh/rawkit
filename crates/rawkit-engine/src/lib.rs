@@ -32,6 +32,27 @@ pub mod render;
 pub mod resize;
 mod tone;
 
+/// A digest of every source file in this crate, computed at build time.
+///
+/// See `build.rs` for why it is derived rather than declared. What it is *for*
+/// lives here: anything that stores rendered pixels and reuses them later has to
+/// be able to ask "would this build still produce these", and the edit that
+/// produced them does not answer that question.
+pub const SOURCE_DIGEST: &str = env!("RAWKIT_ENGINE_DIGEST");
+
+/// What produced a rendered pixel, as one string to key a cache on.
+///
+/// Two halves, because two things decide the answer and neither is enough alone:
+/// this crate's source, and the decoder that handed it a mosaic. A LibRaw
+/// upgrade changes the pixels for the same RAW as surely as a shader edit does.
+///
+/// The decoder's version is a parameter rather than a call, because this crate
+/// does not depend on the decoder and should not start: the engine renders what
+/// it is given, and which library opened the file is the caller's knowledge.
+pub fn renderer_version(decoder: &str) -> String {
+    format!("{SOURCE_DIGEST}/{decoder}")
+}
+
 pub use pipeline::{Domain, Stage};
 pub use present::Presenter;
 pub use preview::{Cell, PreviewBlit, PreviewImage};

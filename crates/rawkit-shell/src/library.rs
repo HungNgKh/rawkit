@@ -523,7 +523,14 @@ impl Library {
         let Some(dir) = previews::directory(&self.catalog) else {
             return Ok(None);
         };
-        let Some(found) = previews::covering(&self.catalog, image.id, needed, hash)? else {
+        let Some(found) = previews::covering(
+            &self.catalog,
+            image.id,
+            needed,
+            hash,
+            &rawkit_engine::renderer_version(&rawkit_decode::decoder_version()),
+        )?
+        else {
             return Ok(None);
         };
         let file = dir.join(&found.path);

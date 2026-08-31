@@ -87,6 +87,10 @@ pub struct Preview {
     /// Relative to [`directory`], so a library that moves keeps its previews.
     pub path: String,
     pub edit_state_hash: String,
+    /// Which build rendered it, from `rawkit_engine::renderer_version`. Opaque
+    /// here: this table stores it and compares it for equality, and has no
+    /// opinion about how a renderer identifies itself.
+    pub renderer: String,
     pub width: u32,
     pub height: u32,
     pub bytes: u64,
@@ -118,11 +122,12 @@ pub fn relative_path(image_id: i64, level: Level, edit_state_hash: &str) -> Stri
 pub fn record(catalog: &Catalog, image_id: i64, preview: &Preview) -> Result<(), CatalogError> {
     catalog.connection().execute(
         "INSERT INTO previews
-              (image_id, level, path, edit_state_hash, width, height, bytes, created_at)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+              (image_id, level, path, edit_state_hash, renderer, width, height, bytes, created_at)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT (image_id, level) DO UPDATE SET
               path = excluded.path,
               edit_state_hash = excluded.edit_state_hash,
+              renderer = excluded.renderer,
               width = excluded.width,
               height = excluded.height,
               bytes = excluded.bytes,
@@ -132,6 +137,7 @@ pub fn record(catalog: &Catalog, image_id: i64, preview: &Preview) -> Result<(),
             preview.level.column(),
             preview.path,
             preview.edit_state_hash,
+            preview.renderer,
             preview.width,
             preview.height,
             preview.bytes as i64,
@@ -150,7 +156,7 @@ pub fn lookup(
     let row = catalog
         .connection()
         .query_row(
-            "SELECT level, path, edit_state_hash, width, height, bytes
+            "SELECT level, path, edit_state_hash, renderer, width, height, bytes
                FROM previews WHERE image_id = ?1 AND level = ?2",
             rusqlite::params![image_id, level.column()],
             |r| {
@@ -158,20 +164,22 @@ pub fn lookup(
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(3)?,
                     r.get::<_, i64>(4)?,
                     r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
                 ))
             },
         )
         .ok();
-    let Some((level, path, hash, width, height, bytes)) = row else {
+    let Some((level, path, hash, renderer, width, height, bytes)) = row else {
         return Ok(None);
     };
     Ok(Some(Preview {
         level: Level::parse(&level)?,
         path,
         edit_state_hash: hash,
+        renderer,
         width: width as u32,
         height: height as u32,
         bytes: bytes as u64,
@@ -187,40 +195,52 @@ pub fn lookup(
 /// The hash has to match. A preview of an edit that has since been changed is
 /// not a preview of this photograph — showing it would put the previous version
 /// of someone's decisions on screen, which is worse than a pause.
+///
+/// So does the renderer, for the same reason one step further back: a preview
+/// this build would no longer produce is not a preview of this photograph
+/// either, and it is the harder case to notice, because nothing about a
+/// wrong-but-plausible thumbnail says it is wrong. A mismatch is simply not
+/// found, and the caller decodes — which is what it already does when no preview
+/// is large enough. Nothing is deleted here; the row is replaced when that image
+/// and level are rebuilt, and [`sweep`] collects the file.
 pub fn covering(
     catalog: &Catalog,
     image_id: i64,
     needed: u32,
     edit_state_hash: &str,
+    renderer: &str,
 ) -> Result<Option<Preview>, CatalogError> {
     let row = catalog
         .connection()
         .query_row(
-            "SELECT level, path, edit_state_hash, width, height, bytes
+            "SELECT level, path, edit_state_hash, renderer, width, height, bytes
                FROM previews
-              WHERE image_id = ?1 AND edit_state_hash = ?2 AND max(width, height) >= ?3
+              WHERE image_id = ?1 AND edit_state_hash = ?2 AND renderer = ?3
+                AND max(width, height) >= ?4
               ORDER BY max(width, height) ASC
               LIMIT 1",
-            rusqlite::params![image_id, edit_state_hash, needed],
+            rusqlite::params![image_id, edit_state_hash, renderer, needed],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(3)?,
                     r.get::<_, i64>(4)?,
                     r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
                 ))
             },
         )
         .ok();
-    let Some((level, path, hash, width, height, bytes)) = row else {
+    let Some((level, path, hash, renderer, width, height, bytes)) = row else {
         return Ok(None);
     };
     Ok(Some(Preview {
         level: Level::parse(&level)?,
         path,
         edit_state_hash: hash,
+        renderer,
         width: width as u32,
         height: height as u32,
         bytes: bytes as u64,
@@ -245,7 +265,17 @@ pub struct Wanted {
 /// Stale and absent are the same answer on purpose: a preview of an edit nobody
 /// is looking at any more is not a preview of this photograph, and treating it
 /// as one is how a grid shows a version of a picture that no longer exists.
-pub fn outstanding(catalog: &Catalog, levels: &[Level]) -> Result<Vec<Wanted>, CatalogError> {
+///
+/// `renderer` has to match for the same reason, and this is the half that is
+/// easy to leave out. [`covering`] declining a preview only stops it being
+/// *shown*; if the builder does not also consider it stale then it is never
+/// replaced, and the library ends up in the worst of both states — previews on
+/// disk that nothing will ever use, and a decode on every photograph, for good.
+pub fn outstanding(
+    catalog: &Catalog,
+    levels: &[Level],
+    renderer: &str,
+) -> Result<Vec<Wanted>, CatalogError> {
     let mut wanted = Vec::new();
     for image in crate::cull::sequence(catalog)? {
         // The edit the photograph currently has — the stored one, or as shot.
@@ -257,7 +287,8 @@ pub fn outstanding(catalog: &Catalog, levels: &[Level]) -> Result<Vec<Wanted>, C
         let mut missing = Vec::new();
         for &level in levels {
             match lookup(catalog, image.id, level)? {
-                Some(existing) if existing.edit_state_hash == hash => {}
+                Some(existing)
+                    if existing.edit_state_hash == hash && existing.renderer == renderer => {}
                 _ => missing.push(level),
             }
         }
@@ -366,11 +397,16 @@ mod tests {
         catalog
     }
 
+    /// The build these fixtures pretend rendered with. Any string works; what
+    /// matters is that a *different* one is not offered.
+    const BUILD: &str = "engine-1/libraw-1";
+
     fn sample(hash: &str) -> Preview {
         Preview {
             level: Level::Thumb,
             path: "00/1-thumb-abc.jpg".into(),
             edit_state_hash: hash.into(),
+            renderer: BUILD.into(),
             width: 256,
             height: 171,
             bytes: 9_000,
@@ -420,7 +456,9 @@ mod tests {
             .unwrap();
         }
         assert!(
-            outstanding(&catalog, Level::BULK).unwrap().is_empty(),
+            outstanding(&catalog, Level::BULK, BUILD)
+                .unwrap()
+                .is_empty(),
             "everything is current"
         );
 
@@ -433,7 +471,7 @@ mod tests {
         };
         crate::edits::save(&catalog, id, &edited, rawkit_editstate::EditSource::User).unwrap();
 
-        let work = outstanding(&catalog, Level::BULK).unwrap();
+        let work = outstanding(&catalog, Level::BULK, BUILD).unwrap();
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].missing, Level::BULK, "all three, not just one");
         assert_eq!(work[0].edit_state_hash, edited.content_hash());
@@ -443,7 +481,7 @@ mod tests {
     fn an_unpreviewed_library_is_entirely_outstanding() {
         let dir = tempdir();
         let catalog = library(&dir, &["a.ARW", "b.ARW", "c.ARW"]);
-        let work = outstanding(&catalog, Level::BULK).unwrap();
+        let work = outstanding(&catalog, Level::BULK, BUILD).unwrap();
         assert_eq!(work.len(), 3);
         assert!(work.iter().all(|w| w.missing.len() == 3));
         // As shot, because none of them has been edited.
@@ -476,7 +514,7 @@ mod tests {
         }
 
         let pick = |needed| {
-            covering(&catalog, id, needed, &hash)
+            covering(&catalog, id, needed, &hash, BUILD)
                 .unwrap()
                 .map(|p| p.level)
         };
@@ -511,10 +549,71 @@ mod tests {
         )
         .unwrap();
         let now = EditState::default().content_hash();
-        assert!(covering(&catalog, id, 100, &now).unwrap().is_none());
-        assert!(covering(&catalog, id, 100, "an older edit")
+        assert!(covering(&catalog, id, 100, &now, BUILD).unwrap().is_none());
+        assert!(covering(&catalog, id, 100, "an older edit", BUILD)
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn a_preview_from_another_build_is_not_offered() {
+        // The harder half of the same idea. A preview of the wrong *edit* is at
+        // least a picture somebody once asked for; a preview from a build whose
+        // renderer has since changed is a picture nothing would produce now, and
+        // there is nothing about it on screen to say so.
+        let dir = tempdir();
+        let catalog = library(&dir, &["a.ARW"]);
+        let id = crate::cull::sequence(&catalog).unwrap()[0].id;
+        let hash = EditState::default().content_hash();
+        record(
+            &catalog,
+            id,
+            &Preview {
+                level: Level::Small,
+                width: 1024,
+                height: 684,
+                edit_state_hash: hash.clone(),
+                renderer: "an older engine".into(),
+                ..sample("")
+            },
+        )
+        .unwrap();
+
+        assert!(
+            covering(&catalog, id, 100, &hash, BUILD).unwrap().is_none(),
+            "the edit matches and the renderer does not, which is still stale"
+        );
+        assert!(
+            covering(&catalog, id, 100, &hash, "an older engine")
+                .unwrap()
+                .is_some(),
+            "and the build that made it would still be offered it"
+        );
+    }
+
+    #[test]
+    fn a_preview_from_before_the_column_existed_is_never_offered() {
+        // Migration 5 defaults existing rows to the empty string, which is not a
+        // version any build produces — so a library upgraded into this scheme
+        // rebuilds rather than trusting previews whose provenance is unknown.
+        let dir = tempdir();
+        let catalog = library(&dir, &["a.ARW"]);
+        let id = crate::cull::sequence(&catalog).unwrap()[0].id;
+        let hash = EditState::default().content_hash();
+        record(
+            &catalog,
+            id,
+            &Preview {
+                level: Level::Small,
+                width: 1024,
+                height: 684,
+                edit_state_hash: hash.clone(),
+                renderer: String::new(),
+                ..sample("")
+            },
+        )
+        .unwrap();
+        assert!(covering(&catalog, id, 100, &hash, BUILD).unwrap().is_none());
     }
 
     #[test]
@@ -526,7 +625,7 @@ mod tests {
             .connection()
             .execute("UPDATE files SET missing = 1 WHERE filename = 'b.ARW'", [])
             .unwrap();
-        let work = outstanding(&catalog, Level::BULK).unwrap();
+        let work = outstanding(&catalog, Level::BULK, BUILD).unwrap();
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].filename, "a.ARW");
     }
