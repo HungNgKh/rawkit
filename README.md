@@ -121,7 +121,16 @@ cargo deny check                           # licence audit (cargo install cargo-
 # extension: .jpg, .png, or .ppm for an unmanaged look at intermediate results.
 cargo run --release -p rawkit-cli -- render photo.ARW -o out.jpg
 cargo run --release -p rawkit-cli -- render photo.ARW -o out.jpg --profile camera.dcp
+
+# Sized exactly, with output sharpening to answer what the resize took away.
+# `--max-dim 0` writes full resolution; nothing is ever enlarged.
+cargo run --release -p rawkit-cli -- render photo.ARW -o out.jpg \
+    --max-dim 2000 --output-sharpen standard
 ```
+
+`--output-sharpen` is not `--sharpen`. The latter is capture sharpening, which
+belongs to the photograph and is stored with its edit; this one belongs to the
+file, because the right amount depends on the size being written.
 
 The decode tests want a RAW file, which is large and not redistributable, so
 they read from `~/rawkit-fixtures` (or `$RAWKIT_FIXTURES`) and fail loudly when

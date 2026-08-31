@@ -30,6 +30,7 @@ pub mod preview;
 pub mod profile;
 pub mod render;
 pub mod resize;
+pub mod sharpen;
 mod tone;
 
 /// A digest of every source file in this crate, computed at build time.

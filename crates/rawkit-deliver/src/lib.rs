@@ -43,6 +43,10 @@ use rawkit_catalog::cull::{self, Flag};
 use rawkit_catalog::db::Catalog;
 use rawkit_editstate::EditState;
 use rawkit_engine::{render::DEFAULT_TILE, BayerPhase, Frame, Gpu, Output, Renderer};
+
+/// Re-exported so a caller configuring an export does not also have to name the
+/// engine: the setting is part of this crate's vocabulary, not the renderer's.
+pub use rawkit_engine::sharpen::OutputSharpening;
 use std::path::Path;
 
 /// Quality for a delivered file. Higher than a preview's 85: this one is looked
@@ -165,13 +169,45 @@ pub fn gather(catalog: &Catalog, selection: Selection) -> Result<Vec<Chosen>> {
     Ok(chosen)
 }
 
+/// The terms an export runs under: what the files look like, and what the run
+/// is allowed to do.
+///
+/// A struct rather than five more positional arguments, two of which are bare
+/// integers and two of which are bare booleans — an order a caller can get
+/// wrong without the compiler noticing.
+#[derive(Debug, Clone, Copy)]
+pub struct Delivery {
+    /// Longest edge in pixels, hit exactly. 0 writes full resolution, and
+    /// nothing is ever enlarged.
+    pub max_dim: u32,
+    /// How much sharpening the *file* gets, over and above the capture
+    /// sharpening stored with the edit. See [`OutputSharpening`] for why this
+    /// lives here and not in the `EditState`.
+    pub sharpening: OutputSharpening,
+    /// Replace files that are already there.
+    pub overwrite: bool,
+    /// How many photographs to render at once.
+    pub jobs: usize,
+}
+
+impl Default for Delivery {
+    fn default() -> Self {
+        Self {
+            // Full resolution, unsharpened, refusing to overwrite: the three
+            // choices that lose nothing the caller did not ask to lose.
+            max_dim: 0,
+            sharpening: OutputSharpening::None,
+            overwrite: false,
+            jobs: 1,
+        }
+    }
+}
+
 /// Render and write what [`gather`] chose. Touches no catalog.
 pub fn write(
     chosen: &[Chosen],
     to: &Destination,
-    max_dim: u32,
-    overwrite: bool,
-    jobs: usize,
+    delivery: Delivery,
     mut progress: impl FnMut(usize, usize, &str),
 ) -> Result<ExportReport> {
     if let (Destination::File(path), false) = (to, chosen.len() == 1) {
@@ -194,7 +230,7 @@ pub fn write(
     // and results come back on a channel so one thread does the reporting.
     let next = std::sync::atomic::AtomicUsize::new(0);
     let (sender, receiver) = std::sync::mpsc::channel();
-    let workers = jobs.max(1).min(chosen.len());
+    let workers = delivery.jobs.max(1).min(chosen.len());
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -220,7 +256,7 @@ pub fn write(
                     )),
                     Destination::File(path) => path.clone(),
                 };
-                let outcome = if destination.exists() && !overwrite {
+                let outcome = if destination.exists() && !delivery.overwrite {
                     Ok(None)
                 } else {
                     one(
@@ -229,7 +265,7 @@ pub fn write(
                         Path::new(&image.path),
                         state,
                         profile.clone(),
-                        max_dim,
+                        delivery,
                         &destination,
                     )
                     .map(Some)
@@ -264,31 +300,26 @@ pub fn export(
     catalog: &Catalog,
     selection: Selection,
     to: &Path,
-    max_dim: u32,
-    overwrite: bool,
-    jobs: usize,
+    delivery: Delivery,
     progress: impl FnMut(usize, usize, &str),
 ) -> Result<ExportReport> {
     let chosen = gather(catalog, selection)?;
     write(
         &chosen,
         &Destination::Folder(to.to_path_buf()),
-        max_dim,
-        overwrite,
-        jobs,
+        delivery,
         progress,
     )
 }
 
 /// Decode, render with the stored edit, and write one file.
-#[allow(clippy::too_many_arguments)]
 fn one(
     gpu: &Gpu,
     renderer: &Renderer,
     raw_path: &Path,
     state: &EditState,
     profile: Option<rawkit_engine::CameraProfile>,
-    max_dim: u32,
+    delivery: Delivery,
     destination: &Path,
 ) -> Result<u64> {
     let raw = rawkit_decode::decode_file(raw_path)
@@ -316,13 +347,18 @@ fn one(
     // The *developed* size, not the sensor's: a cropped frame that asked for a
     // 2000-pixel edge would otherwise be scaled by the factor its uncropped
     // version needed, and come out smaller than requested.
-    let step = rawkit_engine::resize::downsample_step(developed.width, developed.height, max_dim);
-    let (scaled, width, height) = rawkit_engine::resize::downsample(
+    let (width, height) =
+        rawkit_engine::resize::fit(developed.width, developed.height, delivery.max_dim);
+    let mut scaled = rawkit_engine::resize::resample(
         &developed.pixels,
         developed.width,
         developed.height,
-        step,
+        width,
+        height,
     );
+    // After the resize and never before it: sharpening detail that is about to
+    // be thrown away costs time and leaves the halo without the edge.
+    rawkit_engine::sharpen::sharpen(&mut scaled, width, height, delivery.sharpening);
     let bytes = rawkit_export::encode(
         &scaled,
         width,
@@ -388,9 +424,7 @@ mod tests {
         let refused = write(
             &chosen,
             &Destination::File(std::path::PathBuf::from("/nowhere/one.jpg")),
-            0,
-            false,
-            1,
+            Delivery::default(),
             |_, _, _| {},
         )
         .expect_err("two photographs asked to become one file");

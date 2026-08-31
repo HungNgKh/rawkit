@@ -11,7 +11,17 @@ mod render;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use rawkit_catalog::previews::Level as PreviewLevel;
+use rawkit_engine::sharpen::OutputSharpening;
 use std::path::PathBuf;
+
+/// Clap cannot parse an enum it has never heard of, and a bare string argument
+/// would push the mistake past the parser and into the export.
+fn parse_sharpening(name: &str) -> Result<OutputSharpening, String> {
+    OutputSharpening::parse(name).ok_or_else(|| {
+        let names: Vec<&str> = OutputSharpening::ALL.iter().map(|s| s.as_str()).collect();
+        format!("expected one of {}", names.join(", "))
+    })
+}
 
 #[derive(Parser)]
 #[command(name = "rawkit", version, about = "RAW editor — headless tools")]
@@ -72,10 +82,20 @@ enum Command {
         /// Where to write the image. The extension picks the format.
         #[arg(short, long, default_value = "render.ppm")]
         output: PathBuf,
-        /// Box-downsample so the longest edge is at most this many pixels.
-        /// 0 writes full resolution, which for a 24 MP sensor is a 72 MB file.
+        /// Resample so the longest edge is exactly this many pixels. 0 writes
+        /// full resolution, which for a 24 MP sensor is a 72 MB file. Never
+        /// enlarges: an image already smaller than this is written as it is.
         #[arg(long, default_value_t = 2000)]
         max_dim: u32,
+        /// Output sharpening, to answer what the resize took away: `none`,
+        /// `low`, `standard` or `high`. Off by default — a file that was not
+        /// resized has lost nothing to restore.
+        ///
+        /// Not `--sharpen`, which is the *capture* sharpening stored with the
+        /// edit. Two different passes at two different ends of the pipeline;
+        /// see the `sharpen` module in the engine for which is which.
+        #[arg(long, default_value = "none", value_parser = parse_sharpening)]
+        output_sharpen: OutputSharpening,
         /// Tile edge in pixels. Exposed for benchmarking and for proving that
         /// the choice does not change the output.
         #[arg(long, default_value_t = rawkit_engine::render::DEFAULT_TILE)]
@@ -115,10 +135,19 @@ enum Command {
         /// Everything in the library.
         #[arg(long, conflicts_with_all = ["picks", "rated", "image"])]
         all: bool,
-        /// Longest edge in pixels. 0 writes full resolution, which is what an
-        /// export usually wants.
+        /// Longest edge in pixels, hit exactly. 0 writes full resolution, which
+        /// is what an export usually wants. Never enlarges.
         #[arg(long, default_value_t = 0)]
         max_dim: u32,
+        /// Output sharpening, to answer what the resize took away: `none`,
+        /// `low`, `standard` or `high`. Off by default — a file that was not
+        /// resized has lost nothing to restore.
+        ///
+        /// Not `--sharpen`, which is the *capture* sharpening stored with the
+        /// edit. Two different passes at two different ends of the pipeline;
+        /// see the `sharpen` module in the engine for which is which.
+        #[arg(long, default_value = "none", value_parser = parse_sharpening)]
+        output_sharpen: OutputSharpening,
         /// Replace files that are already there. Off by default: an export is
         /// the one thing here that writes outside the catalog's own directory.
         #[arg(long)]
@@ -254,6 +283,7 @@ fn main() -> Result<()> {
             input,
             output,
             max_dim,
+            output_sharpen,
             tile,
             profile,
             edit,
@@ -261,6 +291,7 @@ fn main() -> Result<()> {
             &input,
             &output,
             max_dim,
+            output_sharpen,
             tile,
             profile.as_deref(),
             &edit.state()?,
@@ -391,6 +422,7 @@ fn main() -> Result<()> {
             image,
             all,
             max_dim,
+            output_sharpen,
             overwrite,
             jobs,
         } => {
@@ -414,9 +446,12 @@ fn main() -> Result<()> {
                 &catalog,
                 selection,
                 &to,
-                max_dim,
-                overwrite,
-                jobs,
+                rawkit_deliver::Delivery {
+                    max_dim,
+                    sharpening: output_sharpen,
+                    overwrite,
+                    jobs,
+                },
                 |done, total, name| {
                     if done != last {
                         last = done;

@@ -24,13 +24,16 @@
 
 use anyhow::{bail, Context, Result};
 use rawkit_editstate::EditState;
+use rawkit_engine::sharpen::OutputSharpening;
 use rawkit_engine::{normalise, BayerPhase, CameraProfile, Frame, Gpu, Output, Renderer};
 use std::path::Path;
 
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     input: &Path,
     output: &Path,
     max_dim: u32,
+    sharpening: OutputSharpening,
     tile: u32,
     profile_path: Option<&Path>,
     state: &EditState,
@@ -160,13 +163,17 @@ pub fn render(
         );
     }
 
-    let step = rawkit_engine::resize::downsample_step(developed.width, developed.height, max_dim);
-    let (scaled, out_w, out_h) = rawkit_engine::resize::downsample(
+    let (out_w, out_h) = rawkit_engine::resize::fit(developed.width, developed.height, max_dim);
+    let mut scaled = rawkit_engine::resize::resample(
         &developed.pixels,
         developed.width,
         developed.height,
-        step,
+        out_w,
+        out_h,
     );
+    // After the resize and never before it: sharpening what is about to be
+    // thrown away costs time and produces the halo without the detail.
+    rawkit_engine::sharpen::sharpen(&mut scaled, out_w, out_h, sharpening);
     write_image(output, &scaled, out_w, out_h)?;
     eprintln!("wrote      : {} ({out_w}x{out_h})", output.display());
     Ok(())
