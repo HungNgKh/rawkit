@@ -94,7 +94,7 @@ impl BayerPhase {
     /// The offset that makes the kernel's RGGB reasoning land on this layout.
     /// One kernel, four patterns — a per-pattern kernel would be four places for
     /// the same bug to hide.
-    fn offset(self) -> (u32, u32) {
+    pub(crate) fn offset(self) -> (u32, u32) {
         match self {
             BayerPhase::Rggb => (0, 0),
             BayerPhase::Bggr => (1, 1),
@@ -282,6 +282,16 @@ struct Params {
     hsl_hue: [[f32; 4]; 2],
     hsl_saturation: [[f32; 4]; 2],
     hsl_luminance: [[f32; 4]; 2],
+    /// The local-tone guide: `[start in the cfa buffer, width, height, active]`.
+    ///
+    /// It rides in the tail of the `cfa` binding because group 0 already spends
+    /// all eight storage buffers WebGPU guarantees on its default limits — the
+    /// same reason `pq` and `lp` share one. Read-only and written once when the
+    /// image opens, so sharing costs a longer buffer and nothing else.
+    guide: [u32; 4],
+    /// Guide texels per image pixel, `[x, y]`. A constant of the image; `.zw`
+    /// unused.
+    guide_scale: [f32; 4],
     /// `[dest_x, dest_y, tile, halo]`. Rewritten per tile; everything above it
     /// moves only when the edit does, which is why this sits last and is
     /// patched in place rather than re-uploading the whole uniform.
@@ -295,6 +305,15 @@ struct Params {
     /// along the tile's x and y axes lands on the canvas. Identity when the
     /// photograph is not turned. Written with `present`, since both are per-tile.
     axes: [i32; 4],
+    /// `[image_x, image_y, step, halo]` — where this tile's first interior
+    /// pixel sits in the *full-resolution* image, and how many image pixels one
+    /// tile pixel spans at this level.
+    ///
+    /// The guide is indexed through this rather than through tile coordinates,
+    /// which is what makes two tiles agree where they meet and a tile at level 3
+    /// read the same guide as the same region at level 0. Written per tile, and
+    /// by both render paths — unlike `present`, which only the canvas needs.
+    source: [i32; 4],
 }
 
 /// One control across all eight bands, in `Band::ALL` order, laid out the way a
@@ -320,6 +339,13 @@ fn pack_bands(
 /// writes a tile's position over somebody else's uniform — which shows up as a
 /// wrong-looking picture, not as an error.
 const PRESENT_OFFSET: u64 = std::mem::offset_of!(Params, present) as u64;
+
+/// Byte offset of `Params::source`, for the same reason and by the same route.
+///
+/// Written separately from the `present` block because the whole-image path
+/// needs this one and not that one: an export has no canvas to place a tile on,
+/// and it still has to tell the guide where the tile is.
+const SOURCE_OFFSET: u64 = std::mem::offset_of!(Params, source) as u64;
 
 /// Where the two buffers are looking, for [`Renderer::straighten`].
 ///
@@ -692,7 +718,21 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let cfa = plane("cfa", px, wgpu::BufferUsages::COPY_DST);
+        // The tile's mosaic, and behind it the local-tone guide. One buffer
+        // because the eight storage bindings are all spent; see `Params::guide`.
+        // Capacity is a constant rather than this image's size, so the
+        // allocation does not depend on what was opened.
+        let cfa = plane(
+            "cfa+guide",
+            px + crate::guide::CAPACITY,
+            wgpu::BufferUsages::COPY_DST,
+        );
+        let guide = crate::guide::Guide::build(image.data, image.width, image.height, image.phase);
+        gpu.queue.write_buffer(
+            &cfa,
+            (px * std::mem::size_of::<f32>()) as u64,
+            bytemuck::cast_slice(&guide.data),
+        );
         let vh = plane("vh", px, wgpu::BufferUsages::empty());
         // `pq` and `lp` share one buffer: WebGPU guarantees only eight storage
         // buffers per shader stage, and the develop stage needs one for the
@@ -753,6 +793,12 @@ impl Renderer {
             padded,
             out_size,
             table_cells,
+            guide_offset: px,
+            guide_size: [guide.width, guide.height],
+            guide_scale: [
+                guide.width as f32 / image.width.max(1) as f32,
+                guide.height as f32 / image.height.max(1) as f32,
+            ],
             scratch: std::cell::RefCell::new(vec![0.0; px]),
             _held: vec![vh, helpers, ch_r, ch_g, ch_b],
         }
@@ -803,6 +849,7 @@ impl Renderer {
                     intent,
                     ox,
                     oy,
+                    1,
                 )?;
                 // Copy the interior only. The halo exists to make the interior
                 // correct and is discarded.
@@ -876,7 +923,7 @@ impl Renderer {
         // level, fewer pixels. That is what makes a level render the ordinary
         // render rather than a second code path — and why nothing about the
         // frame's colour needs restating here. It went to the GPU with the edit.
-        let padded = self.render_at(gpu, buffers, data, lw, lh, intent, ox, oy)?;
+        let padded = self.render_at(gpu, buffers, data, lw, lh, intent, ox, oy, 1 << level)?;
 
         let t = self.tile as usize;
         let stride = buffers.padded as usize;
@@ -900,6 +947,7 @@ impl Renderer {
         intent: Output,
         ox: u32,
         oy: u32,
+        step: u32,
     ) -> Result<Vec<f32>, EngineError> {
         {
             let mut scratch = buffers.scratch.borrow_mut();
@@ -907,6 +955,20 @@ impl Renderer {
             gpu.queue
                 .write_buffer(&buffers.cfa, 0, bytemuck::cast_slice(&scratch));
         }
+        // Where this tile is, in the full-resolution image. The guide is
+        // indexed by that and not by the tile, so a coarse level reads the same
+        // neighbourhood as a fine one covering the same ground.
+        let source: [i32; 4] = [
+            (ox * step) as i32,
+            (oy * step) as i32,
+            step as i32,
+            HALO as i32,
+        ];
+        gpu.queue.write_buffer(
+            &buffers.params,
+            SOURCE_OFFSET,
+            bytemuck::cast_slice(&source),
+        );
 
         let mut encoder = gpu
             .device
@@ -1142,7 +1204,8 @@ impl Renderer {
         // before the dispatch that reads it.
         // Everything the present pass needs, written as one patch at the tail of
         // the uniform: where the tile goes, and how much of it is real.
-        let tail: [i32; 12] = [
+        let step = 1i32 << level;
+        let tail: [i32; 16] = [
             dest[0],
             dest[1],
             self.tile as i32,
@@ -1155,6 +1218,12 @@ impl Renderer {
             axes[0][1],
             axes[1][0],
             axes[1][1],
+            // `source`: this tile's place in the full-resolution image, which
+            // is the coordinate the guide is indexed in.
+            ox as i32 * step,
+            oy as i32 * step,
+            step,
+            HALO as i32,
         ];
         gpu.queue
             .write_buffer(&buffers.params, PRESENT_OFFSET, bytemuck::cast_slice(&tail));
@@ -1285,6 +1354,22 @@ impl Renderer {
             hsl_hue: pack_bands(&state.hsl, |mix| mix.hue),
             hsl_saturation: pack_bands(&state.hsl, |mix| mix.saturation),
             hsl_luminance: pack_bands(&state.hsl, |mix| mix.luminance),
+            guide: [
+                buffers.guide_offset as u32,
+                buffers.guide_size[0],
+                buffers.guide_size[1],
+                // Off unless a local control is actually asking for it. The
+                // guide costs a develop per pixel, and a photograph whose
+                // highlights and shadows are at zero should not pay for a
+                // neighbourhood nothing consults — nor differ by one bit from a
+                // build that never had this.
+                u32::from(tone.active && (tone.highlights != 0.0 || tone.shadows != 0.0)),
+            ],
+            guide_scale: [buffers.guide_scale[0], buffers.guide_scale[1], 0.0, 0.0],
+            // Per-tile, and rewritten by both render paths before the develop
+            // stage reads it. Level zero at the origin, with the halo, is what
+            // a single-tile whole-image render would want if nobody wrote it.
+            source: [0, 0, 1, HALO as i32],
             // Per-tile, and rewritten before every present. The value here only
             // has to be something valid for the whole-image path, which never
             // rotates in the shader — geometry is applied to the finished frame.
@@ -1397,6 +1482,15 @@ pub struct TileBuffers {
     padded: u32,
     out_size: u64,
     table_cells: usize,
+    /// Where the guide starts in `cfa`, in floats, and how big it is.
+    ///
+    /// Fixed when the image opens: the guide is the camera's own RGB, which no
+    /// edit changes. A slider move rewrites the uniform and not this.
+    guide_offset: usize,
+    guide_size: [u32; 2],
+    /// Guide texels per image pixel. Carried rather than recomputed so the
+    /// uniform and the buffer can never describe different mappings.
+    guide_scale: [f32; 2],
     /// CPU staging for the gather. Interior-mutable so that rendering a tile
     /// takes `&self`: the canvas holds one set of buffers and draws from a
     /// shared reference.

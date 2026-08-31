@@ -23,6 +23,11 @@
 //! # Bless workflow
 //!
 //! `RAWKIT_BLESS=1 cargo test -p rawkit-engine --test golden -- --ignored`
+//!
+//! Before blessing anything, run it with `RAWKIT_COMPARE=1` — it prints how the
+//! mean level and the surviving texture move for each reference, which is the
+//! difference between a change you meant and a stage that has quietly stopped
+//! working.
 //! writes the references instead of comparing. Blessing is a deliberate act:
 //! the diff is the review, and a reference that changes without anyone looking
 //! at the picture is not a reference.
@@ -274,6 +279,47 @@ fn renders_match_the_committed_references() {
                 actual.len()
             )),
             Some(expected) => {
+                // What moved, when something has. A reference that diverges
+                // says only that it diverged; blessing it is a decision, and
+                // this is the evidence for it — the mean level and how much
+                // texture survives, which between them separate "the change is
+                // what was intended" from "something is now flatter".
+                //
+                // Behind a variable because a passing run should say nothing.
+                if std::env::var_os("RAWKIT_COMPARE").is_some() {
+                    let stats = |v: &[u16]| {
+                        let side = N as usize;
+                        let lum: Vec<f64> = v
+                            .chunks_exact(3)
+                            .map(|p| {
+                                0.2126 * p[0] as f64 + 0.7152 * p[1] as f64 + 0.0722 * p[2] as f64
+                            })
+                            .collect();
+                        let mean = lum.iter().sum::<f64>() / lum.len() as f64;
+                        let mut d = 0.0;
+                        let mut n = 0.0;
+                        for y in 1..side - 1 {
+                            for x in 1..side - 1 {
+                                let c = lum[y * side + x];
+                                d += (4.0 * c
+                                    - lum[y * side + x - 1]
+                                    - lum[y * side + x + 1]
+                                    - lum[(y - 1) * side + x]
+                                    - lum[(y + 1) * side + x])
+                                    .abs();
+                                n += 1.0;
+                            }
+                        }
+                        (mean, d / n)
+                    };
+                    let (om, od) = stats(&expected);
+                    let (nm, nd) = stats(&actual);
+                    println!(
+                        "    {}: mean {om:.0} -> {nm:.0}, texture {od:.1} -> {nd:.1} ({:+.0}%)",
+                        case.name,
+                        100.0 * (nd / od - 1.0)
+                    );
+                }
                 let mut worst = 0u16;
                 let mut worst_at = 0usize;
                 for (i, (a, b)) in actual.iter().zip(&expected).enumerate() {

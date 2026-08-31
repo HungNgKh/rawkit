@@ -33,6 +33,14 @@
 //!   at the pivot*. The obvious version — a plain power on the upper segment —
 //!   leaves a slope discontinuity in the middle of the frame, which shows up in
 //!   a smooth sky as a band. The taper costs one multiply and removes it.
+//!
+//!   They are also the two controls that are **spatially adaptive**: the
+//!   exponent is chosen from the pixel's neighbourhood rather than from the
+//!   pixel, and applied as a gain. The parameters below are the same either
+//!   way — what changes is the value they are keyed on, which is resolved in
+//!   the shader from [`crate::guide`]. Nothing in this module knows about it,
+//!   deliberately: the curve's shape and where it is sampled are separate
+//!   questions, and only the second one needs a picture.
 //! - **Whites and blacks** are a black point and a white point, and they
 //!   **clip**. That is deliberate: nothing else in the pipeline clips, and the
 //!   tone map is asymptotic precisely so that it does not — but an editor whose

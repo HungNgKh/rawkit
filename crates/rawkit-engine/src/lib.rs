@@ -24,6 +24,7 @@
 use rawkit_editstate::EditState;
 
 pub mod geometry;
+pub mod guide;
 pub mod pipeline;
 pub mod present;
 pub mod preview;

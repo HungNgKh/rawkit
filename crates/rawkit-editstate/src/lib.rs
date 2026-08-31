@@ -188,7 +188,17 @@ pub struct Tone {
     /// Stops. Positive brightens.
     pub exposure_ev: f32,
     pub contrast: f32,
+    /// Negative recovers, positive lifts.
+    ///
+    /// **Spatially adaptive**: which part of the curve a pixel gets is decided
+    /// by how bright its *neighbourhood* is, not by its own value, and the
+    /// result is applied as a gain so local contrast survives. Recovering a sky
+    /// therefore leaves a face at the same brightness alone. The neighbourhood
+    /// comes from `rawkit_engine::guide`, and the trade-off it makes is written
+    /// down there.
     pub highlights: f32,
+    /// Positive lifts, negative deepens. Spatially adaptive; see
+    /// [`Tone::highlights`].
     pub shadows: f32,
     pub whites: f32,
     pub blacks: f32,
