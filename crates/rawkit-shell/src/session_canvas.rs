@@ -144,6 +144,22 @@ impl CanvasRenderer {
         Ok(self.renderer.run(gpu, &level, state, Output::Display)?)
     }
 
+    /// Measure the lens's lateral chromatic aberration on this frame.
+    ///
+    /// Full resolution and not the pyramid, which is the one thing this does
+    /// differently from [`CanvasRenderer::survey`] beside it. A survey wants a
+    /// histogram, and a histogram of a reduced frame is the same histogram; this
+    /// wants a hundredth of a pixel, and reducing the frame halves that while
+    /// leaving the sensor noise where it was. So it costs a whole render, which
+    /// is why it happens when somebody presses a button rather than on open.
+    pub fn measure_lens(&self, gpu: &Gpu, frame: &Frame<'_>) -> Result<rawkit_editstate::Lens> {
+        Ok(rawkit_engine::aberration::measure(
+            gpu,
+            &self.renderer,
+            frame,
+        )?)
+    }
+
     pub fn canvas(&self) -> &Canvas {
         &self.canvas
     }

@@ -120,6 +120,10 @@ struct Params {
     // One over the image's size, `.xy`: image pixels to the normalised
     // coordinates a mask texture is sampled in.
     mask_scale: vec4<f32>,
+    // Lateral chromatic aberration: `.xy` are the radial rescalings for red and
+    // blue as fractions, `.zw` the optical centre in full-resolution image
+    // pixels. Zero in `.xy` is a lens with nothing to correct.
+    lateral: vec4<f32>,
     // What each local adjustment multiplies by at full strength, `.rgb`.
     //
     // Exposure and white balance arrive already combined, because both are
@@ -520,11 +524,57 @@ fn pack(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let p = idx(x, y);
     rgba_out[p] = vec4<f32>(
-        ch_r[p] / params.wb.r,
+        lateral_sample(0u, x, y, params.lateral.x) / params.wb.r,
         ch_g[p] / params.wb.g,
-        ch_b[p] / params.wb.b,
+        lateral_sample(2u, x, y, params.lateral.y) / params.wb.b,
         1.0,
     );
+}
+
+/// One channel of the demosaiced tile, read from where the lens actually put it.
+///
+/// Lateral chromatic aberration is a *scale* difference: red and blue land as
+/// images of slightly different size about the optical axis, so undoing it means
+/// sampling them from a radius scaled by the reciprocal amount. Green is left
+/// alone, because green is what the other two are being lined up with.
+///
+/// This is stage `LensCorrection`, and it happens here rather than anywhere
+/// later for a reason that outlives the arithmetic: after the white balance
+/// multiply the three channels are still separable, but one matrix multiply
+/// after that they are mixed, and there is no longer any such thing as
+/// "displace the red channel".
+fn lateral_sample(c: u32, x: i32, y: i32, coefficient: f32) -> f32 {
+    if (coefficient == 0.0) {
+        return select(ch_b[idx(x, y)], ch_r[idx(x, y)], c == 0u);
+    }
+    // The displacement is radial and proportional to the radius, worked out in
+    // *image* pixels so that two tiles agree where they meet and a coarse level
+    // reads the same correction as the same region at level zero -- the same
+    // reason the guide and the masks are indexed through `image_xy`.
+    let offset = image_xy(x, y) - params.lateral.zw;
+    // Back into tile pixels, which is what `ch_r` is indexed in. A level-n tile
+    // spans `source.z` image pixels per tile pixel, so the same fraction of the
+    // radius is a proportionally smaller step here -- which is correct, and is
+    // why a zoomed-out view gets the same correction rather than n times it.
+    let step = f32(max(params.source.z, 1));
+    // Clamped to the halo, and not as a formality: past it the read lands on
+    // demosaic output that the tile edge got wrong, and the failure would look
+    // like a grid at the seams rather than like a bad correction.
+    let reach = f32(params.source.w);
+    let d = clamp(offset * coefficient / step, vec2<f32>(-reach), vec2<f32>(reach));
+
+    let fx = f32(x) + d.x;
+    let fy = f32(y) + d.y;
+    let x0 = i32(floor(fx));
+    let y0 = i32(floor(fy));
+    let tx = fx - f32(x0);
+    let ty = fy - f32(y0);
+    // Bilinear, because the whole signal here is sub-pixel: a nearest read would
+    // quantise a third of a pixel of aberration to nothing or to one whole
+    // pixel, and both are worse than leaving the picture alone.
+    let a = mix(sample_plane(c, x0, y0), sample_plane(c, x0 + 1, y0), tx);
+    let b = mix(sample_plane(c, x0, y0 + 1), sample_plane(c, x0 + 1, y0 + 1), tx);
+    return mix(a, b, ty);
 }
 
 // ---------------------------------------------------------------------------

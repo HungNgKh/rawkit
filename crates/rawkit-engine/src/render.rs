@@ -316,6 +316,15 @@ struct Params {
     /// One over the image's size, `[x, y]`: image pixels to the normalised
     /// coordinates a mask texture is sampled in.
     mask_scale: [f32; 4],
+    /// Lateral chromatic aberration: `[red, blue]` as fractions of the radius,
+    /// and `[x, y]` of the optical centre in full-resolution image pixels.
+    ///
+    /// The centre is carried rather than derived from `mask_scale`, which also
+    /// knows the image's size. Two readings of one number is how they come to
+    /// disagree, and this one has to be exact: a centre half a pixel out puts a
+    /// uniform displacement across the whole frame, which is a shift and not an
+    /// aberration.
+    lateral: [f32; 4],
     /// What each local adjustment multiplies by at full strength.
     ///
     /// Exposure and white balance arrive combined, because both are multiplies
@@ -1702,6 +1711,17 @@ impl Renderer {
                 1.0 / image.height.max(1) as f32,
                 0.0,
                 0.0,
+            ],
+            lateral: [
+                state.lens.chromatic_red,
+                state.lens.chromatic_blue,
+                // The optical centre, taken as the centre of the frame. True of
+                // every fixed lens on every camera this will meet; a shifted
+                // one belongs to tilt-shift and to sensors that crop off-axis,
+                // and guessing at it from the picture is a worse answer than
+                // assuming the obvious.
+                image.width as f32 / 2.0,
+                image.height as f32 / 2.0,
             ],
             mask_gain: {
                 let mut gains = [[1.0f32, 1.0, 1.0, 0.0]; rawkit_editstate::MAX_MASKS];

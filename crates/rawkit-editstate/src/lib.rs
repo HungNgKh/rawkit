@@ -51,6 +51,8 @@ pub enum EditStateError {
     InvalidCrop(String),
     #[error("detail is out of range: {0}")]
     InvalidDetail(String),
+    #[error("lens correction is out of range: {0}")]
+    InvalidLens(String),
     #[error("a local adjustment is not usable: {0}")]
     InvalidMask(String),
     #[error("{0} local adjustments, and {MAX_MASKS} is the most a frame may carry")]
@@ -83,6 +85,8 @@ pub struct EditState {
     #[serde(default)]
     pub detail: Detail,
     #[serde(default)]
+    pub lens: Lens,
+    #[serde(default)]
     pub colour: Colour,
     #[serde(default)]
     pub hsl: Hsl,
@@ -109,6 +113,7 @@ impl Default for EditState {
             crop: Crop::default(),
             masks: Vec::new(),
             detail: Detail::default(),
+            lens: Lens::default(),
             colour: Colour::default(),
             hsl: Hsl::default(),
             curve: Curve::default(),
@@ -146,6 +151,7 @@ impl EditState {
         }
         self.crop.validate()?;
         self.detail.validate()?;
+        self.lens.validate()?;
         if self.masks.len() > MAX_MASKS {
             return Err(EditStateError::TooManyMasks(self.masks.len()));
         }
@@ -724,6 +730,77 @@ impl Detail {
                 "luminance noise reduction is {}, and runs from 0 to 1",
                 self.luminance_noise
             )));
+        }
+        Ok(())
+    }
+}
+
+/// The largest lateral chromatic aberration this build will apply, as a
+/// fraction of the radius.
+///
+/// A fifth of a percent is already ten pixels at the corner of a 24 megapixel
+/// frame, which is far past any lens a photographer would keep. Past it the
+/// number did not come from a lens, and applying it would put fringing into a
+/// picture that did not have any.
+///
+/// It is also what the tile halo can afford: a displacement is a read from a
+/// neighbour, and a read past the halo lands on demosaic output that is wrong
+/// near a tile edge. The engine clamps to the halo as well, so this bound and
+/// that one have to be reconciled rather than merely both true — see
+/// `HALO` in `rawkit-engine`.
+pub const MAX_LATERAL: f32 = 0.002;
+
+/// Lens corrections.
+///
+/// # Why a measurement is stored in the edit
+///
+/// These numbers are measured from the photograph — see `rawkit_engine::aberration`
+/// — and a measurement looks like a fact about the file rather than a decision
+/// about it, which argues for carrying it beside the mosaic instead.
+///
+/// It cannot go there, and the reason is the invariant the engine exists to
+/// protect: *same RAW + same `EditState` -> same pixels*. A measurement made by
+/// a later build, or on a different machine, or from a different resolution
+/// level, need not come back byte-identical — and if the renderer read it from
+/// the frame, the same file and the same edit would quietly render differently.
+/// Storing what was measured makes the render reproducible, the correction
+/// undoable, and the number something a person can see and overrule.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Lens {
+    /// How far red must be rescaled about the optical centre to line up with
+    /// green, as a fraction of the radius.
+    ///
+    /// Operational rather than descriptive: this is what the *renderer*
+    /// multiplies the radius by when sampling red, so a positive value reaches
+    /// further out. Green is the reference because a Bayer sensor has twice as
+    /// much of it, so its edges are the least invented.
+    pub chromatic_red: f32,
+    /// The same, for blue.
+    pub chromatic_blue: f32,
+}
+
+impl Lens {
+    /// Whether this leaves every pixel where it found it.
+    ///
+    /// Exact zeros, not a tolerance. The renderer skips the resampling entirely
+    /// on this, and "close enough to zero to skip" and "small enough not to
+    /// matter" are different questions that would drift apart.
+    pub fn is_identity(&self) -> bool {
+        self.chromatic_red == 0.0 && self.chromatic_blue == 0.0
+    }
+
+    /// Refused rather than clamped, like a sharpening radius and for the same
+    /// reason: a value past the halo does not soften the correction, it reads
+    /// pixels the demosaic got wrong, and the result is a grid at the tile seams
+    /// that nobody would blame on a lens correction.
+    pub fn validate(&self) -> Result<(), EditStateError> {
+        for (name, value) in [("red", self.chromatic_red), ("blue", self.chromatic_blue)] {
+            if !value.is_finite() || value.abs() > MAX_LATERAL {
+                return Err(EditStateError::InvalidLens(format!(
+                    "{name} is scaled by {value}, and the range is +/-{MAX_LATERAL}"
+                )));
+            }
         }
         Ok(())
     }

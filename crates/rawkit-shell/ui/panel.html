@@ -80,6 +80,8 @@
          overflow-wrap: anywhere; }
   #log.refused { color: #e0705f; }
   #keys { color: #7d7d87; font-size: 11px; line-height: 1.7; }
+  .reading { color: #7d7d87; font-size: 11px; margin-top: 8px;
+             font-variant-numeric: tabular-nums; }
   /* `touch-action: none` so a drag on the curve is a drag and not the column
      deciding to scroll underneath it. */
   #wheels { display: flex; gap: 12px; margin: 8px 0 4px; }
@@ -315,6 +317,11 @@
     <label><span>Luma NR</span>
       <input id="luminance_noise" type="range" min="0" max="1" step="0.01" value="0">
       <output id="luminance_noise-value">0.00</output></label>
+    <div class="row">
+      <button id="lens-measure">Fix colour fringing</button>
+      <button id="lens-clear">Clear</button>
+    </div>
+    <div id="lens-reading" class="reading">no lens correction</div>
   </details>
 
   <details id="s-white-balance"><summary>White balance</summary>
@@ -599,7 +606,7 @@
     if (readout) readout.textContent = format(value);
   };
 
-  const sync = state => {
+  const sync = (state, imageSize) => {
     setSlider("exposure", state.tone.exposure_ev, v => Number(v).toFixed(2));
     for (const id of TONE.slice(1)) {
       setSlider(id, state.tone[id], v => Number(v).toFixed(2));
@@ -609,6 +616,19 @@
     setSlider("sharpen_radius", state.detail.sharpen_radius, v => Number(v).toFixed(2));
     setSlider("chroma_noise", state.detail.chroma_noise, v => Number(v).toFixed(2));
     setSlider("luminance_noise", state.detail.luminance_noise, v => Number(v).toFixed(2));
+    // In pixels at the corner rather than as the fraction the edit stores: a
+    // fraction of a radius is not something anyone has intuitions about, and the
+    // pixel is exactly the thing being complained about when this is reached for.
+    {
+      const lens = state.lens || { chromatic_red: 0, chromatic_blue: 0 };
+      const [w, h] = imageSize || [0, 0];
+      const radius = Math.hypot(w, h) / 2;
+      const px = v => `${v * radius >= 0 ? "+" : ""}${(v * radius).toFixed(2)} px`;
+      document.getElementById("lens-reading").textContent =
+        (lens.chromatic_red === 0 && lens.chromatic_blue === 0)
+          ? "no lens correction"
+          : `red ${px(lens.chromatic_red)}, blue ${px(lens.chromatic_blue)} at the corner`;
+    }
     setSlider("saturation", state.colour.saturation, v => Number(v).toFixed(2));
     setSlider("vibrance", state.colour.vibrance, v => Number(v).toFixed(2));
     // The wheels, unless one is being turned — the slider-thumb rule again.
@@ -676,7 +696,7 @@
       seen = s.generation;
       // Reported rather than swallowed. A throw in here is invisible — there is
       // no console to watch — and one lived for a whole slice because of that.
-      try { sync(s.state); } catch (e) { say(`sync: ${e && e.message || e}`); }
+      try { sync(s.state, s.image); } catch (e) { say(`sync: ${e && e.message || e}`); }
     }
     // The panel's width is the shell's answer, not ours: a window too narrow
     // for the width someone chose gets less, and the page finds out here.
@@ -1470,6 +1490,21 @@
       .then(() => { placing = true; say("drag across the photograph to place it"); })
       .catch(say);
   };
+  // Measuring is a whole-frame demosaic, so the button says so and then stops
+  // being pressable. Without that a second click queues a second measurement of
+  // a frame that has not changed, and the first one is what you get anyway.
+  document.getElementById("lens-measure").addEventListener("click", (e) => {
+    e.target.disabled = true;
+    say("measuring the lens…");
+    invoke("measure_lens")
+      .catch(say)
+      .finally(() => { e.target.disabled = false; });
+  });
+  document.getElementById("lens-clear").addEventListener("click", () => {
+    invoke("apply", { command: "set_lens", params: { chromatic_red: 0, chromatic_blue: 0 } })
+      .catch(say);
+  });
+
   document.getElementById("mask-add").addEventListener("click", () => addMask("gradient"));
   document.getElementById("mask-add-radial").addEventListener("click", () => addMask("radial"));
   document.getElementById("mask-add-brush").addEventListener("click", () => addMask("brush"));

@@ -23,6 +23,7 @@
 
 use rawkit_editstate::EditState;
 
+pub mod aberration;
 pub mod geometry;
 pub mod guide;
 pub mod mask;

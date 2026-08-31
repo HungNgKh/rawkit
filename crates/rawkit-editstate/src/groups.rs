@@ -176,7 +176,7 @@ mod tests {
 
         let mut accounted: BTreeSet<String> =
             Group::ALL.iter().map(|g| g.as_str().to_string()).collect();
-        for not_a_look in ["schema_version", "orientation", "crop"] {
+        for not_a_look in ["schema_version", "orientation", "crop", "lens"] {
             accounted.insert(not_a_look.to_string());
         }
 

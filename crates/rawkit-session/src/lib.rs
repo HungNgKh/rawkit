@@ -121,6 +121,14 @@ pub enum Command {
     /// Smooth brightness while sparing edges. Costs detail, unlike the chroma
     /// kind, which is why it is off unless asked for.
     SetLuminanceNoise(f32),
+    /// Correct lateral chromatic aberration by this much, or by nothing.
+    ///
+    /// Carries the measurement rather than asking for one, because measuring
+    /// needs a GPU and a demosaic and the session has neither — see
+    /// `rawkit_engine::aberration::measure`. What arrives here is a number
+    /// somebody can see, undo and overrule, which is the whole reason it is
+    /// stored in the edit instead of re-derived per render.
+    SetLens(rawkit_editstate::Lens),
     /// Every colour equally, and the one that spares the vivid ones.
     SetSaturation(f32),
     SetVibrance(f32),
@@ -228,6 +236,7 @@ impl Command {
             Command::SetSharpen(_) => "set_sharpen",
             Command::SetSharpenRadius(_) => "set_sharpen_radius",
             Command::SetChromaNoise(_) => "set_chroma_noise",
+            Command::SetLens(_) => "set_lens",
             Command::SetLuminanceNoise(_) => "set_luminance_noise",
             Command::SetSaturation(_) => "set_saturation",
             Command::SetVibrance(_) => "set_vibrance",
@@ -310,7 +319,11 @@ impl Command {
             Command::SetGrade { control, .. } => *control != u8::MAX,
             Command::SetMasks { control, .. } => *control != u8::MAX,
 
-            Command::SetOrientation(_)
+            // A measurement arrives whole, once, from a button — never as a
+            // drag. Coalescing it would fold "correct the lens" into whatever
+            // slider the hand happened to be on beforehand.
+            Command::SetLens(_)
+            | Command::SetOrientation(_)
             | Command::SetCrop(_)
             | Command::RotateBy(_)
             | Command::SetEditState(_) => false,
@@ -744,6 +757,13 @@ impl Session {
                 let mut detail = self.state.detail;
                 detail.luminance_noise = amount;
                 self.detail(name, detail)
+            }
+            Command::SetLens(lens) => {
+                if let Err(e) = lens.validate() {
+                    return refused(name, e.to_string());
+                }
+                self.state.lens = lens;
+                self.edit_changed()
             }
 
             Command::SetSaturation(v) => {

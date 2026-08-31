@@ -969,7 +969,8 @@ fn main() -> Result<()> {
             place_mask,
             set_mask,
             set_brush,
-            undo_stroke
+            undo_stroke,
+            measure_lens
         ])
         .setup(move |app| {
             // The surface is created on the main thread because the raw window
@@ -1472,6 +1473,42 @@ fn main() -> Result<()> {
                                 notice(format!("white balance {kelvin:.0} K, tint {tint:.0}"));
                             }
                         },
+                    }
+                }
+
+                // A lens measurement. Here for the same reason the pick is:
+                // it needs the GPU, the renderer and the mosaic together, and
+                // this is the only place the three are in scope.
+                if MEASURE_LENS.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    match showing.raw.as_ref() {
+                        None => notice("no photograph to measure"),
+                        Some(loaded) => {
+                            let began = std::time::Instant::now();
+                            match canvas_renderer.measure_lens(&gpu, &loaded.frame()) {
+                                Err(why) => notice(format!("could not measure: {why}")),
+                                Ok(lens) if lens.is_identity() => notice(
+                                    "no lateral aberration found, and nothing to correct",
+                                ),
+                                Ok(lens) => {
+                                    // In pixels at the corner, because a
+                                    // fraction of a radius is not a quantity
+                                    // anyone has intuitions about and "0.6 px"
+                                    // is exactly the thing being looked at.
+                                    let [w, h] = loaded.size;
+                                    let radius = (w as f32).hypot(h as f32) / 2.0;
+                                    shared
+                                        .lock()
+                                        .expect("session lock")
+                                        .apply(Command::SetLens(lens));
+                                    notice(format!(
+                                        "lens: red {:+.2} px, blue {:+.2} px at the corner ({:.0} ms)",
+                                        lens.chromatic_red * radius,
+                                        lens.chromatic_blue * radius,
+                                        began.elapsed().as_secs_f64() * 1000.0,
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -2304,6 +2341,14 @@ pub(crate) fn picking_wb() -> bool {
 /// canvas position into a rectangle of sensor.
 pub(crate) static WB_PICK: Mutex<Option<[f64; 2]>> = Mutex::new(None);
 
+/// Somebody has asked for the lens to be measured.
+///
+/// A flag rather than a return value, for the same reason the white-balance
+/// pick is one: measuring needs the GPU, the renderer and the mosaic, and the
+/// only place all three meet is the render loop. The panel gets its answer
+/// through the notice line, like the pick does.
+static MEASURE_LENS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Something the shell needs to say, for the page to show once.
 ///
 /// The status line is fed by the events commands return, and a refusal decided
@@ -2637,6 +2682,17 @@ fn undo_stroke(state: tauri::State<'_, Shared>) -> Result<usize, String> {
         control: u8::MAX,
     });
     Ok(left)
+}
+
+/// Measure this photograph's lateral chromatic aberration and correct it.
+///
+/// Asks; it does not answer. The measurement is a whole-frame demosaic and the
+/// render loop is the only place that can run one, so this raises a flag and the
+/// result arrives on the notice line a moment later — which is also what makes
+/// it interruptible by everything else the loop is doing.
+#[tauri::command]
+fn measure_lens() {
+    MEASURE_LENS.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether the next drag on the photograph draws on the selected mask.
