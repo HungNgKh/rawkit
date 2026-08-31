@@ -8,7 +8,7 @@
 //!
 //! `cargo test -p rawkit-engine --test masks -- --ignored`
 
-use rawkit_editstate::{EditState, Mask, MaskShape};
+use rawkit_editstate::{EditState, Mask, MaskShape, Stroke};
 use rawkit_engine::{BayerPhase, CameraProfile, Frame, Gpu, Output, Renderer};
 
 const W: u32 = 512;
@@ -226,7 +226,7 @@ fn two_masks_both_apply_where_they_overlap() {
     };
 
     let one = EditState {
-        masks: vec![top],
+        masks: vec![top.clone()],
         ..EditState::default()
     };
     let both = EditState {
@@ -344,5 +344,59 @@ fn inverting_a_radial_makes_it_a_vignette() {
         at(&spotlight, 6, 6),
         at(&plain, 6, 6),
         "the plain ellipse reached the corner"
+    );
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_painted_stroke_darkens_only_what_it_covers() {
+    // The third mask source, and again nothing in the shader knew about it. A
+    // horizontal stroke across the middle: the row it covers comes down, the
+    // rows above and below are untouched.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    let plain = render(&gpu, &EditState::default());
+    let painted = render(
+        &gpu,
+        &EditState {
+            masks: vec![Mask {
+                shape: MaskShape::Brush {
+                    strokes: vec![Stroke {
+                        points: vec![[0.15, 0.5], [0.85, 0.5]],
+                        radius: 0.05,
+                        erase: false,
+                    }],
+                    feather: 0.4,
+                },
+                exposure_ev: -2.0,
+                ..Mask::default()
+            }],
+            ..EditState::default()
+        },
+    );
+
+    let middle = (luma(&painted, W / 2, H / 2), luma(&plain, W / 2, H / 2));
+    println!("under the stroke {:.4} against {:.4}", middle.0, middle.1);
+    assert!(
+        middle.0 < middle.1 * 0.75,
+        "the stroke did not darken what it covers: {:.4} against {:.4}",
+        middle.0,
+        middle.1
+    );
+    for y in [8, H - 8] {
+        assert_eq!(
+            luma(&painted, W / 2, y),
+            luma(&plain, W / 2, y),
+            "the stroke reached row {y}, which it does not cover"
+        );
+    }
+    // And nothing beyond its ends, which is what says the capsule stops rather
+    // than the whole row being painted.
+    assert_eq!(
+        luma(&painted, 4, H / 2),
+        luma(&plain, 4, H / 2),
+        "the stroke ran off its own end"
     );
 }

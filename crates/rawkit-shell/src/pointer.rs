@@ -16,7 +16,7 @@
 //! scale factor is known rather than passing a scale around.
 
 use crate::{
-    in_crop, in_grid, picking_wb, placing_mask, targeting, Aim, Marquee, CANVAS_CLICK,
+    in_crop, in_grid, picking_wb, placing_mask, targeting, Aim, Marquee, MaskDrag, CANVAS_CLICK,
     CANVAS_MARQUEE, CANVAS_SCROLL, MASK_DRAG, TARGET_AIM, TARGET_RANGE_PX, WB_PICK,
 };
 use rawkit_session::{Command, Session};
@@ -100,7 +100,12 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
             // after it leaves the gradient where it was, which is what makes a
             // mis-click harmless.
             if placing_mask().is_some() && !in_grid() {
-                *MASK_DRAG.lock().expect("mask drag lock") = Some((at, at));
+                *MASK_DRAG.lock().expect("mask drag lock") = Some(MaskDrag {
+                    start: at,
+                    now: at,
+                    trail: vec![at],
+                    fresh: true,
+                });
                 return;
             }
             // Aiming takes the press before anything else, and does not fall
@@ -128,7 +133,11 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
             // The far end follows the pointer. Where that lands on the sensor is
             // the render loop's question, not this one's.
             if let Some(drag) = MASK_DRAG.lock().expect("mask drag lock").as_mut() {
-                drag.1 = at;
+                drag.now = at;
+                // Kept, not replaced: a brush paints along every point the hand
+                // passed through, and a frame that arrives two motions late must
+                // still get both of them.
+                drag.trail.push(at);
                 return;
             }
             if let Some(control) = targeting() {

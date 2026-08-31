@@ -298,6 +298,10 @@ fn snapshot(state: tauri::State<'_, Shared>) -> serde_json::Value {
             index => Some(index),
         },
         "placing_mask": PLACING_MASK.load(std::sync::atomic::Ordering::Relaxed),
+        // The brush's own settings, which are a tool and not an edit: each
+        // stroke records the width it was drawn with, so these say what the
+        // *next* one will be.
+        "brush": { "radius": brush_radius(), "erase": BRUSH_ERASE.load(std::sync::atomic::Ordering::Relaxed) },
         // `None` means the decoder's own matrix, which is a state worth naming
         // rather than an absence to be guessed at.
         "profile": *PROFILE_NAME.lock().expect("profile lock"),
@@ -963,7 +967,9 @@ fn main() -> Result<()> {
             remove_mask,
             select_mask,
             place_mask,
-            set_mask
+            set_mask,
+            set_brush,
+            undo_stroke
         ])
         .setup(move |app| {
             // The surface is created on the main thread because the raw window
@@ -1469,44 +1475,94 @@ fn main() -> Result<()> {
                     }
                 }
 
-                // A gradient being placed. Resolved here for the same reason the
-                // white-balance pick is: turning two canvas positions into two
-                // places on the *sensor* needs the viewport and the geometry,
-                // and this is where both are to hand.
-                if let (Some((from, to)), Some(index)) =
-                    (*MASK_DRAG.lock().expect("mask drag lock"), placing_mask())
-                {
-                    // A press with no travel is not a gradient — and a
-                    // zero-length one has no direction, which the state layer
-                    // refuses. Left alone until the hand has actually moved.
-                    let moved = (to[0] - from[0]).hypot(to[1] - from[1]);
-                    if moved > 4.0 {
+                // A mask being drawn. Resolved here for the same reason the
+                // white-balance pick is: turning canvas positions into places on
+                // the *sensor* needs the viewport and the geometry, and this is
+                // where both are to hand.
+                if let Some(index) = placing_mask() {
+                    // Drained rather than read: everything the hand did since
+                    // the last frame belongs to this one, and leaving it behind
+                    // would turn a fast stroke into a dotted line.
+                    let taken = MASK_DRAG.lock().expect("mask drag lock").as_mut().map(|d| {
+                        (
+                            d.start,
+                            d.now,
+                            std::mem::take(&mut d.trail),
+                            std::mem::replace(&mut d.fresh, false),
+                        )
+                    });
+                    if let Some((start, now, trail, fresh)) = taken {
                         let mut session = shared.lock().expect("session lock");
-                        let existing = session.state().masks.get(index).map(|m| m.shape).unwrap_or(
-                            rawkit_editstate::MaskShape::Linear {
-                                from: [0.5, 0.0],
-                                to: [0.5, 0.35],
-                            },
-                        );
-                        let shape = shape_from_drag(
-                            existing,
-                            from,
-                            to,
-                            session.viewport(),
-                            &session.geometry(),
-                            session.image_size(),
-                        );
+                        let size = session.image_size();
+                        let geometry = session.geometry();
+                        let sensor = |at: [f64; 2]| {
+                            let p = session.viewport().image_at(at);
+                            let r = geometry.sensor_rect([p[0], p[1], p[0], p[1]], size);
+                            [
+                                (r[0] / size[0] as f64) as f32,
+                                (r[1] / size[1] as f64) as f32,
+                            ]
+                        };
                         let mut masks = session.state().masks.clone();
-                        if let Some(mask) = masks.get_mut(index) {
-                            if mask.shape != shape {
-                                mask.shape = shape;
-                                session.apply(Command::SetMasks {
-                                    masks,
-                                    // The shape, of this mask. A drag is one
-                                    // undo step however many frames it spans.
-                                    control: (index as u8) * 8,
-                                });
+                        let changed = match masks.get_mut(index).map(|m| &mut m.shape) {
+                            Some(rawkit_editstate::MaskShape::Brush { strokes, .. }) => {
+                                if fresh {
+                                    strokes.push(rawkit_editstate::Stroke {
+                                        points: Vec::new(),
+                                        radius: brush_radius(),
+                                        erase: BRUSH_ERASE
+                                            .load(std::sync::atomic::Ordering::Relaxed),
+                                    });
+                                }
+                                match strokes.last_mut() {
+                                    Some(stroke) => {
+                                        let before = stroke.points.len();
+                                        let radius = stroke.radius;
+                                        for at in trail {
+                                            extend_stroke(
+                                                &mut stroke.points,
+                                                sensor(at),
+                                                radius,
+                                                size,
+                                            );
+                                        }
+                                        stroke.points.len() != before
+                                    }
+                                    None => false,
+                                }
                             }
+                            Some(shape) => {
+                                // A press with no travel is not a shape, and a
+                                // zero-length gradient has no direction, which
+                                // the state layer refuses. Left alone until the
+                                // hand has actually moved.
+                                if (now[0] - start[0]).hypot(now[1] - start[1]) <= 4.0 {
+                                    false
+                                } else {
+                                    let drawn = shape_from_drag(
+                                        shape.clone(),
+                                        start,
+                                        now,
+                                        session.viewport(),
+                                        &geometry,
+                                        size,
+                                    );
+                                    let moved = *shape != drawn;
+                                    *shape = drawn;
+                                    moved
+                                }
+                            }
+                            None => false,
+                        };
+                        if changed {
+                            session.apply(Command::SetMasks {
+                                masks,
+                                // This mask's shape. A drag is one undo step
+                                // however many frames it spans — and for a brush
+                                // that is one *stroke*, which is the unit anyone
+                                // would expect to take back.
+                                control: (index as u8) * 8,
+                            });
                         }
                     }
                 }
@@ -2360,7 +2416,62 @@ fn shape_from_drag(
                 feather,
             }
         }
+        // A brush is not *placed* by a drag, it is painted by one — every point
+        // along the way matters and none of them replaces what came before. It
+        // is handled where the trail is drained; this arm is here so that adding
+        // a fourth kind cannot quietly forget one.
+        brush @ rawkit_editstate::MaskShape::Brush { .. } => brush,
     }
+}
+
+/// Where the pointer has been since the hand went down.
+///
+/// A gradient and an ellipse only need the two ends; a brush needs every point
+/// between them, which is why this carries a trail rather than a pair.
+pub(crate) struct MaskDrag {
+    pub start: [f64; 2],
+    pub now: [f64; 2],
+    /// Canvas positions the render loop has not been given yet. Drained rather
+    /// than read, so a frame arriving late still gets everything the hand did
+    /// while it was away.
+    pub trail: Vec<[f64; 2]>,
+    /// Cleared once a stroke has been opened for this drag, so one press makes
+    /// one stroke however many frames it spans.
+    pub fresh: bool,
+}
+
+/// Half the brush's width, as a fraction of the frame's longest edge, and
+/// whether it is taking away rather than putting down.
+///
+/// Tool state and not part of the edit: every stroke records the radius it was
+/// drawn with, so what the *next* one will use belongs beside the selection
+/// rather than inside the photograph. Kept as bits because there is no atomic
+/// float.
+static BRUSH_RADIUS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3DA3D70A);
+static BRUSH_ERASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn brush_radius() -> f32 {
+    f32::from_bits(BRUSH_RADIUS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Add a point to a stroke unless it lands too close to the last one kept.
+///
+/// The dabs overlap many times over at a third of a radius, so the difference is
+/// not visible — and it bounds a stroke by its length rather than by how slowly
+/// it was drawn, which matters because undo stores a whole `EditState` per step.
+///
+/// Measured isotropically: the points are fractions of each axis, so without the
+/// scaling a frame that is not square would thin more along its long side.
+fn extend_stroke(points: &mut Vec<[f32; 2]>, point: [f32; 2], radius: f32, size: [u32; 2]) {
+    let long = size[0].max(size[1]) as f32;
+    let (sx, sy) = (size[0] as f32 / long, size[1] as f32 / long);
+    if let Some(last) = points.last() {
+        let (dx, dy) = ((point[0] - last[0]) * sx, (point[1] - last[1]) * sy);
+        if (dx * dx + dy * dy).sqrt() < radius / 3.0 {
+            return;
+        }
+    }
+    points.push(point);
 }
 
 /// Which local adjustment the panel is showing, and whether the next drag on
@@ -2389,7 +2500,7 @@ pub(crate) fn placing_mask() -> Option<usize> {
 /// turning it into a place on the *sensor* needs the viewport and the geometry,
 /// which only the render loop has — the same arrangement the white-balance pick
 /// uses, and for the same reason.
-pub(crate) static MASK_DRAG: Mutex<Option<([f64; 2], [f64; 2])>> = Mutex::new(None);
+pub(crate) static MASK_DRAG: Mutex<Option<MaskDrag>> = Mutex::new(None);
 
 /// Add a local adjustment, select it, and arm the next drag to place it.
 ///
@@ -2401,6 +2512,13 @@ pub(crate) static MASK_DRAG: Mutex<Option<([f64; 2], [f64; 2])>> = Mutex::new(No
 fn add_mask(kind: Option<String>, state: tauri::State<'_, Shared>) -> Result<usize, String> {
     let shape = match kind.as_deref() {
         None | Some("") | Some("gradient") => rawkit_editstate::Mask::default().shape,
+        // Nothing painted yet, so nothing happens until the hand moves — which
+        // is right for a brush and would be wrong for the other two, where an
+        // unplaced mask would be an invisible thing to go looking for.
+        Some("brush") => rawkit_editstate::MaskShape::Brush {
+            strokes: Vec::new(),
+            feather: 0.5,
+        },
         // Middle of the frame, a third across. Visible, and clear of the edges
         // where a drag to reposition it would be awkward.
         Some("radial") => rawkit_editstate::MaskShape::Radial {
@@ -2474,7 +2592,54 @@ fn select_mask(index: Option<usize>) -> usize {
     chosen
 }
 
-/// Whether the next drag on the photograph redraws the selected gradient.
+/// The brush's width and whether it is erasing.
+///
+/// One command for both because they are one tool's settings, and because the
+/// panel has to be able to show what it will do before anything is painted.
+#[tauri::command]
+fn set_brush(radius: Option<f32>, erase: Option<bool>) -> Result<(f32, bool), String> {
+    if let Some(radius) = radius {
+        if !radius.is_finite() || !(0.002..=1.0).contains(&radius) {
+            return Err(format!("a brush radius of {radius} is not a width"));
+        }
+        BRUSH_RADIUS.store(radius.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(erase) = erase {
+        BRUSH_ERASE.store(erase, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok((
+        brush_radius(),
+        BRUSH_ERASE.load(std::sync::atomic::Ordering::Relaxed),
+    ))
+}
+
+/// Take back the last stroke of the selected brush.
+///
+/// Undo would do it too, and this is here because a brush is the one mask where
+/// the last thing you did is a *stroke* rather than a slider — so there should
+/// be somewhere to say that without hunting for how many undo steps it was.
+#[tauri::command]
+fn undo_stroke(state: tauri::State<'_, Shared>) -> Result<usize, String> {
+    let index = SELECTED_MASK.load(std::sync::atomic::Ordering::Relaxed);
+    let mut session = state.0.lock().expect("session lock");
+    let mut masks = session.state().masks.clone();
+    let Some(rawkit_editstate::MaskShape::Brush { strokes, .. }) =
+        masks.get_mut(index).map(|m| &mut m.shape)
+    else {
+        return Err("no brush is selected".into());
+    };
+    if strokes.pop().is_none() {
+        return Err("nothing painted yet".into());
+    }
+    let left = strokes.len();
+    session.apply(Command::SetMasks {
+        masks,
+        control: u8::MAX,
+    });
+    Ok(left)
+}
+
+/// Whether the next drag on the photograph draws on the selected mask.
 #[tauri::command]
 fn place_mask(armed: bool) -> bool {
     PLACING_MASK.store(armed, std::sync::atomic::Ordering::Relaxed);
@@ -2511,7 +2676,8 @@ fn set_mask(
             3
         }
         "feather" => match &mut mask.shape {
-            rawkit_editstate::MaskShape::Radial { feather, .. } => {
+            rawkit_editstate::MaskShape::Radial { feather, .. }
+            | rawkit_editstate::MaskShape::Brush { feather, .. } => {
                 *feather = value;
                 4
             }
@@ -3500,7 +3666,7 @@ mod gradient_tests {
             session.image_size(),
         );
         let mut masks = session.state().masks.clone();
-        masks[0].shape = shape;
+        masks[0].shape = shape.clone();
         masks[0].warmth = 0.5;
         session.apply(Command::SetMasks { masks, control: 0 });
 

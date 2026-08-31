@@ -93,6 +93,7 @@ Keys, most of them Lightroom's, so the hands already know them:
 | `⌃Z` `⌃⇧Z` | undo and redo the edit (`⌘` on macOS) |
 | `Z` | undo a culling judgement — a separate history |
 | `L` / `⇧L` | add a graduated or radial local adjustment, then drag on the photograph to place it |
+| `B` / `⇧B` | add a brush, or switch it between painting and erasing |
 | `⌃E` / `⌃⇧E` | export this photograph / export the picks |
 
 The develop controls live in the column on the right, and the sections you

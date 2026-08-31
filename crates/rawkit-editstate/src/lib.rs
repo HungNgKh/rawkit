@@ -212,13 +212,25 @@ pub const LOCAL_MIRED_REACH: f32 = 50.0;
 /// uses.
 pub const LOCAL_TINT_REACH: f32 = 40.0;
 
+/// The most points one brush mask may carry, over all its strokes.
+///
+/// Not a limit anyone paints into: thinning bounds a stroke by its length, so
+/// reaching this would take a mask covered many times over. It is here because
+/// an `EditState` can arrive from a file, and a file can say anything — and the
+/// thing on the other side of this number is a rasteriser that would sit there
+/// for minutes.
+pub const MAX_BRUSH_POINTS: usize = 20_000;
+
 /// Where a local adjustment applies.
 ///
 /// One shape so far. The renderer does not know about shapes at all — it is
 /// handed a raster and composites it — so a second one is a rasteriser here and
 /// nothing there, which is the arrangement that lets a future mask come from
 /// somewhere other than a drawing.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+/// Not `Copy`, and that is the brush's doing: a painted mask carries its strokes
+/// and a stroke carries its points. Everything that holds a shape clones it,
+/// which happens when an edit changes and not when a pixel is drawn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MaskShape {
     /// A gradient running from full effect at `from` to none at `to`.
@@ -246,6 +258,44 @@ pub enum MaskShape {
         radii: [f32; 2],
         feather: f32,
     },
+    /// Painted by hand: a list of strokes, applied in the order they were made.
+    ///
+    /// The *strokes* are stored and not the picture they make. A raster would
+    /// not fit in the JSON an edit is, would not survive being applied to a
+    /// different size, and could not be undone a stroke at a time. Redrawing it
+    /// from the list costs a few milliseconds and buys all three.
+    ///
+    /// `feather` is shared by every dab, like a radial's — a brush whose
+    /// softness changed from stroke to stroke would be a brush nobody could
+    /// keep track of.
+    Brush { strokes: Vec<Stroke>, feather: f32 },
+}
+
+/// One pass of the brush.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Stroke {
+    /// Where the hand went, in fractions of the sensor frame.
+    ///
+    /// Thinned as they are recorded: a point landing within a third of a radius
+    /// of the last one kept is dropped, because the dabs overlap many times over
+    /// and the difference is not visible. That bounds a stroke by its *length*
+    /// rather than by how slowly it was drawn — which matters because undo
+    /// stores a whole `EditState` per step, so an unthinned stroke would be
+    /// carried again by every step in the history.
+    pub points: Vec<[f32; 2]>,
+    /// Half the brush's width, as a fraction of the frame's **longest** edge.
+    ///
+    /// The longest edge and not each axis, so a round brush stays round: a
+    /// radius stored per axis would paint ellipses on anything but a square
+    /// photograph.
+    pub radius: f32,
+    /// Whether this stroke takes away what earlier ones put down.
+    ///
+    /// Per stroke rather than per mask, because that is what makes the order
+    /// meaningful: paint, erase the overshoot, paint again.
+    #[serde(default)]
+    pub erase: bool,
 }
 
 /// One local adjustment: a region, and what to do inside it.
@@ -254,7 +304,7 @@ pub enum MaskShape {
 /// and not others: the mask composites before the tone map, and these are the
 /// operations that belong there. A local contrast or a local clarity lives on
 /// the far side of that boundary and needs the mask carried across it.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Mask {
     pub shape: MaskShape,
@@ -321,6 +371,35 @@ impl Mask {
                     return Err(EditStateError::InvalidMask(
                         "a gradient whose ends are the same point has no direction".into(),
                     ));
+                }
+            }
+            MaskShape::Brush {
+                ref strokes,
+                feather,
+            } => {
+                if !finite(feather) || !(0.0..=1.0).contains(&feather) {
+                    return Err(EditStateError::InvalidMask(format!(
+                        "feather is {feather}, and runs from 0 to 1"
+                    )));
+                }
+                let total: usize = strokes.iter().map(|s| s.points.len()).sum();
+                if total > MAX_BRUSH_POINTS {
+                    return Err(EditStateError::InvalidMask(format!(
+                        "{total} brush points, and {MAX_BRUSH_POINTS} is the most a mask may carry"
+                    )));
+                }
+                for stroke in strokes {
+                    if !finite(stroke.radius) || stroke.radius <= 0.0 || stroke.radius > 1.0 {
+                        return Err(EditStateError::InvalidMask(format!(
+                            "a brush radius of {} is not a width",
+                            stroke.radius
+                        )));
+                    }
+                    if !stroke.points.iter().flatten().copied().all(finite) {
+                        return Err(EditStateError::InvalidMask(
+                            "a brush stroke passes through somewhere that is not a place".into(),
+                        ));
+                    }
                 }
             }
             MaskShape::Radial {

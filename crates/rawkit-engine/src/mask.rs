@@ -25,7 +25,7 @@
 //! A hard-edged matte from a segmentation model would want more than this, and
 //! that is a constant to raise rather than an arrangement to redo.
 
-use rawkit_editstate::{Mask, MaskShape};
+use rawkit_editstate::{Mask, MaskShape, Stroke};
 
 /// The longest edge a mask raster is built at.
 pub const MAX_EDGE: u32 = 1024;
@@ -68,6 +68,18 @@ pub fn rasterise(mask: &Mask, width: u32, height: u32, out: &mut [f32]) {
 
 fn draw(shape: &MaskShape, w: u32, h: u32, out: &mut [f32]) {
     match *shape {
+        MaskShape::Brush {
+            ref strokes,
+            feather,
+        } => {
+            out[..(w * h) as usize].fill(0.0);
+            // In order, because that is what makes erasing mean anything: paint,
+            // take back the overshoot, paint again.
+            for stroke in strokes {
+                paint(stroke, feather, w, h, out);
+            }
+        }
+
         MaskShape::Linear { from, to } => {
             // Distance along the gradient's axis, as a fraction of its length.
             // Everything is done in the *frame's* proportions rather than in
@@ -129,6 +141,96 @@ fn draw(shape: &MaskShape, w: u32, h: u32, out: &mut [f32]) {
                         1.0 - s * s * (3.0 - 2.0 * s)
                     };
                 }
+            }
+        }
+    }
+}
+
+/// Lay one stroke down, or lift it.
+///
+/// # Why this is fast enough to draw with
+///
+/// The whole mask is redrawn from the stroke list every time the hand moves --
+/// no accumulated raster, no incremental state -- because the list is the only
+/// thing that is true, and anything cached beside it would have to be rebuilt
+/// for every undo, every preset and every reopened photograph anyway.
+///
+/// What makes that affordable is that a segment is only ever tested against the
+/// texels it can *reach*. Work is proportional to the area painted rather than
+/// to the area of the frame: a stroke a thousand texels long with a twenty-texel
+/// radius touches about forty thousand of them however large the photograph is.
+fn paint(stroke: &Stroke, feather: f32, w: u32, h: u32, out: &mut [f32]) {
+    if stroke.points.is_empty() || stroke.radius <= 0.0 {
+        return;
+    }
+    // A round brush on a frame that is not square: the radius is a fraction of
+    // the longest edge, so each axis is scaled by its share of it. Without this
+    // a circular brush paints ellipses on everything but a square photograph.
+    let long = w.max(h) as f32;
+    let (sx, sy) = (w as f32 / long, h as f32 / long);
+    let inner = (1.0 - feather).clamp(0.0, 1.0);
+
+    // A single tap is a dab, which is a segment whose two ends are the same
+    // point -- so it needs no case of its own, only somewhere to start.
+    let ends: Vec<([f32; 2], [f32; 2])> = if stroke.points.len() == 1 {
+        vec![(stroke.points[0], stroke.points[0])]
+    } else {
+        stroke.points.windows(2).map(|p| (p[0], p[1])).collect()
+    };
+
+    for (a, b) in ends {
+        // Only the texels this segment can reach. Everything else in the frame
+        // is untouched by it, whatever the brush is doing elsewhere.
+        //
+        // The reach is *per axis*: the radius is a fraction of the longest edge
+        // and these coordinates are fractions of each edge, so the shorter one
+        // needs a proportionally larger number to mean the same distance. Using
+        // the radius directly clips every dab to the frame's aspect — which
+        // looks like a working brush on a square photograph and like a squashed
+        // one on everything else.
+        let (pad_x, pad_y) = (stroke.radius / sx, stroke.radius / sy);
+        let bound = |v: f32, span: u32, up: bool| -> u32 {
+            let t = v * span as f32;
+            let t = if up { t.ceil() } else { t.floor() };
+            (t as i64).clamp(0, span as i64 - 1) as u32
+        };
+        let x0 = bound(a[0].min(b[0]) - pad_x, w, false);
+        let x1 = bound(a[0].max(b[0]) + pad_x, w, true);
+        let y0 = bound(a[1].min(b[1]) - pad_y, h, false);
+        let y1 = bound(a[1].max(b[1]) + pad_y, h, true);
+
+        let (dx, dy) = ((b[0] - a[0]) * sx, (b[1] - a[1]) * sy);
+        let length = dx * dx + dy * dy;
+        for y in y0..=y1 {
+            let v = (y as f32 + 0.5) / h as f32;
+            for x in x0..=x1 {
+                let u = (x as f32 + 0.5) / w as f32;
+                // Distance to the *segment*, which is the distance to the
+                // nearest point on it -- so a stroke is a capsule rather than a
+                // row of separate dabs with gaps showing between them.
+                let (px, py) = ((u - a[0]) * sx, (v - a[1]) * sy);
+                let t = if length > 0.0 {
+                    ((px * dx + py * dy) / length).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let (ox, oy) = (px - t * dx, py - t * dy);
+                let d = (ox * ox + oy * oy).sqrt() / stroke.radius;
+
+                let weight = if d <= inner {
+                    1.0
+                } else if d >= 1.0 {
+                    continue;
+                } else {
+                    let s = (d - inner) / (1.0 - inner);
+                    1.0 - s * s * (3.0 - 2.0 * s)
+                };
+                let cell = &mut out[(y * w + x) as usize];
+                *cell = if stroke.erase {
+                    cell.min(1.0 - weight)
+                } else {
+                    cell.max(weight)
+                };
             }
         }
     }
@@ -339,6 +441,138 @@ mod tests {
             "the middle is still covered"
         );
         assert_eq!(at(&turned, w, 2, 2), 1.0, "the corner is still clear");
+    }
+
+    fn painted(strokes: Vec<Stroke>, feather: f32) -> Mask {
+        Mask {
+            shape: MaskShape::Brush { strokes, feather },
+            ..Mask::default()
+        }
+    }
+
+    fn stroke(points: &[[f32; 2]], radius: f32, erase: bool) -> Stroke {
+        Stroke {
+            points: points.to_vec(),
+            radius,
+            erase,
+        }
+    }
+
+    #[test]
+    fn a_stroke_is_a_capsule_and_not_a_row_of_dots() {
+        // Points arrive as far apart as the hand moved between two frames, so a
+        // brush that stamped a disc at each one would leave a dotted line at any
+        // speed. Every texel is measured against the *segment*, which is what
+        // joins them up.
+        let mask = painted(vec![stroke(&[[0.2, 0.5], [0.8, 0.5]], 0.03, false)], 0.3);
+        let (pixels, w, h) = draw(&mask, 800, 600);
+        let y = h / 2;
+        for x in (w as f32 * 0.25) as u32..(w as f32 * 0.75) as u32 {
+            assert!(
+                at(&pixels, w, x, y) > 0.99,
+                "a gap along the stroke at x={x}: {}",
+                at(&pixels, w, x, y)
+            );
+        }
+        assert_eq!(at(&pixels, w, w / 2, 4), 0.0, "the stroke reached the top");
+    }
+
+    #[test]
+    fn a_round_brush_stays_round() {
+        // The radius is a fraction of the *longest* edge and each axis is scaled
+        // by its share of it. Stored per axis instead, a circular brush would
+        // paint ellipses on everything but a square photograph.
+        let (iw, ih) = (1600u32, 800u32);
+        let mask = painted(vec![stroke(&[[0.5, 0.5]], 0.1, false)], 0.0);
+        let (pixels, w, h) = draw(&mask, iw, ih);
+        let reach = |dx: i32, dy: i32| {
+            let mut steps = 0;
+            loop {
+                let x = (w as i32 / 2 + dx * steps) as u32;
+                let y = (h as i32 / 2 + dy * steps) as u32;
+                if x >= w || y >= h || at(&pixels, w, x, y) < 0.5 {
+                    return steps as f32
+                        * if dx != 0 {
+                            iw as f32 / w as f32
+                        } else {
+                            ih as f32 / h as f32
+                        };
+                }
+                steps += 1;
+            }
+        };
+        let (across, down) = (reach(1, 0), reach(0, 1));
+        println!("dab reaches {across:.1} px across and {down:.1} px down");
+        assert!(
+            (across - down).abs() < 0.05 * across,
+            "the dab came out {across:.1} by {down:.1} pixels"
+        );
+    }
+
+    #[test]
+    fn erasing_takes_back_what_painting_put_down() {
+        // In order, which is the whole reason `erase` is per stroke rather than
+        // per mask: paint, take back the overshoot, paint again.
+        let wide = stroke(&[[0.1, 0.5], [0.9, 0.5]], 0.06, false);
+        let rubbed = stroke(&[[0.5, 0.5]], 0.04, true);
+        let (before, w, h) = draw(&painted(vec![wide.clone()], 0.2), 600, 400);
+        let (after, _, _) = draw(&painted(vec![wide.clone(), rubbed.clone()], 0.2), 600, 400);
+        assert!(at(&before, w, w / 2, h / 2) > 0.99, "nothing was painted");
+        assert_eq!(
+            at(&after, w, w / 2, h / 2),
+            0.0,
+            "the eraser did not reach the middle of the stroke"
+        );
+        assert!(
+            at(&after, w, w / 6, h / 2) > 0.99,
+            "the eraser took the whole stroke rather than where it went"
+        );
+        // And painting over it again puts it back, which only works if the
+        // strokes are applied in order.
+        let (again, _, _) = draw(&painted(vec![wide.clone(), rubbed, wide], 0.2), 600, 400);
+        assert!(
+            at(&again, w, w / 2, h / 2) > 0.99,
+            "painting over an erased spot did not restore it"
+        );
+    }
+
+    #[test]
+    fn an_unpainted_brush_covers_nothing() {
+        // What a brush looks like the moment it is added, and the reason it is
+        // the one kind that arrives without a placement: there is nothing to
+        // place until a hand moves.
+        let (pixels, w, h) = draw(&painted(Vec::new(), 0.5), 400, 300);
+        assert!(pixels[..(w * h) as usize].iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn painting_costs_the_area_painted_and_not_the_frame() {
+        // The claim that makes a brush usable: the mask is redrawn from the
+        // stroke list every time the hand moves, and that is affordable only
+        // because a segment is tested against the texels it can reach rather
+        // than against all of them.
+        let across = std::time::Instant::now();
+        let long = painted(
+            vec![stroke(
+                &(0..200)
+                    .map(|i| [0.05 + 0.9 * i as f32 / 199.0, 0.5])
+                    .collect::<Vec<_>>(),
+                0.02,
+                false,
+            )],
+            0.5,
+        );
+        let (w, h) = dimensions(6024, 4024);
+        let mut out = vec![0.0f32; (w * h) as usize];
+        rasterise(&long, 6024, 4024, &mut out);
+        let elapsed = across.elapsed();
+        println!("a 200-point stroke across a {w}x{h} raster: {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "redrawing a stroke took {elapsed:?}, which is too slow to draw with"
+        );
+        assert!(out.iter().any(|v| *v > 0.9), "the stroke painted nothing");
+        assert!(h > 0);
     }
 
     #[test]

@@ -334,6 +334,7 @@
     <div class="row">
       <button id="mask-add">Add gradient</button>
       <button id="mask-add-radial">Add radial</button>
+      <button id="mask-add-brush">Add brush</button>
       <button id="mask-remove">Remove</button>
     </div>
     <div class="row" id="mask-list"></div>
@@ -343,6 +344,13 @@
         <button id="mask-place" class="target">Redraw on the photograph</button>
         <button id="mask-invert">Invert</button>
       </div>
+      <div class="row" id="mask-brush-row">
+        <button id="mask-erase">Erase</button>
+        <button id="mask-undo-stroke">Undo stroke</button>
+      </div>
+      <label id="mask-size-row"><span>Brush size</span>
+        <input id="mask-size" type="range" min="0.005" max="0.4" step="0.005" value="0.08">
+        <output id="mask-size-value">0.08</output></label>
       <label id="mask-feather-row"><span>Feather</span>
         <input id="mask-feather" type="range" min="0" max="1" step="0.01" value="0.5">
         <output id="mask-feather-value">0.50</output></label>
@@ -571,7 +579,7 @@
   let dragging = null;
   const TONE = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"];
   for (const id of [...TONE, "straighten", "sharpen", "sharpen_radius", "chroma_noise", "luminance_noise", "saturation", "vibrance", "temperature", "tint",
-    "mask-exposure", "mask-warmth", "mask-tint", "mask-feather",
+    "mask-exposure", "mask-warmth", "mask-tint", "mask-feather", "mask-size",
     "grade-shadows", "grade-midtones", "grade-highlights", "grade-blending", "grade-balance",
     ...BANDS.flatMap(([band]) => HSL_CONTROLS.map(([control]) => `hsl-${band}-${control}`))]) {
     document.getElementById(id).addEventListener("pointerdown", () => (dragging = id));
@@ -1395,6 +1403,7 @@
   let selected = null;
   let placing = false;
   let inverted = false;
+  let erasing = false;
   let shownMasks = null;
 
   const place = (on) => {
@@ -1433,9 +1442,24 @@
       // A gradient's feather is the distance between its two ends, so there is
       // no separate number to show — the row goes rather than sitting there
       // greyed out with nothing to say.
-      const radial = mask.shape && mask.shape.kind === "radial";
-      document.getElementById("mask-feather-row").hidden = !radial;
-      if (radial) setSlider("mask-feather", mask.shape.feather, v => Number(v).toFixed(2));
+      const kind = mask.shape && mask.shape.kind;
+      document.getElementById("mask-feather-row").hidden = kind === "linear";
+      if (kind !== "linear") {
+        setSlider("mask-feather", mask.shape.feather, v => Number(v).toFixed(2));
+      }
+      const brush = kind === "brush";
+      document.getElementById("mask-brush-row").hidden = !brush;
+      document.getElementById("mask-size-row").hidden = !brush;
+      // A brush is painted rather than placed, and the button says so — the
+      // same arming, a different verb, because "redraw" on a brush would read
+      // as "start again".
+      document.getElementById("mask-place").textContent =
+        brush ? "Paint on the photograph" : "Redraw on the photograph";
+    }
+    if (s.brush) {
+      erasing = !!s.brush.erase;
+      document.getElementById("mask-erase").classList.toggle("armed", erasing);
+      setSlider("mask-size", s.brush.radius, v => Number(v).toFixed(3));
     }
   };
 
@@ -1448,6 +1472,16 @@
   };
   document.getElementById("mask-add").addEventListener("click", () => addMask("gradient"));
   document.getElementById("mask-add-radial").addEventListener("click", () => addMask("radial"));
+  document.getElementById("mask-add-brush").addEventListener("click", () => addMask("brush"));
+  document.getElementById("mask-erase").addEventListener("click", () => {
+    invoke("set_brush", { erase: !erasing }).catch(say);
+  });
+  document.getElementById("mask-undo-stroke").addEventListener("click", () => {
+    invoke("undo_stroke").then(left => say(`${left} stroke${left === 1 ? "" : "s"} left`)).catch(say);
+  });
+  document.getElementById("mask-size").addEventListener("input", (e) => {
+    invoke("set_brush", { radius: Number(e.target.value) }).catch(say);
+  });
   document.getElementById("mask-invert").addEventListener("click", () => {
     if (selected === null) return say("nothing selected to invert");
     invoke("set_mask", { index: selected, control: "invert", value: inverted ? 0 : 1 })
@@ -1750,6 +1784,13 @@
       // two. Lightroom puts them on M and shift-M; M sets a frame aside here
       // and had it first, which is the same reason bare Z stayed with culling.
       case "l": addMask(event.shiftKey ? "radial" : "gradient"); break;
+      // B for brush, as everywhere else that has one. Shift toggles the eraser
+      // rather than adding a second brush: erasing is what you reach for in the
+      // middle of painting, not a new mask.
+      case "b":
+        if (event.shiftKey) invoke("set_brush", { erase: !erasing }).catch(say);
+        else addMask("brush");
+        break;
       // M sets a frame aside, C compares what you set aside.
       case "m": act("mark"); break;
       case "c": act("survey"); break;

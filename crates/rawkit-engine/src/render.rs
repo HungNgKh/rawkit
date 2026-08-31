@@ -1608,7 +1608,7 @@ impl Renderer {
             .iter()
             .filter(|m| !m.is_identity())
             .take(rawkit_editstate::MAX_MASKS)
-            .copied()
+            .cloned()
             .collect();
         self.upload_masks(gpu, buffers, image, &live);
         let (wb, m) = (colour.multipliers, colour.cam_to_display);
