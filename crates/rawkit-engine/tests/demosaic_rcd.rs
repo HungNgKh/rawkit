@@ -277,6 +277,50 @@ fn every_bayer_phase_reconstructs_equally_well() {
 
 #[test]
 #[ignore = "requires a GPU adapter"]
+fn the_tile_pipeline_drains_whatever_the_count() {
+    // A whole-image render runs one tile ahead of itself: it queues tile *n*,
+    // then collects tile *n-1*, and drains the last one after the loop. Two
+    // things there are easy to get wrong and invisible in the picture unless
+    // the count is chosen to expose them — the tail, which only ever holds one
+    // tile, and the alternation between the two readback buffers, which lands
+    // the final tile in a different slot depending on whether the count is odd
+    // or even.
+    //
+    // So: several tile sizes over one image, giving one tile, an even number
+    // and an odd number, every one of them bit-identical. Anything that
+    // collected a slot twice or skipped the drain would show here as a band of
+    // the wrong tile rather than as a subtle difference.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let truth = ground_truth();
+    let cfa = mosaic(&truth, BayerPhase::Rggb);
+    let render = |tile: u32| {
+        Renderer::with_tile_size(&gpu, tile)
+            .run(
+                &gpu,
+                &frame(&cfa, W, H, BayerPhase::Rggb),
+                &EditState::default(),
+                Output::SceneLinear,
+            )
+            .expect("render failed")
+            .pixels
+    };
+
+    let one = render(W);
+    for tile in [128, 88, 64, 52] {
+        let tiles = W.div_ceil(tile) * H.div_ceil(tile);
+        let many = render(tile);
+        let differing = one.iter().zip(&many).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            differing, 0,
+            "a {tile}-pixel tiling ({tiles} tiles) differs from one tile in \
+             {differing} samples"
+        );
+        println!("{tiles} tiles: identical");
+    }
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
 fn tiling_does_not_change_a_single_pixel() {
     // The whole argument for tiling is that it is free: a tile boundary must not
     // be visible in the output. "Nearly identical" would not do — a faint seam
