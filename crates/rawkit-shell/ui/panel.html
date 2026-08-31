@@ -330,6 +330,27 @@
     </div>
   </details>
 
+  <details id="s-masks"><summary>Local adjustments</summary>
+    <div class="row">
+      <button id="mask-add">Add gradient</button>
+      <button id="mask-remove">Remove</button>
+    </div>
+    <div class="row" id="mask-list"></div>
+    <p class="empty" id="mask-empty">Nothing local yet.</p>
+    <div id="mask-controls" hidden>
+      <button id="mask-place" class="target">Redraw on the photograph</button>
+      <label><span>Exposure</span>
+        <input id="mask-exposure" type="range" min="-4" max="4" step="0.01" value="0">
+        <output id="mask-exposure-value">0.00</output></label>
+      <label><span>Warmth</span>
+        <input id="mask-warmth" type="range" min="-1" max="1" step="0.01" value="0">
+        <output id="mask-warmth-value">0.00</output></label>
+      <label><span>Tint</span>
+        <input id="mask-tint" type="range" min="-1" max="1" step="0.01" value="0">
+        <output id="mask-tint-value">0.00</output></label>
+    </div>
+  </details>
+
   <details id="s-profile">
     <summary>Camera profile</summary>
     <div id="profile-name">camera matrix</div>
@@ -543,6 +564,7 @@
   let dragging = null;
   const TONE = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"];
   for (const id of [...TONE, "straighten", "sharpen", "sharpen_radius", "chroma_noise", "luminance_noise", "saturation", "vibrance", "temperature", "tint",
+    "mask-exposure", "mask-warmth", "mask-tint",
     "grade-shadows", "grade-midtones", "grade-highlights", "grade-blending", "grade-balance",
     ...BANDS.flatMap(([band]) => HSL_CONTROLS.map(([control]) => `hsl-${band}-${control}`))]) {
     document.getElementById(id).addEventListener("pointerdown", () => (dragging = id));
@@ -654,6 +676,9 @@
     // nobody can see, which is the same as doing it for no reason.
     // Anything the render loop needed to say — a refused pick, most often.
     if (s.notice) { log.className = ""; log.textContent = s.notice; }
+    // Not gated on the generation: selecting a local adjustment does not change
+    // the edit, and neither does arming a placement.
+    try { showMasks(s); } catch (e) { say(`masks: ${e && e.message || e}`); }
     showOrientation(s.orientation);
     // Not gated on the generation: a profile is not part of the edit, so
     // choosing one does not move it.
@@ -1350,8 +1375,82 @@
   };
   dropper.addEventListener("click", () => {
     if (!picking && armed !== null) arm(null);
+    if (!picking) place(false);
     pickWb(!picking);
   });
+
+  // ---- Local adjustments ---------------------------------------------------
+  //
+  // The list is rebuilt only when its shape or its selection changes. Rebuilt
+  // every poll it would be replaced four times a second under whatever finger
+  // was about to click it.
+
+  let selected = null;
+  let placing = false;
+  let shownMasks = null;
+
+  const place = (on) => {
+    placing = on;
+    document.getElementById("mask-place").classList.toggle("armed", on);
+    document.body.classList.toggle("aiming", on || picking || armed !== null);
+    invoke("place_mask", { armed: on }).catch(say);
+  };
+
+  const showMasks = (s) => {
+    const masks = (s.state && s.state.masks) || [];
+    selected = s.selected_mask ?? null;
+    placing = !!s.placing_mask;
+    const shape = `${masks.length}:${selected}`;
+    if (shape !== shownMasks) {
+      shownMasks = shape;
+      document.getElementById("mask-list").replaceChildren(...masks.map((_, i) => {
+        const button = document.createElement("button");
+        button.textContent = `${i + 1}`;
+        button.className = i === selected ? "armed" : "";
+        button.addEventListener("click", () => invoke("select_mask", { index: i }).catch(say));
+        return button;
+      }));
+      document.getElementById("mask-controls").hidden = selected === null;
+      document.getElementById("mask-empty").hidden = masks.length > 0;
+    }
+    document.getElementById("mask-place").classList.toggle("armed", placing);
+    const mask = selected === null ? null : masks[selected];
+    if (mask) {
+      setSlider("mask-exposure", mask.exposure_ev,
+        v => `${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(2)}`);
+      setSlider("mask-warmth", mask.warmth, v => Number(v).toFixed(2));
+      setSlider("mask-tint", mask.tint, v => Number(v).toFixed(2));
+    }
+  };
+
+  const addMask = () => {
+    if (armed !== null) arm(null);
+    if (picking) pickWb(false);
+    invoke("add_mask")
+      .then(() => { placing = true; say("drag across the photograph to place it"); })
+      .catch(say);
+  };
+  document.getElementById("mask-add").addEventListener("click", addMask);
+  document.getElementById("mask-remove").addEventListener("click", () => {
+    if (selected === null) return say("nothing selected to remove");
+    invoke("remove_mask", { index: selected }).catch(say);
+  });
+  document.getElementById("mask-place").addEventListener("click", () => {
+    if (selected === null) return say("nothing selected to redraw");
+    if (!placing && armed !== null) arm(null);
+    if (!placing && picking) pickWb(false);
+    place(!placing);
+  });
+  for (const [id, control] of [
+    ["mask-exposure", "exposure"],
+    ["mask-warmth", "warmth"],
+    ["mask-tint", "tint"],
+  ]) {
+    document.getElementById(id).addEventListener("input", (e) => {
+      if (selected === null) return;
+      invoke("set_mask", { index: selected, control, value: Number(e.target.value) }).catch(say);
+    });
+  }
 
   // ---- The divider ---------------------------------------------------------
   //
@@ -1614,6 +1713,7 @@
         // one key.
         if (armed !== null) { arm(null); break; }
         if (picking) { pickWb(false); break; }
+        if (placing) { place(false); break; }
         if (document.getElementById("mode").textContent === "crop") { act("crop_cancel"); break; }
         act("loupe"); break;
       case "e": act("loupe"); break;
@@ -1622,6 +1722,10 @@
       case "r": act("crop"); break;
       case "[": send({ command: "rotate_by", params: -1 }); break;
       case "]": send({ command: "rotate_by", params: 1 }); break;
+      // L adds a local adjustment and arms the drag that places it. Lightroom
+      // puts its graduated filter on M; M sets a frame aside here and had it
+      // first, which is the same reason bare Z stayed with culling.
+      case "l": addMask(); break;
       // M sets a frame aside, C compares what you set aside.
       case "m": act("mark"); break;
       case "c": act("survey"); break;

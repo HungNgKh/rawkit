@@ -169,11 +169,12 @@ impl Frame<'_> {
     /// ones that neutralise it; computing them apart is how an image ends up
     /// with a cast that looks like a white-balance error and is not one.
     fn colour(&self, state: &EditState) -> Result<Colour, EngineError> {
-        let (multipliers, temperature) = match state.white_balance.temperature_k {
+        let (multipliers, temperature, tint) = match state.white_balance.temperature_k {
             Some(temperature) => (
                 self.profile
                     .multipliers_for(temperature, state.white_balance.tint),
                 temperature,
+                state.white_balance.tint,
             ),
             None => {
                 let g = self.as_shot_wb[1];
@@ -187,8 +188,8 @@ impl Frame<'_> {
                 // on one. Recovering it from the multipliers is exactly the
                 // conversion a UI needs to display "As Shot 5200 K", so the same
                 // path serves both and cannot disagree with itself.
-                let (temperature, _) = self.profile.temperature_from_multipliers(as_shot);
-                (as_shot, temperature)
+                let (temperature, tint) = self.profile.temperature_from_multipliers(as_shot);
+                (as_shot, temperature, tint)
             }
         };
         // With a hue/saturation table the render goes camera -> working space
@@ -209,6 +210,8 @@ impl Frame<'_> {
         Ok(match working {
             Some((to_working, to_display)) if hue_sat.is_some() || look.is_some() => Colour {
                 multipliers,
+                temperature,
+                tint,
                 cam_to_display: to_working,
                 working_to_display: to_display,
                 hue_sat,
@@ -221,6 +224,8 @@ impl Frame<'_> {
             // authored in, so there is nothing to apply them to.
             _ => Colour {
                 multipliers,
+                temperature,
+                tint,
                 cam_to_display: self.profile.camera_to_display(temperature),
                 working_to_display: crate::profile::IDENTITY,
                 hue_sat: None,
@@ -306,6 +311,17 @@ struct Params {
     /// field holds a real colour and 0 when the frame was blown end to end.
     /// A constant of the image; `.w` unused.
     guide_scale: [f32; 4],
+    /// How many local adjustments are bound, in `[0]`.
+    masks: [u32; 4],
+    /// One over the image's size, `[x, y]`: image pixels to the normalised
+    /// coordinates a mask texture is sampled in.
+    mask_scale: [f32; 4],
+    /// What each local adjustment multiplies by at full strength.
+    ///
+    /// Exposure and white balance arrive combined, because both are multiplies
+    /// in the space the mask composites in and the shader has no reason to know
+    /// which part came from which control.
+    mask_gain: [[f32; 4]; rawkit_editstate::MAX_MASKS],
     /// `[dest_x, dest_y, tile, halo]`. Rewritten per tile; everything above it
     /// moves only when the edit does, which is why this sits last and is
     /// patched in place rather than re-uploading the whole uniform.
@@ -517,6 +533,7 @@ pub const DEFAULT_TILE: u32 = 512;
 /// slow to sit on a render path.
 pub struct Renderer {
     layout: wgpu::BindGroupLayout,
+    mask_layout: wgpu::BindGroupLayout,
     canvas_layout: wgpu::BindGroupLayout,
     pipelines: Vec<wgpu::ComputePipeline>,
     present: wgpu::ComputePipeline,
@@ -581,11 +598,38 @@ impl Renderer {
                 label: Some("rcd bindings"),
                 entries: &entries,
             });
+        // Local adjustments, in their own group: a sampled texture array and a
+        // filtering sampler. Separate from group 0 because the masks change when
+        // the *edit* changes and the buffers beside them do not, and separate
+        // from the canvas because that changes when the *window* does.
+        let mask_layout = gpu
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("masks"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2Array,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
         let pipeline_layout = gpu
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("rcd layout"),
-                bind_group_layouts: &[Some(&layout)],
+                bind_group_layouts: &[Some(&layout), Some(&mask_layout)],
                 immediate_size: 0,
             });
 
@@ -625,7 +669,7 @@ impl Renderer {
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("present layout"),
-                bind_group_layouts: &[Some(&layout), Some(&canvas_layout)],
+                bind_group_layouts: &[Some(&layout), Some(&mask_layout), Some(&canvas_layout)],
                 immediate_size: 0,
             });
         let present = gpu
@@ -704,6 +748,7 @@ impl Renderer {
 
         Self {
             layout,
+            mask_layout,
             canvas_layout,
             pipelines,
             present,
@@ -829,6 +874,55 @@ impl Renderer {
             })
         });
 
+        // One layer per possible local adjustment. Sixteen-bit float rather
+        // than eight-bit: a mask multiplies a gain, so a step in the mask is a
+        // step in the picture, and 256 of them across a clear sky is the kind of
+        // banding this project has already refused once for the canvas.
+        let (mask_w, mask_h) = crate::mask::dimensions(image.width, image.height);
+        let mask_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("masks"),
+            size: wgpu::Extent3d {
+                width: mask_w,
+                height: mask_h,
+                depth_or_array_layers: rawkit_editstate::MAX_MASKS as u32,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mask_view = mask_texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let mask_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("mask"),
+            // Clamped, so a gradient keeps whatever it says at the frame's edge
+            // rather than wrapping round to the other side of the picture.
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let mask_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("masks"),
+            layout: &self.mask_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&mask_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&mask_sampler),
+                },
+            ],
+        });
+
         let storage = [&cfa, &vh, &helpers, &ch_r, &ch_g, &ch_b, &out, &hue_sat];
         let mut bindings = vec![wgpu::BindGroupEntry {
             binding: 0,
@@ -862,6 +956,11 @@ impl Renderer {
             guide_offset: px,
             guide_size: [guide.width, guide.height],
             chroma_known: guide.chroma_known,
+            mask_texture,
+            mask_bind_group,
+            mask_size: [mask_w, mask_h],
+            uploaded_masks: std::cell::RefCell::new(Vec::new()),
+            mask_scratch: std::cell::RefCell::new(vec![0.0; (mask_w * mask_h) as usize]),
             guide_scale: [
                 guide.width as f32 / image.width.max(1) as f32,
                 guide.height as f32 / image.height.max(1) as f32,
@@ -1177,6 +1276,7 @@ impl Renderer {
             });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &buffers.bind_group, &[]);
+            pass.set_bind_group(1, &buffers.mask_bind_group, &[]);
             pass.dispatch_workgroups(groups, groups, 1);
         }
     }
@@ -1398,7 +1498,8 @@ impl Renderer {
             });
             pass.set_pipeline(&self.present);
             pass.set_bind_group(0, &buffers.bind_group, &[]);
-            pass.set_bind_group(1, &canvas.bind_group, &[]);
+            pass.set_bind_group(1, &buffers.mask_bind_group, &[]);
+            pass.set_bind_group(2, &canvas.bind_group, &[]);
             let groups = self.tile.div_ceil(8);
             pass.dispatch_workgroups(groups, groups, 1);
         }
@@ -1423,6 +1524,63 @@ impl Renderer {
     /// Separate from rendering because it depends on the *edit* and not on which
     /// tile is being drawn: a slider move rewrites this and nothing else, while
     /// a pan rewrites nothing at all.
+    /// Paint any mask whose shape has moved, and leave the rest alone.
+    ///
+    /// Rasterising is a few milliseconds a layer, which is nothing when a
+    /// gradient is dragged and everything if it happens on every slider. So the
+    /// masks last written are kept and compared: a change to a mask's *exposure*
+    /// rewrites a uniform and no texels at all.
+    fn upload_masks(
+        &self,
+        gpu: &Gpu,
+        buffers: &TileBuffers,
+        image: &Frame<'_>,
+        live: &[rawkit_editstate::Mask],
+    ) {
+        let mut uploaded = buffers.uploaded_masks.borrow_mut();
+        let [mask_w, mask_h] = buffers.mask_size;
+        let mut scratch = buffers.mask_scratch.borrow_mut();
+        for (slot, mask) in live.iter().enumerate() {
+            // The shape decides the texels; everything else about a mask lives
+            // in the uniform, so only a shape that moved needs repainting.
+            if uploaded
+                .get(slot)
+                .is_some_and(|old| old.shape == mask.shape)
+            {
+                continue;
+            }
+            crate::mask::rasterise(mask, image.width, image.height, &mut scratch);
+            let half: Vec<u16> = scratch[..(mask_w * mask_h) as usize]
+                .iter()
+                .map(|v| f32_to_f16(*v))
+                .collect();
+            gpu.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &buffers.mask_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: slot as u32,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&half),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(mask_w * 2),
+                    rows_per_image: Some(mask_h),
+                },
+                wgpu::Extent3d {
+                    width: mask_w,
+                    height: mask_h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        *uploaded = live.to_vec();
+    }
+
     fn upload_params(
         &self,
         gpu: &Gpu,
@@ -1437,6 +1595,19 @@ impl Renderer {
         // would mix scaled and unscaled greens in the same subtraction.
         let colour = image.colour(state)?;
         let tone = crate::tone::ToneCurve::new(&state.tone);
+
+        // Only the adjustments that would change something. A mask sitting at
+        // its defaults still costs a texture layer and a sample per pixel, and
+        // skipping it here is also what makes placing a gradient before touching
+        // a slider cost nothing.
+        let live: Vec<rawkit_editstate::Mask> = state
+            .masks
+            .iter()
+            .filter(|m| !m.is_identity())
+            .take(rawkit_editstate::MAX_MASKS)
+            .copied()
+            .collect();
+        self.upload_masks(gpu, buffers, image, &live);
         let (wb, m) = (colour.multipliers, colour.cam_to_display);
         let working = colour.working_to_display;
         let hsm = colour.hue_sat.as_ref();
@@ -1522,6 +1693,20 @@ impl Renderer {
                 // build that never had this.
                 u32::from(tone.active && (tone.highlights != 0.0 || tone.shadows != 0.0)),
             ],
+            masks: [live.len() as u32, 0, 0, 0],
+            mask_scale: [
+                1.0 / image.width.max(1) as f32,
+                1.0 / image.height.max(1) as f32,
+                0.0,
+                0.0,
+            ],
+            mask_gain: {
+                let mut gains = [[1.0f32, 1.0, 1.0, 0.0]; rawkit_editstate::MAX_MASKS];
+                for (slot, mask) in live.iter().enumerate() {
+                    gains[slot] = mask_gain(image, &colour, mask);
+                }
+                gains
+            },
             guide_scale: [
                 buffers.guide_scale[0],
                 buffers.guide_scale[1],
@@ -1657,6 +1842,18 @@ pub struct TileBuffers {
     guide_size: [u32; 2],
     /// Whether the frame had any unclipped light to borrow a colour from.
     chroma_known: bool,
+    /// One texture layer per local adjustment, and the group that binds it.
+    ///
+    /// Allocated for the maximum whatever the edit currently says, because a
+    /// render must not allocate and a mask can be added while one is running.
+    mask_texture: wgpu::Texture,
+    mask_bind_group: wgpu::BindGroup,
+    /// The size of one mask layer, and the masks last written into them — so a
+    /// slider that does not move a mask does not repaint every layer.
+    mask_size: [u32; 2],
+    uploaded_masks: std::cell::RefCell<Vec<rawkit_editstate::Mask>>,
+    /// CPU staging for one mask layer.
+    mask_scratch: std::cell::RefCell<Vec<f32>>,
     /// Guide texels per image pixel. Carried rather than recomputed so the
     /// uniform and the buffer can never describe different mappings.
     guide_scale: [f32; 2],
@@ -2159,6 +2356,13 @@ fn reduce(src: &[f32], w: u32, h: u32) -> (Vec<f32>, u32, u32) {
 /// frame's profile and the edit together.
 struct Colour {
     multipliers: [f32; 3],
+    /// The temperature and tint those multipliers stand for.
+    ///
+    /// Carried because a *local* white balance is a shift relative to whatever
+    /// the global one settled on, and for an as-shot frame that is a pair
+    /// recovered from the camera's own numbers rather than one anybody typed.
+    temperature: f32,
+    tint: f32,
     cam_to_display: Matrix3,
     working_to_display: Matrix3,
     hue_sat: Option<crate::profile::HueSatMap>,
@@ -2170,6 +2374,64 @@ struct Colour {
     /// The user's hand-shaped curve, which is applied after everything the
     /// profile does.
     user_curve: Option<Vec<f32>>,
+}
+
+/// What one local adjustment multiplies by, at full strength.
+///
+/// Exposure and white balance combined, because at the point a mask composites
+/// both are multiplies and the shader has no reason to know which is which.
+///
+/// # The white balance part, and what it is exactly
+///
+/// A local temperature is a *shift* from whatever the global one settled on, so
+/// what is wanted is the ratio between the multipliers at the shifted setting
+/// and the multipliers at the current one. Those are camera-space numbers and
+/// the mask composites two matrices later, so the ratio is carried across:
+/// `(M·ratio) / (M·1)` is the gain that ratio produces on a **neutral** in the
+/// space the mask lives in.
+///
+/// Exact for neutrals, which is what a white balance is about, and an
+/// approximation for saturated colours — the profile's hue/saturation table sits
+/// inside that chain and is not a matrix, so no gain can be exactly right for
+/// every colour at once. Stated rather than hidden: the alternative is a second
+/// full colour path for local adjustments, which would be a great deal of
+/// machinery for a difference nobody could see.
+fn mask_gain(image: &Frame<'_>, colour: &Colour, mask: &rawkit_editstate::Mask) -> [f32; 4] {
+    let exposure = mask.exposure_ev.exp2();
+    if mask.warmth == 0.0 && mask.tint == 0.0 {
+        return [exposure, exposure, exposure, 0.0];
+    }
+
+    // Mireds, so the same slider means the same shift at 3000 K and at 9000 K.
+    // Warmer means a *higher* assumed temperature: telling the renderer the
+    // light was bluer is what makes the picture come out oranger.
+    let mired =
+        1e6 / colour.temperature.max(1.0) - mask.warmth * rawkit_editstate::LOCAL_MIRED_REACH;
+    let temperature = (1e6 / mired.max(1e-3)).clamp(
+        crate::profile::MIN_TEMPERATURE,
+        crate::profile::MAX_TEMPERATURE,
+    );
+    let tint = colour.tint + mask.tint * rawkit_editstate::LOCAL_TINT_REACH;
+
+    let here = image
+        .profile
+        .multipliers_for(colour.temperature, colour.tint);
+    let there = image.profile.multipliers_for(temperature, tint);
+    let ratio = [
+        there[0] / here[0].max(1e-6),
+        there[1] / here[1].max(1e-6),
+        there[2] / here[2].max(1e-6),
+    ];
+
+    let chain = crate::profile::multiply(&colour.working_to_display, &colour.cam_to_display);
+    let shifted = crate::profile::apply(&chain, ratio);
+    let plain = crate::profile::apply(&chain, [1.0, 1.0, 1.0]);
+    [
+        exposure * shifted[0] / plain[0].max(1e-6),
+        exposure * shifted[1] / plain[1].max(1e-6),
+        exposure * shifted[2] / plain[2].max(1e-6),
+        0.0,
+    ]
 }
 
 /// Fill `out` with the tile at `(ox, oy)` plus its halo, clamping at the image

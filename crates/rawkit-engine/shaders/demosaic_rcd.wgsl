@@ -112,8 +112,20 @@ struct Params {
     // costs a longer buffer and nothing else.
     guide: vec4<u32>,
     // Guide texels per image pixel, `.xy`. A constant of the image, so the
-    // per-tile arithmetic is a multiply.
+    // per-tile arithmetic is a multiply. `.z` is 1 when the guide's chroma field
+    // holds a real colour.
     guide_scale: vec4<f32>,
+    // How many local adjustments are bound, in `.x`. The rest unused.
+    masks: vec4<u32>,
+    // One over the image's size, `.xy`: image pixels to the normalised
+    // coordinates a mask texture is sampled in.
+    mask_scale: vec4<f32>,
+    // What each local adjustment multiplies by at full strength, `.rgb`.
+    //
+    // Exposure and white balance arrive already combined, because both are
+    // multiplies in this space and the shader has no reason to know which part
+    // came from which control. `.a` unused.
+    mask_gain: array<vec4<f32>, 8>,
     // Where this tile lands in the canvas and how to trim it: `.xy` is the
     // destination pixel, `.z` the tile edge, `.w` the halo width. Rewritten per
     // tile, unlike everything above it, which moves only when the edit does.
@@ -162,6 +174,18 @@ struct Params {
 // stride of 16 bytes anyway.
 @group(0) @binding(8) var<storage, read> hue_sat_map: array<vec4<f32>>;
 
+// Local adjustments, one texture layer each: where the adjustment applies, from
+// 0 outside to 1 at full strength.
+//
+// A *texture*, and that is the whole design. The renderer is handed a picture of
+// where an adjustment applies and never asks where it came from, so a gradient,
+// a brush stroke, a luminance range and a segmentation matte all enter the same
+// way. Sampled textures are a separate WebGPU limit from storage buffers
+// (sixteen per stage against eight), so this costs nothing against the eight
+// already spent -- unlike the guide, which had to ride inside `cfa`.
+@group(1) @binding(0) var mask_layers: texture_2d_array<f32>;
+@group(1) @binding(1) var mask_sampler: sampler;
+
 // The canvas, in its own bind group so it can be resized with the window
 // without disturbing the per-image buffers in group 0. Storage textures are a
 // separate WebGPU limit from storage buffers (four per stage against eight), so
@@ -172,7 +196,7 @@ struct Params {
 // would band visibly in the shadows once encoded. Not rgba32float either —
 // half floats carry more precision than a display can show, at half the
 // bandwidth, and bandwidth is what a canvas spends.
-@group(1) @binding(0) var canvas: texture_storage_2d<rgba16float, write>;
+@group(2) @binding(0) var canvas: texture_storage_2d<rgba16float, write>;
 
 const EPS: f32 = 1e-5;
 
@@ -529,11 +553,12 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let p = idx(x, y);
-    // Where this pixel sits in the guide. Worked out once: highlight
-    // reconstruction and the local tone controls both ask about the same place,
-    // and asking twice invites the two to drift apart.
-    let uv = guide_uv(x, y);
-    let looked = develop_rgb(rgba_out[p].rgb, uv);
+    // Where this pixel sits in the *full-resolution image*. Worked out once:
+    // highlight reconstruction, the local tone controls and the local
+    // adjustments all ask about the same place, and asking three times invites
+    // them to drift apart.
+    let ixy = image_xy(x, y);
+    let looked = develop_rgb(rgba_out[p].rgb, ixy);
 
     // Stage I -- display-referred ops. The five tone controls live here and not
     // beside exposure, because the sigmoid is the boundary: exposure decides how
@@ -542,7 +567,7 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
     // The neighbourhood's brightness is resolved once per pixel and handed to
     // all three channels, so shadows and highlights move a colour without
     // turning it -- see `tone_curve`.
-    let local = local_tone(uv);
+    let local = local_tone(ixy);
     var shaped = vec3<f32>(
         tone_curve(looked.r, local),
         tone_curve(looked.g, local),
@@ -572,7 +597,7 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// needs to know is how bright the neighbourhood *ends up*. Developing it by a
 /// second, simpler route would make the guide disagree with the picture it is
 /// describing, by an amount that changes with every slider.
-fn develop_rgb(camera: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+fn develop_rgb(camera: vec3<f32>, ixy: vec2<f32>) -> vec3<f32> {
     // White balance is a plain multiply because the working space is
     // scene-linear. That is the payoff of the linear core, and the reason this
     // is three multiplies rather than a colour-appearance model.
@@ -584,7 +609,7 @@ fn develop_rgb(camera: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
     // it is only visible while the channels are still the sensor's own. One
     // matrix multiply later they are mixed and there is no longer any such
     // thing as "the green channel clipped".
-    let recovered = reconstruct_highlights(balanced, uv);
+    let recovered = reconstruct_highlights(balanced, ixy);
 
     let display = vec3<f32>(
         dot(params.cam_to_display[0].rgb, recovered),
@@ -605,7 +630,10 @@ fn develop_rgb(camera: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
         dot(params.working_to_display[2].rgb, corrected),
     );
 
-    let exposed = shown * params.develop.x;
+    // Stage G -- local adjustments. Exposure has just been applied and the
+    // tone map has not, which is where the declared pipeline puts this and why
+    // the controls a mask carries are the ones that are multiplies here.
+    let exposed = local_adjust(shown * params.develop.x, ixy);
     // The profile's curve *instead of* ours, not as well as. Both map the scene
     // to a display, and running two tone maps in series maps the scene twice —
     // which reads as a flat, muddy picture rather than as a bug.
@@ -1010,15 +1038,47 @@ fn guide_texel(base: u32, x: i32, y: i32) -> vec3<f32> {
     return vec3<f32>(cfa[i], cfa[i + 1u], cfa[i + 2u]);
 }
 
-/// Where a tile pixel sits in the guide.
+/// Stage G -- the local adjustments, composited.
 ///
-/// Converted through the *full-resolution image* coordinate, which is what
-/// makes the answer independent of which tile is being drawn and of the
-/// resolution level it is drawn at.
-fn guide_uv(x: i32, y: i32) -> vec2<f32> {
-    let image_x = f32((x - params.source.w) * params.source.z + params.source.x);
-    let image_y = f32((y - params.source.w) * params.source.z + params.source.y);
-    return vec2<f32>(image_x * params.guide_scale.x, image_y * params.guide_scale.y);
+/// Each mask is a layer, sampled bilinearly at this pixel's place in the image,
+/// and each contributes a multiply raised to its own weight. Raised, not mixed:
+/// half a mask should be half the *stops*, and half the warmth, which is what a
+/// power gives and a linear blend of a multiply does not. It also makes a weight
+/// of exactly zero exactly identity, so a photograph with a mask that does not
+/// reach it is bit-identical to one with no mask at all.
+///
+/// Nothing here knows what shape a mask is. That is the point -- see
+/// `rawkit_engine::mask`.
+fn local_adjust(rgb: vec3<f32>, ixy: vec2<f32>) -> vec3<f32> {
+    let count = params.masks.x;
+    if (count == 0u) {
+        return rgb;
+    }
+    let uv = ixy * params.mask_scale.xy;
+    var out = rgb;
+    for (var i = 0u; i < count; i = i + 1u) {
+        // No implicit derivatives in a compute shader, so the mip level is
+        // named rather than inferred. There is only one level anyway.
+        let weight = textureSampleLevel(mask_layers, mask_sampler, uv, i, 0.0).r;
+        if (weight > 0.0) {
+            let gain = max(params.mask_gain[i].rgb, vec3<f32>(EPS));
+            out = out * pow(gain, vec3<f32>(weight));
+        }
+    }
+    return out;
+}
+
+/// Where a tile pixel sits in the full-resolution image.
+///
+/// Everything that asks a question about *place* -- the local-tone guide, the
+/// chroma reference, the masks -- is indexed through this rather than through
+/// tile coordinates. That is what makes the answers independent of which tile is
+/// being drawn and of the resolution level it is drawn at.
+fn image_xy(x: i32, y: i32) -> vec2<f32> {
+    return vec2<f32>(
+        f32((x - params.source.w) * params.source.z + params.source.x),
+        f32((y - params.source.w) * params.source.z + params.source.y),
+    );
 }
 
 /// A guide field, sampled bilinearly.
@@ -1027,7 +1087,8 @@ fn guide_uv(x: i32, y: i32) -> vec2<f32> {
 /// way round: developing four texels and blending the results would cost four
 /// tone maps a pixel, and blending a non-linear result is not obviously the
 /// value anyone wants anyway.
-fn guide_sample(base: u32, uv: vec2<f32>) -> vec3<f32> {
+fn guide_sample(base: u32, ixy: vec2<f32>) -> vec3<f32> {
+    let uv = ixy * params.guide_scale.xy;
     let gw = i32(params.guide.y);
     let gh = i32(params.guide.z);
     // Texel centres sit at half-integers, the same convention the resampler
@@ -1057,13 +1118,13 @@ fn guide_sample(base: u32, uv: vec2<f32>) -> vec3<f32> {
 /// reconstruction the multipliers themselves as a colour, and a frame with
 /// nothing unclipped in it would come back with a cast instead of the grey it
 /// used to get.
-fn guide_chroma(uv: vec2<f32>) -> vec3<f32> {
+fn guide_chroma(ixy: vec2<f32>) -> vec3<f32> {
     if (params.guide_scale.z < 0.5) {
         return 1.0 / max(params.wb.rgb, vec3<f32>(EPS));
     }
     // The second field, immediately behind the first.
     let base = params.guide.x + params.guide.y * params.guide.z * 3u;
-    return guide_sample(base, uv);
+    return guide_sample(base, ixy);
 }
 
 /// How bright this pixel's neighbourhood is, in the tone curve's coordinate.
@@ -1071,14 +1132,14 @@ fn guide_chroma(uv: vec2<f32>) -> vec3<f32> {
 /// Negative when neither local control is off zero, which is what `tone_curve`
 /// reads as "use the pixel's own value" -- so the whole arrangement costs
 /// nothing on a photograph that is not using it.
-fn local_tone(uv: vec2<f32>) -> f32 {
+fn local_tone(ixy: vec2<f32>) -> f32 {
     if (params.guide.w == 0u) {
         return -1.0;
     }
     // The guide's own blown pixels are reconstructed against the same
     // neighbourhood the picture's are, so the two agree about how bright a
     // highlight ended up.
-    let rgb = develop_rgb(guide_sample(params.guide.x, uv), uv);
+    let rgb = develop_rgb(guide_sample(params.guide.x, ixy), ixy);
     // Rec. 709, which is what the developed values are in by this point. One
     // number for all three channels, so the control moves a colour's brightness
     // and never its hue.
@@ -1315,7 +1376,7 @@ const CLIP_RUNUP: f32 = 0.25;
 /// for specular highlights, skies and light sources, which is most of what
 /// actually blows out, and wrong in the direction of white — uniformly white,
 /// now — for a saturated subject that clips.
-fn reconstruct_highlights(balanced: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+fn reconstruct_highlights(balanced: vec3<f32>, ixy: vec2<f32>) -> vec3<f32> {
     // The sensor clips at one value in its own space; white balance moves that
     // to a different height per channel, which is why the threshold is a vector.
     let thresholds = params.wb.rgb * params.develop.z;
@@ -1351,7 +1412,7 @@ fn reconstruct_highlights(balanced: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
     // returns and only the pixels that are actually blown read the guide. Not
     // an optimisation: measured either way the difference is inside the noise
     // of a full render on this adapter. It is simply where the value is needed.
-    let reference = guide_chroma(uv) * params.wb.rgb;
+    let reference = guide_chroma(ixy) * params.wb.rgb;
 
     // Anchor it to the channels that are still measurements. A channel that did
     // not clip is a *fact*, and a reconstruction has no business contradicting

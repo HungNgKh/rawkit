@@ -38,13 +38,14 @@ pub enum Group {
     Hsl,
     Curve,
     Grade,
+    Masks,
 }
 
 impl Group {
     /// Every group, in the order an interface should offer them — which is the
     /// order the renderer applies them, so a list of ticked boxes reads down the
     /// pipeline rather than in an order chosen by the alphabet.
-    pub const ALL: [Group; 7] = [
+    pub const ALL: [Group; 8] = [
         Group::WhiteBalance,
         Group::Tone,
         Group::Detail,
@@ -52,6 +53,7 @@ impl Group {
         Group::Hsl,
         Group::Curve,
         Group::Grade,
+        Group::Masks,
     ];
 
     /// The `EditState` field this group covers.
@@ -64,6 +66,7 @@ impl Group {
             Group::Hsl => "hsl",
             Group::Curve => "curve",
             Group::Grade => "grade",
+            Group::Masks => "masks",
         }
     }
 
@@ -84,6 +87,7 @@ impl Group {
             Group::Hsl => "Hue mixer",
             Group::Curve => "Tone curve",
             Group::Grade => "Colour grading",
+            Group::Masks => "Local adjustments",
         }
     }
 }
@@ -105,6 +109,11 @@ impl EditState {
                 Group::Hsl => self.hsl = source.hsl,
                 Group::Curve => self.curve = source.curve.clone(),
                 Group::Grade => self.grade = source.grade,
+                // Cloned rather than copied, and *replacing* rather than
+                // appending: a preset that added its masks to whatever the
+                // target already had would build up a stack nobody asked for,
+                // one application at a time.
+                Group::Masks => self.masks = source.masks.clone(),
             }
         }
     }
@@ -146,6 +155,10 @@ mod tests {
         s.hsl.red.hue = 0.3;
         s.curve.points = vec![[0.0, 0.0], [0.4, 0.6], [1.0, 1.0]];
         s.grade.shadows.saturation = 0.5;
+        s.masks = vec![crate::Mask {
+            exposure_ev: -1.0,
+            ..crate::Mask::default()
+        }];
         s
     }
 

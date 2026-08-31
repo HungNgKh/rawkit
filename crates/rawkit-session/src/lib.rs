@@ -134,6 +134,18 @@ pub enum Command {
         grade: Box<rawkit_editstate::Grade>,
         control: u8,
     },
+    /// Replace the local adjustments.
+    ///
+    /// The whole list at once, like the curve and the grading and for the same
+    /// reason: adding, removing and reordering change the *shape* of the list,
+    /// and a per-mask command would need a vocabulary for all three. `control`
+    /// is which control of which mask is being moved, so a drag on one slider
+    /// does not fold into a drag on another; `u8::MAX` means the list itself
+    /// changed, which is a discrete act and opens a step of its own.
+    SetMasks {
+        masks: Vec<rawkit_editstate::Mask>,
+        control: u8,
+    },
     /// Replace the hand-drawn tone curve.
     ///
     /// Carries the whole curve rather than one point, because inserting and
@@ -222,6 +234,7 @@ impl Command {
             Command::SetHsl { .. } => "set_hsl",
             Command::SetCurve { .. } => "set_curve",
             Command::SetGrade { .. } => "set_grade",
+            Command::SetMasks { .. } => "set_masks",
             Command::SetStraighten(_) => "set_straighten",
             Command::RotateBy(_) => "rotate_by",
             Command::SetEditState(_) => "set_edit_state",
@@ -258,6 +271,7 @@ impl Command {
         match self {
             Command::SetCurve { point, .. } => *point,
             Command::SetGrade { control, .. } => *control,
+            Command::SetMasks { control, .. } => *control,
             Command::SetHsl { band, control, .. } => {
                 let control = match control {
                     rawkit_editstate::BandControl::Hue => 0,
@@ -294,6 +308,7 @@ impl Command {
             // and opens a step of its own.
             Command::SetCurve { point, .. } => *point != u8::MAX,
             Command::SetGrade { control, .. } => *control != u8::MAX,
+            Command::SetMasks { control, .. } => *control != u8::MAX,
 
             Command::SetOrientation(_)
             | Command::SetCrop(_)
@@ -747,6 +762,19 @@ impl Session {
                     return refused(name, e.to_string());
                 }
                 self.state.grade = *grade;
+                self.edit_changed()
+            }
+
+            Command::SetMasks { masks, .. } => {
+                // Validated as a list, because the cap is a property of the list
+                // and not of any mask in it — and refused whole, so a bad one
+                // cannot leave the others half-applied.
+                let mut proposed = self.state.clone();
+                proposed.masks = masks;
+                if let Err(e) = proposed.validate() {
+                    return refused(name, e.to_string());
+                }
+                self.state = proposed;
                 self.edit_changed()
             }
 

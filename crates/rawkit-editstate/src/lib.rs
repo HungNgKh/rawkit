@@ -51,6 +51,10 @@ pub enum EditStateError {
     InvalidCrop(String),
     #[error("detail is out of range: {0}")]
     InvalidDetail(String),
+    #[error("a local adjustment is not usable: {0}")]
+    InvalidMask(String),
+    #[error("{0} local adjustments, and {MAX_MASKS} is the most a frame may carry")]
+    TooManyMasks(usize),
     #[error("colour is out of range: {0}")]
     InvalidColour(String),
     #[error("hue mixer is out of range: {0}")]
@@ -86,6 +90,9 @@ pub struct EditState {
     pub curve: Curve,
     #[serde(default)]
     pub grade: Grade,
+    /// Local adjustments: what changes, and where.
+    #[serde(default)]
+    pub masks: Vec<Mask>,
 }
 
 fn default_schema_version() -> u32 {
@@ -100,6 +107,7 @@ impl Default for EditState {
             tone: Tone::default(),
             orientation: Orientation::default(),
             crop: Crop::default(),
+            masks: Vec::new(),
             detail: Detail::default(),
             colour: Colour::default(),
             hsl: Hsl::default(),
@@ -138,6 +146,12 @@ impl EditState {
         }
         self.crop.validate()?;
         self.detail.validate()?;
+        if self.masks.len() > MAX_MASKS {
+            return Err(EditStateError::TooManyMasks(self.masks.len()));
+        }
+        for mask in &self.masks {
+            mask.validate()?;
+        }
         self.colour.validate()?;
         self.hsl.validate()?;
         self.curve.validate()?;
@@ -173,6 +187,131 @@ impl Default for WhiteBalance {
             temperature_k: None,
             tint: 0.0,
         }
+    }
+}
+
+/// The largest number of local adjustments one photograph may carry.
+///
+/// A cap rather than an open list, because the renderer holds their gains in a
+/// uniform and their masks in a fixed set of texture layers — both sized once
+/// when the image opens, because a render must not allocate. Eight is well past
+/// what a photograph needs and small enough that the arrays cost nothing.
+pub const MAX_MASKS: usize = 8;
+
+/// How far the local temperature control reaches, in mireds at full deflection.
+///
+/// Mireds and not Kelvin. A thousand Kelvin at 3000 K is a different picture
+/// from a thousand Kelvin at 9000 K, and a control that did one thing at one end
+/// of its range and another at the other is not a control. The reciprocal scale
+/// is near enough perceptually uniform that the same number means the same shift
+/// wherever the global temperature sits — which is why the profile's own inverse
+/// search runs in mireds too.
+pub const LOCAL_MIRED_REACH: f32 = 50.0;
+
+/// How far the local tint control reaches, in the units [`WhiteBalance::tint`]
+/// uses.
+pub const LOCAL_TINT_REACH: f32 = 40.0;
+
+/// Where a local adjustment applies.
+///
+/// One shape so far. The renderer does not know about shapes at all — it is
+/// handed a raster and composites it — so a second one is a rasteriser here and
+/// nothing there, which is the arrangement that lets a future mask come from
+/// somewhere other than a drawing.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MaskShape {
+    /// A gradient running from full effect at `from` to none at `to`.
+    ///
+    /// Both are fractions of the **unoriented, uncropped sensor frame**, which
+    /// is the only frame that does not move when the picture is turned or
+    /// trimmed. Stored in the displayed frame instead, a mask would slide across
+    /// the photograph the moment somebody adjusted the crop.
+    ///
+    /// Beyond `from` the effect is full and beyond `to` it is absent, so a
+    /// gradient covers the whole frame rather than a band across the middle of
+    /// it — which is what a graduated filter in front of a lens does.
+    Linear { from: [f32; 2], to: [f32; 2] },
+}
+
+/// One local adjustment: a region, and what to do inside it.
+///
+/// Both controls are scene-referred multiplies, which is why they are these two
+/// and not others: the mask composites before the tone map, and these are the
+/// operations that belong there. A local contrast or a local clarity lives on
+/// the far side of that boundary and needs the mask carried across it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Mask {
+    pub shape: MaskShape,
+    /// Stops, inside the mask.
+    pub exposure_ev: f32,
+    /// Warm or cool, -1 to 1. See [`LOCAL_MIRED_REACH`].
+    pub warmth: f32,
+    /// Green or magenta, -1 to 1. Positive is magenta, matching
+    /// [`WhiteBalance::tint`].
+    pub tint: f32,
+}
+
+impl Default for Mask {
+    fn default() -> Self {
+        Self {
+            // Across the top of the frame, running down: the graduated filter
+            // somebody reaches for first, and a placement that is visible
+            // straight away rather than one that has to be found.
+            shape: MaskShape::Linear {
+                from: [0.5, 0.0],
+                to: [0.5, 0.35],
+            },
+            exposure_ev: 0.0,
+            warmth: 0.0,
+            tint: 0.0,
+        }
+    }
+}
+
+impl Mask {
+    /// The largest exposure a local adjustment may carry, in stops.
+    pub const EXPOSURE_REACH: f32 = 4.0;
+
+    /// Whether this adjustment would change anything at all.
+    ///
+    /// A mask with every control at zero still costs a texture layer and a
+    /// sample, so the renderer skips it — and a user placing a gradient before
+    /// touching a slider sees nothing happen, which is correct and is why the
+    /// window draws the placement itself rather than relying on the picture.
+    pub fn is_identity(&self) -> bool {
+        self.exposure_ev == 0.0 && self.warmth == 0.0 && self.tint == 0.0
+    }
+
+    fn validate(&self) -> Result<(), EditStateError> {
+        let finite = |v: f32| v.is_finite();
+        let MaskShape::Linear { from, to } = self.shape;
+        if !from.iter().chain(&to).copied().all(finite) {
+            return Err(EditStateError::InvalidMask(format!(
+                "a gradient runs from {from:?} to {to:?}, which is not a place"
+            )));
+        }
+        if from == to {
+            return Err(EditStateError::InvalidMask(
+                "a gradient whose ends are the same point has no direction".into(),
+            ));
+        }
+        if !finite(self.exposure_ev) || self.exposure_ev.abs() > Self::EXPOSURE_REACH {
+            return Err(EditStateError::InvalidMask(format!(
+                "local exposure is {}, and runs to {} stops",
+                self.exposure_ev,
+                Self::EXPOSURE_REACH
+            )));
+        }
+        for (name, v) in [("warmth", self.warmth), ("tint", self.tint)] {
+            if !finite(v) || !(-1.0..=1.0).contains(&v) {
+                return Err(EditStateError::InvalidMask(format!(
+                    "local {name} is {v}, and runs from -1 to 1"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 

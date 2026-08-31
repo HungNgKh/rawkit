@@ -16,8 +16,8 @@
 //! scale factor is known rather than passing a scale around.
 
 use crate::{
-    in_crop, in_grid, picking_wb, targeting, Aim, Marquee, CANVAS_CLICK, CANVAS_MARQUEE,
-    CANVAS_SCROLL, TARGET_AIM, TARGET_RANGE_PX, WB_PICK,
+    in_crop, in_grid, picking_wb, placing_mask, targeting, Aim, Marquee, CANVAS_CLICK,
+    CANVAS_MARQUEE, CANVAS_SCROLL, MASK_DRAG, TARGET_AIM, TARGET_RANGE_PX, WB_PICK,
 };
 use rawkit_session::{Command, Session};
 use std::sync::{Arc, Mutex};
@@ -94,6 +94,15 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
                 *WB_PICK.lock().expect("pick lock") = Some(at);
                 return;
             }
+            // Placing a gradient takes the press for the same reason aiming
+            // does: the drag draws the mask, so it must not also pan the
+            // photograph the mask is being drawn on. A press with no motion
+            // after it leaves the gradient where it was, which is what makes a
+            // mis-click harmless.
+            if placing_mask().is_some() && !in_grid() {
+                *MASK_DRAG.lock().expect("mask drag lock") = Some((at, at));
+                return;
+            }
             // Aiming takes the press before anything else, and does not fall
             // through to `DRAG`: a targeted drag must not also pan the
             // photograph out from under the colour it is adjusting.
@@ -116,6 +125,12 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
         }
 
         Pointer::Motion { at } => {
+            // The far end follows the pointer. Where that lands on the sensor is
+            // the render loop's question, not this one's.
+            if let Some(drag) = MASK_DRAG.lock().expect("mask drag lock").as_mut() {
+                drag.1 = at;
+                return;
+            }
             if let Some(control) = targeting() {
                 aim(at, control, session);
                 return;
@@ -146,6 +161,10 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
         Pointer::Release => {
             *DRAG.lock().expect("drag lock") = None;
             *TARGET_AIM.lock().expect("aim lock") = None;
+            // The gradient stays where the drag left it; only the drag ends.
+            // Disarming here as well would make placing a second gradient need
+            // a trip back to the panel between every attempt.
+            *MASK_DRAG.lock().expect("mask drag lock") = None;
         }
 
         Pointer::Scroll { at, notches } => {

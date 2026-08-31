@@ -289,6 +289,15 @@ fn snapshot(state: tauri::State<'_, Shared>) -> serde_json::Value {
         "viewport": session.viewport(),
         "image": session.image_size(),
         "generation": session.generation(),
+        // Which local adjustment the panel is showing, and whether the next
+        // drag on the photograph redraws it. Neither is part of the *edit* —
+        // they are where the hands are, not what the picture is — so they live
+        // beside it rather than in it. `null` for none.
+        "selected_mask": match SELECTED_MASK.load(std::sync::atomic::Ordering::Relaxed) {
+            usize::MAX => None,
+            index => Some(index),
+        },
+        "placing_mask": PLACING_MASK.load(std::sync::atomic::Ordering::Relaxed),
         // `None` means the decoder's own matrix, which is a state worth naming
         // rather than an absence to be guessed at.
         "profile": *PROFILE_NAME.lock().expect("profile lock"),
@@ -949,7 +958,12 @@ fn main() -> Result<()> {
             panel_width,
             toggle_fullscreen,
             arm_target,
-            pick_white_balance
+            pick_white_balance,
+            add_mask,
+            remove_mask,
+            select_mask,
+            place_mask,
+            set_mask
         ])
         .setup(move |app| {
             // The surface is created on the main thread because the raw window
@@ -1452,6 +1466,41 @@ fn main() -> Result<()> {
                                 notice(format!("white balance {kelvin:.0} K, tint {tint:.0}"));
                             }
                         },
+                    }
+                }
+
+                // A gradient being placed. Resolved here for the same reason the
+                // white-balance pick is: turning two canvas positions into two
+                // places on the *sensor* needs the viewport and the geometry,
+                // and this is where both are to hand.
+                if let (Some((from, to)), Some(index)) =
+                    (*MASK_DRAG.lock().expect("mask drag lock"), placing_mask())
+                {
+                    // A press with no travel is not a gradient — and a
+                    // zero-length one has no direction, which the state layer
+                    // refuses. Left alone until the hand has actually moved.
+                    let moved = (to[0] - from[0]).hypot(to[1] - from[1]);
+                    if moved > 4.0 {
+                        let mut session = shared.lock().expect("session lock");
+                        let shape = gradient_between(
+                            from,
+                            to,
+                            session.viewport(),
+                            &session.geometry(),
+                            session.image_size(),
+                        );
+                        let mut masks = session.state().masks.clone();
+                        if let Some(mask) = masks.get_mut(index) {
+                            if mask.shape != shape {
+                                mask.shape = shape;
+                                session.apply(Command::SetMasks {
+                                    masks,
+                                    // The shape, of this mask. A drag is one
+                                    // undo step however many frames it spans.
+                                    control: (index as u8) * 4,
+                                });
+                            }
+                        }
                     }
                 }
 
@@ -2251,6 +2300,185 @@ pub(crate) fn neutralising(
 
 pub(crate) fn notice(what: impl Into<String>) {
     *NOTICE.lock().expect("notice lock") = Some(what.into());
+}
+
+/// Two canvas positions to the gradient they describe.
+///
+/// The result is in fractions of the **sensor**, which is the frame that does
+/// not move when the picture is turned or trimmed — so a gradient drawn across
+/// the sky stays across the sky afterwards, rather than sliding as soon as
+/// somebody adjusts the crop. Getting that wrong is invisible while the frame is
+/// upright and uncropped, which is most of the time and none of the interesting
+/// cases.
+fn gradient_between(
+    from: [f64; 2],
+    to: [f64; 2],
+    viewport: rawkit_session::Viewport,
+    geometry: &rawkit_editstate::Geometry,
+    size: [u32; 2],
+) -> rawkit_editstate::MaskShape {
+    let sensor = |at: [f64; 2]| {
+        let p = viewport.image_at(at);
+        // A degenerate rectangle, because `sensor_rect` is the one conversion
+        // that already knows about rotation, straightening and the crop window,
+        // and a second one written for points would be a second one to keep
+        // right.
+        let r = geometry.sensor_rect([p[0], p[1], p[0], p[1]], size);
+        [
+            (r[0] / size[0] as f64) as f32,
+            (r[1] / size[1] as f64) as f32,
+        ]
+    };
+    rawkit_editstate::MaskShape::Linear {
+        from: sensor(from),
+        to: sensor(to),
+    }
+}
+
+/// Which local adjustment the panel is showing, and whether the next drag on
+/// the photograph places it.
+///
+/// Two atomics rather than one selection object, because they are read from the
+/// pointer routing on whichever thread delivered the event and written from a
+/// command on another. `usize::MAX` is "none selected".
+static SELECTED_MASK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+static PLACING_MASK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn placing_mask() -> Option<usize> {
+    if !PLACING_MASK.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    match SELECTED_MASK.load(std::sync::atomic::Ordering::Relaxed) {
+        usize::MAX => None,
+        index => Some(index),
+    }
+}
+
+/// Where the placing drag started, in canvas pixels.
+///
+/// The gradient's near end. Held here rather than in the pointer module because
+/// turning it into a place on the *sensor* needs the viewport and the geometry,
+/// which only the render loop has — the same arrangement the white-balance pick
+/// uses, and for the same reason.
+pub(crate) static MASK_DRAG: Mutex<Option<([f64; 2], [f64; 2])>> = Mutex::new(None);
+
+/// Add a local adjustment, select it, and arm the next drag to place it.
+///
+/// It arrives darkening by a stop rather than doing nothing. A gradient that
+/// changes nothing is invisible, and an invisible thing that has to be dragged
+/// into position is a thing nobody can place — so the first press already shows
+/// where it is, and the sliders take it from there.
+#[tauri::command]
+fn add_mask(state: tauri::State<'_, Shared>) -> Result<usize, String> {
+    let mut session = state.0.lock().expect("session lock");
+    let mut masks = session.state().masks.clone();
+    if masks.len() >= rawkit_editstate::MAX_MASKS {
+        return Err(format!(
+            "{} local adjustments is the most a photograph may carry",
+            rawkit_editstate::MAX_MASKS
+        ));
+    }
+    masks.push(rawkit_editstate::Mask {
+        exposure_ev: -1.0,
+        ..rawkit_editstate::Mask::default()
+    });
+    let index = masks.len() - 1;
+    session.apply(Command::SetMasks {
+        masks,
+        control: u8::MAX,
+    });
+    drop(session);
+    SELECTED_MASK.store(index, std::sync::atomic::Ordering::Relaxed);
+    PLACING_MASK.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(index)
+}
+
+/// Throw one away.
+#[tauri::command]
+fn remove_mask(index: usize, state: tauri::State<'_, Shared>) -> Result<usize, String> {
+    let mut session = state.0.lock().expect("session lock");
+    let mut masks = session.state().masks.clone();
+    if index >= masks.len() {
+        return Err("there is no such local adjustment".into());
+    }
+    masks.remove(index);
+    let left = masks.len();
+    session.apply(Command::SetMasks {
+        masks,
+        control: u8::MAX,
+    });
+    drop(session);
+    // Selecting the one before it rather than nothing: removing the third of
+    // four and being left with no selection means finding the list again.
+    SELECTED_MASK.store(
+        if left == 0 {
+            usize::MAX
+        } else {
+            index.min(left - 1)
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    PLACING_MASK.store(false, std::sync::atomic::Ordering::Relaxed);
+    Ok(left)
+}
+
+/// Which one the panel is showing.
+#[tauri::command]
+fn select_mask(index: Option<usize>) -> usize {
+    let chosen = index.unwrap_or(usize::MAX);
+    SELECTED_MASK.store(chosen, std::sync::atomic::Ordering::Relaxed);
+    if index.is_none() {
+        PLACING_MASK.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    chosen
+}
+
+/// Whether the next drag on the photograph redraws the selected gradient.
+#[tauri::command]
+fn place_mask(armed: bool) -> bool {
+    PLACING_MASK.store(armed, std::sync::atomic::Ordering::Relaxed);
+    if !armed {
+        *MASK_DRAG.lock().expect("mask drag lock") = None;
+    }
+    armed
+}
+
+/// Move one control of one local adjustment.
+#[tauri::command]
+fn set_mask(
+    index: usize,
+    control: String,
+    value: f32,
+    state: tauri::State<'_, Shared>,
+) -> Result<(), String> {
+    let mut session = state.0.lock().expect("session lock");
+    let mut masks = session.state().masks.clone();
+    let mask = masks
+        .get_mut(index)
+        .ok_or_else(|| "there is no such local adjustment".to_string())?;
+    let slot = match control.as_str() {
+        "exposure" => {
+            mask.exposure_ev = value;
+            1
+        }
+        "warmth" => {
+            mask.warmth = value;
+            2
+        }
+        "tint" => {
+            mask.tint = value;
+            3
+        }
+        other => return Err(format!("{other:?} is not one of a mask's controls")),
+    };
+    session.apply(Command::SetMasks {
+        masks,
+        // Which control of which mask, so dragging exposure on one and then on
+        // another opens two undo steps rather than folding into one.
+        control: (index as u8) * 4 + slot,
+    });
+    Ok(())
 }
 
 /// Set the white balance from a patch that ought to be neutral.
@@ -3054,6 +3282,166 @@ mod tests {
             "a blue patch gave {:.0} K against a grey's {:.0} K",
             blue.0,
             grey.0
+        );
+    }
+}
+
+#[cfg(test)]
+mod gradient_tests {
+    use super::*;
+    use rawkit_editstate::{Crop, EditState, MaskShape, Orientation};
+    use rawkit_session::{Command, Session};
+
+    const SENSOR: [u32; 2] = [6000, 4000];
+
+    /// A session fitted to a window, which is what the shell hands the drag.
+    fn fitted(state: EditState) -> Session {
+        let mut session = Session::new(SENSOR, 512, state, Orientation::AsShot);
+        session.apply(Command::Resize {
+            width: 1200,
+            height: 800,
+        });
+        session
+    }
+
+    fn drawn(session: &Session, from: [f64; 2], to: [f64; 2]) -> ([f32; 2], [f32; 2]) {
+        let MaskShape::Linear { from, to } = gradient_between(
+            from,
+            to,
+            session.viewport(),
+            &session.geometry(),
+            session.image_size(),
+        );
+        (from, to)
+    }
+
+    /// Where the photograph sits inside the window, so a drag can be aimed at
+    /// the picture rather than at the letterboxing beside it.
+    ///
+    /// `Viewport` maps canvas to image and not the other way, so this inverts
+    /// it by probing: the mapping is affine, so two points along each axis give
+    /// its origin and its step exactly.
+    fn frame(session: &Session) -> [f64; 4] {
+        let view = session.viewport();
+        let origin = view.image_at([0.0, 0.0]);
+        let step = view.image_at([1.0, 1.0]);
+        let canvas = |image: [f64; 2]| {
+            [
+                (image[0] - origin[0]) / (step[0] - origin[0]),
+                (image[1] - origin[1]) / (step[1] - origin[1]),
+            ]
+        };
+        let size = session.geometry().output_size(session.image_size());
+        let a = canvas([0.0, 0.0]);
+        let b = canvas([size[0] as f64, size[1] as f64]);
+        [a[0], a[1], b[0], b[1]]
+    }
+
+    #[test]
+    fn a_drag_down_the_picture_is_a_gradient_down_the_sensor() {
+        let session = fitted(EditState::default());
+        let [x0, y0, x1, y1] = frame(&session);
+        let middle = (x0 + x1) / 2.0;
+        let (from, to) = drawn(&session, [middle, y0 + 1.0], [middle, (y0 + y1) / 2.0]);
+        println!("upright: {from:?} -> {to:?}");
+        assert!(from[1] < 0.01, "the near end is not at the top: {from:?}");
+        assert!(
+            (to[1] - 0.5).abs() < 0.02,
+            "the far end is not half way down: {to:?}"
+        );
+        assert!(
+            (from[0] - 0.5).abs() < 0.02 && (to[0] - 0.5).abs() < 0.02,
+            "a straight drag came out slanted: {from:?} -> {to:?}"
+        );
+    }
+
+    #[test]
+    fn a_drag_on_a_turned_frame_lands_where_the_hand_drew_it() {
+        // The whole reason the shape is stored in sensor fractions. Turned a
+        // quarter, a drag down the *screen* runs across the sensor — and if it
+        // were stored in screen fractions instead, the gradient would swing
+        // round the moment the picture was turned back.
+        let session = fitted(EditState {
+            orientation: Orientation::Rotate90Cw,
+            ..EditState::default()
+        });
+        let [x0, y0, x1, y1] = frame(&session);
+        let middle = (x0 + x1) / 2.0;
+        let (from, to) = drawn(&session, [middle, y0 + 1.0], [middle, (y0 + y1) / 2.0]);
+        println!("turned: {from:?} -> {to:?}");
+        // Down the screen is along one of the sensor's *horizontal* axes now.
+        assert!(
+            (from[1] - to[1]).abs() < 0.02,
+            "a drag down a turned frame moved down the sensor too: {from:?} -> {to:?}"
+        );
+        assert!(
+            (from[0] - to[0]).abs() > 0.3,
+            "a drag down a turned frame did not move across the sensor: {from:?} -> {to:?}"
+        );
+    }
+
+    #[test]
+    fn a_drag_on_a_cropped_frame_is_measured_against_the_whole_sensor() {
+        // A crop shows the middle half. Dragging from the top of what is *shown*
+        // must land a quarter of the way down the sensor, not at the top of it —
+        // otherwise the gradient would jump the moment the crop changed.
+        let session = fitted(EditState {
+            crop: Crop {
+                left: 0.25,
+                top: 0.25,
+                right: 0.75,
+                bottom: 0.75,
+                angle_deg: 0.0,
+            },
+            ..EditState::default()
+        });
+        let [x0, y0, x1, y1] = frame(&session);
+        let middle = (x0 + x1) / 2.0;
+        let (from, to) = drawn(&session, [middle, y0 + 1.0], [middle, y1 - 1.0]);
+        println!("cropped: {from:?} -> {to:?}");
+        assert!(
+            (from[1] - 0.25).abs() < 0.02,
+            "the top of the crop is not a quarter down the sensor: {from:?}"
+        );
+        assert!(
+            (to[1] - 0.75).abs() < 0.02,
+            "the bottom of the crop is not three quarters down: {to:?}"
+        );
+    }
+
+    #[test]
+    fn a_gradient_survives_the_state_it_is_stored_in() {
+        // End to end through the session, the way the window does it: add,
+        // place, adjust. The point is that `SetMasks` accepts what the drag
+        // produces — a shape rejected here would leave the mask at whatever
+        // placement it had and look like a dead drag.
+        let mut session = fitted(EditState::default());
+        session.apply(Command::SetMasks {
+            masks: vec![rawkit_editstate::Mask {
+                exposure_ev: -1.0,
+                ..rawkit_editstate::Mask::default()
+            }],
+            control: u8::MAX,
+        });
+        let [x0, y0, x1, y1] = frame(&session);
+        let shape = gradient_between(
+            [(x0 + x1) / 2.0, y0 + 1.0],
+            [(x0 + x1) / 2.0, (y0 + y1) / 2.0],
+            session.viewport(),
+            &session.geometry(),
+            session.image_size(),
+        );
+        let mut masks = session.state().masks.clone();
+        masks[0].shape = shape;
+        masks[0].warmth = 0.5;
+        session.apply(Command::SetMasks { masks, control: 0 });
+
+        let stored = &session.state().masks[0];
+        assert_eq!(stored.shape, shape, "the placement was refused");
+        assert_eq!(stored.warmth, 0.5);
+        assert!(
+            session.state().validate().is_ok(),
+            "a placement the window can make is not a state the catalog will hold"
         );
     }
 }

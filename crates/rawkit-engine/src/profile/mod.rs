@@ -621,7 +621,7 @@ fn mired_blend(low_cct: f32, high_cct: f32, cct: f32) -> f32 {
     ((m - b) / (a - b)).clamp(0.0, 1.0)
 }
 
-fn multiply(a: &Matrix3, b: &Matrix3) -> Matrix3 {
+pub(crate) fn multiply(a: &Matrix3, b: &Matrix3) -> Matrix3 {
     let mut out = [[0.0f32; 3]; 3];
     for (r, row) in out.iter_mut().enumerate() {
         for (c, cell) in row.iter_mut().enumerate() {
@@ -717,7 +717,7 @@ fn uv_from_cct(t: f32) -> (f32, f32) {
     (4.0 * x / denom, 6.0 * y / denom)
 }
 
-fn apply(m: &Matrix3, v: [f32; 3]) -> [f32; 3] {
+pub(crate) fn apply(m: &Matrix3, v: [f32; 3]) -> [f32; 3] {
     [
         m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
         m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
