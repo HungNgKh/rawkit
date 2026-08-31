@@ -9,6 +9,24 @@
 //! result is a pixel where red and blue exceed green — magenta — in the one part
 //! of the picture the eye most expects to be white.
 //!
+//! # Two regimes, and which tests are in which
+//!
+//! Reconstruction now borrows the colour of nearby light that did *not* clip,
+//! from [`rawkit_engine::guide`]. That splits these tests in two, and the split
+//! is worth knowing before adding another.
+//!
+//! Everything rendered through `render` uses a **uniform** frame, where either
+//! every pixel is blown or none is. There is no unclipped light anywhere, so
+//! there is nothing to ask, and reconstruction falls back to neutral — bit for
+//! bit the arithmetic it used before it had anywhere to ask. Those tests pin
+//! that fallback.
+//!
+//! Everything rendered through `render_field` puts a blown patch inside lit
+//! surroundings, which is the case a photograph is actually in. Those tests pin
+//! the propagation: that a highlight takes the colour of the light around it,
+//! that it never comes out more saturated than that light, and that when the
+//! *last* channel goes too it gives up and renders neutral again.
+//!
 //! `cargo test -p rawkit-engine --test highlights -- --ignored`
 
 use rawkit_editstate::EditState;
@@ -252,8 +270,29 @@ fn the_transition_into_clipping_is_gradual() {
     // highlight, which is a worse artefact than the magenta it replaces and
     // much harder to explain. Stepping across the boundary must not produce a
     // jump larger than the steps either side of it.
+    //
+    // Swept inside a frame that always has unclipped light in it. Rendered as a
+    // uniform frame the sweep would cross from "no light to ask about" to "some"
+    // partway along, and report that change of regime as a step at the clip
+    // point — which is a fact about the test, not about the picture. No single
+    // photograph is ever in both regimes at once.
     let gpu = Gpu::new().expect("no usable GPU adapter");
-    let sample = |green: f32| render(&gpu, [0.55, green, 0.75], DAYLIGHT_WB, 1.0)[1];
+    let sample = |green: f32| {
+        render_field(
+            &gpu,
+            BLOWN,
+            |x, y| {
+                if (192..320).contains(&x) && (192..320).contains(&y) {
+                    [0.55, green, 0.75]
+                } else {
+                    [0.40, 0.42, 0.44]
+                }
+            },
+            DAYLIGHT_WB,
+            1.0,
+            (256, 256, 24),
+        )[1]
+    };
 
     let steps: Vec<f32> = (0..12).map(|i| sample(0.970 + 0.005 * i as f32)).collect();
     let deltas: Vec<f32> = steps.windows(2).map(|w| w[1] - w[0]).collect();
@@ -264,4 +303,255 @@ fn the_transition_into_clipping_is_gradual() {
         largest < typical.abs() * 4.0 + 0.02,
         "a step change at the clip point: deltas {deltas:?}"
     );
+}
+
+/// A frame whose camera colour varies with position, and the average of a
+/// patch of the result.
+///
+/// The tests above all render a *uniform* frame, where every pixel is blown or
+/// none is — so reconstruction has never had anywhere to borrow a colour from
+/// and has always fallen back to neutral. Colour propagation is precisely the
+/// case those cannot reach: a blown region with unclipped light around it.
+fn render_field(
+    gpu: &Gpu,
+    side: u32,
+    camera: impl Fn(u32, u32) -> [f32; 3],
+    wb: [f32; 3],
+    clip: f32,
+    patch: (u32, u32, u32),
+) -> [f32; 3] {
+    let mut cfa = Vec::with_capacity((side * side) as usize);
+    for y in 0..side {
+        for x in 0..side {
+            let channel = if (x + y) % 2 == 1 {
+                1
+            } else if y % 2 == 0 {
+                0
+            } else {
+                2
+            };
+            cfa.push(camera(x, y)[channel]);
+        }
+    }
+    let out = Renderer::new(gpu)
+        .run(
+            gpu,
+            &Frame {
+                data: &cfa,
+                width: side,
+                height: side,
+                phase: BayerPhase::Rggb,
+                as_shot_wb: wb,
+                clip_level: clip,
+                profile: neutral_profile(),
+                recorded_orientation: rawkit_editstate::Orientation::AsShot,
+            },
+            &unsharpened(),
+            Output::Display,
+        )
+        .expect("render failed")
+        .pixels;
+
+    let (cx, cy, half) = patch;
+    let mut total = [0.0f64; 3];
+    let mut n = 0.0f64;
+    for y in cy - half..cy + half {
+        for x in cx - half..cx + half {
+            let i = ((y * side + x) * 4) as usize;
+            for (c, total) in total.iter_mut().enumerate() {
+                *total += out[i + c] as f64;
+            }
+            n += 1.0;
+        }
+    }
+    [
+        (total[0] / n) as f32,
+        (total[1] / n) as f32,
+        (total[2] / n) as f32,
+    ]
+}
+
+/// Hue as an angle in degrees, for comparing two colours' *kind* rather than
+/// their strength.
+fn hue(rgb: [f32; 3]) -> f32 {
+    let high = rgb[0].max(rgb[1]).max(rgb[2]);
+    let low = rgb[0].min(rgb[1]).min(rgb[2]);
+    let span = high - low;
+    if span <= 1e-6 {
+        return 0.0;
+    }
+    let h = if high == rgb[0] {
+        ((rgb[1] - rgb[2]) / span).rem_euclid(6.0)
+    } else if high == rgb[1] {
+        2.0 + (rgb[2] - rgb[0]) / span
+    } else {
+        4.0 + (rgb[0] - rgb[1]) / span
+    };
+    (h * 60.0).rem_euclid(360.0)
+}
+
+/// A scene lit by one colour, with a blown patch in the middle of it.
+const BLOWN: u32 = 512;
+
+/// The middle: red and green gone, blue still inside the sensor's range.
+///
+/// The *shoulder* of a highlight rather than its core, and deliberately. Where
+/// every channel is gone the magnitude is unknowable however well the colour is
+/// known, and reconstruction says so by rendering neutral — so a fully blown
+/// patch could not tell a working propagation from a broken one. This is also
+/// the case that covers the most of a real photograph: the ring around a
+/// specular, where the channels go one at a time.
+const SHOULDER: [f32; 3] = [1.0, 1.0, 0.5];
+
+fn lit_scene(x: u32, y: u32, light: [f32; 3]) -> [f32; 3] {
+    if (192..320).contains(&x) && (192..320).contains(&y) {
+        SHOULDER
+    } else {
+        light
+    }
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_blown_highlight_takes_the_colour_of_the_light_around_it() {
+    // The thing neutral reconstruction gets wrong. A blown sunset is not white:
+    // the light going into it is warm, and every unclipped pixel around it says
+    // so. Rendering it grey is a defensible answer to "what colour was this?"
+    // only while there is nothing to ask.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    // Warm light, comfortably below the sensor's limit in every channel.
+    const LIGHT: [f32; 3] = [0.62, 0.34, 0.16];
+    let surround = render_field(
+        &gpu,
+        BLOWN,
+        |x, y| lit_scene(x, y, LIGHT),
+        DAYLIGHT_WB,
+        1.0,
+        (96, 256, 24),
+    );
+    let recovered = render_field(
+        &gpu,
+        BLOWN,
+        |x, y| lit_scene(x, y, LIGHT),
+        DAYLIGHT_WB,
+        1.0,
+        (256, 256, 24),
+    );
+    println!(
+        "surrounding light {surround:?} hue {:.0} cast {:.3}\n\
+         blown middle      {recovered:?} hue {:.0} cast {:.3}",
+        hue(surround),
+        cast(surround),
+        hue(recovered),
+        cast(recovered)
+    );
+
+    assert!(
+        cast(recovered) > 0.08,
+        "the blown middle came out grey, so nothing was propagated: {recovered:?}"
+    );
+    let turn = (hue(recovered) - hue(surround) + 540.0).rem_euclid(360.0) - 180.0;
+    assert!(
+        turn.abs() < 12.0,
+        "the blown middle is a different colour from the light around it: \
+         {:.0} against {:.0} degrees",
+        hue(recovered),
+        hue(surround)
+    );
+    assert!(
+        recovered.iter().cloned().fold(0.0f32, f32::max) > 0.7,
+        "a blown highlight should still be bright: {recovered:?}"
+    );
+    // Its dim channels are the *point* — a warm highlight has little blue in
+    // it, and requiring every channel to be bright would be requiring grey.
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_highlight_with_nothing_left_still_renders_neutral() {
+    // The other side of the same decision, and the reason the fade to neutral
+    // is keyed on the *last* channel to go rather than the first. Knowing what
+    // colour the light was does not tell you how much of it there was: with
+    // every channel pinned there is no anchor to scale the borrowed colour to,
+    // and inventing one would paint a blown sun the colour of the sky beside it.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    const LIGHT: [f32; 3] = [0.62, 0.34, 0.16];
+    let recovered = render_field(
+        &gpu,
+        BLOWN,
+        |x, y| {
+            if (192..320).contains(&x) && (192..320).contains(&y) {
+                [1.0, 1.0, 1.0]
+            } else {
+                LIGHT
+            }
+        },
+        DAYLIGHT_WB,
+        1.0,
+        (256, 256, 24),
+    );
+    println!("nothing left: {recovered:?} cast {:.3}", cast(recovered));
+    assert!(
+        cast(recovered) < 0.06,
+        "a highlight with no surviving channel took a colour it cannot know: \
+         {recovered:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn reconstruction_is_never_more_saturated_than_its_surroundings() {
+    // The failure that made this whole area worth revisiting. An earlier
+    // version raised a surviving channel to meet another and produced
+    // highlights *more* saturated than the sky they interrupted — cyan and
+    // lavender arcs around every cloud edge. Borrowing a colour is exactly the
+    // operation that could bring it back, so the bound is checked rather than
+    // argued: whatever the light, the reconstruction may match its surroundings
+    // and may not exceed them.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    for light in [
+        [0.62f32, 0.34, 0.16], // warm
+        [0.20, 0.36, 0.70],    // cool
+        [0.40, 0.40, 0.40],    // neutral
+        [0.30, 0.62, 0.28],    // green
+    ] {
+        // The highlight is the *same light, brighter* — scaled until its
+        // strongest channel reaches the sensor's limit. That is the case the
+        // bound is about: a subject that is genuinely a different colour from
+        // its surroundings may legitimately come out more saturated than they
+        // are, and holding reconstruction to their saturation would be holding
+        // it to the wrong number. Here there is no such excuse.
+        let top = light[0].max(light[1]).max(light[2]);
+        let shoulder = [light[0] / top, light[1] / top, light[2] / top];
+        let scene = |x: u32, y: u32| {
+            if (192..320).contains(&x) && (192..320).contains(&y) {
+                shoulder
+            } else {
+                light
+            }
+        };
+        let surround = render_field(&gpu, BLOWN, scene, DAYLIGHT_WB, 1.0, (96, 256, 24));
+        let recovered = render_field(&gpu, BLOWN, scene, DAYLIGHT_WB, 1.0, (256, 256, 24));
+        println!(
+            "light {light:?}: surround cast {:.3}, blown cast {:.3}",
+            cast(surround),
+            cast(recovered)
+        );
+        assert!(
+            cast(recovered) <= cast(surround) + 0.02,
+            "light {light:?}: the reconstruction is more saturated than the light \
+             around it — {:.3} against {:.3}",
+            cast(recovered),
+            cast(surround)
+        );
+    }
 }

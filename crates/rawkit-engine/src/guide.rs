@@ -30,6 +30,22 @@
 //!   brightness difference as well as distance, so an edge of more than about a
 //!   stop stops it.
 //!
+//! # It carries a second field: the colour of unclipped light
+//!
+//! Highlight reconstruction has the same problem pointing the other way. A
+//! pixel whose blue channel clipped is *at least* as blue as it looks, and the
+//! honest thing to do with a measurement that stopped meaning anything is to
+//! replace it — but with what? Grey is what shipped, and grey turns a blown
+//! sunset white.
+//!
+//! So each texel also carries the camera RGB of the light that did **not** clip
+//! there, and a texel with no unclipped light of its own takes its neighbours'
+//! by diffusion. That last part is why this is a whole-frame structure rather
+//! than a search inside the tile halo: the middle of a large blown region has no
+//! unclipped pixel within eighteen pixels of it, and a reconstruction that
+//! coloured only the *rim* of a highlight would be a worse artefact than the
+//! white middle it replaced.
+//!
 //! # What it is not
 //!
 //! Not a bilateral filter in the strict sense: the two passes are separable and
@@ -62,11 +78,20 @@ const SIGMA_DIVISOR: f32 = 32.0;
 /// a skyline does not.
 const RANGE_STOPS: f32 = 1.0;
 
+/// A sample this close to the clip level is not to be trusted.
+///
+/// The mosaic arrives with the decoder's white level at 1.0, and sensors do not
+/// clip cleanly at it — the last percent is where the response goes non-linear.
+/// A chroma reference built from values inside that shoulder would carry the
+/// very skew it exists to correct.
+const TRUSTED: f32 = 0.98;
+
 /// The largest guide any allocation has to hold, in floats.
 ///
 /// Square, because [`MAX_EDGE`] bounds the longest edge and the shortest is
-/// never longer. Three floats a texel: RGB, and no alpha to invent.
-pub const CAPACITY: usize = (MAX_EDGE * MAX_EDGE) as usize * 3;
+/// never longer. Three floats a texel, and two fields — the light, and the
+/// colour of the light that did not clip.
+pub const CAPACITY: usize = (MAX_EDGE * MAX_EDGE) as usize * 3 * 2;
 
 /// The whole frame at a few hundred pixels, in the camera's own RGB.
 #[derive(Debug, Clone)]
@@ -74,6 +99,14 @@ pub struct Guide {
     /// Three floats per texel, row major: red, green, blue as the sensor saw
     /// them, white balance not applied.
     pub data: Vec<f32>,
+    /// The same shape again: the colour of the light that did not clip, for
+    /// highlight reconstruction to borrow. Filled everywhere — a texel with
+    /// nothing unclipped of its own takes its neighbours'.
+    pub chroma: Vec<f32>,
+    /// Whether any unclipped light was found at all. False for a frame blown
+    /// end to end, where [`Guide::chroma`] is neutral and reconstruction falls
+    /// back to the grey it used to produce unconditionally.
+    pub chroma_known: bool,
     pub width: u32,
     pub height: u32,
 }
@@ -81,10 +114,10 @@ pub struct Guide {
 /// How big a guide for an image this size is.
 ///
 /// Never more than half the image in either direction, which is what makes each
-/// texel cover at least a 2x2 block — and a 2x2 block of a Bayer mosaic holds
-/// one red, two green and one blue wherever it starts. Below that a texel could
-/// land on a single sample and two of its three channels would have nothing in
-/// them.
+/// texel cover at least one whole 2x2 block — and a 2x2 block of a Bayer mosaic
+/// holds one red, two green and one blue wherever it starts. Below that a texel
+/// could land on a single sample and two of its three channels would have
+/// nothing in them.
 fn dimensions(width: u32, height: u32) -> (u32, u32) {
     let longest = width.max(height);
     let scale = if longest > MAX_EDGE {
@@ -97,83 +130,192 @@ fn dimensions(width: u32, height: u32) -> (u32, u32) {
 }
 
 impl Guide {
-    /// Reduce a mosaic to a guide, and smooth it without crossing edges.
+    /// Reduce a mosaic to a guide, smooth it without crossing edges, and work
+    /// out the colour of the light that did not clip.
     ///
-    /// Costs one pass over the mosaic — 98 ms for a 24 MP frame — and is paid
-    /// once when the image opens, never while editing. Against the decode that
+    /// `clip_level` is where the sensor saturates, in the same units as
+    /// `mosaic` — 1.0 for anything that came through `normalise`.
+    ///
+    /// Costs one pass over the mosaic — 133 ms for a 24 MP frame, the chroma
+    /// field and its diffusion included — and is paid once when the image
+    /// opens, never while editing. Against the decode that
     /// precedes it that is small; against a slider drag it does not exist,
     /// which is the property that matters.
-    pub fn build(mosaic: &[f32], width: u32, height: u32, phase: BayerPhase) -> Guide {
+    pub fn build(
+        mosaic: &[f32],
+        width: u32,
+        height: u32,
+        phase: BayerPhase,
+        clip_level: f32,
+    ) -> Guide {
         let (gw, gh) = dimensions(width, height);
         let cells = (gw as usize) * (gh as usize);
         let mut sum = vec![0.0f32; cells * 3];
-        let mut count = vec![0.0f32; cells * 3];
+        let mut count = vec![0.0f32; cells];
+        let mut chroma = vec![0.0f32; cells * 3];
+        let mut chroma_weight = vec![0.0f32; cells];
 
         // Which guide column each image column falls in, worked out once rather
         // than as a 64-bit divide per pixel — it is the same answer every row.
-        // Worth 8% and no more: at 98 ms for 24 megapixels this pass is bound by
-        // the scattered accumulation and not by its arithmetic, which is worth
-        // knowing before anyone optimises the arithmetic again.
+        // Worth 8% and no more: this pass is bound by the scattered
+        // accumulation and not by its arithmetic, which is worth knowing before
+        // anyone optimises the arithmetic again.
         let column: Vec<u32> = (0..width)
             .map(|x| ((x as u64 * gw as u64) / width as u64).min(gw as u64 - 1) as u32)
             .collect();
 
+        // Walked in 2x2 blocks rather than pixel by pixel. A block is a whole
+        // Bayer quad wherever it starts, so each one yields a complete RGB
+        // triple — which the chroma field *needs*: "did this light clip" is a
+        // question about a pixel, and a lone red sample cannot answer it.
         let (dx, dy) = phase.offset();
-        for y in 0..height {
-            let gy = ((y as u64 * gh as u64) / height as u64).min(gh as u64 - 1) as u32;
-            let py = y + dy;
-            for x in 0..width {
-                let gx = column[x as usize];
-                let px = x + dx;
-                // The same rule as `colour_at` in the shader, and the only place
-                // this module knows the mosaic is a mosaic.
-                let c = if (px + py) % 2 == 1 {
-                    1
-                } else if py % 2 == 0 {
-                    0
-                } else {
-                    2
-                };
-                let i = (gy as usize * gw as usize + gx as usize) * 3 + c;
-                sum[i] += mosaic[(y as usize) * width as usize + x as usize];
-                count[i] += 1.0;
+        let trusted = clip_level * TRUSTED;
+        for by in (0..height.saturating_sub(1)).step_by(2) {
+            let gy = ((by as u64 * gh as u64) / height as u64).min(gh as u64 - 1) as u32;
+            for bx in (0..width.saturating_sub(1)).step_by(2) {
+                let mut rgb = [0.0f32; 3];
+                let mut clipped = false;
+                for j in 0..2u32 {
+                    for i in 0..2u32 {
+                        let (x, y) = (bx + i, by + j);
+                        let v = mosaic[y as usize * width as usize + x as usize];
+                        clipped |= v >= trusted;
+                        // The same rule as `colour_at` in the shader, and the
+                        // only place this module knows a mosaic is a mosaic.
+                        let (px, py) = (x + dx, y + dy);
+                        let c = if (px + py) % 2 == 1 {
+                            1
+                        } else if py % 2 == 0 {
+                            0
+                        } else {
+                            2
+                        };
+                        // Green twice per quad, so it is halved on the way in.
+                        rgb[c] += if c == 1 { v * 0.5 } else { v };
+                    }
+                }
+
+                let cell = gy as usize * gw as usize + column[bx as usize] as usize;
+                for (c, v) in rgb.iter().enumerate() {
+                    sum[cell * 3 + c] += v;
+                }
+                count[cell] += 1.0;
+
+                if !clipped {
+                    // Weighted by the quad's own brightness, so the reference
+                    // is the colour of the *bright* light near a highlight
+                    // rather than an average that a large shadow would drag
+                    // towards its own cast. One weight for all three channels:
+                    // weighting each by itself would bias the chroma outwards,
+                    // which is the direction that produces the artefact this
+                    // whole field exists to avoid.
+                    let weight = rgb[1].max(0.0);
+                    for (c, v) in rgb.iter().enumerate() {
+                        chroma[cell * 3 + c] += v * weight;
+                    }
+                    chroma_weight[cell] += weight;
+                }
             }
         }
 
-        // A channel with nothing in it cannot happen for a texel covering 2x2 or
-        // more, which `dimensions` guarantees. It is filled from the frame's own
-        // mean rather than left at zero, because a zero here would read as a
-        // black neighbourhood and pull the recovery the wrong way — a silent
-        // wrong answer where a visible one would be better.
-        let mean: Vec<f32> = (0..3)
-            .map(|c| {
-                let (s, n): (f32, f32) = (0..cells).fold((0.0, 0.0), |(s, n), i| {
-                    (s + sum[i * 3 + c], n + count[i * 3 + c])
-                });
-                if n > 0.0 {
-                    s / n
-                } else {
-                    0.0
-                }
-            })
-            .collect();
         let mut data = vec![0.0f32; cells * 3];
-        for i in 0..cells * 3 {
-            data[i] = if count[i] > 0.0 {
-                sum[i] / count[i]
-            } else {
-                mean[i % 3]
-            };
+        for cell in 0..cells {
+            // A texel with no complete quad cannot happen for one covering 2x2
+            // or more, which `dimensions` guarantees. Left at zero it would read
+            // as a black neighbourhood and pull the local tone the wrong way — a
+            // silent wrong answer where a visible one would be better.
+            let n = count[cell].max(1.0);
+            for c in 0..3 {
+                data[cell * 3 + c] = sum[cell * 3 + c] / n;
+            }
         }
 
         let sigma = (gw.max(gh) as f32 / SIGMA_DIVISOR).max(1.0);
         blur(&mut data, gw, gh, sigma);
+        let chroma_known = spread_chroma(&mut chroma, &chroma_weight, gw, gh);
+
         Guide {
             data,
+            chroma,
+            chroma_known,
             width: gw,
             height: gh,
         }
     }
+}
+
+/// Turn the weighted sums into colours, and carry them into the texels that had
+/// no unclipped light of their own.
+///
+/// Returns whether there was any to carry. Diffusion rather than a nearest-
+/// neighbour search: a blown region is filled from all sides at once, so the
+/// colour it ends up with varies smoothly across it instead of stepping along
+/// the boundaries of whichever edge pixel happened to be closest. Enough passes
+/// to cross the guide, which at a few hundred texels is nothing.
+fn spread_chroma(chroma: &mut [f32], weight: &[f32], width: u32, height: u32) -> bool {
+    let cells = (width as usize) * (height as usize);
+    let mut known = vec![false; cells];
+    let mut any = false;
+    for cell in 0..cells {
+        if weight[cell] > 0.0 {
+            known[cell] = true;
+            any = true;
+            for c in 0..3 {
+                chroma[cell * 3 + c] /= weight[cell];
+            }
+        }
+    }
+    if !any {
+        // A frame blown from edge to edge. Left at zero and flagged unknown:
+        // what neutral *means* in camera RGB depends on the white balance,
+        // which is an edit and not a property of the mosaic, so the shader
+        // supplies it rather than this. See `guide_chroma`.
+        return false;
+    }
+
+    let (w, h) = (width as i32, height as i32);
+    let mut filled = known.clone();
+    // The longest run of unknown texels is bounded by the guide's diagonal, and
+    // each pass advances the front by one.
+    for _ in 0..(w + h) {
+        let mut moved = false;
+        let source = chroma.to_vec();
+        let settled = filled.clone();
+        for y in 0..h {
+            for x in 0..w {
+                let cell = (y * w + x) as usize;
+                if settled[cell] {
+                    continue;
+                }
+                let mut acc = [0.0f32; 3];
+                let mut n = 0.0f32;
+                for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
+                    if nx < 0 || ny < 0 || nx >= w || ny >= h {
+                        continue;
+                    }
+                    let near = (ny * w + nx) as usize;
+                    if !settled[near] {
+                        continue;
+                    }
+                    for (c, acc) in acc.iter_mut().enumerate() {
+                        *acc += source[near * 3 + c];
+                    }
+                    n += 1.0;
+                }
+                if n > 0.0 {
+                    for (c, acc) in acc.iter().enumerate() {
+                        chroma[cell * 3 + c] = acc / n;
+                    }
+                    filled[cell] = true;
+                    moved = true;
+                }
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    true
 }
 
 /// Separable edge-aware blur, weighted by distance and by brightness together.
@@ -266,7 +408,7 @@ mod tests {
             );
             assert!(gw <= MAX_EDGE && gh <= MAX_EDGE, "{w}x{h} exceeded the cap");
             assert!(
-                (gw * gh) as usize * 3 <= CAPACITY,
+                (gw * gh) as usize * 3 * 2 <= CAPACITY,
                 "{w}x{h} needs more than the allocation reserves"
             );
         }
@@ -279,7 +421,7 @@ mod tests {
         // a guide that darkened at the edges would recover the corners of every
         // photograph differently from its middle.
         let data = mosaic(128, 96, |_, _| [0.4, 0.5, 0.2]);
-        let guide = Guide::build(&data, 128, 96, BayerPhase::Rggb);
+        let guide = Guide::build(&data, 128, 96, BayerPhase::Rggb, 1.0);
         for (i, texel) in guide.data.chunks_exact(3).enumerate() {
             for (c, (v, expected)) in texel.iter().zip([0.4, 0.5, 0.2]).enumerate() {
                 assert!(
@@ -296,7 +438,7 @@ mod tests {
         // give the local operator a red frame's brightness for a blue one, which
         // is invisible until a picture looks wrong.
         let data = mosaic(64, 64, |_, _| [0.8, 0.4, 0.1]);
-        let guide = Guide::build(&data, 64, 64, BayerPhase::Rggb);
+        let guide = Guide::build(&data, 64, 64, BayerPhase::Rggb, 1.0);
         let mid = ((guide.height / 2) * guide.width + guide.width / 2) as usize * 3;
         assert!((guide.data[mid] - 0.8).abs() < 1e-3);
         assert!((guide.data[mid + 1] - 0.4).abs() < 1e-3);
@@ -313,7 +455,7 @@ mod tests {
             let v = if x < 128 { 0.05 } else { 0.8 };
             [v, v, v]
         });
-        let guide = Guide::build(&data, 256, 256, BayerPhase::Rggb);
+        let guide = Guide::build(&data, 256, 256, BayerPhase::Rggb, 1.0);
         let row = (guide.height / 2) as usize * guide.width as usize;
         let half = guide.width as usize / 2;
         // Four texels back from the boundary, well inside the blur's reach.
@@ -338,7 +480,7 @@ mod tests {
             let v = 0.1 + 0.5 * x as f32 / 255.0;
             [v, v, v]
         });
-        let guide = Guide::build(&data, 256, 256, BayerPhase::Rggb);
+        let guide = Guide::build(&data, 256, 256, BayerPhase::Rggb, 1.0);
         let row = (guide.height / 2) as usize * guide.width as usize;
         let left = guide.data[(row + 8) * 3 + 1];
         let right = guide.data[(row + guide.width as usize - 8) * 3 + 1];

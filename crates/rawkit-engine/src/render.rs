@@ -289,8 +289,9 @@ struct Params {
     /// same reason `pq` and `lp` share one. Read-only and written once when the
     /// image opens, so sharing costs a longer buffer and nothing else.
     guide: [u32; 4],
-    /// Guide texels per image pixel, `[x, y]`. A constant of the image; `.zw`
-    /// unused.
+    /// Guide texels per image pixel, `[x, y]`; `.z` is 1 when the guide's chroma
+    /// field holds a real colour and 0 when the frame was blown end to end.
+    /// A constant of the image; `.w` unused.
     guide_scale: [f32; 4],
     /// `[dest_x, dest_y, tile, halo]`. Rewritten per tile; everything above it
     /// moves only when the edit does, which is why this sits last and is
@@ -727,11 +728,22 @@ impl Renderer {
             px + crate::guide::CAPACITY,
             wgpu::BufferUsages::COPY_DST,
         );
-        let guide = crate::guide::Guide::build(image.data, image.width, image.height, image.phase);
+        let guide = crate::guide::Guide::build(
+            image.data,
+            image.width,
+            image.height,
+            image.phase,
+            image.clip_level,
+        );
         gpu.queue.write_buffer(
             &cfa,
             (px * std::mem::size_of::<f32>()) as u64,
             bytemuck::cast_slice(&guide.data),
+        );
+        gpu.queue.write_buffer(
+            &cfa,
+            ((px + guide.data.len()) * std::mem::size_of::<f32>()) as u64,
+            bytemuck::cast_slice(&guide.chroma),
         );
         let vh = plane("vh", px, wgpu::BufferUsages::empty());
         // `pq` and `lp` share one buffer: WebGPU guarantees only eight storage
@@ -795,6 +807,7 @@ impl Renderer {
             table_cells,
             guide_offset: px,
             guide_size: [guide.width, guide.height],
+            chroma_known: guide.chroma_known,
             guide_scale: [
                 guide.width as f32 / image.width.max(1) as f32,
                 guide.height as f32 / image.height.max(1) as f32,
@@ -1365,7 +1378,16 @@ impl Renderer {
                 // build that never had this.
                 u32::from(tone.active && (tone.highlights != 0.0 || tone.shadows != 0.0)),
             ],
-            guide_scale: [buffers.guide_scale[0], buffers.guide_scale[1], 0.0, 0.0],
+            guide_scale: [
+                buffers.guide_scale[0],
+                buffers.guide_scale[1],
+                // Whether highlight reconstruction has a colour to borrow. Not
+                // the same question as whether the local tone is switched on:
+                // reconstruction runs on every frame with a blown pixel in it,
+                // whatever the tone controls say.
+                if buffers.chroma_known { 1.0 } else { 0.0 },
+                0.0,
+            ],
             // Per-tile, and rewritten by both render paths before the develop
             // stage reads it. Level zero at the origin, with the halo, is what
             // a single-tile whole-image render would want if nobody wrote it.
@@ -1488,6 +1510,8 @@ pub struct TileBuffers {
     /// edit changes. A slider move rewrites the uniform and not this.
     guide_offset: usize,
     guide_size: [u32; 2],
+    /// Whether the frame had any unclipped light to borrow a colour from.
+    chroma_known: bool,
     /// Guide texels per image pixel. Carried rather than recomputed so the
     /// uniform and the buffer can never describe different mappings.
     guide_scale: [f32; 2],

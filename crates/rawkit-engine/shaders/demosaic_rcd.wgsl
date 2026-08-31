@@ -529,7 +529,11 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let p = idx(x, y);
-    let looked = develop_rgb(rgba_out[p].rgb);
+    // Where this pixel sits in the guide. Worked out once: highlight
+    // reconstruction and the local tone controls both ask about the same place,
+    // and asking twice invites the two to drift apart.
+    let uv = guide_uv(x, y);
+    let looked = develop_rgb(rgba_out[p].rgb, uv);
 
     // Stage I -- display-referred ops. The five tone controls live here and not
     // beside exposure, because the sigmoid is the boundary: exposure decides how
@@ -538,7 +542,7 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
     // The neighbourhood's brightness is resolved once per pixel and handed to
     // all three channels, so shadows and highlights move a colour without
     // turning it -- see `tone_curve`.
-    let local = local_tone(x, y);
+    let local = local_tone(uv);
     var shaped = vec3<f32>(
         tone_curve(looked.r, local),
         tone_curve(looked.g, local),
@@ -568,7 +572,7 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// needs to know is how bright the neighbourhood *ends up*. Developing it by a
 /// second, simpler route would make the guide disagree with the picture it is
 /// describing, by an amount that changes with every slider.
-fn develop_rgb(camera: vec3<f32>) -> vec3<f32> {
+fn develop_rgb(camera: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
     // White balance is a plain multiply because the working space is
     // scene-linear. That is the payoff of the linear core, and the reason this
     // is three multiplies rather than a colour-appearance model.
@@ -580,7 +584,7 @@ fn develop_rgb(camera: vec3<f32>) -> vec3<f32> {
     // it is only visible while the channels are still the sensor's own. One
     // matrix multiply later they are mixed and there is no longer any such
     // thing as "the green channel clipped".
-    let recovered = reconstruct_highlights(balanced);
+    let recovered = reconstruct_highlights(balanced, uv);
 
     let display = vec3<f32>(
         dot(params.cam_to_display[0].rgb, recovered),
@@ -1000,56 +1004,81 @@ fn tone_curve(y: f32, local: f32) -> f32 {
     return pow(levelled, TONE_GAMMA);
 }
 
-/// One texel of the guide, in the camera's own RGB.
-fn guide_texel(x: i32, y: i32) -> vec3<f32> {
-    let i = params.guide.x + u32(y * i32(params.guide.y) + x) * 3u;
+/// One texel of one of the guide's two fields, in the camera's own RGB.
+fn guide_texel(base: u32, x: i32, y: i32) -> vec3<f32> {
+    let i = base + u32(y * i32(params.guide.y) + x) * 3u;
     return vec3<f32>(cfa[i], cfa[i + 1u], cfa[i + 2u]);
 }
 
-/// The guide, sampled bilinearly at a point in guide coordinates.
+/// Where a tile pixel sits in the guide.
+///
+/// Converted through the *full-resolution image* coordinate, which is what
+/// makes the answer independent of which tile is being drawn and of the
+/// resolution level it is drawn at.
+fn guide_uv(x: i32, y: i32) -> vec2<f32> {
+    let image_x = f32((x - params.source.w) * params.source.z + params.source.x);
+    let image_y = f32((y - params.source.w) * params.source.z + params.source.y);
+    return vec2<f32>(image_x * params.guide_scale.x, image_y * params.guide_scale.y);
+}
+
+/// A guide field, sampled bilinearly.
 ///
 /// The camera's RGB is interpolated and *then* developed, rather than the other
 /// way round: developing four texels and blending the results would cost four
 /// tone maps a pixel, and blending a non-linear result is not obviously the
 /// value anyone wants anyway.
-fn guide_rgb(u: f32, v: f32) -> vec3<f32> {
+fn guide_sample(base: u32, uv: vec2<f32>) -> vec3<f32> {
     let gw = i32(params.guide.y);
     let gh = i32(params.guide.z);
     // Texel centres sit at half-integers, the same convention the resampler
     // uses; without the half the guide slides by half a texel, which no test
     // would notice and every gradient would.
-    let fx = clamp(u - 0.5, 0.0, f32(gw - 1));
-    let fy = clamp(v - 0.5, 0.0, f32(gh - 1));
+    let fx = clamp(uv.x - 0.5, 0.0, f32(gw - 1));
+    let fy = clamp(uv.y - 0.5, 0.0, f32(gh - 1));
     let x0 = i32(floor(fx));
     let y0 = i32(floor(fy));
     let x1 = min(x0 + 1, gw - 1);
     let y1 = min(y0 + 1, gh - 1);
     let tx = fx - f32(x0);
     let ty = fy - f32(y0);
-    let top = mix(guide_texel(x0, y0), guide_texel(x1, y0), tx);
-    let bottom = mix(guide_texel(x0, y1), guide_texel(x1, y1), tx);
+    let top = mix(guide_texel(base, x0, y0), guide_texel(base, x1, y0), tx);
+    let bottom = mix(guide_texel(base, x0, y1), guide_texel(base, x1, y1), tx);
     return mix(top, bottom, ty);
+}
+
+/// The colour of the light that did not clip near this pixel, in camera RGB.
+///
+/// Neutral when the frame had none to offer, which is what makes reconstruction
+/// fall back to the grey it used to produce unconditionally.
+///
+/// **Neutral here is `1 / wb`, not `1`.** This field is in the camera's own RGB,
+/// where a grey object does not have equal channels -- undoing that is what the
+/// white balance multipliers are *for*. Returning ones would hand
+/// reconstruction the multipliers themselves as a colour, and a frame with
+/// nothing unclipped in it would come back with a cast instead of the grey it
+/// used to get.
+fn guide_chroma(uv: vec2<f32>) -> vec3<f32> {
+    if (params.guide_scale.z < 0.5) {
+        return 1.0 / max(params.wb.rgb, vec3<f32>(EPS));
+    }
+    // The second field, immediately behind the first.
+    let base = params.guide.x + params.guide.y * params.guide.z * 3u;
+    return guide_sample(base, uv);
 }
 
 /// How bright this pixel's neighbourhood is, in the tone curve's coordinate.
 ///
-/// Negative when no guide is bound or neither local control is off zero, which
-/// is what `tone_curve` reads as "use the pixel's own value" -- so the whole
-/// arrangement costs nothing on a photograph that is not using it.
-///
-/// The tile's pixel is converted to a *full-resolution image* coordinate first.
-/// That is what makes the result independent of which tile is being drawn and
-/// of the resolution level it is drawn at.
-fn local_tone(x: i32, y: i32) -> f32 {
+/// Negative when neither local control is off zero, which is what `tone_curve`
+/// reads as "use the pixel's own value" -- so the whole arrangement costs
+/// nothing on a photograph that is not using it.
+fn local_tone(uv: vec2<f32>) -> f32 {
     if (params.guide.w == 0u) {
         return -1.0;
     }
-    let image_x = f32((x - params.source.w) * params.source.z + params.source.x);
-    let image_y = f32((y - params.source.w) * params.source.z + params.source.y);
-    let rgb = develop_rgb(guide_rgb(
-        image_x * params.guide_scale.x,
-        image_y * params.guide_scale.y,
-    ));
+    // The guide's own blown pixels are reconstructed against the same
+    // neighbourhood the picture's are, so the two agree about how bright a
+    // highlight ended up.
+    let rgb = develop_rgb(guide_sample(params.guide.x, uv), uv);
     // Rec. 709, which is what the developed values are in by this point. One
     // number for all three channels, so the control moves a colour's brightness
     // and never its hue.
@@ -1286,7 +1315,7 @@ const CLIP_RUNUP: f32 = 0.25;
 /// for specular highlights, skies and light sources, which is most of what
 /// actually blows out, and wrong in the direction of white — uniformly white,
 /// now — for a saturated subject that clips.
-fn reconstruct_highlights(balanced: vec3<f32>) -> vec3<f32> {
+fn reconstruct_highlights(balanced: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
     // The sensor clips at one value in its own space; white balance moves that
     // to a different height per channel, which is why the threshold is a vector.
     let thresholds = params.wb.rgb * params.develop.z;
@@ -1295,17 +1324,65 @@ fn reconstruct_highlights(balanced: vec3<f32>) -> vec3<f32> {
     // How far this pixel is a blown highlight at all. The *first* channel to go
     // drives it, because that is when the colour stops being known.
     let blown = max(clipped.r, max(clipped.g, clipped.b));
+    // Exactly zero below the run-up, so an unclipped pixel comes through
+    // untouched rather than merely almost untouched.
+    if (blown <= 0.0) {
+        return balanced;
+    }
 
-    // Neutral at the pixel's own brightest channel — which for a fully clipped
-    // pixel is the highest threshold, so the "nothing left to believe" case
-    // needs no branch of its own. Never below any channel, so this can only
-    // raise: a highlight that could darken would grow a dark rim where the
-    // run-up begins.
+    // Neutral at the pixel's own brightest channel. Never below any channel, so
+    // this can only raise: a highlight that could darken would grow a dark rim
+    // where the run-up begins.
     let level = max(balanced.r, max(balanced.g, balanced.b));
+    let neutral = vec3<f32>(level);
 
-    // `blown` is exactly zero below the run-up, so an unclipped pixel comes
-    // through this untouched rather than merely almost untouched.
-    return mix(balanced, vec3<f32>(level), blown);
+    // Nothing in the frame stayed inside the sensor's range, so there is no
+    // light to ask about. Neutral, which is what this did unconditionally
+    // before it had anywhere to ask -- and bit for bit the same arithmetic, so
+    // a frame in this regime renders exactly as it used to.
+    if (params.guide_scale.z < 0.5) {
+        return mix(balanced, neutral, blown);
+    }
+
+    // The colour of nearby light that did not clip, brought into this space by
+    // the same multipliers the pixel went through.
+    //
+    // Fetched here rather than by the caller, so it sits past both early
+    // returns and only the pixels that are actually blown read the guide. Not
+    // an optimisation: measured either way the difference is inside the noise
+    // of a full render on this adapter. It is simply where the value is needed.
+    let reference = guide_chroma(uv) * params.wb.rgb;
+
+    // Anchor it to the channels that are still measurements. A channel that did
+    // not clip is a *fact*, and a reconstruction has no business contradicting
+    // one -- so the borrowed colour is scaled to agree with the survivors and
+    // only the channels that stopped meaning anything are replaced.
+    //
+    // Least squares over all of them, rather than picking the least-clipped.
+    // Picking is ambiguous exactly when it matters: with green gone, red and
+    // blue both survive and disagree, and choosing the brighter is precisely
+    // what produced the cyan arcs. This uses both, weighted by how much of each
+    // is left.
+    let survives = vec3<f32>(1.0) - clipped;
+    let scale = dot(survives, balanced * reference)
+        / max(dot(survives, reference * reference), EPS);
+
+    // Never below where a channel clipped: a clipped channel is known to be at
+    // least its threshold, and a reference cooler than this pixel would
+    // otherwise reconstruct it *downwards* into a value the sensor has already
+    // ruled out.
+    let inferred = max(reference * scale, thresholds);
+    // Per channel, by how far that channel has gone. A channel still in the
+    // clear keeps its measurement exactly; one inside the run-up crosses over
+    // smoothly, which is what keeps the boundary of a highlight invisible.
+    let borrowed = mix(balanced, inferred, clipped);
+
+    // And when the *last* channel goes too there is no anchor left, so the
+    // magnitude is unknowable however well the colour is known. Neutral again,
+    // faded in as the final survivor disappears -- which is also what the middle
+    // of a genuinely blown highlight looks like.
+    let nothing_left = min(clipped.r, min(clipped.g, clipped.b));
+    return mix(borrowed, neutral, nothing_left);
 }
 
 /// Fixed sigmoid roll-off, applied per channel.

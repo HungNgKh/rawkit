@@ -25,9 +25,9 @@
 //! `RAWKIT_BLESS=1 cargo test -p rawkit-engine --test golden -- --ignored`
 //!
 //! Before blessing anything, run it with `RAWKIT_COMPARE=1` — it prints how the
-//! mean level and the surviving texture move for each reference, which is the
-//! difference between a change you meant and a stage that has quietly stopped
-//! working.
+//! mean level, the surviving texture and the colour move for each reference,
+//! which is the difference between a change you meant and a stage that has
+//! quietly stopped working.
 //! writes the references instead of comparing. Blessing is a deliberate act:
 //! the diff is the review, and a reference that changes without anyone looking
 //! at the picture is not a reference.
@@ -296,6 +296,24 @@ fn renders_match_the_committed_references() {
                             })
                             .collect();
                         let mean = lum.iter().sum::<f64>() / lum.len() as f64;
+                        // How coloured the frame is. Luminance and texture
+                        // between them cannot see a change that only moves
+                        // chroma — which highlight reconstruction is entirely
+                        // made of, and which this reported as "+0%" until it
+                        // was asked the right question.
+                        let saturation = v
+                            .chunks_exact(3)
+                            .map(|p| {
+                                let high = p[0].max(p[1]).max(p[2]) as f64;
+                                let low = p[0].min(p[1]).min(p[2]) as f64;
+                                if high <= 0.0 {
+                                    0.0
+                                } else {
+                                    (high - low) / high
+                                }
+                            })
+                            .sum::<f64>()
+                            / lum.len() as f64;
                         let mut d = 0.0;
                         let mut n = 0.0;
                         for y in 1..side - 1 {
@@ -310,14 +328,16 @@ fn renders_match_the_committed_references() {
                                 n += 1.0;
                             }
                         }
-                        (mean, d / n)
+                        (mean, d / n, saturation)
                     };
-                    let (om, od) = stats(&expected);
-                    let (nm, nd) = stats(&actual);
+                    let (om, od, os) = stats(&expected);
+                    let (nm, nd, ns) = stats(&actual);
                     println!(
-                        "    {}: mean {om:.0} -> {nm:.0}, texture {od:.1} -> {nd:.1} ({:+.0}%)",
+                        "    {}: mean {om:.0} -> {nm:.0}, texture {od:.1} -> {nd:.1} \
+                         ({:+.0}%), colour {os:.4} -> {ns:.4} ({:+.0}%)",
                         case.name,
-                        100.0 * (nd / od - 1.0)
+                        100.0 * (nd / od - 1.0),
+                        100.0 * (ns / os - 1.0)
                     );
                 }
                 let mut worst = 0u16;
