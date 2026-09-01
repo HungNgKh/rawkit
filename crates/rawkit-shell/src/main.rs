@@ -442,9 +442,11 @@ fn export_progress() -> Option<serde_json::Value> {
 fn choose_profile(app: tauri::AppHandle, state: tauri::State<'_, Shelf>) -> Result<(), String> {
     use tauri_plugin_dialog::DialogExt;
 
-    let Some(library) = state.0.clone() else {
-        return Err("no catalog is open, so there is nowhere to remember a profile".into());
-    };
+    // No catalog is no longer a refusal. It used to be, and the consequence was
+    // that opening a RAW directly — the commonest thing anyone does here — had
+    // no way to set a profile at all, and silently rendered with the decoder's
+    // matrix for the whole session.
+    let library = state.0.clone();
     let Some((make, model)) = CURRENT_CAMERA.lock().expect("camera lock").clone() else {
         return Err("no photograph is open, so there is no camera to profile".into());
     };
@@ -453,28 +455,38 @@ fn choose_profile(app: tauri::AppHandle, state: tauri::State<'_, Shelf>) -> Resu
         let Some(path) = chosen.and_then(|p| p.into_path().ok()) else {
             return;
         };
-        // Parsed before it is remembered: a file that is not a profile should
-        // be refused at the moment somebody picks it, not silently stored and
-        // then quietly ignored on every future open.
-        let parsed = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| rawkit_engine::profile::dcp::parse(&bytes).ok());
-        let Some(profile) = parsed else {
-            eprintln!("profile    : {} is not a camera profile", path.display());
+        // Parsed before it is kept: a file that is not a profile should be
+        // refused at the moment somebody picks it, not silently stored and then
+        // quietly ignored on every future open.
+        let Some((_, name)) = read_profile_or_warn(&path) else {
             return;
         };
-        let library = library.lock().expect("library lock");
-        if let Err(e) = rawkit_catalog::profiles::remember(
-            library.catalog(),
-            &make,
-            &model,
-            &path.to_string_lossy(),
-            profile.name.as_deref(),
-        ) {
-            eprintln!("profile    : could not remember it: {e}");
-            return;
+        // The catalog when there is one, because an export run from the terminal
+        // has to render the colour the window showed. The session either way,
+        // because that is what the *window* reads and it must not depend on
+        // whether a catalog happened to be open.
+        match &library {
+            Some(library) => {
+                let library = library.lock().expect("library lock");
+                if let Err(e) = rawkit_catalog::profiles::remember(
+                    library.catalog(),
+                    &make,
+                    &model,
+                    &path.to_string_lossy(),
+                    name.as_deref(),
+                ) {
+                    eprintln!("profile    : could not remember it: {e}");
+                    return;
+                }
+                eprintln!("profile    : {model} renders with {}", path.display());
+            }
+            None => eprintln!(
+                "profile    : {model} renders with {} for this session; open a catalog to \
+                 keep the choice",
+                path.display()
+            ),
         }
-        eprintln!("profile    : {model} renders with {}", path.display());
+        remember_for_session((make.clone(), model.clone()), path, name);
         PROFILE_CHANGED.store(true, std::sync::atomic::Ordering::Relaxed);
     };
     app.dialog()
@@ -487,18 +499,26 @@ fn choose_profile(app: tauri::AppHandle, state: tauri::State<'_, Shelf>) -> Resu
 /// Go back to the decoder's own matrix for this camera.
 #[tauri::command]
 fn clear_profile(state: tauri::State<'_, Shelf>) -> Result<(), String> {
-    let Some(library) = state.0.clone() else {
-        return Err("no catalog is open".into());
-    };
-    let Some((make, model)) = CURRENT_CAMERA.lock().expect("camera lock").clone() else {
+    let Some(camera) = CURRENT_CAMERA.lock().expect("camera lock").clone() else {
         return Err("no photograph is open".into());
     };
-    rawkit_catalog::profiles::forget(
-        library.lock().expect("library lock").catalog(),
-        &make,
-        &model,
-    )
-    .map_err(|e| e.to_string())?;
+    // Both, and in this order, because either alone would leave the other still
+    // answering: a catalog entry cleared while the session still held one would
+    // change nothing on screen, and the reverse would come back on the next open.
+    let dropped = forget_for_session(&camera);
+    // And the command line, or `--profile` would reassert itself the moment the
+    // session choice was dropped — which would read as the button not working.
+    let named = ARG_PROFILE.lock().expect("argument profile lock").take();
+    if let Some(library) = state.0.clone() {
+        rawkit_catalog::profiles::forget(
+            library.lock().expect("library lock").catalog(),
+            &camera.0,
+            &camera.1,
+        )
+        .map_err(|e| e.to_string())?;
+    } else if !dropped && named.is_none() {
+        return Err("this camera is already rendering with the decoder's own matrix".into());
+    }
     PROFILE_CHANGED.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
@@ -912,6 +932,39 @@ fn cull_view(state: tauri::State<'_, Shelf>) -> Option<CullView> {
     library.lock().expect("library lock").view().ok()
 }
 
+/// The command line: at most one file to open, and optionally a profile.
+///
+/// Hand-written rather than reached for a parser, because two arguments do not
+/// justify a dependency in a binary that has none for this — and because the
+/// failure this must not have is silence. An unknown flag is refused rather than
+/// taken for a filename, so `--porfile x.dcp` says so instead of trying to
+/// decode a RAW called `--porfile`.
+fn parse_arguments(
+    args: impl Iterator<Item = String>,
+) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
+    let (mut target, mut profile) = (None, None);
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--profile" => {
+                let next = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--profile needs the path of a .dcp file"))?;
+                profile = Some(PathBuf::from(next));
+            }
+            _ if arg.starts_with("--profile=") => {
+                profile = Some(PathBuf::from(&arg["--profile=".len()..]));
+            }
+            _ if arg.starts_with('-') && arg != "-" => {
+                return Err(anyhow!("unknown option {arg}"));
+            }
+            _ if target.is_none() => target = Some(PathBuf::from(arg)),
+            _ => return Err(anyhow!("only one photograph can be opened at a time")),
+        }
+    }
+    Ok((target, profile))
+}
+
 fn main() -> Result<()> {
     // Before GTK, before Tauri, before anything opens a display.
     #[cfg(target_os = "linux")]
@@ -930,10 +983,37 @@ fn main() -> Result<()> {
         _ if cfg!(target_os = "linux") => Route::NativeChild,
         _ => Route::Cutout,
     };
-    // One positional argument. A `.rawkit` file opens a library and its first
-    // image; anything else is a raw opened directly, which is how the shell has
-    // always worked and stays useful when there is no catalog to hand.
-    let target = std::env::args().nth(1).map(PathBuf::from);
+    // One positional argument, and one option. A `.rawkit` file opens a library
+    // and its first image; anything else is a raw opened directly, which is how
+    // the shell has always worked and stays useful when there is no catalog to
+    // hand.
+    //
+    // `--profile <file.dcp>` renders whatever opens with that profile. It exists
+    // because a directly-opened RAW had no way to reach one: the picker wanted a
+    // catalog to write the choice into, so the commonest way to use this program
+    // was also the only way that could not be colour-managed.
+    let (target, profile) = match parse_arguments(std::env::args().skip(1)) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!(
+                "usage      : rawkit-shell [--profile <file.dcp>] [<file.ARW>|<file.rawkit>]"
+            );
+            return Err(e);
+        }
+    };
+    if let Some(path) = &profile {
+        // Read now rather than at the first render, so a mistyped path is an
+        // error at the moment it was made and not a photograph that quietly
+        // looks wrong an hour later.
+        let (_, name) = read_profile(path)
+            .ok_or_else(|| anyhow!("{} is not a camera profile", path.display()))?;
+        eprintln!(
+            "profile    : {} ({})",
+            name.as_deref().unwrap_or("unnamed"),
+            path.display()
+        );
+        *ARG_PROFILE.lock().expect("argument profile lock") = Some(path.clone());
+    }
     eprintln!("route      : {route:?}");
 
     tauri::Builder::default()
@@ -2883,42 +2963,136 @@ static PROFILE_NAME: Mutex<Option<String>> = Mutex::new(None);
 /// owns the GPU buffers and the profile decides how big one of them is.
 static PROFILE_CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Profiles chosen during this run, per camera, for when there is no catalog to
+/// remember them in.
+///
+/// # Why this exists at all
+///
+/// A profile choice used to live only in the catalog, which made it unreachable
+/// for the commonest thing anyone does with this program: open a RAW file
+/// directly. `choose_profile` refused with *"no catalog is open"*, the automatic
+/// lookup had nowhere to look, and so a bare open always rendered with the
+/// decoder's own matrix — a stopgap that on an ILCE-6400 halves the saturation
+/// of every shadow. There was no way to say otherwise from inside the window.
+///
+/// So the choice is kept here for the session, and *also* written to the catalog
+/// when there is one. The catalog remains the durable answer, because an export
+/// run from the terminal has to render the colour the window showed; this is
+/// what makes the window usable when there is no catalog yet.
+static SESSION_PROFILES: Mutex<Vec<SessionProfile>> = Mutex::new(Vec::new());
+
+/// One camera's choice: which body, which file, and what the profile calls
+/// itself. Named rather than a tuple because three anonymous fields of which two
+/// are strings is a shape nobody can read at the call site.
+struct SessionProfile {
+    camera: (String, String),
+    path: PathBuf,
+    name: Option<String>,
+}
+
+/// A profile named on the command line, applied to whatever camera opens.
+///
+/// Per *run* rather than per camera, which is the honest reading of `--profile`:
+/// somebody who names a file on the command line means this photograph, and the
+/// camera it came from is not something they should have to say twice.
+static ARG_PROFILE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Remember a profile for this camera for the rest of the run.
+fn remember_for_session(camera: (String, String), path: PathBuf, name: Option<String>) {
+    let mut kept = SESSION_PROFILES.lock().expect("session profile lock");
+    kept.retain(|k| k.camera != camera);
+    kept.push(SessionProfile { camera, path, name });
+}
+
+/// Forget this run's choice for a camera. Returns whether there was one.
+fn forget_for_session(camera: &(String, String)) -> bool {
+    let mut kept = SESSION_PROFILES.lock().expect("session profile lock");
+    let before = kept.len();
+    kept.retain(|k| k.camera != *camera);
+    kept.len() != before
+}
+
+/// Load a profile from disk.
+///
+/// One place, because three callers need it and each of them used to decide for
+/// itself what an unreadable file meant.
+fn read_profile(path: &std::path::Path) -> Option<(rawkit_engine::CameraProfile, Option<String>)> {
+    let profile = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| rawkit_engine::profile::dcp::parse(&bytes).ok())?;
+    let name = profile.name.clone();
+    Some((profile, name))
+}
+
+/// The same, for the render path, where an unreadable profile is a fallback
+/// rather than a failure.
+///
+/// Split from [`read_profile`] because the two want opposite things from the
+/// same failure: rendering carries on with the decoder's matrix and should say
+/// so, while a profile named on the command line has to stop the program — and
+/// a caller that is about to return an error should not first print a line
+/// claiming it continued.
+fn read_profile_or_warn(
+    path: &std::path::Path,
+) -> Option<(rawkit_engine::CameraProfile, Option<String>)> {
+    let found = read_profile(path);
+    if found.is_none() {
+        // Named rather than silently ignored. A profile that has moved should
+        // say so; the alternative is a photograph quietly changing colour
+        // between one session and the next.
+        eprintln!(
+            "profile    : {} is missing or not a camera profile; rendering with the \
+             decoder's own matrix",
+            path.display()
+        );
+    }
+    found
+}
+
 /// Render this photograph with whatever profile its camera has been given.
 ///
 /// Returns what to call it, or `None` for the decoder's own matrix — which is
 /// also what a profile that has moved falls back to, loudly.
 fn apply_profile(library: Option<&Arc<Mutex<Library>>>, loaded: &mut Loaded) -> Option<String> {
     let camera = loaded.camera().cloned()?;
-    *CURRENT_CAMERA.lock().expect("camera lock") =
-        Some((camera.make.clone(), camera.model.clone()));
+    let key = (camera.make.clone(), camera.model.clone());
+    *CURRENT_CAMERA.lock().expect("camera lock") = Some(key.clone());
 
-    let chosen = rawkit_catalog::profiles::chosen(
-        library?.lock().expect("library lock").catalog(),
-        &camera.make,
-        &camera.model,
-    )
-    .ok()??;
-
-    match std::fs::read(&chosen.path)
+    // Three places a profile can come from, in the order of how deliberately it
+    // was asked for. This run's picker beats the command line, because it is the
+    // more recent act of the same person; the command line beats the catalog,
+    // because naming a file when starting the program is not something anyone
+    // does by accident.
+    let session = SESSION_PROFILES
+        .lock()
+        .expect("session profile lock")
+        .iter()
+        .find(|k| k.camera == key)
+        .map(|k| (k.path.clone(), k.name.clone()));
+    let argument = ARG_PROFILE
+        .lock()
+        .expect("argument profile lock")
+        .clone()
+        .map(|p| (p, None));
+    let stored = library.and_then(|library| {
+        rawkit_catalog::profiles::chosen(
+            library.lock().expect("library lock").catalog(),
+            &camera.make,
+            &camera.model,
+        )
         .ok()
-        .and_then(|bytes| rawkit_engine::profile::dcp::parse(&bytes).ok())
-    {
-        Some(profile) => {
-            loaded.set_profile(profile);
-            Some(chosen.name.unwrap_or(chosen.path))
-        }
-        // Named rather than silently ignored. A profile that has moved should
-        // say so; the alternative is a photograph quietly changing colour
-        // between one session and the next.
-        None => {
-            eprintln!(
-                "profile    : {} is missing or unreadable; rendering with the decoder's \
-                 own matrix",
-                chosen.path
-            );
-            None
-        }
-    }
+        .flatten()
+        .map(|c| (PathBuf::from(c.path), c.name))
+    });
+
+    let (path, remembered) = session.or(argument).or(stored)?;
+    let (profile, name) = read_profile_or_warn(&path)?;
+    loaded.set_profile(profile);
+    Some(
+        remembered
+            .or(name)
+            .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+    )
 }
 
 /// An export the user has chosen a destination for, waiting for the render loop
@@ -3877,5 +4051,58 @@ mod radial_tests {
         let radial = shape_from_drag(ELLIPSE, a, b, session.viewport(), &session.geometry(), size);
         assert!(matches!(linear, MaskShape::Linear { .. }), "{linear:?}");
         assert!(matches!(radial, MaskShape::Radial { .. }), "{radial:?}");
+    }
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::parse_arguments;
+    use std::path::PathBuf;
+
+    fn parse(args: &[&str]) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
+        parse_arguments(args.iter().map(|s| s.to_string())).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn a_photograph_and_a_profile_in_either_order() {
+        // Order is not something anyone should have to remember, and the two
+        // spellings of an option's value are both in ordinary use.
+        for args in [
+            vec!["a.ARW", "--profile", "p.dcp"],
+            vec!["--profile", "p.dcp", "a.ARW"],
+            vec!["--profile=p.dcp", "a.ARW"],
+        ] {
+            let (target, profile) = parse(&args).expect("should parse");
+            assert_eq!(target, Some(PathBuf::from("a.ARW")), "{args:?}");
+            assert_eq!(profile, Some(PathBuf::from("p.dcp")), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn either_may_be_left_out() {
+        assert_eq!(parse(&[]).unwrap(), (None, None));
+        assert_eq!(
+            parse(&["a.ARW"]).unwrap(),
+            (Some(PathBuf::from("a.ARW")), None)
+        );
+        assert_eq!(
+            parse(&["--profile", "p.dcp"]).unwrap(),
+            (None, Some(PathBuf::from("p.dcp")))
+        );
+    }
+
+    #[test]
+    fn a_mistyped_option_is_refused_rather_than_opened() {
+        // The failure this parser exists to prevent: taking an unknown flag for
+        // a filename, so a typo becomes an attempt to decode a RAW called
+        // `--porfile` and the real mistake is never mentioned.
+        let e = parse(&["--porfile", "p.dcp"]).expect_err("should refuse");
+        assert!(e.contains("--porfile"), "said: {e}");
+
+        let e = parse(&["--profile"]).expect_err("should refuse");
+        assert!(e.contains("--profile needs"), "said: {e}");
+
+        let e = parse(&["a.ARW", "b.ARW"]).expect_err("should refuse");
+        assert!(e.contains("one photograph"), "said: {e}");
     }
 }
