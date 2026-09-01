@@ -283,10 +283,6 @@ impl<'a> Tiff<'a> {
         })
     }
 
-    fn i32_at(&self, offset: usize) -> Result<i32, DcpError> {
-        Ok(self.u32_at(offset)? as i32)
-    }
-
     fn entries(&self) -> Result<Vec<Entry>, DcpError> {
         let count = self.u16_at(self.ifd_offset)? as usize;
         let mut entries = Vec::with_capacity(count);
@@ -306,25 +302,54 @@ impl<'a> Tiff<'a> {
     /// Where an entry's data lives. Values of four bytes or fewer are stored
     /// inline in the entry itself, which is the classic TIFF trap: read them as
     /// an offset and you get a wild pointer into the file.
-    fn data_offset(&self, entry: &Entry) -> Result<usize, DcpError> {
-        let size = match entry.kind {
+    /// How many bytes one value of this type occupies.
+    fn width(kind: u16) -> usize {
+        match kind {
             1 | 2 | 6 | 7 => 1,
             3 | 8 => 2,
             4 | 9 | 11 => 4,
             5 | 10 | 12 => 8,
             _ => 1,
-        };
-        let total = size * entry.count as usize;
+        }
+    }
+
+    /// An entry's payload bytes, wherever TIFF chose to put them.
+    ///
+    /// A value of four bytes or fewer lives *in* the directory entry rather than
+    /// at an offset — which is the single most-missed rule of the format, and
+    /// this reader missed it. `data_offset` used to answer `Ok(0)` for that
+    /// case, with a comment claiming it reported the payload's position in the
+    /// file; it reported the start of the file. Every inline scalar therefore
+    /// read back as the TIFF magic number.
+    ///
+    /// It cost exactly one tag, and that tag was `ProfileLookTableEncoding`: an
+    /// inline `LONG` whose value is 1 for sRGB, read as 2774857 and so treated
+    /// as 0, so every Adobe look table was applied in linear light when it was
+    /// authored in sRGB. The visible result was a systematic hue rotation that
+    /// grew towards the shadows, because that is where the two encodings differ.
+    ///
+    /// Returning the bytes rather than an offset is what stops the next reader
+    /// from having to remember: there is nowhere left to put the assumption.
+    fn payload(&self, entry: &Entry) -> Option<Vec<u8>> {
+        let total = Self::width(entry.kind) * entry.count as usize;
         if total <= 4 {
-            // The payload is inline; report its position within the file.
-            Ok(0)
+            entry.payload.get(..total).map(<[u8]>::to_vec)
         } else {
-            let raw = if self.little_endian {
+            let at = if self.little_endian {
                 u32::from_le_bytes(entry.payload)
             } else {
                 u32::from_be_bytes(entry.payload)
-            };
-            Ok(raw as usize)
+            } as usize;
+            self.slice(at, total).ok().map(<[u8]>::to_vec)
+        }
+    }
+
+    fn u32_from(&self, b: &[u8]) -> u32 {
+        let v = [b[0], b[1], b[2], b[3]];
+        if self.little_endian {
+            u32::from_le_bytes(v)
+        } else {
+            u32::from_be_bytes(v)
         }
     }
 
@@ -333,12 +358,12 @@ impl<'a> Tiff<'a> {
         if entry.count != 9 {
             return Err(DcpError::NoColorMatrix);
         }
-        let base = self.data_offset(entry)?;
+        let bytes = self.payload(entry).ok_or(DcpError::NoColorMatrix)?;
         let mut out = [[0.0f32; 3]; 3];
         for (i, cell) in out.iter_mut().flatten().enumerate() {
-            let at = base + i * 8;
-            let numerator = self.i32_at(at)?;
-            let denominator = self.i32_at(at + 4)?;
+            let pair = &bytes[i * 8..i * 8 + 8];
+            let numerator = self.u32_from(&pair[..4]) as i32;
+            let denominator = self.u32_from(&pair[4..]) as i32;
             *cell = if denominator == 0 {
                 0.0
             } else {
@@ -354,10 +379,8 @@ impl<'a> Tiff<'a> {
         if entry.kind != 4 || entry.count as usize != expected {
             return None;
         }
-        let base = self.data_offset(entry).ok()?;
-        (0..expected)
-            .map(|i| self.u32_at(base + i * 4).ok())
-            .collect()
+        let bytes = self.payload(entry)?;
+        Some(bytes.chunks_exact(4).map(|c| self.u32_from(c)).collect())
     }
 
     /// A run of FLOATs, which is how the tables themselves are stored.
@@ -365,10 +388,13 @@ impl<'a> Tiff<'a> {
         if entry.kind != 11 {
             return None;
         }
-        let base = self.data_offset(entry).ok()?;
-        (0..entry.count as usize)
-            .map(|i| self.u32_at(base + i * 4).ok().map(f32::from_bits))
-            .collect()
+        let bytes = self.payload(entry)?;
+        Some(
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_bits(self.u32_from(c)))
+                .collect(),
+        )
     }
 
     fn short(&self, entry: &Entry) -> Option<u16> {
@@ -386,14 +412,8 @@ impl<'a> Tiff<'a> {
         if entry.kind != 2 {
             return None;
         }
-        let len = entry.count as usize;
-        let bytes = if len <= 4 {
-            &entry.payload[..len]
-        } else {
-            let at = self.data_offset(entry).ok()?;
-            self.slice(at, len).ok()?
-        };
-        let text = String::from_utf8_lossy(bytes);
+        let bytes = self.payload(entry)?;
+        let text = String::from_utf8_lossy(&bytes);
         Some(text.trim_end_matches('\0').to_owned())
     }
 }
@@ -435,6 +455,26 @@ mod tests {
 
         fn short(mut self, tag: u16, value: u16) -> Self {
             self.entries.push((tag, 3, 1, value.to_le_bytes().to_vec()));
+            self
+        }
+
+        /// A single `LONG`, which the format stores *inside* the directory
+        /// entry because it fits in four bytes. That case is the whole point of
+        /// `an_inline_value_is_read_from_the_entry_and_not_from_the_file`.
+        fn long(mut self, tag: u16, value: u32) -> Self {
+            self.entries.push((tag, 4, 1, value.to_le_bytes().to_vec()));
+            self
+        }
+
+        fn longs(mut self, tag: u16, values: &[u32]) -> Self {
+            let data = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            self.entries.push((tag, 4, values.len() as u32, data));
+            self
+        }
+
+        fn floats(mut self, tag: u16, values: &[f32]) -> Self {
+            let data = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            self.entries.push((tag, 11, values.len() as u32, data));
             self
         }
 
@@ -503,6 +543,60 @@ mod tests {
             .short(tag::CALIBRATION_ILLUMINANT_1, 17)
             .short(tag::CALIBRATION_ILLUMINANT_2, 21)
             .build()
+    }
+
+    /// A look table small enough to read, and valid: two divisions on each
+    /// axis, three deltas a cell.
+    fn with_look(encoding: Option<u32>) -> Vec<u8> {
+        let cells = 2 * 2 * 2 * 3;
+        let data: Vec<f32> = (0..cells).map(|i| i as f32 * 0.01).collect();
+        let mut b = DcpBuilder::new()
+            .ascii(tag::PROFILE_NAME, "Test Camera Standard")
+            .matrix(tag::COLOR_MATRIX_1, COLOR_1)
+            .matrix(tag::COLOR_MATRIX_2, COLOR_2)
+            .short(tag::CALIBRATION_ILLUMINANT_1, 17)
+            .short(tag::CALIBRATION_ILLUMINANT_2, 21)
+            .longs(tag::PROFILE_LOOK_TABLE_DIMS, &[2, 2, 2])
+            .floats(tag::PROFILE_LOOK_TABLE_DATA, &data);
+        if let Some(e) = encoding {
+            b = b.long(tag::PROFILE_LOOK_TABLE_ENCODING, e);
+        }
+        b.build()
+    }
+
+    #[test]
+    fn an_inline_value_is_read_from_the_entry_and_not_from_the_file() {
+        // TIFF stores a value of four bytes or fewer *in* the directory entry
+        // rather than at an offset. This reader did not, and answered offset
+        // zero for that case — so every inline scalar read back as the file's
+        // magic number.
+        //
+        // It cost exactly one tag, and it happened to be the one that decides
+        // which space Adobe's look table was authored in. `ProfileLookTableEncoding`
+        // of 1 means sRGB; read as 2774857 it compared unequal to 1 and every
+        // look table was applied in linear light. On a real ILCE-6400 frame
+        // against Lightroom's own render of it, that showed up as a hue rotation
+        // towards violet that grew as the picture got darker — 11.7 degrees in
+        // the shadows and 17.4 in the midtones, falling to 2.1 and 4.4 once this
+        // was fixed.
+        let srgb = parse(&with_look(Some(1))).expect("parse");
+        assert!(
+            srgb.look_is_srgb,
+            "an encoding of 1 is sRGB, and the tag says 1"
+        );
+
+        // The other two cases, so this pins a rule and not a single value.
+        let linear = parse(&with_look(Some(0))).expect("parse");
+        assert!(!linear.look_is_srgb, "an encoding of 0 is linear");
+        let absent = parse(&with_look(None)).expect("parse");
+        assert!(
+            !absent.look_is_srgb,
+            "the specification's default is linear when the tag is missing"
+        );
+
+        // And the table itself still arrives, so the fixture is testing the
+        // encoding rather than a profile that failed to carry a look at all.
+        assert!(srgb.look_table().is_some(), "no look table in the fixture");
     }
 
     #[test]
