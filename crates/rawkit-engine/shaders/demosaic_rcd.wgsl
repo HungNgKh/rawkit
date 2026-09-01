@@ -131,6 +131,11 @@ struct Params {
     // `.x` is how much of the clipping cast to take off an edge beside a blown
     // highlight. The rest unused.
     defringe: vec4<f32>,
+
+    // The colour of the light that did not clip, for the whole frame: camera
+    // RGB in `.xyz`, and `.w` is 1 when there was any to find. One triple and
+    // not a field -- see `Guide::chroma`.
+    guide_chroma: vec4<f32>,
     // What each local adjustment multiplies by at full strength, `.rgb`.
     //
     // Exposure and white balance arrive already combined, because both are
@@ -1379,13 +1384,11 @@ fn guide_sample(base: u32, ixy: vec2<f32>) -> vec3<f32> {
 /// reconstruction the multipliers themselves as a colour, and a frame with
 /// nothing unclipped in it would come back with a cast instead of the grey it
 /// used to get.
-fn guide_chroma(ixy: vec2<f32>) -> vec3<f32> {
-    if (params.guide_scale.z < 0.5) {
+fn unclipped_colour() -> vec3<f32> {
+    if (params.guide_chroma.w < 0.5) {
         return 1.0 / max(params.wb.rgb, vec3<f32>(EPS));
     }
-    // The second field, immediately behind the first.
-    let base = params.guide.x + params.guide.y * params.guide.z * 3u;
-    return guide_sample(base, ixy);
+    return params.guide_chroma.rgb;
 }
 
 /// How bright this pixel's neighbourhood is, in the tone curve's coordinate.
@@ -1684,7 +1687,7 @@ fn reconstruct_highlights(balanced: vec3<f32>, ixy: vec2<f32>) -> vec3<f32> {
     // returns and only the pixels that are actually blown read the guide. Not
     // an optimisation: measured either way the difference is inside the noise
     // of a full render on this adapter. It is simply where the value is needed.
-    let reference = guide_chroma(ixy) * params.wb.rgb;
+    let reference = unclipped_colour() * params.wb.rgb;
 
     // Anchor it to the channels that are still measurements. A channel that did
     // not clip is a *fact*, and a reconstruction has no business contradicting

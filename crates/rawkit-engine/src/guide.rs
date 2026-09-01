@@ -100,9 +100,10 @@ const TRUSTED: f32 = 0.98;
 /// The largest guide any allocation has to hold, in floats.
 ///
 /// Square, because [`MAX_EDGE`] bounds the longest edge and the shortest is
-/// never longer. Three floats a texel, and two fields — the light, and the
-/// colour of the light that did not clip.
-pub const CAPACITY: usize = (MAX_EDGE * MAX_EDGE) as usize * 3 * 2;
+/// never longer. Three floats a texel, for the one field there is — the light.
+/// The colour of the light that did not clip is a single triple and travels in
+/// the uniforms; see [`Guide::chroma`].
+pub const CAPACITY: usize = (MAX_EDGE * MAX_EDGE) as usize * 3;
 
 /// The whole frame at a few hundred pixels, in the camera's own RGB.
 #[derive(Debug, Clone)]
@@ -110,10 +111,34 @@ pub struct Guide {
     /// Three floats per texel, row major: red, green, blue as the sensor saw
     /// them, white balance not applied.
     pub data: Vec<f32>,
-    /// The same shape again: the colour of the light that did not clip, for
-    /// highlight reconstruction to borrow. Filled everywhere — a texel with
-    /// nothing unclipped of its own takes its neighbours'.
-    pub chroma: Vec<f32>,
+    /// The colour of the light that did not clip, in camera RGB, for the whole
+    /// frame.
+    ///
+    /// **One triple, not a field, and that is the point.** It used to be a
+    /// per-texel map, filled outwards from the texels that had unclipped light
+    /// of their own until it covered the frame. On a dusk seascape the middle of
+    /// a blown cloud came out violet, and the reason was structural rather than
+    /// a bug to find: the colour arriving there had been carried about forty-
+    /// seven texels, so it was already a long-range average — but an
+    /// ill-defined one, the running mean of whichever diffusion front reached
+    /// the texel first. All the cost of a local method and none of the locality.
+    ///
+    /// Measured on that frame: the flat unclipped quads read *slightly green* at
+    /// every brightness, frame-wide and within five hundred pixels of the cloud,
+    /// while the diffused value produced magenta. A frame-wide mean of the same
+    /// quads is both better defined and closer to what the sensor actually saw.
+    ///
+    /// It is also where the field has settled. RawTherapee's Color Propagation
+    /// spreads neighbouring colour the way this used to, and has an open report
+    /// of purple fill on sun reflecting off water — the same photograph, the
+    /// same artefact. darktable's default since 4.2 computes one chrominance
+    /// correction from the whole image instead.
+    ///
+    /// The cost is real and worth stating: a frame with two blown regions under
+    /// different light gets one answer for both. Estimating each region from its
+    /// own boundary is the better method and a larger one, and this is the
+    /// floor it would be built on.
+    pub chroma: [f32; 3],
     /// Whether any unclipped light was found at all. False for a frame blown
     /// end to end, where [`Guide::chroma`] is neutral and reconstruction falls
     /// back to the grey it used to produce unconditionally.
@@ -163,8 +188,8 @@ impl Guide {
         let cells = (gw as usize) * (gh as usize);
         let mut sum = vec![0.0f32; cells * 3];
         let mut count = vec![0.0f32; cells];
-        let mut chroma = vec![0.0f32; cells * 3];
-        let mut chroma_weight = vec![0.0f32; cells];
+        let mut chroma = [0.0f32; 3];
+        let mut chroma_weight = 0.0f32;
 
         // Which guide column each image column falls in, worked out once rather
         // than as a 64-bit divide per pixel — it is the same answer every row.
@@ -258,9 +283,9 @@ impl Guide {
                     // whole field exists to avoid.
                     let weight = rgb[1].max(0.0);
                     for (c, v) in rgb.iter().enumerate() {
-                        chroma[cell * 3 + c] += v * weight;
+                        chroma[c] += v * weight;
                     }
-                    chroma_weight[cell] += weight;
+                    chroma_weight += weight;
                 }
             }
         }
@@ -279,7 +304,21 @@ impl Guide {
 
         let sigma = (gw.max(gh) as f32 / SIGMA_DIVISOR).max(1.0);
         blur(&mut data, gw, gh, sigma);
-        let chroma_known = spread_chroma(&mut chroma, &chroma_weight, gw, gh);
+        let chroma_known = chroma_weight > 0.0;
+        let chroma = if chroma_known {
+            [
+                chroma[0] / chroma_weight,
+                chroma[1] / chroma_weight,
+                chroma[2] / chroma_weight,
+            ]
+        } else {
+            // Nothing in the frame stayed inside the sensor's range, so there
+            // is no light to ask about. Flagged rather than guessed: what
+            // neutral *means* in camera RGB depends on the white balance, which
+            // is an edit and not a property of the mosaic, so the shader
+            // supplies it. See `unclipped_colour`.
+            [0.0; 3]
+        };
 
         Guide {
             data,
@@ -289,80 +328,6 @@ impl Guide {
             height: gh,
         }
     }
-}
-
-/// Turn the weighted sums into colours, and carry them into the texels that had
-/// no unclipped light of their own.
-///
-/// Returns whether there was any to carry. Diffusion rather than a nearest-
-/// neighbour search: a blown region is filled from all sides at once, so the
-/// colour it ends up with varies smoothly across it instead of stepping along
-/// the boundaries of whichever edge pixel happened to be closest. Enough passes
-/// to cross the guide, which at a few hundred texels is nothing.
-fn spread_chroma(chroma: &mut [f32], weight: &[f32], width: u32, height: u32) -> bool {
-    let cells = (width as usize) * (height as usize);
-    let mut known = vec![false; cells];
-    let mut any = false;
-    for cell in 0..cells {
-        if weight[cell] > 0.0 {
-            known[cell] = true;
-            any = true;
-            for c in 0..3 {
-                chroma[cell * 3 + c] /= weight[cell];
-            }
-        }
-    }
-    if !any {
-        // A frame blown from edge to edge. Left at zero and flagged unknown:
-        // what neutral *means* in camera RGB depends on the white balance,
-        // which is an edit and not a property of the mosaic, so the shader
-        // supplies it rather than this. See `guide_chroma`.
-        return false;
-    }
-
-    let (w, h) = (width as i32, height as i32);
-    let mut filled = known.clone();
-    // The longest run of unknown texels is bounded by the guide's diagonal, and
-    // each pass advances the front by one.
-    for _ in 0..(w + h) {
-        let mut moved = false;
-        let source = chroma.to_vec();
-        let settled = filled.clone();
-        for y in 0..h {
-            for x in 0..w {
-                let cell = (y * w + x) as usize;
-                if settled[cell] {
-                    continue;
-                }
-                let mut acc = [0.0f32; 3];
-                let mut n = 0.0f32;
-                for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
-                    if nx < 0 || ny < 0 || nx >= w || ny >= h {
-                        continue;
-                    }
-                    let near = (ny * w + nx) as usize;
-                    if !settled[near] {
-                        continue;
-                    }
-                    for (c, acc) in acc.iter_mut().enumerate() {
-                        *acc += source[near * 3 + c];
-                    }
-                    n += 1.0;
-                }
-                if n > 0.0 {
-                    for (c, acc) in acc.iter().enumerate() {
-                        chroma[cell * 3 + c] = acc / n;
-                    }
-                    filled[cell] = true;
-                    moved = true;
-                }
-            }
-        }
-        if !moved {
-            break;
-        }
-    }
-    true
 }
 
 /// Separable edge-aware blur, weighted by distance and by brightness together.
@@ -455,7 +420,7 @@ mod tests {
             );
             assert!(gw <= MAX_EDGE && gh <= MAX_EDGE, "{w}x{h} exceeded the cap");
             assert!(
-                (gw * gh) as usize * 3 * 2 <= CAPACITY,
+                (gw * gh) as usize * 3 <= CAPACITY,
                 "{w}x{h} needs more than the allocation reserves"
             );
         }
@@ -517,44 +482,47 @@ mod tests {
         // both together — an edge that lands on an odd column and passes through
         // intermediate values on the way down, so a quad can hold two very
         // different brightnesses while every sample in it is honest.
-        let level = |x: u32| match x {
-            0..=24 => 1.0,
-            25 => 0.90,
-            26 => 0.50,
-            27..=30 => 0.05,
-            31 => 0.50,
-            32 => 0.90,
+        // Repeated across the frame rather than once down the middle. The
+        // colour of the light that did not clip is now one number for the whole
+        // photograph, and an average is robust to a handful of bad quads by
+        // construction — so a single stripe proves nothing about the test that
+        // rejects them. A frame ruled with stripes is the case that separates
+        // them: it is what a bare tree against a bright sky looks like to a
+        // guide texel, and there the invented colours are the majority.
+        let level = |x: u32| match x % 8 {
+            0..=2 => 1.0,
+            3 => 0.90,
+            4 => 0.50,
+            5 => 0.05,
+            6 => 0.50,
+            7 => 0.90,
             _ => 1.0,
         };
         let data = mosaic(w, h, |x, _| [level(x); 3]);
         let guide = Guide::build(&data, w, h, BayerPhase::Rggb, 1.0);
-        assert!(guide.chroma_known, "found no unclipped light at all");
 
-        // Everywhere, not just at the stripe: the diffusion carries whatever the
-        // seeds were across the entire field, so a bad seed anywhere is a bad
-        // answer everywhere.
-        let mut worst = (0.0f32, 0usize);
-        for cell in 0..(guide.width * guide.height) as usize {
-            let c = &guide.chroma[cell * 3..cell * 3 + 3];
-            let mean = (c[0] + c[1] + c[2]) / 3.0;
-            if mean <= 1e-6 {
-                continue;
-            }
-            let cast = (c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2])) / mean;
-            if cast > worst.0 {
-                worst = (cast, cell);
-            }
+        // Two acceptable answers and one unacceptable one. Reporting no colour
+        // is honest here — every quad in this frame straddles an edge, so there
+        // is nothing to report and the shader renders neutral. Reporting a
+        // colourless colour would be fine too. Reporting a *colour*, on a frame
+        // that has none, is the failure: it is invented, and it is now the only
+        // answer the whole photograph gets.
+        if !guide.chroma_known {
+            println!("no unclipped light survived, which is the honest answer here");
+            return;
         }
-        println!(
-            "worst invented cast {:.4} at texel {} of {}",
-            worst.0,
-            worst.1,
-            guide.width * guide.height
-        );
+
+        // One triple for the frame, so one number to check — and the stakes are
+        // higher than when this was a field, not lower: a bad quad no longer
+        // spoils a neighbourhood, it spoils the only answer there is.
+        let c = guide.chroma;
+        let mean = (c[0] + c[1] + c[2]) / 3.0;
+        assert!(mean > 1e-6, "the frame's colour came out black");
+        let cast = (c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2])) / mean;
+        println!("invented cast {cast:.4} on a frame that is neutral everywhere");
         assert!(
-            worst.0 < 0.02,
-            "invented a cast of {:.3} from a frame with no colour in it",
-            worst.0
+            cast < 0.02,
+            "invented a cast of {cast:.3} from a frame with no colour in it"
         );
     }
 

@@ -349,6 +349,9 @@ struct Params {
     /// are the same kind of thing to a reader — a repair of a colour the
     /// rendering introduced — and `detail` is the noise and sharpening group.
     defringe: [f32; 4],
+    /// The colour of the light that did not clip, for the whole frame: camera
+    /// RGB in `[0..3]`, and `[3]` is 1 when there was any to find.
+    guide_chroma: [f32; 4],
     /// What each local adjustment multiplies by at full strength.
     ///
     /// Exposure and white balance arrive combined, because both are multiplies
@@ -872,11 +875,7 @@ impl Renderer {
             (px * std::mem::size_of::<f32>()) as u64,
             bytemuck::cast_slice(&guide.data),
         );
-        gpu.queue.write_buffer(
-            &cfa,
-            ((px + guide.data.len()) * std::mem::size_of::<f32>()) as u64,
-            bytemuck::cast_slice(&guide.chroma),
-        );
+
         let vh = plane("vh", px, wgpu::BufferUsages::empty());
         // `pq` and `lp` share one buffer: WebGPU guarantees only eight storage
         // buffers per shader stage, and the develop stage needs one for the
@@ -993,6 +992,7 @@ impl Renderer {
             table_cells,
             guide_offset: px,
             guide_size: [guide.width, guide.height],
+            chroma: guide.chroma,
             chroma_known: guide.chroma_known,
             mask_texture,
             mask_bind_group,
@@ -1760,6 +1760,12 @@ impl Renderer {
                 image.height as f32 / 2.0,
             ],
             defringe: [state.detail.defringe, 0.0, 0.0, 0.0],
+            guide_chroma: [
+                buffers.chroma[0],
+                buffers.chroma[1],
+                buffers.chroma[2],
+                if buffers.chroma_known { 1.0 } else { 0.0 },
+            ],
             mask_gain: {
                 let mut gains = [[1.0f32, 1.0, 1.0, 0.0]; rawkit_editstate::MAX_MASKS];
                 for (slot, mask) in live.iter().enumerate() {
@@ -1901,6 +1907,7 @@ pub struct TileBuffers {
     guide_offset: usize,
     guide_size: [u32; 2],
     /// Whether the frame had any unclipped light to borrow a colour from.
+    chroma: [f32; 3],
     chroma_known: bool,
     /// One texture layer per local adjustment, and the group that binds it.
     ///
