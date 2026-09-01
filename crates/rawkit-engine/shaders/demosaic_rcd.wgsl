@@ -890,11 +890,7 @@ fn develop_rgb(camera: vec3<f32>, ixy: vec2<f32>) -> vec3<f32> {
     // which reads as a flat, muddy picture rather than as a bug.
     var mapped = tone_map(exposed);
     if (params.curve.z > 0u) {
-        mapped = vec3<f32>(
-            profile_tone(exposed.r),
-            profile_tone(exposed.g),
-            profile_tone(exposed.b),
-        );
+        mapped = profile_tone_rgb(exposed);
     }
 
     // The profile's look, applied here and not beside the hue/saturation
@@ -1749,6 +1745,42 @@ fn reconstruct_highlights(balanced: vec3<f32>, ixy: vec2<f32>) -> vec3<f32> {
 /// than white is white, which is the whole point of a shoulder.
 fn profile_tone(v: f32) -> f32 {
     return sample_curve(params.curve.x, params.curve.y, v);
+}
+
+/// The profile's curve over a colour rather than over a number.
+///
+/// Running the curve down each channel on its own is the obvious thing and it
+/// is wrong: a curve steeper in the darks lifts the dimmest channel further
+/// than the brightest, which drags the colour towards grey in the shadows and
+/// away from it in the highlights. On a clear sky -- red dim, blue bright, green
+/// between them -- that shows up as the green pulling clear of red and the whole
+/// thing turning cyan.
+///
+/// So only the darkest and brightest channels go through the curve, and the
+/// middle one is put back at the same fraction of the way between them that it
+/// started at. Lightness and contrast come from the curve; the hue is the one
+/// the profile's matrices already decided. This is what the DNG reference
+/// implementation does, and it is why a profile can carry a strong curve
+/// without also carrying a colour shift.
+fn profile_tone_rgb(c: vec3<f32>) -> vec3<f32> {
+    let lo = min(c.r, min(c.g, c.b));
+    let hi = max(c.r, max(c.g, c.b));
+    let lo_out = profile_tone(lo);
+    let hi_out = profile_tone(hi);
+    // A neutral has nothing between the ends to place, and the division below
+    // would be by zero.
+    if (hi <= lo) {
+        return vec3<f32>(lo_out, lo_out, lo_out);
+    }
+    let mid = clamp(c.r + c.g + c.b - lo - hi, lo, hi);
+    let mid_out = lo_out + (hi_out - lo_out) * (mid - lo) / (hi - lo);
+    // Rebuilt by matching each channel back to the end it came from, so a
+    // colour with two equal channels keeps them equal.
+    return vec3<f32>(
+        select(select(mid_out, hi_out, c.r >= hi), lo_out, c.r <= lo),
+        select(select(mid_out, hi_out, c.g >= hi), lo_out, c.g <= lo),
+        select(select(mid_out, hi_out, c.b >= hi), lo_out, c.b <= lo),
+    );
 }
 
 /// The user's own curve, shaped by hand and applied after everything the profile

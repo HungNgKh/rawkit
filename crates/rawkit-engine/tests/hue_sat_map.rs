@@ -4,7 +4,9 @@
 //! illuminant, and a look would not depend on the light. The **look** table is
 //! here too, and is the same format applied somewhere else: after the tone
 //! curve, because a look is authored against a rendered picture rather than
-//! against the light. `ProfileToneCurve` is still not adopted.
+//! against the light. `ProfileToneCurve` is here too, and is applied over a
+//! colour rather than down each channel — see
+//! `a_profile_curve_changes_brightness_without_turning_the_colour`.
 //!
 //! `cargo test -p rawkit-engine --test hue_sat_map -- --ignored`
 
@@ -208,6 +210,85 @@ fn a_higher_profile_curve_renders_brighter() {
     assert!(
         high > low * 1.5,
         "the taller curve did not render brighter: {high:.4} against {low:.4}"
+    );
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_profile_curve_changes_brightness_without_turning_the_colour() {
+    // A tone curve says how much light becomes how much picture. Running it
+    // down each channel on its own also makes it say what colour the light
+    // was: a curve steeper in the darks lifts the dimmest channel further than
+    // the brightest, the gap between them closes, and the colour turns.
+    //
+    // On a real frame -- a clear sky over Sony's own Camera Standard profile --
+    // that was worth 3 units of a\* and about 25 degrees of hue, which is the
+    // difference between a sky reading blue and a sky reading cyan.
+    //
+    // Some turn is inherent and right: lifting the darks towards the brights
+    // genuinely desaturates, and the DNG reference implementation desaturates
+    // in just this way. What must not happen is the *middle* channel wandering
+    // off on its own, which is the part the per-channel version got wrong.
+    // Measured here: 25.4 degrees running the curve down each channel, 16.7
+    // degrees putting the middle channel back where it started.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    // Red dim, blue bright, green between: a sky, in camera RGB.
+    let colour = [0.05, 0.30, 0.90];
+
+    // A real profile curve is strongly concave -- it lifts the darks far more
+    // than the brights, which is exactly the shape that pulls a dim channel up
+    // towards a bright one.
+    let lift: Vec<(f32, f32)> = (0..=32)
+        .map(|i| {
+            let x = i as f32 / 32.0;
+            (x, x.powf(0.4))
+        })
+        .collect();
+    let straight: Vec<(f32, f32)> = vec![(0.0, 0.0), (1.0, 1.0)];
+
+    let hue_of = |points: &[(f32, f32)]| {
+        let mut profile = profile_with(None);
+        profile.set_tone_curve(points);
+        let out = render_colour(&gpu, &profile, colour);
+        let linear = |v: f32| {
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let (r, g, b) = (linear(out[0]), linear(out[1]), linear(out[2]));
+        let x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.9505;
+        let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.089;
+        let f = |t: f32| {
+            if t > 0.008856 {
+                t.cbrt()
+            } else {
+                7.787 * t + 16.0 / 116.0
+            }
+        };
+        let (fx, fy, fz) = (f(x), f(y), f(z));
+        let a = 500.0 * (fx - fy);
+        let bb = 200.0 * (fy - fz);
+        (bb.atan2(a).to_degrees(), y)
+    };
+
+    let (straight_hue, straight_luma) = hue_of(&straight);
+    let (lift_hue, lift_luma) = hue_of(&lift);
+    let turn = (lift_hue - straight_hue).abs();
+    println!(
+        "curve lifted luma {straight_luma:.4} to {lift_luma:.4} and turned the hue \
+         {turn:.2} degrees ({straight_hue:.2} to {lift_hue:.2})"
+    );
+    assert!(
+        lift_luma > straight_luma * 1.5,
+        "the curve did not lift anything: {lift_luma:.4} against {straight_luma:.4}"
+    );
+    assert!(
+        turn < 20.0,
+        "the curve turned the colour {turn:.2} degrees, which is the per-channel \
+         curve's answer rather than the hue-preserving one"
     );
 }
 

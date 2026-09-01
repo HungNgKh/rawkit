@@ -14,29 +14,33 @@
 //! that light. Without a profile, temperature is not a hard feature, it is a
 //! meaningless one.
 //!
-//! # What this implements, and what it does not
+//! # What a profile carries, and what is done with each part
 //!
-//! # The line this module draws
+//! A profile file holds two different kinds of thing, and the difference shows
+//! in how many of each there are.
 //!
-//! A profile file carries two different kinds of thing, and only one of them is
-//! adopted here.
+//! **Measurement.** The colour matrices, the forward matrices, and the
+//! hue/saturation table. These describe how the sensor responds, and a profile
+//! carries *two* of each, one per calibration illuminant, interpolated by
+//! temperature — because a description of a sensor has to depend on the light.
 //!
-//! **Measurement — used.** The colour matrices, the forward matrices, and the
-//! hue/saturation table. These describe how the sensor responds. The tell is
-//! that a profile carries *two* of each, one per calibration illuminant,
-//! interpolated by temperature: a description of the sensor has to depend on the
-//! light, and a look does not.
+//! **Rendering.** `ProfileLookTable` and `ProfileToneCurve`, of which there is
+//! exactly one regardless of illuminant, because what a photograph should look
+//! like does not depend on what lit it.
 //!
-//! **Look — deliberately not used.** `ProfileLookTable` and `ProfileToneCurve`,
-//! of which there is exactly one regardless of illuminant. These encode what
-//! Adobe thinks a photograph should look like. Adopting them would mean the
-//! product renders differently depending on whether a user happened to have
-//! Adobe software installed, would leave our tone map dead code for profiled
-//! files, and would quietly reverse the decision to stop chasing rendering
-//! parity. The tags are named in [`dcp`] so the omission reads as a choice.
+//! Both are applied. That was not the original decision — the rendering half was
+//! left out to avoid depending on what Adobe thinks a photograph should look
+//! like — but a profile's matrices and its curve are two halves of one rendering
+//! and using half of it is not neutral, it is wrong. A Camera Matching profile
+//! keeps nearly everything in its look table; ignoring that landed *further*
+//! from the camera's own JPEG than using no profile at all. Where the profile
+//! supplies a curve it replaces our tone map rather than compounding it, and it
+//! is applied over a colour rather than down each channel — see `profile_tone_rgb`
+//! in the shader for why that distinction is the difference between a blue sky
+//! and a cyan one.
 //!
-//! Adobe's own bundled `.dcp` files are not redistributable in any case, so this
-//! reads what the *user* already has; the project can never ship one.
+//! Adobe's own bundled `.dcp` files are not redistributable, so this reads what
+//! the *user* already has; the project can never ship one.
 
 /// A 3x3 matrix, row-major. Small enough that a dedicated type earns nothing
 /// beyond an alias, and this keeps it obvious which way round the rows are.
