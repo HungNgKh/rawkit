@@ -1015,11 +1015,10 @@ impl Renderer {
     /// there is no untiled one — the same rule that keeps preview and export
     /// sharing kernels.
     ///
-    /// The outermost few pixels of the *image* are still wrong by construction:
-    /// RCD reaches four pixels out and the kernel clamps at the edge rather than
-    /// mirroring, which would flip CFA parity. Crop before showing the result.
-    /// Tile seams are not in that category — they are exact, and a test asserts
-    /// it.
+    /// The outermost pixels of the *image* are reconstructed from a halo that
+    /// mirrors the frame back on itself — see [`gather_padded`] for why that is
+    /// reflection about the edge pixel rather than a clamp. Tile seams are exact,
+    /// and a test asserts it.
     pub fn run(
         &self,
         gpu: &Gpu,
@@ -2503,12 +2502,26 @@ fn mask_gain(image: &Frame<'_>, colour: &Colour, mask: &rawkit_editstate::Mask) 
     ]
 }
 
-/// Fill `out` with the tile at `(ox, oy)` plus its halo, clamping at the image
+/// Fill `out` with the tile at `(ox, oy)` plus its halo, mirroring at the image
 /// edge.
 ///
-/// Clamping here has to match what the shader does when it reads out of bounds,
-/// or the tiled result would differ from an untiled one along the image border.
-/// Both clamp to the nearest edge pixel.
+/// **Mirrored, not clamped, and on a mosaic that is not a preference.** Filling
+/// the halo with the edge pixel repeated gives every column in it the same
+/// value, so alternate columns hold the wrong CFA channel: the demosaic asks for
+/// red four pixels out and is handed green. It reconstructs a colour from that,
+/// and the result was a magenta fringe one to three pixels wide along all four
+/// edges of every photograph — top row 0.27 of a green-magenta cast against
+/// 0.00 in the middle of the same frame.
+///
+/// Reflection about the edge *pixel* keeps the parity: -1 comes from 1, -2 from
+/// 2, and both land on the channel that was asked for. This is what the note on
+/// [`Renderer::run`] used to say could not be done, on the grounds that
+/// mirroring flips CFA parity — which is true of reflecting about the *boundary*
+/// between pixels and false of reflecting about the edge pixel itself.
+///
+/// A flat frame never showed it: with one colour everywhere there is nothing for
+/// the wrong channel to be wrong about. It takes detail at the edge, which every
+/// photograph has and no synthetic fixture had.
 ///
 /// # Why this is written in three parts
 ///
@@ -2534,8 +2547,9 @@ fn gather_padded(
     let (w, h) = (width as i64, height as i64);
     let (padded, first_x) = (padded as i64, ox as i64 - HALO as i64);
 
-    // How the row splits: `left` columns clamped to the first pixel, `run`
-    // columns copied straight, the rest clamped to the last.
+    // How the row splits: `left` columns mirrored back inside, `run` columns
+    // copied straight, the rest mirrored back from the far edge. The middle is
+    // still one memcpy, which is what the split is for.
     let left = (-first_x).clamp(0, padded) as usize;
     let start = first_x.max(0);
     let end = (first_x + padded).min(w);
@@ -2543,19 +2557,43 @@ fn gather_padded(
     let right = padded as usize - left - run;
 
     for py in 0..padded {
-        let gy = (oy as i64 - HALO as i64 + py).clamp(0, h - 1);
+        let gy = mirror(oy as i64 - HALO as i64 + py, h);
         let src = (gy * w) as usize;
         let dst = (py * padded) as usize;
         let row = &mut out[dst..dst + padded as usize];
 
-        row[..left].fill(mosaic[src]);
+        for (i, cell) in row[..left].iter_mut().enumerate() {
+            *cell = mosaic[src + mirror(first_x + i as i64, w) as usize];
+        }
         if run > 0 {
             let from = src + start as usize;
             row[left..left + run].copy_from_slice(&mosaic[from..from + run]);
         }
-        row[left + run..].fill(mosaic[src + (w - 1) as usize]);
+        for (i, cell) in row[left + run..].iter_mut().enumerate() {
+            *cell = mosaic[src + mirror(end + i as i64, w) as usize];
+        }
         debug_assert_eq!(left + run + right, padded as usize);
     }
+}
+
+/// Reflect a coordinate back inside `0..extent`, about the edge pixel.
+///
+/// A loop rather than one reflection: a halo can reach past the far edge of a
+/// small image, and once is not always enough.
+fn mirror(v: i64, extent: i64) -> i64 {
+    if extent <= 1 {
+        return 0;
+    }
+    let last = extent - 1;
+    let mut x = v;
+    while x < 0 || x > last {
+        if x < 0 {
+            x = -x;
+        } else {
+            x = 2 * last - x;
+        }
+    }
+    x
 }
 
 /// Sensor readings to scene-linear [0, 1]: subtract black, divide by headroom.

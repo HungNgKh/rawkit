@@ -419,3 +419,87 @@ fn a_full_frame_renders_within_webgpu_default_limits() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn the_border_is_not_a_different_colour_from_the_frame() {
+    // Every render carries a magenta fringe one to three pixels wide along all
+    // four edges. It is small enough to be invisible at a normal size and it is
+    // on every photograph, which is the combination that keeps a defect alive.
+    //
+    // The scene is grey everywhere and textured everywhere: every site sees the
+    // same value in all three channels, so *any* colour in the result is
+    // invented. The texture is the part a flat frame cannot test — with one
+    // value everywhere there is nothing for a wrong channel to be wrong about,
+    // and a flat fixture passed this happily while every photograph had the
+    // fringe.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    // The luminance of the fixture the rest of this file measures against, used
+    // as a *grey* scene. It carries detail past the Nyquist limit of a single
+    // colour plane, which is the content that makes a demosaic border wrong, and
+    // it has that detail right up to the edge.
+    let (w, h) = (W, H);
+    let truth = ground_truth();
+
+    // **With a real camera's white balance**, which is what makes this defect
+    // visible rather than academic. A halo that hands the demosaic the wrong CFA
+    // channel is an error of one channel against another, and the next stage
+    // multiplies red by 2.75 and blue by 1.73 to make grey come out grey. With
+    // the identity multipliers a synthetic fixture usually gets, the same
+    // mistake is a rounding difference and every version of this test passed.
+    const WB: [f32; 3] = [2.75, 1.0, 1.73];
+
+    // Divided by the multiplier its own site will be multiplied by, so the
+    // photograph is neutral *after* white balance. Then any colour in the
+    // result is invented rather than inherited.
+    let cfa: Vec<f32> = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            let p = truth[(y * w + x) as usize];
+            let grey = 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
+            grey / WB[colour_at(x, y, BayerPhase::Rggb)]
+        })
+        .collect();
+
+    let mut f = frame(&cfa, w, h, BayerPhase::Rggb);
+    f.as_shot_wb = WB;
+    let out = Renderer::new(&gpu)
+        .run(&gpu, &f, &EditState::default(), Output::Display)
+        .expect("render failed")
+        .pixels;
+
+    let at = |x: u32, y: u32| {
+        let i = ((y * w + x) * 4) as usize;
+        [out[i], out[i + 1], out[i + 2]]
+    };
+    let cast = |c: [f32; 3]| (c[0] + c[2]) * 0.5 - c[1];
+
+    // The **mean**, signed, and not the worst. Demosaicing invents a little
+    // colour wherever detail outruns a single colour plane, and on a fixture
+    // built to do exactly that the worst pixel is large everywhere -- border,
+    // interior, either halo. What made the border a defect was that its errors
+    // all pointed the same way: a fringe you can see, because it is a systematic
+    // cast rather than scattered noise. So the test is whether the border leans
+    // in a direction the rest of the picture does not.
+    let mean = |pts: &[(u32, u32)]| {
+        pts.iter().map(|&(x, y)| cast(at(x, y))).sum::<f32>() / pts.len() as f32
+    };
+    let edges: Vec<(u32, u32)> = (0..w)
+        .map(|x| (x, 0))
+        .chain((0..w).map(|x| (x, h - 1)))
+        .chain((0..h).map(|y| (0, y)))
+        .chain((0..h).map(|y| (w - 1, y)))
+        .collect();
+    let inside: Vec<(u32, u32)> = (8..h - 8)
+        .flat_map(|y| (8..w - 8).map(move |x| (x, y)))
+        .collect();
+    let (border, interior) = (mean(&edges), mean(&inside));
+    println!("mean cast: border {border:+.4}, interior {interior:+.4}");
+    assert!(
+        (border - interior).abs() < 0.01,
+        "the border leans {:+.4} against the interior's {:+.4} on a frame that is \
+         grey everywhere, so the difference is invented",
+        border,
+        interior
+    );
+}
