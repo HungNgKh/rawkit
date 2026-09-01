@@ -90,6 +90,10 @@ struct Params {
     tone: vec4<f32>,
     // `.xy` are the black and white points. `.zw` unused.
     levels: vec4<f32>,
+    // How far the *local* tone operator will trust its own neighbourhood:
+    // `.x` the brightest reference it will read a gain at, `.y` the darkest.
+    // `.zw` unused. See `tone_curve`, and `ToneCurve::local` in Rust.
+    tone_local: vec4<f32>,
     // `.x` is the sharpening amount, `.y` its radius in pixels, `.z` the chroma
     // noise reduction. `.w` unused.
     detail: vec4<f32>,
@@ -1248,7 +1252,22 @@ fn tone_curve(y: f32, local: f32) -> f32 {
         // texture inside a bright region is what makes a global shadow control
         // look washed out -- but it does mean the slider does less on a frame
         // with no dark regions in it.
-        let reference = tone_contrast(local);
+        //
+        // And *bounded*, which is the difference between a control that works
+        // and one that stops exactly where it is wanted. The gain is
+        // `curve(r)/r`, and this curve pins both its endpoints — so that ratio
+        // is not monotone in `r`. Towards white it turns around and climbs back
+        // to 1, which left a bright patch of untouched sky sitting in a sky that
+        // had been pulled down; towards black it diverges instead, so a glint
+        // inside a shadow was multiplied by the darkness around it and clipped
+        // to white. Holding the reference at the point where the curve stops
+        // becoming more effective fixes both, and the two numbers come from the
+        // CPU because finding them is a scan rather than a formula.
+        let reference = clamp(
+            tone_contrast(local),
+            params.tone_local.y,
+            params.tone_local.x,
+        );
         p2 = p1 * tone_shadow_highlight(reference) / max(reference, EPS);
     }
 

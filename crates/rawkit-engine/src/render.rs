@@ -290,6 +290,9 @@ struct Params {
     tone: [f32; 4],
     /// `[black point, white point, unused, unused]`.
     levels: [f32; 4],
+    /// `[highlight reference, shadow reference, unused, unused]` — how far the
+    /// local tone operator will trust its own neighbourhood.
+    tone_local: [f32; 4],
     /// `[sharpen amount, sharpen radius, chroma noise, luminance noise]`.
     detail: [f32; 4],
     /// `[saturation, vibrance, hue mixer active, unused]`.
@@ -1673,6 +1676,7 @@ impl Renderer {
             ],
             tone: tone.shape(),
             levels: tone.levels(),
+            tone_local: tone.local(),
             detail: [
                 state.detail.sharpen_amount,
                 state.detail.sharpen_radius,

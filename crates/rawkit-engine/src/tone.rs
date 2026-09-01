@@ -70,7 +70,13 @@ use rawkit_editstate::Tone;
 ///
 /// The same 0.18 the tone map fixes. If that constant ever moves, this one
 /// moves with it or the controls stop pivoting on middle grey.
-#[cfg(test)]
+///
+/// Not test-only, unlike the gamma below it. The curve itself lives in the
+/// shader and this side only passed sliders through — until the local operator
+/// needed *bounds* on the neighbourhood it reads a gain from, which are a
+/// property of the curve's shape and so have to be worked out where the shape
+/// is known. `the_constants_match_the_shader` is what keeps the two copies
+/// honest, and it is why duplicating them is affordable at all.
 const PIVOT: f32 = 0.45865646;
 
 /// The exponent the perceptual coordinate uses.
@@ -80,7 +86,7 @@ const GAMMA: f32 = 2.2;
 /// How far the shadow and highlight exponents may travel from 1.
 ///
 /// Bounded by monotonicity at 0.8807; see the module docs for the derivation.
-#[cfg(test)]
+/// Not test-only, for the reason given on [`PIVOT`].
 const TAPER: f32 = 0.75;
 
 /// How far the black and white points may travel from their defaults.
@@ -106,6 +112,32 @@ pub(crate) struct ToneCurve {
     pub shadows: f32,
     pub black_point: f32,
     pub white_point: f32,
+    /// The brightest and darkest a *neighbourhood* may be taken to be, when the
+    /// local operator reads a gain off the curve.
+    ///
+    /// # Why a gain read off this curve needs bounding at all
+    ///
+    /// The local path multiplies a pixel by `curve(reference) / reference` —
+    /// how much the curve moves a neighbourhood of that brightness. It is a
+    /// gain rather than a remap so that two neighbours keep their ratio, which
+    /// is the whole reason the control does not read as flat.
+    ///
+    /// But the curve pins both its endpoints: `curve(0) = 0` and `curve(1) = 1`.
+    /// So that ratio is **not monotone**. Towards white it turns around and
+    /// climbs back to exactly 1, and the highlights slider stops doing anything
+    /// precisely where the neighbourhood is brightest — measured on a real
+    /// frame, a gain of 0.786 at a reference of 0.95 and 1.000 at 1.0, which
+    /// rendered as a bright blob of untouched sky sitting in a sky that had
+    /// been pulled down. Towards black it does not turn around at all, it
+    /// diverges: 16x at a reference of 0.01 and 556x at 0.0001, so a glint
+    /// inside a shadow is multiplied by that and clips to white.
+    ///
+    /// Both ends are the same defect and take the same repair: stop reading the
+    /// gain past the point where the curve stops becoming more effective, and
+    /// hold the strongest gain it reached. Clamping the *reference* rather than
+    /// the gain is what makes that one line in the shader instead of two cases.
+    pub highlight_reference: f32,
+    pub shadow_reference: f32,
     /// Whether any control is off its default.
     ///
     /// Carried explicitly so the shader can return the tone-mapped value
@@ -141,6 +173,8 @@ impl ToneCurve {
             // darkest values meet it and clip.
             black_point: -blacks * LEVELS_REACH,
             white_point: 1.0 - whites * LEVELS_REACH,
+            highlight_reference: highlight_reference(highlights),
+            shadow_reference: shadow_reference(shadows),
             active: [contrast, highlights, shadows, whites, blacks]
                 .iter()
                 .any(|v| *v != 0.0),
@@ -161,7 +195,98 @@ impl ToneCurve {
     pub fn levels(&self) -> [f32; 4] {
         [self.black_point, self.white_point, 0.0, 0.0]
     }
+
+    /// `[highlight reference, shadow reference, unused, unused]`.
+    ///
+    /// Beside `levels` rather than in it: the endpoints are where a photograph
+    /// clips, and these are how far the *local* operator will trust its own
+    /// neighbourhood. Two different ideas that happen to be two numbers each.
+    pub fn local(&self) -> [f32; 4] {
+        [self.highlight_reference, self.shadow_reference, 0.0, 0.0]
+    }
 }
+
+/// The highlight branch's gain, `curve(r) / r`, over the range it applies to.
+fn highlight_gain(r: f32, highlights: f32) -> f32 {
+    let u = (1.0 - r) / (1.0 - PIVOT);
+    (1.0 - (1.0 - PIVOT) * u.powf(1.0 + highlights * TAPER * (1.0 - u))) / r
+}
+
+/// The same, below the pivot.
+fn shadow_gain(r: f32, shadows: f32) -> f32 {
+    let v = r / PIVOT;
+    PIVOT * v.powf(1.0 - shadows * TAPER * (1.0 - v)) / r
+}
+
+/// The brightest a neighbourhood is worth reading a gain at.
+///
+/// Found by scanning rather than solved, and that is a deliberate trade: the
+/// turning point moves with the slider — measured between 0.80 and 0.95 across
+/// the range — and a closed form for it would be a page of algebra that has to
+/// be re-derived the first time anybody reshapes the curve. This runs once per
+/// edit over a few hundred steps of arithmetic, which is nothing beside the
+/// render it precedes, and it stays correct if the curve changes shape.
+fn highlight_reference(highlights: f32) -> f32 {
+    if highlights == 0.0 {
+        // The gain is 1 everywhere, so there is nothing to hold and no reason
+        // to move the reference at all. Exactness matters here: it is what
+        // keeps an edit that never touched this control bit-identical.
+        return 1.0;
+    }
+    let mut best = (PIVOT, 1.0f32);
+    for i in 0..=STEPS {
+        let r = PIVOT + (1.0 - PIVOT) * i as f32 / STEPS as f32;
+        let g = highlight_gain(r.min(1.0 - f32::EPSILON), highlights);
+        // Furthest from unity in the direction the slider asked for.
+        if (highlights < 0.0 && g < best.1) || (highlights > 0.0 && g > best.1) {
+            best = (r, g);
+        }
+    }
+    best.0
+}
+
+/// The darkest a neighbourhood is worth reading a gain at.
+///
+/// Unlike the highlight side this one never turns around — the gain diverges as
+/// the neighbourhood approaches black — so the bound is a stated maximum lift
+/// rather than a discovered extremum.
+fn shadow_reference(shadows: f32) -> f32 {
+    if shadows == 0.0 {
+        return 0.0;
+    }
+    // Scanned upwards from black, where the gain is at its most extreme, and
+    // stopped at the first reference that is *inside* the bound — not the last
+    // one outside it, which is a step too far and leaves the bound exceeded by
+    // exactly one step's worth.
+    for i in 0..=STEPS {
+        let r = PIVOT * i as f32 / STEPS as f32;
+        if r <= 0.0 {
+            continue;
+        }
+        let g = shadow_gain(r, shadows);
+        let inside = (1.0 / MAX_LOCAL_GAIN..=MAX_LOCAL_GAIN).contains(&g);
+        if inside {
+            return r;
+        }
+    }
+    PIVOT
+}
+
+/// How far the local operator may take a pixel, as a multiple.
+///
+/// Three stops. The gain only exceeds it below a reference of about 0.025,
+/// which is 0.0003 of full scale once the output gamma is applied — black, in
+/// any photograph anybody is looking at. What lives above that bound is not a
+/// shadow being lifted but a bright speck being multiplied by the darkness
+/// around it, and the visible result of leaving it unbounded is a white dot.
+const MAX_LOCAL_GAIN: f32 = 8.0;
+
+/// How finely the two references above are scanned.
+///
+/// The gain is smooth and its extremum is broad, so this decides a fraction of
+/// a percent of the reference and nothing a person could see; it is here to be
+/// a number rather than a magic literal in two places.
+const STEPS: usize = 512;
 
 /// The user's hand-shaped curve, resampled to a lookup the shader can index.
 ///
@@ -421,6 +546,102 @@ mod tests {
                 .unwrap_or_else(|| panic!("cannot read a number out of `{line}`"));
             assert_eq!(literal, value, "{name} disagrees with the shader");
         }
+    }
+
+    /// The gain the local operator actually applies at a neighbourhood of `r`,
+    /// bounds included — which is the thing that has to behave, rather than the
+    /// raw ratio it is derived from.
+    fn effective_gain(c: &ToneCurve, r: f32) -> f32 {
+        let r = r.clamp(c.shadow_reference, c.highlight_reference).max(1e-6);
+        if r <= PIVOT {
+            super::shadow_gain(r, c.shadows)
+        } else {
+            super::highlight_gain(r.min(1.0 - f32::EPSILON), c.highlights)
+        }
+    }
+
+    #[test]
+    fn the_local_gain_never_gives_up_where_it_is_most_needed() {
+        // The defect this exists for: the gain is `curve(r)/r`, and the curve
+        // pins both endpoints — so towards white the ratio turns around and
+        // climbs back to exactly 1, and the highlights slider stops doing
+        // anything precisely where the neighbourhood is brightest. On a real
+        // photograph that rendered as a bright patch of untouched sky sitting
+        // inside a sky that had been pulled down.
+        //
+        // Stated as monotonicity rather than as "no blob": once the gain has
+        // started moving away from 1 it may not come back towards it, at either
+        // end. That is the property the artefact violated, and it is checkable.
+        for c in every_extreme() {
+            if !c.active {
+                continue;
+            }
+            // Walked from the pivot *upwards*: the brighter the neighbourhood,
+            // the further the gain may be from 1 and never nearer. Weakening as
+            // a neighbourhood gets dimmer is the operator working; weakening as
+            // it gets brighter is the bug.
+            let mut worst: Option<(f32, f32, f32)> = None;
+            let mut previous = (effective_gain(&c, PIVOT) - 1.0).abs();
+            for step in 0..=2000 {
+                let r = PIVOT + (1.0 - PIVOT) * step as f32 / 2000.0;
+                let strength = (effective_gain(&c, r) - 1.0).abs();
+                // A relative slack, because the reference bound is found by a
+                // scan and the gain either side of it agrees only to within a
+                // step of that scan.
+                if strength + 1e-4 < previous && worst.is_none() {
+                    worst = Some((r, previous, strength));
+                }
+                previous = previous.max(strength);
+            }
+            assert!(
+                worst.is_none(),
+                "highlights {:+.2}: the gain weakens as the neighbourhood brightens \
+                 — at {:?}",
+                c.highlights,
+                worst
+            );
+        }
+    }
+
+    #[test]
+    fn the_local_gain_cannot_run_away_in_the_dark() {
+        // The same defect at the other end, and the one that has not been seen
+        // yet only because nobody has pulled the shadows up on a frame with a
+        // glint in a dark corner. Unbounded, the gain reaches 16x at a
+        // neighbourhood of 0.01 and 556x at 0.0001 — and it multiplies the
+        // *pixel*, not the neighbourhood, so anything brighter than the darkness
+        // around it clips to white.
+        for c in every_extreme() {
+            if !c.active {
+                continue;
+            }
+            for step in 0..=2000 {
+                let r = step as f32 / 2000.0;
+                let g = effective_gain(&c, r);
+                assert!(
+                    g.is_finite()
+                        && (1.0 / MAX_LOCAL_GAIN / 1.001..=MAX_LOCAL_GAIN * 1.001).contains(&g),
+                    "shadows {:+.2}: a neighbourhood of {r} gives a gain of {g}",
+                    c.shadows
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_control_left_alone_moves_no_reference() {
+        // The bounds must not become a second way for an untouched slider to
+        // change a photograph. Exact values, because the shader clamps by them
+        // unconditionally and 0.999999 would be a quiet, permanent nudge.
+        let c = ToneCurve::new(&Tone {
+            exposure_ev: 0.0,
+            contrast: 0.5,
+            highlights: 0.0,
+            shadows: 0.0,
+            whites: 0.0,
+            blacks: 0.0,
+        });
+        assert_eq!(c.local(), [1.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
