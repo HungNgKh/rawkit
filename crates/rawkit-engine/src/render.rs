@@ -198,17 +198,30 @@ impl Frame<'_> {
         // way.
         // Ask for the transform and the table together, so there is no way to
         // end up with one and not the other.
-        // The working-space hop is worth taking for *either* table. It used to
-        // be conditional on the hue/saturation correction alone, which meant a
-        // Camera Matching profile — which carries no such correction and keeps
-        // everything in its look — took the direct path and had its look
-        // discarded.
+        // The working-space hop is taken whenever the profile can describe one —
+        // that is, whenever it brought a forward matrix — and no longer only
+        // when it also brought a table.
+        //
+        // It was narrowed twice before being got right. First to the
+        // hue/saturation correction alone, which meant a Camera Matching
+        // profile — which carries no such correction and keeps everything in its
+        // look — took the direct path and had its look discarded. Then to
+        // "either table", which was enough while the working space was somewhere
+        // the pipeline visited to read a table and came straight back from.
+        //
+        // It is not somewhere it visits any more: the tone curve runs there,
+        // because Adobe's reference rendering applies it there and a per-channel
+        // curve cannot be moved between primaries without changing colour. So
+        // the condition has to be about the *space*, not about what is read in
+        // it — otherwise whether a photograph's curve ran in ProPhoto would
+        // depend on whether its profile happened to carry a look table, which
+        // `an_identity_look_changes_nothing` is exactly the test to notice.
         let working = self.profile.camera_to_working(temperature);
         let hue_sat = self.profile.hue_sat_map(temperature);
         let look = self.profile.look_table().cloned();
 
         Ok(match working {
-            Some((to_working, to_display)) if hue_sat.is_some() || look.is_some() => Colour {
+            Some((to_working, to_display)) => Colour {
                 multipliers,
                 temperature,
                 tint,

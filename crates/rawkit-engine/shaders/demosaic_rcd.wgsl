@@ -860,16 +860,31 @@ fn develop_rgb(camera: vec3<f32>, ixy: vec2<f32>) -> vec3<f32> {
     if (params.develop.y > 0.5) {
         corrected = apply_hue_sat(display);
     }
-    let shown = vec3<f32>(
-        dot(params.working_to_display[0].rgb, corrected),
-        dot(params.working_to_display[1].rgb, corrected),
-        dot(params.working_to_display[2].rgb, corrected),
-    );
+    // Everything from here to the last line stays in the profile's working
+    // space, and the conversion to display happens once at the end.
+    //
+    // It used to convert here, run the tone curve in the display space, and
+    // convert *back* for the look table — which is the shape of the mistake:
+    // whoever wrote the round trip knew the look needed the space its axes were
+    // measured in, and the curve immediately before it needed the same space
+    // for the same reason. Adobe's reference rendering applies the tone curve in
+    // ProPhoto, and a per-channel curve is not something you can move between
+    // primaries: narrower primaries make a colour's channel ratios more extreme,
+    // and a curve that is steep there pushes them further apart still.
+    //
+    // Measured against Lightroom's own render of `DSC01643`, on the same
+    // photosites: in the band where it bites hardest we were 28% over-saturated
+    // and 15 degrees off in hue, and neither moved when the curve's *shape* was
+    // varied — which is what said the shape was not the problem.
+    //
+    // Costs nothing when there is no working space to speak of: a profile with
+    // no forward matrix leaves both matrices at identity, so this is the same
+    // arithmetic in the same order and the goldens do not move.
 
     // Stage G -- local adjustments. Exposure has just been applied and the
     // tone map has not, which is where the declared pipeline puts this and why
     // the controls a mask carries are the ones that are multiplies here.
-    let exposed = local_adjust(shown * params.develop.x, ixy);
+    let exposed = local_adjust(corrected * params.develop.x, ixy);
     // The profile's curve *instead of* ours, not as well as. Both map the scene
     // to a display, and running two tone maps in series maps the scene twice —
     // which reads as a flat, muddy picture rather than as a bug.
@@ -896,20 +911,16 @@ fn develop_rgb(camera: vec3<f32>, ixy: vec2<f32>) -> vec3<f32> {
     // finishes first and the person adjusts the result.
     var looked = mapped;
     if (params.develop.w > 0.5) {
-        let working = vec3<f32>(
-            dot(params.display_to_working[0].rgb, mapped),
-            dot(params.display_to_working[1].rgb, mapped),
-            dot(params.display_to_working[2].rgb, mapped),
-        );
-        let adjusted = apply_look(working);
-        looked = vec3<f32>(
-            dot(params.working_to_display[0].rgb, adjusted),
-            dot(params.working_to_display[1].rgb, adjusted),
-            dot(params.working_to_display[2].rgb, adjusted),
-        );
+        looked = apply_look(mapped);
     }
 
-    return looked;
+    // And out to the display's primaries, once, with everything that wanted the
+    // working space behind it.
+    return vec3<f32>(
+        dot(params.working_to_display[0].rgb, looked),
+        dot(params.working_to_display[1].rgb, looked),
+        dot(params.working_to_display[2].rgb, looked),
+    );
 }
 
 /// Saturation and vibrance.
