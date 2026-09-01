@@ -661,6 +661,29 @@ pub struct Detail {
     /// costs nothing visible, because the eye takes its detail from luminance —
     /// which is why this has a default and [`Detail::luminance_noise`] does not.
     pub chroma_noise: f32,
+    /// How much of the clipping cast to take off an edge that sits beside a
+    /// blown highlight. 0 is off.
+    ///
+    /// # Why this exists, and why it has a default
+    ///
+    /// A sensor clips at one value; white balance moves that to a different
+    /// height per channel, so a blown neutral sky arrives *magenta* and
+    /// highlight reconstruction replaces it with neutral. A pixel on the edge of
+    /// a bare twig is a mixture of that light with honest dark content — it
+    /// carries the whole lie, scaled down, and reconstruction cannot see it
+    /// because reconstruction asks about the pixel's own level and this pixel is
+    /// nowhere near clipping. The result is a violet rim on every twig against a
+    /// bright sky, and it is manufactured entirely by the pipeline: on a
+    /// synthetic scene that is neutral everywhere in the truth, the cast is
+    /// 0.000 with the sky just below the clip point and 2.229 at three times it.
+    ///
+    /// So it defaults on, for the same reason capture sharpening does: it
+    /// repairs something the rendering itself introduces, and a converter that
+    /// left it there would look worse than its neighbours for a reason the user
+    /// cannot see. It is a slider rather than a switch because how much colour
+    /// beside a highlight is *real* depends on the photograph — a sunset's cloud
+    /// edge genuinely is orange.
+    pub defringe: f32,
     /// How far to smooth *brightness*, sparing edges. 0 is off, and off is the
     /// default.
     ///
@@ -688,6 +711,14 @@ impl Default for Detail {
             // Off. See the field's own note: this one costs detail, and which
             // frames want it is not ours to assume.
             luminance_noise: 0.0,
+            // Full, and that is a measurement rather than a preference. The
+            // step is the one that leaves the least colour behind, so it cannot
+            // overshoot however hard it is pushed — and what it costs a subject
+            // that *is* magenta was measured rather than assumed: 2% of the
+            // chroma at the middle of one, because the reach is a few pixels and
+            // a dark pixel is bounded by how much blown light it could hold.
+            // The slider is there for the photograph that is the exception.
+            defringe: 1.0,
         }
     }
 }
@@ -729,6 +760,12 @@ impl Detail {
             return Err(EditStateError::InvalidDetail(format!(
                 "luminance noise reduction is {}, and runs from 0 to 1",
                 self.luminance_noise
+            )));
+        }
+        if !self.defringe.is_finite() || !(0.0..=1.0).contains(&self.defringe) {
+            return Err(EditStateError::InvalidDetail(format!(
+                "defringe is {}, and runs from 0 to 1",
+                self.defringe
             )));
         }
         Ok(())

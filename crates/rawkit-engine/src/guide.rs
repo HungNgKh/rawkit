@@ -78,6 +78,17 @@ const SIGMA_DIVISOR: f32 = 32.0;
 /// a skyline does not.
 const RANGE_STOPS: f32 = 1.0;
 
+/// How far a quad's two greens may differ before it is taken to span an edge,
+/// as a fraction of their sum.
+///
+/// A tenth is about a fifth of a stop across two pixels — well beyond sensor
+/// noise on anything bright enough to matter as a chroma reference, and far
+/// short of the edge of a twig, which reads several hundred percent. The
+/// consequence of being too strict is a guide with fewer chroma samples in it,
+/// which the diffusion covers; the consequence of being too loose is an invented
+/// colour spreading across a whole sky, which nothing covers.
+const FLAT_ENOUGH: f32 = 0.1;
+
 /// A sample this close to the clip level is not to be trusted.
 ///
 /// The mosaic arrives with the decoder's white level at 1.0, and sensors do not
@@ -175,6 +186,12 @@ impl Guide {
             for bx in (0..width.saturating_sub(1)).step_by(2) {
                 let mut rgb = [0.0f32; 3];
                 let mut clipped = false;
+                // The quad's two greens, kept apart rather than summed. Their
+                // *difference* is what says whether this quad is one colour or
+                // two — see below, and see `chroma` for what it costs when
+                // nobody asks.
+                let mut greens = [0.0f32; 2];
+                let mut seen = 0usize;
                 for j in 0..2u32 {
                     for i in 0..2u32 {
                         let (x, y) = (bx + i, by + j);
@@ -192,6 +209,14 @@ impl Guide {
                         };
                         // Green twice per quad, so it is halved on the way in.
                         rgb[c] += if c == 1 { v * 0.5 } else { v };
+                        // Counted rather than indexed by position: which two
+                        // corners of the quad hold green depends on the pattern
+                        // phase, and a formula for that is a fourth place to get
+                        // the phase wrong.
+                        if c == 1 && seen < 2 {
+                            greens[seen] = v;
+                            seen += 1;
+                        }
                     }
                 }
 
@@ -201,7 +226,29 @@ impl Guide {
                 }
                 count[cell] += 1.0;
 
-                if !clipped {
+                // A quad that spans an edge is not a colour.
+                //
+                // Its red comes from one side of the edge and its blue from the
+                // other, so the triple is a colour that is in neither — and
+                // since the whole point of this field is to be *borrowed*, a
+                // colour nothing in the frame has is the worst possible thing to
+                // put in it. On a dark twig against a blown sky the straddling
+                // quads are the only unclipped ones anywhere near, so their
+                // invented colour is what the diffusion below then spreads
+                // across the entire sky. Measured on a synthetic frame that is
+                // neutral everywhere: the quad on the edge reads (0.32, 0.47,
+                // 0.05) against the truth's (0.04, 0.10, 0.05), and the sky
+                // three hundred pixels away inherits it.
+                //
+                // The two greens are what detect it. They sit on opposite
+                // corners of the quad and see the same light in a flat area, so
+                // a difference between them is an edge inside the quad — and it
+                // is the only measurement available that compares like with
+                // like, since red and blue have one sample each and no way to
+                // disagree with themselves.
+                let level = greens[0] + greens[1];
+                let flat = (greens[0] - greens[1]).abs() <= FLAT_ENOUGH * level;
+                if !clipped && flat {
                     // Weighted by the quad's own brightness, so the reference
                     // is the colour of the *bright* light near a highlight
                     // rather than an average that a large shadow would drag
@@ -443,6 +490,72 @@ mod tests {
         assert!((guide.data[mid] - 0.8).abs() < 1e-3);
         assert!((guide.data[mid + 1] - 0.4).abs() < 1e-3);
         assert!((guide.data[mid + 2] - 0.1).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_quad_on_an_edge_does_not_invent_a_colour() {
+        // The chroma field is *borrowed* — a blown pixel takes its colour from
+        // it — so a colour that is nowhere in the frame is the worst thing that
+        // can be in it. A quad straddling an edge produces exactly that: its red
+        // sample comes from one side and its blue from the other.
+        //
+        // This is not hypothetical. On a bare twig against a blown sky the
+        // straddling quads are the *only* unclipped ones anywhere near, so the
+        // invented colour is what the diffusion then spreads over the whole sky
+        // — which is what a green cast around a tree turned out to be.
+        //
+        // A blown neutral sky, with a dark neutral stripe down it. Nothing here
+        // has any colour, so anything the guide reports is something it made.
+        let (w, h) = (64u32, 64u32);
+        //
+        // The edge *ramps*, and takes two goes to get right. A hard step from
+        // sky to stripe is not enough: every quad touching it holds a sample at
+        // the clip level and is thrown out by the trust test before the flat
+        // test is reached. And a stripe starting on an even column is not enough
+        // either, because the quad grid then falls either side of the boundary
+        // and nothing straddles anything. What actually happens on a twig is
+        // both together — an edge that lands on an odd column and passes through
+        // intermediate values on the way down, so a quad can hold two very
+        // different brightnesses while every sample in it is honest.
+        let level = |x: u32| match x {
+            0..=24 => 1.0,
+            25 => 0.90,
+            26 => 0.50,
+            27..=30 => 0.05,
+            31 => 0.50,
+            32 => 0.90,
+            _ => 1.0,
+        };
+        let data = mosaic(w, h, |x, _| [level(x); 3]);
+        let guide = Guide::build(&data, w, h, BayerPhase::Rggb, 1.0);
+        assert!(guide.chroma_known, "found no unclipped light at all");
+
+        // Everywhere, not just at the stripe: the diffusion carries whatever the
+        // seeds were across the entire field, so a bad seed anywhere is a bad
+        // answer everywhere.
+        let mut worst = (0.0f32, 0usize);
+        for cell in 0..(guide.width * guide.height) as usize {
+            let c = &guide.chroma[cell * 3..cell * 3 + 3];
+            let mean = (c[0] + c[1] + c[2]) / 3.0;
+            if mean <= 1e-6 {
+                continue;
+            }
+            let cast = (c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2])) / mean;
+            if cast > worst.0 {
+                worst = (cast, cell);
+            }
+        }
+        println!(
+            "worst invented cast {:.4} at texel {} of {}",
+            worst.0,
+            worst.1,
+            guide.width * guide.height
+        );
+        assert!(
+            worst.0 < 0.02,
+            "invented a cast of {:.3} from a frame with no colour in it",
+            worst.0
+        );
     }
 
     #[test]

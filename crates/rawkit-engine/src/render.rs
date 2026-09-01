@@ -325,6 +325,12 @@ struct Params {
     /// uniform displacement across the whole frame, which is a shift and not an
     /// aberration.
     lateral: [f32; 4],
+    /// `[defringe amount, unused, unused, unused]`.
+    ///
+    /// Beside `lateral` rather than in `detail`, which is already full: the two
+    /// are the same kind of thing to a reader — a repair of a colour the
+    /// rendering introduced — and `detail` is the noise and sharpening group.
+    defringe: [f32; 4],
     /// What each local adjustment multiplies by at full strength.
     ///
     /// Exposure and white balance arrive combined, because both are multiplies
@@ -483,12 +489,14 @@ pub enum Output {
     Display,
 }
 
-const STAGES: [&str; 12] = [
+const STAGES: [&str; 14] = [
     "conv",
     "green_at_rb",
     "rb_at_br",
     "rb_at_g",
     "pack",
+    "defringe_scan",
+    "defringe_apply",
     "chroma_blur",
     "chroma_mix",
     "luminance_blur",
@@ -503,7 +511,7 @@ const STAGES: [&str; 12] = [
 /// Named rather than counted back from the end: it used to be `len() - 1`, which
 /// was right only while `develop` was last and would have silently started
 /// returning sharpened pixels the moment anything was appended.
-const SCENE_LINEAR_STAGES: usize = 9;
+const SCENE_LINEAR_STAGES: usize = 11;
 
 /// How far outside a tile the kernel reaches, in pixels.
 ///
@@ -517,21 +525,24 @@ const SCENE_LINEAR_STAGES: usize = 9;
 /// | `rb_at_br` | `pq` ±1, green ±3 (itself reach 5) | 8 |
 /// | `rb_at_g` | chroma ±3 (itself reach 8) | 11 |
 ///
-/// | `chroma_blur` | RGB ±2 (itself reach 11) | 13 |
-/// | `luminance_blur` | RGB ±3 (itself reach 13) | 16 |
-/// | `sharpen` | `vh` ±2 (itself the denoised value, reach 16) | 18 |
+/// | `defringe_scan` | RGB ±4 (itself reach 11) | 15 |
+/// | `chroma_blur` | RGB ±2 (itself reach 15) | 17 |
+/// | `luminance_blur` | RGB ±3 (itself reach 17) | 20 |
+/// | `sharpen` | `vh` ±2 (itself the denoised value, reach 20) | 22 |
 ///
 /// Kept **even**, which is not cosmetic: an odd halo shifts the CFA phase inside
 /// the tile, and every pixel would come out the wrong colour.
 ///
-/// It was 12 before capture sharpening, 14 before chroma noise reduction and 16
-/// before luminance noise reduction. That last one is why the bilateral reaches
-/// three rather than two: at ±2 the chain comes to 17 and rounds to 18 anyway,
-/// so the wider kernel is free.
+/// It was 12 before capture sharpening, 14 before chroma noise reduction, 16
+/// before luminance noise reduction and 18 before the defringe. That third one
+/// is why the bilateral reaches three rather than two: at ±2 the chain rounded
+/// up to the same number anyway, so the wider kernel was free. The defringe is
+/// the one that actually cost something — four more pixels of halo is 3% more
+/// work per tile, and a narrower reach would leave part of the rim behind.
 /// Get this wrong and the symptom is a faint grid at the tile boundaries on
 /// detailed frames — which is why `a_level_zero_tile_is_identical_to_the_whole_image_render`
 /// is the test that guards it rather than anything that looks at a photograph.
-pub const HALO: u32 = 18;
+pub const HALO: u32 = 22;
 
 /// Tile edge in pixels, excluding halo. 512 keeps every buffer far inside
 /// WebGPU's default limits while leaving the halo a small fraction of the work
@@ -1723,6 +1734,7 @@ impl Renderer {
                 image.width as f32 / 2.0,
                 image.height as f32 / 2.0,
             ],
+            defringe: [state.detail.defringe, 0.0, 0.0, 0.0],
             mask_gain: {
                 let mut gains = [[1.0f32, 1.0, 1.0, 0.0]; rawkit_editstate::MAX_MASKS];
                 for (slot, mask) in live.iter().enumerate() {

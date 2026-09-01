@@ -614,6 +614,11 @@ pub struct EditFlags {
     /// spending depends on the ISO and on whether you like grain.
     #[arg(long, default_value_t = rawkit_editstate::Detail::default().luminance_noise)]
     luminance_noise: f32,
+    /// Defringe, 0 to 1. Takes the clipping cast off edges beside a blown
+    /// highlight — the violet rim on bare twigs against a bright sky. On by
+    /// default, because it repairs a colour the rendering itself introduces.
+    #[arg(long, default_value_t = rawkit_editstate::Detail::default().defringe)]
+    defringe: f32,
     /// Saturation, -1 to 1. Every colour equally.
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     saturation: f32,
@@ -688,6 +693,7 @@ impl EditFlags {
                 sharpen_radius: self.sharpen_radius,
                 chroma_noise: self.chroma_noise,
                 luminance_noise: self.luminance_noise,
+                defringe: self.defringe,
             },
             colour: rawkit_editstate::Colour {
                 saturation: self.saturation,

@@ -124,6 +124,9 @@ struct Params {
     // blue as fractions, `.zw` the optical centre in full-resolution image
     // pixels. Zero in `.xy` is a lens with nothing to correct.
     lateral: vec4<f32>,
+    // `.x` is how much of the clipping cast to take off an edge beside a blown
+    // highlight. The rest unused.
+    defringe: vec4<f32>,
     // What each local adjustment multiplies by at full strength, `.rgb`.
     //
     // Exposure and white balance arrive already combined, because both are
@@ -575,6 +578,185 @@ fn lateral_sample(c: u32, x: i32, y: i32, coefficient: f32) -> f32 {
     let a = mix(sample_plane(c, x0, y0), sample_plane(c, x0 + 1, y0), tx);
     let b = mix(sample_plane(c, x0, y0 + 1), sample_plane(c, x0 + 1, y0 + 1), tx);
     return mix(a, b, ty);
+}
+
+// ---------------------------------------------------------------------------
+// Stage 5' -- defringe: take the clipping cast off the edge of a highlight.
+//
+// # The artefact, and why nothing else in the pipeline can see it
+//
+// A sensor clips at one value in its own space. White balance moves that to a
+// different height per channel, so a blown neutral sky arrives at `wb * clip` --
+// on an ILCE-6400 that is (2.63, 1.00, 1.82), which is *magenta*. Highlight
+// reconstruction knows this and replaces it with neutral, which is why open sky
+// renders white.
+//
+// A pixel on the edge of a bare twig is a **mixture** of that light with honest
+// dark content. It carries the whole lie, scaled down: its ratios are still the
+// sky's magenta while its level sits at half the threshold. Reconstruction
+// cannot see it, because reconstruction asks about the pixel's own level and
+// this pixel is nowhere near clipping. Measured on a synthetic scene that is
+// neutral everywhere in the truth, a dark line down a sky at 0.95x the clip
+// level has a cast of 0.000; at 1.6x it is 0.647; at 3.0x it is 2.229 with green
+// driven to zero. Every bit of that colour is manufactured here.
+//
+// # The correction, which is the same arithmetic reconstruction already does
+//
+// Clipping displaced the light by `d = max(T) - T`, where `T` is the per-channel
+// threshold: the channel with the lowest threshold lost the most, which is why
+// the cast is magenta and not some other colour. Undoing it is a step back along
+// that vector, and **how far** is the one thing worth solving properly.
+//
+// The step is chosen to leave the pixel as close to neutral as a move along `d`
+// can bring it -- a one-dimensional least squares with a closed form. Two
+// properties fall out of that and neither was designed in:
+//
+// - **It cannot overshoot.** The minimum of a parabola is not past itself, so
+//   the correction can never carry a magenta rim through neutral and out the
+//   other side into green.
+// - **It only moves the green-magenta axis.** `d`'s chromatic part is very
+//   nearly (-1, 1, 0) once the multipliers are real numbers, so a genuinely
+//   blue or orange subject beside a highlight is barely touched. That is the
+//   axis every defringe control in every editor offers, arrived at from the
+//   arithmetic rather than from the convention.
+//
+// And for a *fully* clipped pixel the same formula returns exactly what
+// reconstruction returns -- neutral at the brightest channel. The two are one
+// idea applied at two levels of the same mixture, which is the reason to trust
+// it on the pixels in between.
+//
+// Two passes, like the chroma and luminance filters: the neighbourhood scalar is
+// worked out first, and the second pass is then a per-pixel operation that can
+// read and write the same buffer without a race.
+// ---------------------------------------------------------------------------
+
+/// How far a blown pixel casts onto its neighbours, in pixels.
+///
+/// The rim is one to three pixels wide -- the demosaic's own reach plus whatever
+/// the lens spread. Four covers it with a margin, and is folded into `HALO` in
+/// `render.rs`.
+const FRINGE_REACH: i32 = 4;
+
+/// The per-channel value a blown pixel arrives at, after white balance.
+///
+/// One place, because `reconstruct_highlights` asks the same question and the
+/// two answers must not be able to differ.
+fn clip_thresholds() -> vec3<f32> {
+    return params.wb.rgb * params.develop.z;
+}
+
+/// How far gone each channel is. The same measure `reconstruct_highlights`
+/// opens with, and shared with it so the two cannot come to disagree about
+/// where clipping starts.
+fn clipped_at(balanced: vec3<f32>) -> vec3<f32> {
+    let t = clip_thresholds();
+    return smoothstep(t * (1.0 - CLIP_RUNUP), t, balanced);
+}
+
+@compute @workgroup_size(8, 8)
+fn defringe_scan(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    if (x >= i32(params.width) || y >= i32(params.height)) {
+        return;
+    }
+    // How much blown light is close enough to have leaked into this pixel.
+    //
+    // A *max* with a distance falloff rather than a mean: one blown neighbour is
+    // enough to contaminate, and averaging would let the size of the highlight
+    // decide how hard the correction pushes -- so a thin bright gap between two
+    // dark branches would be treated more gently than a wide sky for no reason.
+    // The falloff is what keeps the edge of the correction from being an edge.
+    var near = 0.0;
+    let reach = f32(FRINGE_REACH) + 1.0;
+    for (var j = -FRINGE_REACH; j <= FRINGE_REACH; j = j + 1) {
+        for (var i = -FRINGE_REACH; i <= FRINGE_REACH; i = i + 1) {
+            let sx = clamp(x + i, 0, i32(params.width) - 1);
+            let sy = clamp(y + j, 0, i32(params.height) - 1);
+            let c = clipped_at(rgba_out[idx(sx, sy)].rgb * params.wb.rgb);
+            // The *first* channel to go, because that is when the neighbour's
+            // colour stopped being a measurement and started being able to leak
+            // a false one into this pixel.
+            let b = max(c.r, max(c.g, c.b));
+            let falloff = 1.0 - length(vec2<f32>(f32(i), f32(j))) / reach;
+            near = max(near, b * max(falloff, 0.0));
+        }
+    }
+    // The red plane, which the demosaic has finished with and the chroma blur
+    // has not started on. Read back by `defringe_apply` and overwritten there
+    // after, so nothing downstream sees it.
+    ch_r[idx(x, y)] = near;
+}
+
+@compute @workgroup_size(8, 8)
+fn defringe_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let amount = params.defringe.x;
+    // Exactly zero changes exactly nothing, the same contract the noise
+    // reduction keeps: a stored edit can turn this off rather than nearly off.
+    if (amount <= 0.0) {
+        return;
+    }
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    if (x >= i32(params.width) || y >= i32(params.height)) {
+        return;
+    }
+    let p = idx(x, y);
+    let near = ch_r[p];
+    if (near <= 0.0) {
+        return;
+    }
+    let wb = params.wb.rgb;
+    let balanced = rgba_out[p].rgb * wb;
+    let t = clip_thresholds();
+    // Hand over to reconstruction as this pixel's *first* channel goes. Both
+    // stages undo the same displacement, so running them in turn on one pixel
+    // would undo it twice.
+    //
+    // The first channel and not the last, and that was measured rather than
+    // reasoned. Handing over on the last is tempting — reconstruction is at its
+    // worst when the channels disagree, because it then anchors to the ones that
+    // have not clipped and treats them as facts, and on a rim pixel a surviving
+    // channel is a mixture rather than a fact. But on the frame this was
+    // diagnosed from, the pixels with one channel gone are ones reconstruction
+    // handles *well*: a pixel whose green is at its threshold while red sits at
+    // 0.6 of its own has an honest red to anchor to, and taking it away from
+    // reconstruction moved it from a cast of 0.03 to 0.11. The rim itself is
+    // nowhere near clipping in any channel, so it is kept either way.
+    let clipped = clipped_at(balanced);
+    let mine = 1.0 - max(clipped.r, max(clipped.g, clipped.b));
+    let weight = amount * near * mine;
+    if (weight <= 0.0) {
+        return;
+    }
+
+    // What clipping did: the channel with the lowest threshold lost the most.
+    let displaced = vec3<f32>(max(t.r, max(t.g, t.b))) - t;
+    // Only the chromatic part of either matters. A move that changes all three
+    // channels together is a brightness change, and brightness is not what is
+    // wrong here -- the twig really is dark.
+    let dm = displaced - vec3<f32>((displaced.r + displaced.g + displaced.b) / 3.0);
+    let pm = balanced - vec3<f32>((balanced.r + balanced.g + balanced.b) / 3.0);
+    let span = dot(dm, dm);
+    if (span <= EPS) {
+        // Neutral multipliers, so clipping had no colour to give and there is
+        // nothing here to take away.
+        return;
+    }
+    // The step along `displaced` that leaves the least colour behind. Negative
+    // means the pixel is already on the far side, and stepping would *add* the
+    // cast rather than remove it.
+    let best = -dot(pm, dm) / span;
+    // And no more clipped light than the pixel could physically hold: a blown
+    // contribution of `a` puts at least `a * t` into every channel, so a dark
+    // pixel cannot be mostly highlight however magenta it looks. This is what
+    // keeps the correction off a deep shadow that happens to sit beside a
+    // window.
+    let room = min(balanced.r / t.r, min(balanced.g / t.g, balanced.b / t.b));
+    let step = clamp(best, 0.0, room);
+
+    let repaired = balanced + weight * step * displaced;
+    rgba_out[p] = vec4<f32>(repaired / wb, 1.0);
 }
 
 // ---------------------------------------------------------------------------

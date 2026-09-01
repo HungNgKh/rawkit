@@ -121,6 +121,8 @@ pub enum Command {
     /// Smooth brightness while sparing edges. Costs detail, unlike the chroma
     /// kind, which is why it is off unless asked for.
     SetLuminanceNoise(f32),
+    /// Take this much of the clipping cast off the edges of a blown highlight.
+    SetDefringe(f32),
     /// Correct lateral chromatic aberration by this much, or by nothing.
     ///
     /// Carries the measurement rather than asking for one, because measuring
@@ -236,6 +238,7 @@ impl Command {
             Command::SetSharpen(_) => "set_sharpen",
             Command::SetSharpenRadius(_) => "set_sharpen_radius",
             Command::SetChromaNoise(_) => "set_chroma_noise",
+            Command::SetDefringe(_) => "set_defringe",
             Command::SetLens(_) => "set_lens",
             Command::SetLuminanceNoise(_) => "set_luminance_noise",
             Command::SetSaturation(_) => "set_saturation",
@@ -307,6 +310,7 @@ impl Command {
             | Command::SetSharpenRadius(_)
             | Command::SetChromaNoise(_)
             | Command::SetLuminanceNoise(_)
+            | Command::SetDefringe(_)
             | Command::SetSaturation(_)
             | Command::SetVibrance(_)
             | Command::SetHsl { .. }
@@ -756,6 +760,11 @@ impl Session {
             Command::SetLuminanceNoise(amount) => {
                 let mut detail = self.state.detail;
                 detail.luminance_noise = amount;
+                self.detail(name, detail)
+            }
+            Command::SetDefringe(amount) => {
+                let mut detail = self.state.detail;
+                detail.defringe = amount;
                 self.detail(name, detail)
             }
             Command::SetLens(lens) => {
