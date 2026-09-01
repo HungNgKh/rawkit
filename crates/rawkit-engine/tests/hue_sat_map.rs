@@ -215,6 +215,79 @@ fn a_higher_profile_curve_renders_brighter() {
 
 #[test]
 #[ignore = "requires a GPU adapter"]
+fn a_look_and_a_hue_saturation_table_are_applied_in_the_same_space() {
+    // The specification says the look table "uses the same format as the tables
+    // stored in the ProfileHueSatMapData1 and ProfileHueSatMapData2 tags and is
+    // applied in the same color space", later in the pipe but "before any tone
+    // curve stage".
+    //
+    // With no exposure to separate them, "the same colour space, before the
+    // curve" has a consequence that can be checked without reimplementing
+    // anything: the same table applied either way must render the same picture.
+    // It used to run *after* the tone map, so the two answers differed by an
+    // entire tone mapping.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let colour = [0.55, 0.30, 0.22];
+    let table = uniform_map(6, 4, 4, [20.0, 1.3, 1.0]);
+
+    let as_hue_sat = render_colour(&gpu, &profile_with(Some(table.clone())), colour);
+    let as_look = render_colour(&gpu, &profile_with_look(table), colour);
+
+    println!("as a hue/saturation table {as_hue_sat:?}, as a look {as_look:?}");
+    for c in 0..3 {
+        assert!(
+            (as_hue_sat[c] - as_look[c]).abs() < 0.01,
+            "the same table gave {as_hue_sat:?} as a hue/saturation correction \
+             and {as_look:?} as a look, so one of them is not being applied \
+             where the specification puts it"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn an_encoding_chooses_a_cell_and_does_not_bend_the_colour() {
+    // `ProfileLookTableEncoding` says how to index the table, and the
+    // specification spells the sRGB method out step by step: convert linear
+    // ProPhoto to HSV, **encode the V coordinate**, index and scale with V
+    // encoded, decode V, convert back. One coordinate.
+    //
+    // The obvious misreading is to encode red, green and blue and convert the
+    // encoded triple to HSV. That is a different operation: the transfer curve
+    // is not linear, so bending each channel separately moves the differences
+    // between them, and hue and saturation live in those differences. The table
+    // then answers a question about a colour nobody has.
+    //
+    // A table whose cells are all identical makes the difference visible on its
+    // own terms. Indexing cannot matter -- every cell holds the same delta --
+    // so switching the encoding may change nothing at all. Under the misreading
+    // it changes the colour.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    // Saturated, and far from grey in every channel: the further apart the
+    // channels are, the more a per-channel transfer curve moves the gaps.
+    let colour = [0.70, 0.20, 0.08];
+    let table = uniform_map(6, 4, 4, [0.0, 0.4, 1.0]);
+
+    let render = |srgb: bool| {
+        let mut profile = profile_with_look(table.clone());
+        profile.look_is_srgb = srgb;
+        render_colour(&gpu, &profile, colour)
+    };
+    let linear = render(false);
+    let encoded = render(true);
+
+    println!("linear encoding {linear:?}, sRGB encoding {encoded:?}");
+    for c in 0..3 {
+        assert!(
+            (linear[c] - encoded[c]).abs() < 0.002,
+            "the encoding changed the colour rather than only the cell it reads: \
+             {linear:?} against {encoded:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
 fn a_profile_curve_changes_brightness_without_turning_the_colour() {
     // A tone curve says how much light becomes how much picture. Running it
     // down each channel on its own also makes it say what colour the light

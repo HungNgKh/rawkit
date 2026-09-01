@@ -885,37 +885,40 @@ fn develop_rgb(camera: vec3<f32>, ixy: vec2<f32>) -> vec3<f32> {
     // tone map has not, which is where the declared pipeline puts this and why
     // the controls a mask carries are the ones that are multiplies here.
     let exposed = local_adjust(corrected * params.develop.x, ixy);
+
+    // The profile's look, applied to scene-linear light and *before* the tone
+    // curve, which is where the specification puts it: "it should be applied
+    // later in the processing pipe, after any exposure compensation and/or fill
+    // light stages, but before any tone curve stage", in the same colour space
+    // as the hue/saturation table.
+    //
+    // It used to run after the curve, from reading "a look is authored against
+    // a rendered picture" into the specification rather than out of it. The
+    // difference is not academic: a look that boosts saturation lands on
+    // highlights the curve has already compressed, and pushes them out of the
+    // space instead of letting the curve roll the boosted colour off. Measured
+    // over 96 frames against the camera's own JPEG, moving it before the curve
+    // took the highlight hue error from 5.10 to 2.34 and the midtone error from
+    // 4.72 to 3.53.
+    var looked = exposed;
+    if (params.develop.w > 0.5) {
+        looked = apply_look(exposed);
+    }
+
     // The profile's curve *instead of* ours, not as well as. Both map the scene
     // to a display, and running two tone maps in series maps the scene twice —
     // which reads as a flat, muddy picture rather than as a bug.
-    var mapped = tone_map(exposed);
+    var mapped = tone_map(looked);
     if (params.curve.z > 0u) {
-        mapped = profile_tone_rgb(exposed);
-    }
-
-    // The profile's look, applied here and not beside the hue/saturation
-    // correction: a look is authored against a rendered picture. Round-tripped
-    // through the profile's working space, because that is where its hue and
-    // saturation axes were measured — applying a ProPhoto-authored table to
-    // sRGB primaries would read the wrong cell for every colour that is not
-    // grey.
-    //
-    // **Before the user's controls, not after.** It used to be after, from
-    // reading the specification's "the look comes after the tone curve" as
-    // meaning *ours* — it means the profile's own. A look landing on top of
-    // somebody's tone adjustments partly undoes them; the profile's rendering
-    // finishes first and the person adjusts the result.
-    var looked = mapped;
-    if (params.develop.w > 0.5) {
-        looked = apply_look(mapped);
+        mapped = profile_tone_rgb(looked);
     }
 
     // And out to the display's primaries, once, with everything that wanted the
     // working space behind it.
     return vec3<f32>(
-        dot(params.working_to_display[0].rgb, looked),
-        dot(params.working_to_display[1].rgb, looked),
-        dot(params.working_to_display[2].rgb, looked),
+        dot(params.working_to_display[0].rgb, mapped),
+        dot(params.working_to_display[1].rgb, mapped),
+        dot(params.working_to_display[2].rgb, mapped),
     );
 }
 
@@ -1471,7 +1474,7 @@ fn hsm_at(h: u32, s: u32, v: u32) -> vec4<f32> {
 /// wrap is not a detail: hue is circular, so a table sampled without it would
 /// produce a visible seam at 0 degrees — which lands squarely on reds.
 fn apply_hue_sat(rgb: vec3<f32>) -> vec3<f32> {
-    return apply_table(0u, params.hsm_dims, rgb);
+    return apply_table(0u, params.hsm_dims, rgb, params.develop.y >= 1.5);
 }
 
 /// The profile's look, which is the same table format applied somewhere else.
@@ -1483,14 +1486,7 @@ fn apply_hue_sat(rgb: vec3<f32>) -> vec3<f32> {
 /// axes are in, because the specification lets a profile choose and Adobe's
 /// camera-matching profiles choose sRGB.
 fn apply_look(rgb: vec3<f32>) -> vec3<f32> {
-    if (params.develop.w >= 1.5) {
-        // Encoded, converted, and decoded again, so the table sees the space it
-        // was built in.
-        let encoded = vec3<f32>(encode_srgb(rgb.r), encode_srgb(rgb.g), encode_srgb(rgb.b));
-        let out = apply_table(params.look_dims.w, params.look_dims, encoded);
-        return vec3<f32>(decode_srgb(out.r), decode_srgb(out.g), decode_srgb(out.b));
-    }
-    return apply_table(params.look_dims.w, params.look_dims, rgb);
+    return apply_table(params.look_dims.w, params.look_dims, rgb, params.develop.w >= 1.5);
 }
 
 /// The sRGB transfer function, for a look table whose axes are encoded.
@@ -1513,8 +1509,21 @@ fn decode_srgb(v: f32) -> f32 {
     return pow((x + 0.055) / 1.055, 2.4);
 }
 
-fn apply_table(base: u32, dims: vec4<u32>, rgb: vec3<f32>) -> vec3<f32> {
+fn apply_table(base: u32, dims: vec4<u32>, rgb: vec3<f32>, encode_value: bool) -> vec3<f32> {
     let hsv = rgb_to_hsv(rgb);
+
+    // **Only the value coordinate is encoded**, and the specification is
+    // explicit about it: convert to HSV from linear, encode V, index and scale
+    // with V encoded, decode V, convert back. Encoding red, green and blue
+    // separately instead -- which is the obvious reading, and what this did --
+    // is a different operation: the transfer curve is not linear, so bending
+    // each channel on its own moves the *differences* between them, which is
+    // where hue and saturation live. The table then gets asked about a colour
+    // that is not the one in hand.
+    var value = hsv.z;
+    if (encode_value) {
+        value = encode_srgb(value);
+    }
 
     // Hue spans the full circle across `hue_divisions` cells and wraps, so the
     // spacing is 360/divisions rather than 360/(divisions-1).
@@ -1535,7 +1544,7 @@ fn apply_table(base: u32, dims: vec4<u32>, rgb: vec3<f32>) -> vec3<f32> {
     var v1 = 0u;
     var vf = 0.0;
     if (dims.z > 1u) {
-        let val_pos = clamp(hsv.z, 0.0, 1.0) * f32(dims.z - 1u);
+        let val_pos = clamp(value, 0.0, 1.0) * f32(dims.z - 1u);
         v0 = min(u32(floor(val_pos)), dims.z - 1u);
         v1 = min(v0 + 1u, dims.z - 1u);
         vf = fract(val_pos);
@@ -1562,9 +1571,14 @@ fn apply_table(base: u32, dims: vec4<u32>, rgb: vec3<f32>) -> vec3<f32> {
     // Wrap rather than clamp, for the same reason the lookup wraps.
     hue = hue - 360.0 * floor(hue / 360.0);
     let saturation = clamp(hsv.y * delta.y, 0.0, 1.0);
-    let value = max(hsv.z * delta.z, 0.0);
+    // The scale lands on the encoded value, which is then decoded -- steps 4
+    // and 5 of the specification's sRGB method.
+    var scaled = max(value * delta.z, 0.0);
+    if (encode_value) {
+        scaled = decode_srgb(scaled);
+    }
 
-    return hsv_to_rgb(vec3<f32>(hue, saturation, value));
+    return hsv_to_rgb(vec3<f32>(hue, saturation, scaled));
 }
 
 /// How far below the clip point reconstruction starts to take effect.

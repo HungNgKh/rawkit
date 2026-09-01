@@ -222,6 +222,10 @@ pub struct CameraProfile {
     /// Whether the look table's axes are in sRGB-encoded space rather than
     /// linear. See [`Self::look_is_srgb`].
     pub look_is_srgb: bool,
+
+    /// The same, for the hue/saturation table. A separate tag because the
+    /// specification lets a profile encode the two tables differently.
+    pub hue_sat_is_srgb: bool,
     /// The profile's own tone curve, resampled to [`TONE_LUT`] entries evenly
     /// spaced over `[0, 1]`.
     ///
@@ -264,6 +268,7 @@ impl CameraProfile {
             hue_sat: vec![None],
             look: None,
             look_is_srgb: false,
+            hue_sat_is_srgb: false,
             tone: None,
             name: None,
         }
@@ -288,6 +293,7 @@ impl CameraProfile {
             hue_sat: vec![None, None],
             look: None,
             look_is_srgb: false,
+            hue_sat_is_srgb: false,
             tone: None,
             name: None,
         }

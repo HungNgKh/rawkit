@@ -230,6 +230,7 @@ impl Frame<'_> {
                 hue_sat,
                 look,
                 look_is_srgb: self.profile.look_is_srgb,
+                hue_sat_is_srgb: self.profile.hue_sat_is_srgb,
                 tone: self.profile.tone_curve().map(|lut| lut.to_vec()),
                 user_curve: crate::tone::user_curve_lut(&state.curve),
             },
@@ -244,6 +245,7 @@ impl Frame<'_> {
                 hue_sat: None,
                 look: None,
                 look_is_srgb: false,
+                hue_sat_is_srgb: false,
                 // The curve needs no working space, so it survives the path
                 // that has no forward matrix to reach one.
                 tone: self.profile.tone_curve().map(|lut| lut.to_vec()),
@@ -1675,7 +1677,13 @@ impl Renderer {
             ],
             develop: [
                 crate::exposure_multiplier(state),
-                if hsm.is_some() { 1.0 } else { 0.0 },
+                // 0 no table, 1 a table in linear light, 2 one indexed on an
+                // sRGB-encoded value. Same three states as the look below.
+                match (&hsm, colour.hue_sat_is_srgb) {
+                    (None, _) => 0.0,
+                    (Some(_), false) => 1.0,
+                    (Some(_), true) => 2.0,
+                },
                 image.clip_level,
                 // 0 no look, 1 a look in linear light, 2 a look in sRGB-encoded
                 // light. The encoding is not cosmetic: a table with sixteen
@@ -2421,6 +2429,8 @@ struct Colour {
     /// The profile's look, applied after the tone curve rather than before it.
     look: Option<crate::profile::HueSatMap>,
     look_is_srgb: bool,
+    /// The same for the hue/saturation table, which carries its own encoding tag.
+    hue_sat_is_srgb: bool,
     /// The profile's own tone curve, which *replaces* the built-in tone map.
     tone: Option<Vec<f32>>,
     /// The user's hand-shaped curve, which is applied after everything the

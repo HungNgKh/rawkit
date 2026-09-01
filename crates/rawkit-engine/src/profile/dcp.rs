@@ -74,6 +74,10 @@ mod tag {
     /// light reads a different slice for almost every pixel.
     pub const PROFILE_LOOK_TABLE_ENCODING: u16 = 51108;
 
+    /// The same choice for the hue/saturation table, which the specification
+    /// gives its own tag because the two tables are applied independently.
+    pub const PROFILE_HUE_SAT_MAP_ENCODING: u16 = 51107;
+
     /// The profile's own rendering: scene-linear in, display-encoded out. Read
     /// now, and it *replaces* our tone map rather than composing with it —
     /// applying two tone maps would map the scene twice.
@@ -156,6 +160,9 @@ pub fn parse(bytes: &[u8]) -> Result<CameraProfile, DcpError> {
         if let Some(m) = build(tag::PROFILE_HUE_SAT_MAP_DATA_2) {
             profile.set_hue_sat_map(cct2, m);
         }
+        profile.hue_sat_is_srgb = find(tag::PROFILE_HUE_SAT_MAP_ENCODING)
+            .and_then(|e| reader.longs(e, 1))
+            .is_some_and(|v| v[0] == 1);
     }
 
     // The look table, which shares the hue/saturation table's format exactly —
