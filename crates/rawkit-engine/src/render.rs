@@ -1004,6 +1004,7 @@ impl Renderer {
             uploaded_masks: std::cell::RefCell::new(Vec::new()),
             mask_scratch: std::cell::RefCell::new(vec![0.0; (mask_w * mask_h) as usize]),
             mask_joining: std::cell::RefCell::new(vec![0.0; (mask_w * mask_h) as usize]),
+            spots: std::cell::RefCell::new(Vec::new()),
             guide_scale: [
                 guide_w as f32 / image.width.max(1) as f32,
                 guide_h as f32 / image.height.max(1) as f32,
@@ -1230,6 +1231,15 @@ impl Renderer {
         {
             let mut scratch = buffers.scratch.borrow_mut();
             gather_padded(mosaic, width, height, ox, oy, buffers.padded, &mut scratch);
+            crate::spot::apply(
+                &buffers.spots.borrow(),
+                mosaic,
+                width,
+                height,
+                [ox as i64 - HALO as i64, oy as i64 - HALO as i64],
+                buffers.padded,
+                &mut scratch,
+            );
             gpu.queue
                 .write_buffer(&buffers.cfa, 0, bytemuck::cast_slice(&scratch));
         }
@@ -1493,6 +1503,15 @@ impl Renderer {
         {
             let mut scratch = buffers.scratch.borrow_mut();
             gather_padded(data, lw, lh, ox, oy, buffers.padded, &mut scratch);
+            crate::spot::apply(
+                &buffers.spots.borrow(),
+                data,
+                lw,
+                lh,
+                [ox as i64 - HALO as i64, oy as i64 - HALO as i64],
+                buffers.padded,
+                &mut scratch,
+            );
             gpu.queue
                 .write_buffer(&buffers.cfa, 0, bytemuck::cast_slice(&scratch));
         }
@@ -1663,6 +1682,15 @@ impl Renderer {
             .cloned()
             .collect();
         self.upload_masks(gpu, buffers, image, &live);
+        // Measured against the mosaic rather than uploaded to the GPU: a spot is
+        // patched into the sensor data on the way to the tile, before any shader
+        // sees it.
+        *buffers.spots.borrow_mut() = crate::spot::resolve(
+            &state.spots[..state.spots.len().min(rawkit_editstate::MAX_SPOTS)],
+            image.data,
+            image.width,
+            image.height,
+        );
         let (wb, m) = (colour.multipliers, colour.cam_to_display);
         let working = colour.working_to_display;
         let hsm = colour.hue_sat.as_ref();
@@ -1950,6 +1978,13 @@ pub struct TileBuffers {
     mask_scratch: std::cell::RefCell<Vec<f32>>,
     /// Where a refinement is drawn before it is joined to what came before.
     mask_joining: std::cell::RefCell<Vec<f32>>,
+    /// The spots, with each one's correction already measured.
+    ///
+    /// Resolved once per edit against the full-resolution mosaic and reused at
+    /// every pyramid level — see [`crate::spot`] for why one measurement serves
+    /// all of them. Beside the masks because it is the same kind of thing: work
+    /// that belongs to the edit rather than to the tile being drawn.
+    spots: std::cell::RefCell<Vec<crate::spot::Resolved>>,
     /// Guide texels per image pixel. Carried rather than recomputed so the
     /// uniform and the buffer can never describe different mappings.
     guide_scale: [f32; 2],

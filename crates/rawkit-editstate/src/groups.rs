@@ -166,17 +166,27 @@ mod tests {
     fn every_field_is_either_a_group_or_deliberately_not_one() {
         // The guard that keeps this module honest as `EditState` grows: a new
         // field must be given a `Group`, or named here as per-photograph.
-        let json = serde_json::to_value(EditState::default()).unwrap();
-        let fields: BTreeSet<String> = json
-            .as_object()
-            .expect("an EditState serialises as an object")
+        // From the *schema* and not from a serialised default, which is what
+        // this used to read. A field that is skipped when it is empty — `spots`
+        // is, so that adding it did not rebuild every cached preview — never
+        // appears in a default edit's JSON, and the guard would have gone on
+        // passing while presets quietly stopped carrying it. The schema lists
+        // every field whether or not one is written.
+        let schema = EditState::json_schema();
+        let fields: BTreeSet<String> = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("the schema describes an object")
             .keys()
             .cloned()
             .collect();
 
         let mut accounted: BTreeSet<String> =
             Group::ALL.iter().map(|g| g.as_str().to_string()).collect();
-        for not_a_look in ["schema_version", "orientation", "crop", "lens"] {
+        // `spots` is per-photograph in the strongest sense on this list: it is
+        // where the dust sat on *this* frame. Carried into a preset it would
+        // smear a repair across every photograph the preset touched.
+        for not_a_look in ["schema_version", "orientation", "crop", "lens", "spots"] {
             accounted.insert(not_a_look.to_string());
         }
 

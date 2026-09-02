@@ -299,6 +299,17 @@ fn snapshot(state: tauri::State<'_, Shared>) -> serde_json::Value {
             index => Some(index),
         },
         "placing_mask": PLACING_MASK.load(std::sync::atomic::Ordering::Relaxed),
+        "selected_spot": match selected_spot() {
+            usize::MAX => None,
+            index => Some(index),
+        },
+        // What the *next* spot will be, on the same terms as the brush below.
+        "spot": { "radius": spot_radius(), "clone": SPOT_CLONE.load(std::sync::atomic::Ordering::Relaxed) },
+        // Which tool is live. The page tracks this from its own keypresses too,
+        // but the mode can change without one — leaving crop by pressing Enter,
+        // say — and a button that goes on claiming to be armed is worse than
+        // one that is a frame behind.
+        "mode": mode_name(),
         // The brush's own settings, which are a tool and not an edit: each
         // stroke records the width it was drawn with, so these say what the
         // *next* one will be.
@@ -868,6 +879,19 @@ fn cull(
             MODE.store(next, std::sync::atomic::Ordering::Relaxed);
             CullAction::SelectBy(0)
         }
+        // The spot tool, on the same terms as crop: the loupe, with markers on
+        // it and a press that means something else.
+        CullAction::Spot => {
+            let next = if mode() == MODE_SPOT {
+                MODE_LOUPE
+            } else {
+                MODE_SPOT
+            };
+            *SPOT_DRAG.lock().expect("spot drag lock") = None;
+            *SPOT_GRAB.lock().expect("spot grab lock") = None;
+            MODE.store(next, std::sync::atomic::Ordering::Relaxed);
+            CullAction::SelectBy(0)
+        }
         CullAction::CropApply => {
             // Turning a rectangle into a crop needs the viewport, which lives in
             // the render loop. This only says that it should happen.
@@ -1053,6 +1077,11 @@ fn main() -> Result<()> {
             select_mask,
             place_mask,
             set_mask,
+            remove_spot,
+            select_spot,
+            set_spot,
+            set_spot_mode,
+            find_spot_source,
             set_brush,
             undo_stroke,
             measure_lens
@@ -1247,6 +1276,11 @@ fn main() -> Result<()> {
             // The rectangle the canvas currently carries, so a settled one is
             // not redrawn on every frame. See the crop block below.
             let mut last_marquee: Option<[f64; 4]> = None;
+            // What the spot rings were last drawn from. Compared rather than
+            // hashed: the list is short, and an equality that can be wrong is
+            // worse here than the clone, because being wrong means stale rings
+            // left painted on the canvas.
+            let mut last_spots: Option<(Vec<rawkit_editstate::Spot>, usize)> = None;
             // When the histogram was last recomputed. See `SURVEY_INTERVAL`.
             let mut last_survey: Option<std::time::Instant> = None;
             // What the coarse-while-dragging decision is made from: the edit
@@ -1717,6 +1751,182 @@ fn main() -> Result<()> {
                     }
                 }
 
+                // The spot tool, resolved here for the reason the mask
+                // placement above is: a press arrives in canvas pixels and a
+                // blemish is a place on the *sensor*, and only this loop holds
+                // the viewport and the geometry that turn one into the other.
+                if in_spot() {
+                    let taken = SPOT_DRAG
+                        .lock()
+                        .expect("spot drag lock")
+                        .as_mut()
+                        .map(|d| (d.start, d.now, std::mem::replace(&mut d.fresh, false)));
+                    if let Some((start, now, fresh)) = taken {
+                        let mut session = shared.lock().expect("session lock");
+                        let size = session.image_size();
+                        let geometry = session.geometry();
+                        let sensor = |at: [f64; 2]| {
+                            let p = session.viewport().image_at(at);
+                            let r = geometry.sensor_rect([p[0], p[1], p[0], p[1]], size);
+                            [
+                                (r[0] / size[0] as f64) as f32,
+                                (r[1] / size[1] as f64) as f32,
+                            ]
+                        };
+                        // A radius is a fraction of the width, so a vertical
+                        // distance has to be converted into one before it can be
+                        // compared against it. Without this a spot on a 3:2 frame
+                        // would be grabbable from half again as far above it as
+                        // beside it.
+                        let aspect = size[1] as f32 / size[0] as f32;
+                        let reach = |a: [f32; 2], b: [f32; 2]| {
+                            let dx = a[0] - b[0];
+                            let dy = (a[1] - b[1]) * aspect;
+                            (dx * dx + dy * dy).sqrt()
+                        };
+
+                        let mut spots = session.state().spots.clone();
+                        if fresh {
+                            let at = sensor(start);
+                            // The source circle is tested first because it sits
+                            // on top of everything and because it is the one
+                            // anybody reaches for — the automatic choice is a
+                            // proposal, and moving it is the second half of
+                            // placing a spot.
+                            let grabbed = spots
+                                .iter()
+                                .position(|spot| reach(at, spot.source) <= spot.radius)
+                                .map(SpotGrab::Source)
+                                .or_else(|| {
+                                    spots
+                                        .iter()
+                                        .position(|spot| reach(at, spot.centre) <= spot.radius)
+                                        .map(SpotGrab::Centre)
+                                });
+                            let grabbed = match grabbed {
+                                Some(grabbed) => Some(grabbed),
+                                // A new one, borrowing from itself until the
+                                // hand lets go and the search runs. Until then
+                                // it changes nothing, which is right: the drag
+                                // is still deciding how big it is.
+                                None if spots.len() < rawkit_editstate::MAX_SPOTS => {
+                                    spots.push(rawkit_editstate::Spot {
+                                        centre: at,
+                                        source: at,
+                                        radius: spot_radius(),
+                                        feather: 0.5,
+                                        mode: spot_mode(),
+                                    });
+                                    Some(SpotGrab::Size(spots.len() - 1))
+                                }
+                                None => None,
+                            };
+                            if let Some(SpotGrab::Size(index) | SpotGrab::Centre(index) | SpotGrab::Source(index)) = grabbed {
+                                SELECTED_SPOT.store(index, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            *SPOT_GRAB.lock().expect("spot grab lock") = grabbed;
+                        }
+
+                        let grab = *SPOT_GRAB.lock().expect("spot grab lock");
+                        let changed = match grab {
+                            Some(SpotGrab::Size(index)) => match spots.get_mut(index) {
+                                Some(spot) => {
+                                    // A press with no travel keeps the radius the
+                                    // tool is set to, so a click is a spot and
+                                    // only a drag resizes one.
+                                    let out = reach(sensor(now), spot.centre);
+                                    let radius = if out > 2.0 / size[0] as f32 {
+                                        out.min(rawkit_editstate::Spot::MAX_RADIUS)
+                                    } else {
+                                        spot.radius
+                                    };
+                                    let moved = spot.radius != radius;
+                                    spot.radius = radius;
+                                    SPOT_RADIUS.store(
+                                        radius.to_bits(),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    moved || fresh
+                                }
+                                None => false,
+                            },
+                            Some(SpotGrab::Centre(index)) => match spots.get_mut(index) {
+                                Some(spot) => {
+                                    // The source travels with it. Moving a
+                                    // blemish marker off its own source and
+                                    // leaving the borrow behind would repair the
+                                    // wrong place, and every gesture after the
+                                    // first would need two.
+                                    let at = sensor(now);
+                                    let shift = [at[0] - spot.centre[0], at[1] - spot.centre[1]];
+                                    let moved = shift != [0.0, 0.0];
+                                    spot.centre = at;
+                                    spot.source =
+                                        [spot.source[0] + shift[0], spot.source[1] + shift[1]];
+                                    moved
+                                }
+                                None => false,
+                            },
+                            Some(SpotGrab::Source(index)) => match spots.get_mut(index) {
+                                Some(spot) => {
+                                    let at = sensor(now);
+                                    let moved = spot.source != at;
+                                    spot.source = at;
+                                    moved
+                                }
+                                None => false,
+                            },
+                            None => false,
+                        };
+                        if changed {
+                            // One undo step for the whole drag, and a separate
+                            // one for each spot: `SPOT_CONTROLS` keeps two spots
+                            // being placed in a row from folding together.
+                            let index = match grab {
+                                Some(
+                                    SpotGrab::Size(i) | SpotGrab::Centre(i) | SpotGrab::Source(i),
+                                ) => i,
+                                None => 0,
+                            };
+                            session.apply(Command::SetSpots {
+                                spots,
+                                control: (index as u8).saturating_mul(SPOT_CONTROLS),
+                            });
+                        }
+                    }
+                }
+
+                // A spot has been sized and needs somewhere to borrow from. The
+                // search reads the mosaic, so it happens here and its answer is
+                // written into the edit — never re-run at render time, which is
+                // what keeps the same edit rendering the same way.
+                let proposing = SPOT_PROPOSE.swap(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+                if proposing != usize::MAX {
+                    if let Some(loaded) = showing.raw.as_ref() {
+                        let mut session = shared.lock().expect("session lock");
+                        let mut spots = session.state().spots.clone();
+                        // Every spot, this one included: the search is told not
+                        // to borrow from a blemish, and the blemish it must not
+                        // borrow from most of all is the one it is repairing.
+                        let others = spots.clone();
+                        if let Some(spot) = spots.get_mut(proposing) {
+                            let frame = loaded.frame();
+                            spot.source = rawkit_engine::spot::propose_source(
+                                frame.data,
+                                frame.width,
+                                frame.height,
+                                spot.centre,
+                                spot.radius,
+                                &others,
+                            );
+                            session.apply(Command::SetSpots {
+                                spots,
+                                control: u8::MAX,
+                            });
+                        }
+                    }
+                }
+
                 // An aim taken but not yet resolved: the press said where, and
                 // this is the only place that holds the canvas and can say what
                 // colour is there. One small readback per gesture, not per
@@ -1907,6 +2117,29 @@ fn main() -> Result<()> {
                     // Escape left crop mode, and the outline is still painted
                     // into the canvas. One redraw takes it off; without this it
                     // stays until something else happens to move the view.
+                    canvas_renderer.invalidate();
+                }
+                // The spot markers, on the same terms as the crop outline: drawn
+                // into the canvas after the tiles, so anything that moves them
+                // has to redraw the tiles underneath or the old rings stay.
+                if in_spot() {
+                    let session = shared.lock().expect("session lock");
+                    let drawn = (session.state().spots.clone(), selected_spot());
+                    draw_spots(
+                        &gpu,
+                        &blit,
+                        &white,
+                        &canvas_renderer,
+                        &session,
+                        &drawn.0,
+                        drawn.1,
+                    );
+                    drop(session);
+                    if last_spots.as_ref() != Some(&drawn) {
+                        last_spots = Some(drawn);
+                        canvas_renderer.invalidate();
+                    }
+                } else if last_spots.take().is_some() {
                     canvas_renderer.invalidate();
                 }
                 let cost = started.elapsed();
@@ -2674,6 +2907,69 @@ static PLACING_MASK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// coalesce".
 const MASK_CONTROLS: u8 = 16;
 
+/// Which blemish the panel is showing. `usize::MAX` is "none".
+static SELECTED_SPOT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// How many controls one spot reserves in its coalescing byte.
+///
+/// Four for two sliders, which is room to spare. It cannot collide with
+/// [`MASK_CONTROLS`] however either grows: the history is keyed on the command's
+/// *name* as well as this byte, and a spot arrives as `SetSpots`.
+const SPOT_CONTROLS: u8 = 4;
+
+/// Half the width of the next spot, as a fraction of the frame's width.
+///
+/// Tool state rather than part of the edit, exactly like [`BRUSH_RADIUS`]: every
+/// spot records its own radius, so what the *next* one will be belongs beside
+/// the selection. Bits, because there is no atomic float. 0.012 of a 6000-pixel
+/// frame is 72 pixels across, which covers the dust marks this is for.
+static SPOT_RADIUS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3C449BA6);
+
+/// Whether the next spot copies its source outright rather than matching the
+/// light around it. Tool state, like the radius.
+static SPOT_CLONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn spot_mode() -> rawkit_editstate::SpotMode {
+    if SPOT_CLONE.load(std::sync::atomic::Ordering::Relaxed) {
+        rawkit_editstate::SpotMode::Clone
+    } else {
+        rawkit_editstate::SpotMode::Heal
+    }
+}
+
+fn spot_radius() -> f32 {
+    f32::from_bits(SPOT_RADIUS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+pub(crate) fn selected_spot() -> usize {
+    SELECTED_SPOT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What a drag in spot mode is doing to which spot.
+///
+/// Decided once, when the press lands, and held for the rest of the drag. Asking
+/// again every frame would let a spot being dragged past its own source circle
+/// hand the drag over to it half way through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpotGrab {
+    /// A spot that has just been placed, being sized by the drag that placed it.
+    Size(usize),
+    Centre(usize),
+    Source(usize),
+}
+
+pub(crate) static SPOT_GRAB: Mutex<Option<SpotGrab>> = Mutex::new(None);
+pub(crate) static SPOT_DRAG: Mutex<Option<MaskDrag>> = Mutex::new(None);
+
+/// A spot that has been sized and still needs somewhere to borrow from.
+///
+/// The search needs the mosaic, which only the render loop holds — the same
+/// arrangement the white-balance pick and the lens measurement use, and for the
+/// same reason. `usize::MAX` is "nothing waiting".
+pub(crate) static SPOT_PROPOSE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
 static SELECTED_PART: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn selected_part() -> usize {
@@ -2985,6 +3281,119 @@ fn place_mask(armed: bool) -> bool {
 }
 
 /// Move one control of one local adjustment.
+/// Throw a blemish away.
+#[tauri::command]
+fn remove_spot(index: usize, state: tauri::State<'_, Shared>) -> Result<usize, String> {
+    let mut session = state.0.lock().expect("session lock");
+    let mut spots = session.state().spots.clone();
+    if index >= spots.len() {
+        return Err("there is no such spot".into());
+    }
+    spots.remove(index);
+    let left = spots.len();
+    session.apply(Command::SetSpots {
+        spots,
+        control: u8::MAX,
+    });
+    drop(session);
+    SELECTED_SPOT.store(
+        if left == 0 {
+            usize::MAX
+        } else {
+            index.min(left - 1)
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    Ok(left)
+}
+
+/// Show a different one in the panel.
+#[tauri::command]
+fn select_spot(index: usize, state: tauri::State<'_, Shared>) -> Result<usize, String> {
+    let session = state.0.lock().expect("session lock");
+    if index >= session.state().spots.len() {
+        return Err("there is no such spot".into());
+    }
+    drop(session);
+    SELECTED_SPOT.store(index, std::sync::atomic::Ordering::Relaxed);
+    Ok(index)
+}
+
+/// Move one of a spot's two sliders.
+///
+/// The radius also becomes what the *next* spot starts at, which is what makes
+/// covering a run of dust marks one gesture each rather than two.
+#[tauri::command]
+fn set_spot(
+    index: usize,
+    control: String,
+    value: f32,
+    state: tauri::State<'_, Shared>,
+) -> Result<(), String> {
+    let mut session = state.0.lock().expect("session lock");
+    let mut spots = session.state().spots.clone();
+    let spot = spots
+        .get_mut(index)
+        .ok_or_else(|| "there is no such spot".to_string())?;
+    let slot = match control.as_str() {
+        "radius" => {
+            spot.radius = value;
+            SPOT_RADIUS.store(value.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            1
+        }
+        "feather" => {
+            spot.feather = value;
+            2
+        }
+        other => return Err(format!("{other:?} is not a spot control")),
+    };
+    session.apply(Command::SetSpots {
+        spots,
+        control: (index as u8).saturating_mul(SPOT_CONTROLS) + slot,
+    });
+    Ok(())
+}
+
+/// Whether a spot copies its source outright or matches the light around it.
+///
+/// Sets the tool as well as the spot, because somebody who has just said "clone"
+/// about this one means it about the next.
+#[tauri::command]
+fn set_spot_mode(index: usize, clone: bool, state: tauri::State<'_, Shared>) -> Result<(), String> {
+    SPOT_CLONE.store(clone, std::sync::atomic::Ordering::Relaxed);
+    let mut session = state.0.lock().expect("session lock");
+    let mut spots = session.state().spots.clone();
+    let spot = spots
+        .get_mut(index)
+        .ok_or_else(|| "there is no such spot".to_string())?;
+    spot.mode = if clone {
+        rawkit_editstate::SpotMode::Clone
+    } else {
+        rawkit_editstate::SpotMode::Heal
+    };
+    session.apply(Command::SetSpots {
+        spots,
+        control: u8::MAX,
+    });
+    Ok(())
+}
+
+/// Look for somewhere better to borrow from.
+///
+/// The search reads the mosaic, which this side of the bus has no access to, so
+/// this only says that it should happen — the render loop does it on the next
+/// frame. The same arrangement as the white-balance pick.
+#[tauri::command]
+fn find_spot_source(index: usize, state: tauri::State<'_, Shared>) -> Result<(), String> {
+    let session = state.0.lock().expect("session lock");
+    if index >= session.state().spots.len() {
+        return Err("there is no such spot".into());
+    }
+    drop(session);
+    SPOT_PROPOSE.store(index, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
 #[tauri::command]
 fn set_mask(
     index: usize,
@@ -3223,6 +3632,13 @@ const MODE_SURVEY: u8 = 2;
 /// commits the rectangle instead of returning to the loupe, and Escape discards
 /// it instead of doing nothing.
 const MODE_CROP: u8 = 3;
+/// The loupe, with the spot tool live.
+///
+/// A mode for the same reason crop is: a press means something different. It
+/// places or grabs a blemish marker instead of panning the photograph, and a
+/// tool that did both depending on where you happened to click would be one
+/// nobody could use at a magnification where the markers are large.
+const MODE_SPOT: u8 = 4;
 
 fn mode() -> u8 {
     MODE.load(std::sync::atomic::Ordering::Relaxed)
@@ -3243,6 +3659,11 @@ pub(crate) fn in_grid() -> bool {
 /// Whether a drag on the canvas draws a rectangle rather than panning.
 pub(crate) fn in_crop() -> bool {
     mode() == MODE_CROP
+}
+
+/// Whether a press on the canvas belongs to the spot tool.
+pub(crate) fn in_spot() -> bool {
+    mode() == MODE_SPOT
 }
 
 /// The rectangle being drawn on the canvas, in surface pixels.
@@ -3514,6 +3935,7 @@ impl Marquee {
 pub(crate) fn mode_name() -> &'static str {
     match mode() {
         MODE_CROP => "crop",
+        MODE_SPOT => "spot",
         MODE_GRID => "grid",
         MODE_SURVEY => "survey",
         _ => "loupe",
@@ -3771,6 +4193,7 @@ fn draw_grid(
             tint,
             edge,
             inner,
+            round: false,
         });
     }
 
@@ -3981,9 +4404,128 @@ fn draw_marquee(
             // is never sampled.
             edge: (colour, t as f32),
             inner: ([0.0; 3], 0.0),
+            round: false,
         })
         .collect();
     blit.draw_over(gpu, canvas_renderer.canvas(), &cells);
+}
+
+/// The spot markers, as rings drawn over the photograph.
+///
+/// Two per spot: where the blemish is, and where its replacement comes from. The
+/// selected one is drawn brighter and thicker, because with half a dozen on a
+/// frame the only way to tell which the panel is talking about is to look.
+fn draw_spots(
+    gpu: &Gpu,
+    blit: &rawkit_engine::PreviewBlit,
+    white: &rawkit_engine::PreviewImage,
+    canvas_renderer: &session_canvas::CanvasRenderer,
+    session: &Session,
+    spots: &[rawkit_editstate::Spot],
+    selected: usize,
+) {
+    if spots.is_empty() {
+        return;
+    }
+    let viewport = session.viewport();
+    let level = viewport.level(session.max_level());
+    let step = (1u32 << level) as f64;
+    if viewport.scale <= 0.0 {
+        return;
+    }
+    let size = session.image_size();
+    let geometry = session.geometry();
+    let Some(straight) = straight_of_sensor(&geometry, size) else {
+        return;
+    };
+
+    // A sensor fraction to a canvas pixel, by the inverse of the very map the
+    // pointer uses on the way in. Deriving it the other way round instead is how
+    // a marker ends up somewhere a click on it would not land.
+    let canvas_at = |at: [f32; 2]| {
+        let [sx, sy] = straight([at[0] * size[0] as f32, at[1] * size[1] as f32]);
+        [
+            ((sx as f64 - viewport.center[0]) * viewport.scale + viewport.size[0] as f64 / 2.0)
+                / (viewport.scale * step),
+            ((sy as f64 - viewport.center[1]) * viewport.scale + viewport.size[1] as f64 / 2.0)
+                / (viewport.scale * step),
+        ]
+    };
+
+    let mut cells = Vec::with_capacity(spots.len() * 2);
+    let mut rects = Vec::with_capacity(spots.len() * 2);
+    for (index, spot) in spots.iter().enumerate() {
+        let chosen = index == selected;
+        // The radius measured through the same map, so a straightened frame's
+        // markers shrink with the photograph rather than staying put.
+        let edge = canvas_at([spot.centre[0] + spot.radius, spot.centre[1]]);
+        for (at, colour) in [
+            (spot.centre, if chosen { 0.99 } else { 0.72 }),
+            (spot.source, if chosen { 0.72 } else { 0.5 }),
+        ] {
+            let middle = canvas_at(at);
+            let r = ((edge[0] - canvas_at(spot.centre)[0]).powi(2)
+                + (edge[1] - canvas_at(spot.centre)[1]).powi(2))
+            .sqrt();
+            if r < 2.0 {
+                continue;
+            }
+            rects.push((
+                [
+                    (middle[0] - r).round() as i32,
+                    (middle[1] - r).round() as i32,
+                    (2.0 * r).round() as i32,
+                    (2.0 * r).round() as i32,
+                ],
+                colour,
+                if chosen { 2.0 } else { 1.0 },
+            ));
+        }
+    }
+    // Two screen pixels whatever the zoom, like the crop outline: in canvas
+    // pixels the same line thins out as the view pulls back.
+    let thin = (1.0 / (viewport.scale * step)).max(1.0);
+    for (dest, colour, weight) in &rects {
+        cells.push(rawkit_engine::Cell {
+            image: white,
+            dest: *dest,
+            tint: [1.0; 3],
+            edge: ([*colour; 3], (thin * weight).ceil() as f32),
+            inner: ([0.0; 3], 0.0),
+            round: true,
+        });
+    }
+    blit.draw_over(gpu, canvas_renderer.canvas(), &cells);
+}
+
+/// The map from a sensor pixel to a point of the straightened photograph.
+///
+/// The inverse of what [`rawkit_editstate::Geometry::sensor_rect`] does, built
+/// by measuring that function at three points rather than by re-deriving the
+/// algebra — the same technique, and the same reason, as
+/// [`rawkit_editstate::Geometry::flat_transform`]. `None` when the map is
+/// degenerate, which a zero-sized viewport can produce.
+fn straight_of_sensor(
+    geometry: &rawkit_editstate::Geometry,
+    size: [u32; 2],
+) -> Option<impl Fn([f32; 2]) -> [f32; 2] + '_> {
+    let sensor_of = |x: f64, y: f64| {
+        let r = geometry.sensor_rect([x, y, x, y], size);
+        [r[0] as f32, r[1] as f32]
+    };
+    let origin = sensor_of(0.0, 0.0);
+    let along_x = sensor_of(1.0, 0.0);
+    let along_y = sensor_of(0.0, 1.0);
+    let (a, b) = (along_x[0] - origin[0], along_y[0] - origin[0]);
+    let (c, d) = (along_x[1] - origin[1], along_y[1] - origin[1]);
+    let det = a * d - b * c;
+    if det.abs() < f32::EPSILON {
+        return None;
+    }
+    Some(move |at: [f32; 2]| {
+        let (px, py) = (at[0] - origin[0], at[1] - origin[1]);
+        [(d * px - b * py) / det, (a * py - c * px) / det]
+    })
 }
 
 /// The rectangle on screen, as a crop of the photograph.

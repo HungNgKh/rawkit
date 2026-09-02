@@ -28,6 +28,11 @@ struct Region {
     // rather than one because a frame can be picked *and* labelled, and a single
     // edge would make them argue about which is shown.
     inner: vec4<f32>,
+    // `.x` above a half draws the cell as a ring inscribed in its rectangle and
+    // discards everything else, so the photograph shows through the middle. For
+    // the spot tool, where the marker has to show the radius it stands for and a
+    // square would claim the wrong area. `.yzw` unused.
+    ring: vec4<f32>,
 }
 
 struct VsOut {
@@ -52,9 +57,21 @@ fn vs(@builtin(vertex_index) index: u32) -> VsOut {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    // The cell's own coordinates. `in.uv` runs 0 to 1 across the part of the
+    // rectangle that survived being clipped to the canvas, which is what the
+    // edge is measured against; a *ring* has to be measured against the whole
+    // cell instead, or a marker half off-screen would draw an ellipse.
+    let cell = region.origin + in.uv * region.span;
+    if (region.ring.x > 0.5) {
+        let d = length(cell - vec2<f32>(0.5, 0.5)) * 2.0;
+        if (d > 1.0 || d < 1.0 - region.edge.w * 2.0) {
+            discard;
+        }
+        return vec4<f32>(region.edge.rgb, 1.0);
+    }
     // The edge is drawn in the cell's own rectangle rather than as extra
     // geometry, so selection and flags cost no draw calls and no second
-    // pipeline. `in.uv` runs 0 to 1 across whatever rectangle was set.
+    // pipeline.
     let inset = min(min(in.uv.x, in.uv.y), min(1.0 - in.uv.x, 1.0 - in.uv.y));
     if (region.edge.w > 0.0 && inset < region.edge.w) {
         return vec4<f32>(region.edge.rgb, 1.0);
@@ -63,12 +80,11 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(region.inner.rgb, 1.0);
     }
 
-    let uv = region.origin + in.uv * region.span;
     // Outside the photograph is black, not the edge pixel smeared outwards.
     // Clamping would paint a border of stretched sky wherever the image does not
     // fill the view, which reads as part of the picture.
-    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) {
+    if (cell.x < 0.0 || cell.y < 0.0 || cell.x > 1.0 || cell.y > 1.0) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
-    return vec4<f32>(textureSample(image, image_sampler, uv).rgb * region.tint.rgb, 1.0);
+    return vec4<f32>(textureSample(image, image_sampler, cell).rgb * region.tint.rgb, 1.0);
 }

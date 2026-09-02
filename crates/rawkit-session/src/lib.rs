@@ -156,6 +156,18 @@ pub enum Command {
         masks: Vec<rawkit_editstate::Mask>,
         control: u8,
     },
+    /// Replace the blemishes being covered.
+    ///
+    /// The whole list at once, for the same reason [`Command::SetMasks`] is.
+    /// `control` is which control of which spot is moving; `u8::MAX` means one
+    /// arrived or left. It cannot collide with a mask's control byte because the
+    /// history is keyed on the command's *name* as well as this — which is worth
+    /// knowing, because sharing the byte would have needed a shared numbering
+    /// that nothing enforces.
+    SetSpots {
+        spots: Vec<rawkit_editstate::Spot>,
+        control: u8,
+    },
     /// Replace the hand-drawn tone curve.
     ///
     /// Carries the whole curve rather than one point, because inserting and
@@ -247,6 +259,7 @@ impl Command {
             Command::SetCurve { .. } => "set_curve",
             Command::SetGrade { .. } => "set_grade",
             Command::SetMasks { .. } => "set_masks",
+            Command::SetSpots { .. } => "set_spots",
             Command::SetStraighten(_) => "set_straighten",
             Command::RotateBy(_) => "rotate_by",
             Command::SetEditState(_) => "set_edit_state",
@@ -284,6 +297,7 @@ impl Command {
             Command::SetCurve { point, .. } => *point,
             Command::SetGrade { control, .. } => *control,
             Command::SetMasks { control, .. } => *control,
+            Command::SetSpots { control, .. } => *control,
             Command::SetHsl { band, control, .. } => {
                 let control = match control {
                     rawkit_editstate::BandControl::Hue => 0,
@@ -322,6 +336,7 @@ impl Command {
             Command::SetCurve { point, .. } => *point != u8::MAX,
             Command::SetGrade { control, .. } => *control != u8::MAX,
             Command::SetMasks { control, .. } => *control != u8::MAX,
+            Command::SetSpots { control, .. } => *control != u8::MAX,
 
             // A measurement arrives whole, once, from a button — never as a
             // drag. Coalescing it would fold "correct the lens" into whatever
@@ -800,6 +815,16 @@ impl Session {
                 // cannot leave the others half-applied.
                 let mut proposed = self.state.clone();
                 proposed.masks = masks;
+                if let Err(e) = proposed.validate() {
+                    return refused(name, e.to_string());
+                }
+                self.state = proposed;
+                self.edit_changed()
+            }
+
+            Command::SetSpots { spots, .. } => {
+                let mut proposed = self.state.clone();
+                proposed.spots = spots;
                 if let Err(e) = proposed.validate() {
                     return refused(name, e.to_string());
                 }

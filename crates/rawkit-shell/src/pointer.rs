@@ -114,6 +114,19 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
                 });
                 return;
             }
+            // The spot tool takes the press on the same terms: the drag either
+            // places a blemish marker and sizes it, or moves one that is already
+            // there. Panning underneath it would move the photograph out from
+            // under the thing being covered.
+            if crate::in_spot() && !in_grid() {
+                *crate::SPOT_DRAG.lock().expect("spot drag lock") = Some(MaskDrag {
+                    start: at,
+                    now: at,
+                    trail: Vec::new(),
+                    fresh: true,
+                });
+                return;
+            }
             // Aiming takes the press before anything else, and does not fall
             // through to `DRAG`: a targeted drag must not also pan the
             // photograph out from under the colour it is adjusting.
@@ -144,6 +157,10 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
                 // passed through, and a frame that arrives two motions late must
                 // still get both of them.
                 drag.trail.push(at);
+                return;
+            }
+            if let Some(drag) = crate::SPOT_DRAG.lock().expect("spot drag lock").as_mut() {
+                drag.now = at;
                 return;
             }
             if let Some(control) = targeting() {
@@ -180,6 +197,15 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
             // Disarming here as well would make placing a second gradient need
             // a trip back to the panel between every attempt.
             *MASK_DRAG.lock().expect("mask drag lock") = None;
+            // A spot that was being sized now needs somewhere to borrow from,
+            // and the search wants the radius the hand settled on rather than
+            // the one it passed through. The render loop does it, because that
+            // is where the mosaic is.
+            let grab = crate::SPOT_GRAB.lock().expect("spot grab lock").take();
+            if let Some(crate::SpotGrab::Size(index)) = grab {
+                crate::SPOT_PROPOSE.store(index, std::sync::atomic::Ordering::Relaxed);
+            }
+            *crate::SPOT_DRAG.lock().expect("spot drag lock") = None;
         }
 
         Pointer::Scroll { at, notches } => {

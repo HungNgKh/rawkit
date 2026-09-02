@@ -289,6 +289,9 @@ pub enum CullAction {
     PasteEdit,
     /// Draw a rectangle on the loupe. Pressed again, it stops.
     Crop,
+    /// Put markers on the loupe and let a press place one. Pressed again, it
+    /// stops.
+    Spot,
     /// Take the rectangle that was drawn, or throw it away.
     CropApply,
     CropCancel,
@@ -619,6 +622,7 @@ impl Library {
             // wildcard so adding a cull action still fails to compile here,
             // which is what has kept this match honest.
             CullAction::Crop | CullAction::CropApply | CullAction::CropCancel => {}
+            CullAction::Spot => {}
             // The clipboard is filled in the command handler, which is the only
             // place that can see the session — this frame's edit is what is on
             // screen, not what was last written to the catalog.

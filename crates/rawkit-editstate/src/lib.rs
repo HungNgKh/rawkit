@@ -57,6 +57,10 @@ pub enum EditStateError {
     InvalidMask(String),
     #[error("{0} local adjustments, and {MAX_MASKS} is the most a frame may carry")]
     TooManyMasks(usize),
+    #[error("spot is not usable: {0}")]
+    InvalidSpot(String),
+    #[error("more spots than a photograph may carry: {0}")]
+    TooManySpots(usize),
     #[error("colour is out of range: {0}")]
     InvalidColour(String),
     #[error("hue mixer is out of range: {0}")]
@@ -97,6 +101,14 @@ pub struct EditState {
     /// Local adjustments: what changes, and where.
     #[serde(default)]
     pub masks: Vec<Mask>,
+    /// Blemishes to cover, and where to borrow the cover from.
+    ///
+    /// Not a mask, and deliberately not stored as one: a mask says *where* an
+    /// adjustment applies and the renderer composites it in scene-linear light,
+    /// while a spot replaces sensor data before the demosaic has run. They are
+    /// two different kinds of thing that happen to both be round.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spots: Vec<Spot>,
 }
 
 fn default_schema_version() -> u32 {
@@ -112,6 +124,7 @@ impl Default for EditState {
             orientation: Orientation::default(),
             crop: Crop::default(),
             masks: Vec::new(),
+            spots: Vec::new(),
             detail: Detail::default(),
             lens: Lens::default(),
             colour: Colour::default(),
@@ -157,6 +170,12 @@ impl EditState {
         }
         for mask in &self.masks {
             mask.validate()?;
+        }
+        if self.spots.len() > MAX_SPOTS {
+            return Err(EditStateError::TooManySpots(self.spots.len()));
+        }
+        for spot in &self.spots {
+            spot.validate()?;
         }
         self.colour.validate()?;
         self.hsl.validate()?;
@@ -613,6 +632,118 @@ impl Mask {
                     "local {name} is {v}, and runs from -1 to 1"
                 )));
             }
+        }
+        Ok(())
+    }
+}
+
+/// The most spots one photograph may carry.
+///
+/// A sensor with sixty-four visible dust marks wants cleaning, not retouching.
+/// The number is here for the same reason [`MAX_MASKS`] is — an `EditState` can
+/// arrive from a file, and a file can say anything — but unlike masks these cost
+/// nothing on the GPU, so the cap is loose rather than structural.
+pub const MAX_SPOTS: usize = 64;
+
+/// How a spot fills itself in.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SpotMode {
+    /// Take the source's texture and the destination's light level.
+    ///
+    /// The default, and what "remove this dust mark" means: the surroundings
+    /// decide how bright the patch is, so a source borrowed from a slightly
+    /// different part of the sky does not arrive as a disc of the wrong blue.
+    #[default]
+    Heal,
+    /// Take the source exactly.
+    ///
+    /// For when the destination's own light level is the thing being replaced —
+    /// a blown highlight, a lens flare — where matching it would reproduce the
+    /// problem.
+    Clone,
+}
+
+/// A blemish, and where to borrow the pixels that replace it.
+///
+/// # Why the coordinates are fractions of the sensor frame
+///
+/// The same reason [`MaskShape`]'s are: it is the only frame that does not move
+/// when the photograph is turned or trimmed. A spot stored in the displayed
+/// frame would slide off the dust mark the moment somebody adjusted the crop,
+/// which is exactly when they are looking closely enough to place one.
+///
+/// # Why one radius and not two
+///
+/// A `MaskShape::Radial` carries two, so that a circle drawn on a 3:2 frame
+/// comes back a circle rather than an egg. A spot needs the opposite: it is a
+/// circle in *sensor pixels*, because the thing it covers is a speck of dust
+/// sitting on the sensor. Bayer photosites are square, so one fraction of the
+/// width is the radius in both directions.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Spot {
+    /// What to cover.
+    pub centre: [f32; 2],
+    /// Where to take the replacement from.
+    ///
+    /// Stored rather than searched for at render time, and that is a deliberate
+    /// decision rather than a cache. A search that ran during the render would
+    /// make the same `EditState` render differently as the search improved, and
+    /// "same RAW plus same EditState gives the same pixels" would stop being
+    /// true without anything appearing to change. What the search finds is a
+    /// *proposal*, made once when the spot is placed, which the user can then
+    /// drag somewhere better.
+    pub source: [f32; 2],
+    /// As a fraction of the frame's width.
+    pub radius: f32,
+    /// How much of the radius the edge fade occupies, 0 for a hard edge and 1
+    /// for a falloff that begins at the centre. The same meaning it has on a
+    /// radial mask.
+    pub feather: f32,
+    #[serde(default)]
+    pub mode: SpotMode,
+}
+
+impl Default for Spot {
+    fn default() -> Self {
+        Self {
+            centre: [0.5, 0.5],
+            source: [0.5, 0.5],
+            radius: 0.01,
+            feather: 0.5,
+            mode: SpotMode::default(),
+        }
+    }
+}
+
+impl Spot {
+    /// The largest a spot may be, as a fraction of the width.
+    ///
+    /// A quarter of the frame. Past that the tool being reached for is not this
+    /// one, and the annulus a heal measures its light level from would be
+    /// most of the photograph.
+    pub const MAX_RADIUS: f32 = 0.25;
+
+    fn validate(&self) -> Result<(), EditStateError> {
+        let finite = |v: [f32; 2]| v[0].is_finite() && v[1].is_finite();
+        if !finite(self.centre) || !finite(self.source) {
+            return Err(EditStateError::InvalidSpot(
+                "a spot has a coordinate that is not a number".into(),
+            ));
+        }
+        if !self.radius.is_finite() || self.radius <= 0.0 || self.radius > Self::MAX_RADIUS {
+            return Err(EditStateError::InvalidSpot(format!(
+                "spot radius is {}, and runs above 0 up to {}",
+                self.radius,
+                Self::MAX_RADIUS
+            )));
+        }
+        if !self.feather.is_finite() || !(0.0..=1.0).contains(&self.feather) {
+            return Err(EditStateError::InvalidSpot(format!(
+                "spot feather is {}, and runs from 0 to 1",
+                self.feather
+            )));
         }
         Ok(())
     }
@@ -1592,6 +1723,81 @@ mod tests {
             !encoded.contains("refinements"),
             "an empty refinement list was written out: {encoded}"
         );
+    }
+
+    #[test]
+    fn an_edit_written_before_spots_existed_still_reads() {
+        // The same contract `refinements` has, and it matters more here: every
+        // edit anybody has stored so far predates this field, and a catalog that
+        // needed a migration to open would need one that runs on strangers'
+        // catalogs for the fifteen months between the beta and 1.0.
+        let json = r#"{"schema_version": 1, "tone": {"exposure_ev": 0.5, "contrast": 0.0,
+            "highlights": 0.0, "shadows": 0.0, "whites": 0.0, "blacks": 0.0}}"#;
+        let state: EditState = serde_json::from_str(json).expect("an edit from before this");
+        assert!(state.spots.is_empty());
+        state.validate().expect("and it is still a usable edit");
+
+        // And an edit with no blemishes does not grow a field, so the content
+        // hash of every stored edit is what it was.
+        let encoded = serde_json::to_string(&state).unwrap();
+        assert!(
+            !encoded.contains("spots"),
+            "an empty spot list was written: {encoded}"
+        );
+        assert_eq!(
+            state.content_hash(),
+            EditState {
+                tone: state.tone,
+                ..EditState::default()
+            }
+            .content_hash()
+        );
+    }
+
+    #[test]
+    fn a_spot_round_trips_and_keeps_its_mode() {
+        let state = EditState {
+            spots: vec![Spot {
+                centre: [0.4, 0.6],
+                source: [0.5, 0.6],
+                radius: 0.01,
+                feather: 0.25,
+                mode: SpotMode::Clone,
+            }],
+            ..EditState::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: EditState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, state);
+        // Named in the JSON rather than numbered: the schema is read from
+        // outside this workspace, and `"mode": 1` would mean nothing there.
+        assert!(json.contains(r#""mode":"clone""#), "{json}");
+    }
+
+    #[test]
+    fn a_spot_with_no_size_is_refused() {
+        // A radius of zero covers nothing and a negative one is not a shape.
+        // Refused rather than clamped, for the reason every other refusal here
+        // exists: a render that quietly did nothing looks exactly like a render
+        // that worked.
+        for bad in [0.0, -0.01, f32::NAN, Spot::MAX_RADIUS * 2.0] {
+            let state = EditState {
+                spots: vec![Spot {
+                    radius: bad,
+                    ..Spot::default()
+                }],
+                ..EditState::default()
+            };
+            assert!(state.validate().is_err(), "a radius of {bad} was accepted");
+        }
+        let state = EditState {
+            spots: vec![Spot::default(); MAX_SPOTS + 1],
+            ..EditState::default()
+        };
+        assert!(matches!(
+            state.validate(),
+            Err(EditStateError::TooManySpots(_))
+        ));
     }
 
     #[test]

@@ -27,8 +27,8 @@ use crate::{render::Canvas, EngineError, Gpu, CANVAS_FORMAT};
 /// one buffer and binds a slice of it per draw. 256 is the alignment every
 /// backend accepts.
 const REGION_STRIDE: u64 = 256;
-/// origin(2) + span(2) + tint(4) + edge(4) + inner(4), in floats.
-const REGION_FLOATS: usize = 16;
+/// origin(2) + span(2) + tint(4) + edge(4) + inner(4) + ring(4), in floats.
+const REGION_FLOATS: usize = 20;
 
 /// One thumbnail to draw, and how it should look.
 pub struct Cell<'a> {
@@ -44,6 +44,13 @@ pub struct Cell<'a> {
     /// A second band just inside the first — a colour label, which a frame can
     /// carry at the same time as a flag.
     pub inner: ([f32; 3], f32),
+    /// Draw only a ring inscribed in the rectangle, and discard the rest.
+    ///
+    /// For a marker that stands for a round thing — the spot tool's — where a
+    /// square outline would claim an area a third larger than the one being
+    /// repaired. The interior is discarded rather than drawn, so what shows
+    /// through the middle is the photograph and not a thumbnail.
+    pub round: bool,
 }
 
 /// A preview uploaded to the GPU, ready to be drawn at any zoom.
@@ -288,10 +295,17 @@ impl PreviewBlit {
                 cell.tint[2],
                 1.0,
             ]);
-            // Thickness as a fraction of the *drawn* rectangle, so an edge stays
-            // the same number of pixels wide on a cell that is half off-screen.
+            // As a fraction of the *drawn* rectangle, so an edge stays the same
+            // number of pixels wide on a cell that is half off-screen — except
+            // for a ring, which is measured in the cell's own coordinates and
+            // would thicken as it slid off the canvas.
+            let against = if cell.round {
+                w.min(h).max(1)
+            } else {
+                (right - left).min(bottom - top).max(1)
+            };
             let thickness = if cell.edge.1 > 0.0 {
-                cell.edge.1 / (right - left).min(bottom - top).max(1) as f32
+                cell.edge.1 / against as f32
             } else {
                 0.0
             };
@@ -311,6 +325,12 @@ impl PreviewBlit {
                 cell.inner.0[1],
                 cell.inner.0[2],
                 inner,
+            ]);
+            regions[at + 16..at + 20].copy_from_slice(&[
+                if cell.round { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+                0.0,
             ]);
             placed.push((
                 [

@@ -163,6 +163,7 @@ fn a_grid_puts_each_cell_where_it_was_told_and_tints_it() {
                 tint: [1.0, 1.0, 1.0],
                 edge: ([0.0; 3], 0.0),
                 inner: ([0.0; 3], 0.0),
+                round: false,
             },
             // A third the brightness, the way a rejected frame is drawn.
             rawkit_engine::Cell {
@@ -171,6 +172,7 @@ fn a_grid_puts_each_cell_where_it_was_told_and_tints_it() {
                 tint: [0.33, 0.33, 0.33],
                 edge: ([0.0; 3], 0.0),
                 inner: ([0.0; 3], 0.0),
+                round: false,
             },
         ],
     );
@@ -221,6 +223,7 @@ fn a_cell_hanging_off_the_edge_is_cropped_rather_than_squashed() {
             tint: [1.0; 3],
             edge: ([0.0; 3], 0.0),
             inner: ([0.0; 3], 0.0),
+            round: false,
         }],
     );
     let pixels = canvas.read_back(&gpu).expect("read back");
@@ -255,6 +258,7 @@ fn a_flag_and_a_colour_label_can_be_shown_at_once() {
             // Pure green outside, pure red just inside it.
             edge: ([0.0, 1.0, 0.0], 4.0),
             inner: ([1.0, 0.0, 0.0], 4.0),
+            round: false,
         }],
     );
 
@@ -272,4 +276,66 @@ fn a_flag_and_a_colour_label_can_be_shown_at_once() {
         middle.iter().all(|c| *c < 0.05),
         "the photograph: {middle:?}"
     );
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_round_cell_draws_a_ring_and_leaves_the_middle_alone() {
+    // The spot tool's marker. What matters is not that a circle appears but that
+    // the middle is *discarded* rather than drawn: a marker that painted over
+    // the blemish would hide the thing the person is trying to judge.
+    let Some(gpu) = gpu() else { return };
+    let renderer = Renderer::new(&gpu);
+    let blit = PreviewBlit::new(&gpu);
+    let canvas = renderer.create_canvas(&gpu, 40, 40);
+
+    // Fill the canvas with a known colour first, so anything the ring pass does
+    // not touch can be recognised.
+    let grey = blit.upload(&gpu, &flat(128, 4, 4), 4, 4).expect("upload");
+    blit.draw_grid(
+        &gpu,
+        &canvas,
+        &[rawkit_engine::Cell {
+            image: &grey,
+            dest: [0, 0, 40, 40],
+            tint: [1.0; 3],
+            edge: ([0.0; 3], 0.0),
+            inner: ([0.0; 3], 0.0),
+            round: false,
+        }],
+    );
+    let before = canvas.read_back(&gpu).expect("read back");
+
+    blit.draw_over(
+        &gpu,
+        &canvas,
+        &[rawkit_engine::Cell {
+            image: &grey,
+            dest: [4, 4, 32, 32],
+            tint: [1.0; 3],
+            edge: ([1.0, 0.0, 0.0], 3.0),
+            inner: ([0.0; 3], 0.0),
+            round: true,
+        }],
+    );
+    let after = canvas.read_back(&gpu).expect("read back");
+    let red = |px: &[f32], x: usize, y: usize| {
+        let i = (y * 40 + x) * 4;
+        [px[i], px[i + 1], px[i + 2]]
+    };
+
+    // On the ring: the left edge of a circle centred at (20, 20) with radius 16.
+    let on = red(&after, 5, 20);
+    assert!(
+        on[0] > 0.5 && on[1] < 0.1,
+        "the ring should be red at its left edge; got {on:?}"
+    );
+    // Inside it, and outside the whole cell: untouched, bit for bit.
+    for (x, y) in [(20usize, 20usize), (1, 1), (38, 38)] {
+        assert_eq!(
+            red(&after, x, y),
+            red(&before, x, y),
+            "({x}, {y}) was painted over"
+        );
+    }
 }

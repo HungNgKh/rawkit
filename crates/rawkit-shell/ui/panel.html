@@ -400,6 +400,27 @@
     </div>
   </details>
 
+  <details id="s-spots"><summary>Spot removal</summary>
+    <div class="row">
+      <button id="spot-tool" class="target">Place spots</button>
+      <button id="spot-remove">Remove</button>
+    </div>
+    <div class="row" id="spot-list"></div>
+    <p class="empty" id="spot-empty">Nothing covered yet.</p>
+    <div id="spot-controls" hidden>
+      <div class="row">
+        <button id="spot-mode">Heal</button>
+        <button id="spot-source">Find another source</button>
+      </div>
+      <label><span>Size</span>
+        <input id="spot-radius" type="range" min="0.002" max="0.25" step="0.001" value="0.012">
+        <output id="spot-radius-value">0.012</output></label>
+      <label><span>Feather</span>
+        <input id="spot-feather" type="range" min="0" max="1" step="0.01" value="0.5">
+        <output id="spot-feather-value">0.50</output></label>
+    </div>
+  </details>
+
   <details id="s-profile">
     <summary>Camera profile</summary>
     <div id="profile-name">camera matrix</div>
@@ -426,7 +447,7 @@
   </details>
   <details id="s-keys">
     <summary>Keys</summary>
-    <div id="keys">G grid · E loupe · R crop · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · Z undo cull · ⌃Z undo edit · ⌃E export · F11 fullscreen</div>
+    <div id="keys">G grid · E loupe · R crop · Q spots · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · Z undo cull · ⌃Z undo edit · ⌃E export · F11 fullscreen</div>
   </details>
 </main>
 </div>
@@ -742,6 +763,7 @@
     // Not gated on the generation: selecting a local adjustment does not change
     // the edit, and neither does arming a placement.
     try { showMasks(s); } catch (e) { say(`masks: ${e && e.message || e}`); }
+    try { showSpots(s); } catch (e) { say(`spots: ${e && e.message || e}`); }
     showOrientation(s.orientation);
     // Not gated on the generation: a profile is not part of the edit, so
     // choosing one does not move it.
@@ -1583,6 +1605,67 @@
     }
   };
 
+  // ---- Spots ---------------------------------------------------------------
+  //
+  // Two circles per blemish live on the photograph rather than in here: the
+  // panel holds the numbers, and where a thing *is* belongs on the picture.
+
+  let spot = null;
+  let shownSpots = "";
+  let spotCloning = false;
+
+  const showSpots = (s) => {
+    const spots = (s.state && s.state.spots) || [];
+    spot = s.selected_spot ?? null;
+    const shape = `${spots.length}:${spot}`;
+    if (shape !== shownSpots) {
+      shownSpots = shape;
+      document.getElementById("spot-list").replaceChildren(...spots.map((_, i) => {
+        const button = document.createElement("button");
+        button.textContent = `${i + 1}`;
+        button.className = i === spot ? "armed" : "";
+        button.addEventListener("click", () => invoke("select_spot", { index: i }).catch(say));
+        return button;
+      }));
+      document.getElementById("spot-controls").hidden = spot === null;
+      document.getElementById("spot-empty").hidden = spots.length > 0;
+    }
+    const chosen = spot === null ? null : spots[spot];
+    if (chosen) {
+      spotCloning = chosen.mode === "clone";
+      document.getElementById("spot-mode").textContent = spotCloning ? "Clone" : "Heal";
+      document.getElementById("spot-mode").classList.toggle("armed", spotCloning);
+      setSlider("spot-radius", chosen.radius, v => Number(v).toFixed(3));
+      setSlider("spot-feather", chosen.feather, v => Number(v).toFixed(2));
+    }
+    document.getElementById("spot-tool").classList.toggle("armed", s.mode === "spot");
+  };
+
+  document.getElementById("spot-tool").addEventListener("click", () => {
+    act("spot").then(() =>
+      say("drag on the photograph to cover a mark; drag a circle to move it"));
+  });
+  document.getElementById("spot-remove").addEventListener("click", () => {
+    if (spot === null) return say("nothing selected to remove");
+    invoke("remove_spot", { index: spot }).catch(say);
+  });
+  document.getElementById("spot-mode").addEventListener("click", () => {
+    if (spot === null) return;
+    invoke("set_spot_mode", { index: spot, clone: !spotCloning }).catch(say);
+  });
+  document.getElementById("spot-source").addEventListener("click", () => {
+    if (spot === null) return;
+    invoke("find_spot_source", { index: spot })
+      .then(() => say("looking for somewhere to borrow from"))
+      .catch(say);
+  });
+  for (const [id, control] of [["spot-radius", "radius"], ["spot-feather", "feather"]]) {
+    document.getElementById(id).addEventListener("input", (e) => {
+      if (spot === null) return;
+      invoke("set_spot", { index: spot, control, value: Number(e.target.value) }).catch(say);
+    });
+  }
+
   const addMask = (kind) => {
     if (armed !== null) arm(null);
     if (picking) pickWb(false);
@@ -1951,6 +2034,8 @@
       // R for the crop tool, as in Lightroom; the brackets rotate, as in
       // Lightroom's Ctrl+[ and Ctrl+].
       case "r": act("crop"); break;
+      // Q for the spot tool, as in Lightroom.
+      case "q": act("spot"); break;
       case "[": send({ command: "rotate_by", params: -1 }); break;
       case "]": send({ command: "rotate_by", params: 1 }); break;
       // L adds a graduated local adjustment and arms the drag that places it;

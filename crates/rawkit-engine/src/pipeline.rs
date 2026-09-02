@@ -46,6 +46,18 @@ pub enum Domain {
 pub enum Stage {
     /// LibRaw hands back the sensor mosaic (`rawkit-decode`).
     Decode,
+    /// Dust and blemishes, patched into the mosaic before anything reads it.
+    ///
+    /// Before the demosaic and not after, because the thing being removed is a
+    /// speck sitting on the sensor. Patching the mosaic means the demosaic
+    /// interpolates *through* the repair, so there is no disc of differently
+    /// interpolated pixels where the spot was, and one copy carries all three
+    /// colours instead of three channels reconciled after the fact.
+    ///
+    /// It earns a stage where orientation and crop do not: those select a region
+    /// and permute axes, and every value that survives comes through untouched.
+    /// This one substitutes values.
+    SpotRemoval,
     /// RCD, ported to WGSL. The P0 go/no-go spike.
     Demosaic,
     /// Distortion, vignette, chromatic aberration, defringe.
@@ -84,8 +96,9 @@ pub enum Stage {
 
 impl Stage {
     /// Every stage, in execution order.
-    pub const ALL: [Stage; 13] = [
+    pub const ALL: [Stage; 14] = [
         Stage::Decode,
+        Stage::SpotRemoval,
         Stage::Demosaic,
         Stage::LensCorrection,
         Stage::WhiteBalance,
@@ -102,7 +115,7 @@ impl Stage {
 
     pub fn domain(self) -> Domain {
         match self {
-            Stage::Decode | Stage::Demosaic => Domain::Sensor,
+            Stage::Decode | Stage::SpotRemoval | Stage::Demosaic => Domain::Sensor,
             Stage::LensCorrection
             | Stage::WhiteBalance
             | Stage::CameraProfile
