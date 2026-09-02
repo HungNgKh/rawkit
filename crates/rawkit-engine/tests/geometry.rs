@@ -194,6 +194,9 @@ fn the_canvas_straightens_the_same_way_the_export_does() {
     // storage format rather than the two implementations.
     let stored = flat.read_back(&gpu).expect("flat readback");
 
+    // Both at once, and that is the point of doing it here rather than in a
+    // test of its own: a lens correction is composed *into* the straighten's
+    // gather, so the two have exactly one chance to disagree and it is this one.
     let geometry = Geometry::from_parts(
         Orientation::AsShot,
         Orientation::AsShot,
@@ -201,6 +204,13 @@ fn the_canvas_straightens_the_same_way_the_export_does() {
             angle_deg: 7.5,
             ..Crop::default()
         },
+        Some(rawkit_editstate::Distortion {
+            // The Sony E 70-350 mm at 284 mm, as the body recorded it.
+            knots: [
+                0, 8, 8, 24, 56, 100, 160, 236, 328, 440, 572, 724, 0, 0, 0, 0,
+            ],
+            amount: 1.0,
+        }),
     );
     let [ow, oh] = geometry.output_size([w, h]);
     let canvas = renderer.create_canvas(&gpu, ow, oh);

@@ -33,7 +33,20 @@
 //! exactly why it is not here: a different kind of operation, with its own
 //! decisions about interpolation.
 
-use crate::{Crop, EditState, Orientation};
+use crate::{Crop, Distortion, EditState, Orientation};
+
+/// A lens's distortion, ready for a gather that works in flat coordinates.
+///
+/// See [`Geometry::distortion_map`]. The curve is the resolved one — amount
+/// applied, peak subtracted, divisor divided out — so whoever holds this adds it
+/// to one and multiplies.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DistortionMap {
+    pub centre: [f32; 2],
+    pub corner: f32,
+    pub curve: [f32; 16],
+    pub used: u32,
+}
 
 /// The frame the edit says to show, given the frame the sensor recorded.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -49,6 +62,15 @@ pub struct Geometry {
     recorded: Orientation,
     orientation: Orientation,
     crop: Crop,
+    /// The lens's own curve, in *sensor* coordinates.
+    ///
+    /// Here and not in the renderer's lens stage for the reason at the top of
+    /// this module: it moves a pixel without changing its value, which is what
+    /// everything else here does. It also has to compose with the straighten
+    /// rather than run beside it — two resamples of the same photograph would
+    /// cost twice the softening for no reason, and the straighten already owns
+    /// the one gather this pipeline is allowed.
+    distortion: Option<Distortion>,
 }
 
 impl Geometry {
@@ -58,11 +80,17 @@ impl Geometry {
     /// drags a rectangle and wants to know what the frame would become, and
     /// building a whole `EditState` to ask that would mean the interface could
     /// accidentally answer with a different edit's orientation.
-    pub fn from_parts(recorded: Orientation, orientation: Orientation, crop: Crop) -> Self {
+    pub fn from_parts(
+        recorded: Orientation,
+        orientation: Orientation,
+        crop: Crop,
+        distortion: Option<Distortion>,
+    ) -> Self {
         Self {
             recorded,
             orientation,
             crop,
+            distortion: distortion.filter(|d| !d.is_identity()),
         }
     }
 
@@ -73,11 +101,12 @@ impl Geometry {
     /// that a caller which does not have it has to say so, instead of silently
     /// rendering every portrait frame on its side.
     pub fn new(state: &EditState, recorded: Orientation) -> Self {
-        Self {
+        Self::from_parts(
             recorded,
-            orientation: state.orientation,
-            crop: state.crop,
-        }
+            state.orientation,
+            state.crop,
+            state.lens.distortion,
+        )
     }
 
     /// Whether there is nothing to do.
@@ -86,7 +115,7 @@ impl Geometry {
     /// keeps "an unedited photograph is bit-identical to one from a build before
     /// this existed" true rather than approximately true.
     pub fn is_identity(&self) -> bool {
-        self.turns() == 0 && self.crop.is_full_frame()
+        self.turns() == 0 && self.crop.is_full_frame() && self.distortion.is_none()
     }
 
     /// The straighten, in radians clockwise. Zero when there is none.
@@ -101,7 +130,7 @@ impl Geometry {
     /// path is worth taking whenever it is available, not only when there is
     /// nothing to do at all.
     pub fn resamples(&self) -> bool {
-        self.crop.angle_deg != 0.0
+        self.crop.angle_deg != 0.0 || self.distortion.is_some()
     }
 
     /// How far outside a sample the renderer's filter reaches, in pixels.
@@ -297,7 +326,57 @@ impl Geometry {
         let [x0, y0, _, _] = self.window(image);
         // Flat is measured from the crop's corner; the quarter turn is not.
         let oriented = [flat[0] + x0 as f32, flat[1] + y0 as f32];
-        self.orient_to_sensor(oriented, image)
+        self.undistort(self.orient_to_sensor(oriented, image), image)
+    }
+
+    /// The distortion as a gather in *flat* coordinates.
+    ///
+    /// The CPU resampler works in sensor coordinates and can call
+    /// [`undistort`](Self::undistort) directly; the canvas has already scattered
+    /// its tiles into flat space and would have to undo the quarter turn to get
+    /// back. It does not need to: a quarter turn is an isometry, so the same
+    /// radial map about the *image of the optical centre* is the same map. This
+    /// is where that image is, and how far its corner sits.
+    ///
+    /// `None` when there is nothing to undo.
+    pub fn distortion_map(&self, image: [u32; 2]) -> Option<DistortionMap> {
+        let distortion = self.distortion.as_ref()?;
+        let [fw, fh] = self.oriented_size(image);
+        let [x0, y0, _, _] = self.window(image);
+        // Flat is measured from the crop's corner, and the optical centre is the
+        // middle of the whole frame rather than of what is left of it — a crop
+        // moves the picture, not the lens.
+        let (curve, used) = distortion.resolved();
+        Some(DistortionMap {
+            centre: [fw as f32 / 2.0 - x0 as f32, fh as f32 / 2.0 - y0 as f32],
+            corner: ((image[0] as f32 / 2.0).powi(2) + (image[1] as f32 / 2.0).powi(2)).sqrt(),
+            curve,
+            used,
+        })
+    }
+
+    /// Where a point of the *corrected* photograph sits on the lens's own,
+    /// uncorrected image.
+    ///
+    /// In sensor coordinates and about the sensor's centre, which is where a
+    /// lens is radial. Applied after the quarter turn rather than before it
+    /// because a quarter turn is an isometry — radii survive it — and doing it
+    /// on this side means one map instead of four.
+    fn undistort(&self, p: [f32; 2], image: [u32; 2]) -> [f32; 2] {
+        let Some(distortion) = &self.distortion else {
+            return p;
+        };
+        let (cx, cy) = (image[0] as f32 / 2.0, image[1] as f32 / 2.0);
+        let (dx, dy) = (p[0] - cx, p[1] - cy);
+        let radius = (dx * dx + dy * dy).sqrt();
+        // The corner. Distortion is measured against the longest radius the
+        // frame has, so this is the same denominator on any crop of it.
+        let corner = (cx * cx + cy * cy).sqrt();
+        if corner <= 0.0 {
+            return p;
+        }
+        let scale = distortion.scale_at(radius / corner);
+        [cx + dx * scale, cy + dy * scale]
     }
 
     /// The quarter-turn half of the map, in floating point.
@@ -378,7 +457,14 @@ impl Geometry {
         let [x0, y0, _, _] = self.window(image);
         let corner = |sx: f64, sy: f64| -> [f32; 2] {
             let flat = self.flat_of_straight([sx as f32, sy as f32], image);
-            self.orient_to_sensor([flat[0] + x0 as f32, flat[1] + y0 as f32], image)
+            // Through the distortion as well, so a click on the photograph lands
+            // on the sensor pixel that is actually under it. Without this a mask
+            // placed on a corrected frame would sit a percent off, which reads as
+            // the mask drifting rather than as a coordinate bug.
+            self.undistort(
+                self.orient_to_sensor([flat[0] + x0 as f32, flat[1] + y0 as f32], image),
+                image,
+            )
         };
         let mut out = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
         for (sx, sy) in [
@@ -408,6 +494,7 @@ mod tests {
             recorded: Orientation::AsShot,
             orientation,
             crop,
+            distortion: None,
         }
     }
 
@@ -416,6 +503,7 @@ mod tests {
             recorded,
             orientation,
             crop: Crop::default(),
+            distortion: None,
         }
     }
 

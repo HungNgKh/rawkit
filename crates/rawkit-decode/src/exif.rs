@@ -39,6 +39,25 @@ const DATE_TIME_DIGITIZED: u16 = 0x9004;
 /// approximate date than by none.
 const DATE_TIME: u16 = 0x0132;
 
+const MAKER_NOTE: u16 = 0x927c;
+/// Sony's block of lens-correction curves.
+const SONY_LENS_CORRECTION: u16 = 0x9405;
+
+/// Where the distortion spline sits inside that block, and how long it is.
+///
+/// Found by measurement rather than from a description — see the module note on
+/// [`distortion`]. The two numbers before it are a marker, and the knots begin
+/// at zero because a lens does not distort at the centre of its own image.
+const DISTORTION_AT: usize = 98;
+const DISTORTION_KNOTS: usize = 16;
+/// The flag two slots earlier, and the value it takes when the body has a
+/// profile for the lens that is mounted.
+const PROFILE_FLAG_AT: usize = 90;
+const PROFILE_PRESENT: i16 = 257;
+
+/// Larger than any maker note seen, and small enough to read without care.
+const MAX_MAKER_NOTE: u32 = 256 * 1024;
+
 /// More entries than any real IFD has. A corrupt count is otherwise an
 /// invitation to read twelve bytes a million times.
 const MAX_ENTRIES: u16 = 512;
@@ -168,6 +187,106 @@ fn read_timestamp(file: &mut File, at: u64, length: u64) -> Option<String> {
     // absent date look like a present one to anything that only checks for None.
     (text.len() >= 19 && text.starts_with(|c: char| c.is_ascii_digit())).then_some(text)
 }
+
+/// Sony's own distortion spline for the lens that took this photograph.
+///
+/// # Where this comes from, and how far it is trusted
+///
+/// The format is **not published**. What is here was found by measurement: the
+/// camera's own JPEG was compared against our render of the same RAW, patch by
+/// patch, giving the radial displacement the body applied. Sixteen-bit windows
+/// across every maker-note tag were then scored on whether they reproduced that
+/// displacement — the same curve, to one constant, on four frames of a Sony zoom
+/// at 128, 284 and 350 mm. One window did, to **0.6 px rms against a 0.6 px
+/// measurement floor**, and it is this one.
+///
+/// The same search says the frames taken with a third-party lens carry a curve
+/// fifty times smaller, byte-identical between them, and their JPEGs show no
+/// correction at all. So the marker two slots ahead is read as *whether the body
+/// has a profile*, and a lens it does not know is reported as `None` rather than
+/// corrected by a placeholder.
+///
+/// Everything is checked against the file's length; a maker note is a structure
+/// a stranger wrote.
+pub fn distortion(path: &Path) -> Option<[i16; DISTORTION_KNOTS]> {
+    let mut file = File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+
+    let mut header = [0u8; 8];
+    file.read_exact(&mut header).ok()?;
+    let big_endian = match &header[..2] {
+        b"MM" => true,
+        b"II" => false,
+        _ => return None,
+    };
+    let read16 = move |b: &[u8]| -> u16 {
+        if big_endian {
+            u16::from_be_bytes([b[0], b[1]])
+        } else {
+            u16::from_le_bytes([b[0], b[1]])
+        }
+    };
+    let read32 = move |b: &[u8]| -> u32 {
+        if big_endian {
+            u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+        } else {
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        }
+    };
+    if read16(&header[2..4]) != 42 {
+        return None;
+    }
+
+    let ifd0 = read_ifd(&mut file, read32(&header[4..8]) as u64, length, &read16)?;
+    let exif = find(&ifd0, EXIF_IFD_POINTER, &read16, &read32)?;
+    let exif = read_ifd(&mut file, exif as u64, length, &read16)?;
+    // Sony writes its maker note as a bare IFD at the tag's own offset, with no
+    // header and no relocation. A vendor that writes one differently falls out
+    // here as an unreadable IFD, which is the right answer for a body whose
+    // curves we could not interpret anyway.
+    let maker = find(&exif, MAKER_NOTE, &read16, &read32)?;
+    let maker = read_ifd(&mut file, maker as u64, length, &read16)?;
+
+    let entry = maker
+        .iter()
+        .find(|entry| read16(&entry[..2]) == SONY_LENS_CORRECTION)?;
+    let count = read32(&entry[4..8]);
+    let at = read32(&entry[8..12]) as u64;
+    let wanted = (DISTORTION_AT + DISTORTION_KNOTS * 2) as u32;
+    if count < wanted || count > MAX_MAKER_NOTE || at < 8 || at + u64::from(wanted) > length {
+        return None;
+    }
+    file.seek(SeekFrom::Start(at)).ok()?;
+    let mut raw = vec![0u8; wanted as usize];
+    file.read_exact(&mut raw).ok()?;
+    for byte in &mut raw {
+        *byte = DECIPHER[*byte as usize];
+    }
+
+    if read16(&raw[PROFILE_FLAG_AT..]) as i16 != PROFILE_PRESENT {
+        return None;
+    }
+    let mut knots = [0i16; DISTORTION_KNOTS];
+    for (i, knot) in knots.iter_mut().enumerate() {
+        *knot = read16(&raw[DISTORTION_AT + i * 2..]) as i16;
+    }
+    // A profile that says the lens does not distort is not a profile worth
+    // carrying: it would make the interface offer a correction that does
+    // nothing, which reads as the correction being broken.
+    knots.iter().any(|k| *k != 0).then_some(knots)
+}
+
+/// Sony scrambles these tags with a byte substitution, and it is its own
+/// description: the forward map is `i -> (i * i * i) mod 249` for the first 249
+/// values, with the last seven left alone. This is its inverse, built once.
+static DECIPHER: std::sync::LazyLock<[u8; 256]> = std::sync::LazyLock::new(|| {
+    let mut table = [0u8; 256];
+    for i in 0..256usize {
+        let encoded = if i < 249 { (i * i * i) % 249 } else { i };
+        table[encoded] = i as u8;
+    }
+    table
+});
 
 #[cfg(test)]
 mod tests {

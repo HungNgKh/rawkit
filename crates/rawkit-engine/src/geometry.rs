@@ -140,7 +140,7 @@ mod tests {
     }
 
     fn with(orientation: Orientation, crop: Crop) -> Geometry {
-        Geometry::from_parts(Orientation::AsShot, orientation, crop)
+        Geometry::from_parts(Orientation::AsShot, orientation, crop, None)
     }
 
     #[test]
@@ -296,6 +296,7 @@ mod tests {
                 angle_deg: degrees,
                 ..Crop::default()
             },
+            None,
         )
     }
 
@@ -372,6 +373,85 @@ mod tests {
         assert!(worst < 1e-3, "worst departure from the ramp was {worst}");
     }
 
+    fn lens() -> rawkit_editstate::Distortion {
+        rawkit_editstate::Distortion {
+            // The Sony E 70-350 mm at 284 mm, as the body recorded it.
+            knots: [
+                0, 8, 8, 24, 56, 100, 160, 236, 328, 440, 572, 724, 0, 0, 0, 0,
+            ],
+            amount: 1.0,
+        }
+    }
+
+    #[test]
+    fn a_lens_correction_pins_the_corner_and_pulls_the_middle_in() {
+        // The direction of the map, which is the thing that is silently
+        // reversible: a correction applied backwards doubles the distortion
+        // instead of removing it, and on a gentle lens that looks like a
+        // correction that is not working rather than one that is inverted.
+        let (w, h) = (1000u32, 1000u32);
+        let g = Geometry::from_parts(
+            Orientation::AsShot,
+            Orientation::AsShot,
+            Crop::default(),
+            Some(lens()),
+        );
+        let centre = [w as f32 / 2.0, h as f32 / 2.0];
+        let radius = |p: [f32; 2]| (p[0] - centre[0]).hypot(p[1] - centre[1]);
+
+        // The middle of the frame reads from nearer the centre than it sits, so
+        // the picture there is stretched outwards — which is what undoes a
+        // pincushion.
+        let out = [w as f32 * 0.75, h as f32 / 2.0];
+        let from = g.source_at(out, [w, h]);
+        assert!(
+            radius(from) < radius([out[0] + 0.5, out[1] + 0.5]) - 2.0,
+            "mid-field reads from {:.1} where it sits at {:.1}",
+            radius(from),
+            radius([out[0], out[1]])
+        );
+        // The corner is where the curve peaks, so the correction itself moves it
+        // nowhere. What it does move is the filter's own inset: a resampled
+        // frame pulls in far enough that Catmull-Rom's outermost taps are on the
+        // photograph, which is two pixels on each axis and so 2.83 along the
+        // diagonal. Inwards only — a corner reading from *outside* the frame is
+        // the failure this bounds.
+        let [ow, oh] = g.output_size([w, h]);
+        let corner = [ow as f32 - 1.0, oh as f32 - 1.0];
+        let moved =
+            radius(g.source_at(corner, [w, h])) - radius([corner[0] + 0.5, corner[1] + 0.5]);
+        assert!(
+            (0.0..=3.0).contains(&moved),
+            "the corner reads from {moved:.2} px further out than it sits"
+        );
+    }
+
+    #[test]
+    fn a_correction_of_nothing_never_reaches_the_resampler() {
+        // The counterpart of the straighten's own test below, and it matters
+        // more: every photograph from a Sony lens carries a profile, so a
+        // correction turned down to zero is a state people will be in. It has to
+        // cost nothing and be bit-identical to a photograph that has no profile
+        // at all.
+        let off = rawkit_editstate::Distortion {
+            amount: 0.0,
+            ..lens()
+        };
+        let g = Geometry::from_parts(
+            Orientation::AsShot,
+            Orientation::AsShot,
+            Crop::default(),
+            Some(off),
+        );
+        assert!(!g.resamples(), "an amount of zero asked for a resample");
+        assert!(g.is_identity());
+
+        let pixels = frame(9, 7);
+        let (out, size) = apply(&g, &pixels, [9, 7]);
+        assert_eq!(size, [9, 7]);
+        assert_eq!(out, pixels, "an amount of zero changed a pixel");
+    }
+
     #[test]
     fn a_straighten_of_zero_never_reaches_the_resampler() {
         // Cropping alone must stay exact. If a zero angle took the interpolating
@@ -389,6 +469,7 @@ mod tests {
                 bottom: 0.9,
                 angle_deg: 0.0,
             },
+            None,
         );
         assert!(!g.resamples());
         let (out, size) = apply(&g, &pixels, [9, 7]);

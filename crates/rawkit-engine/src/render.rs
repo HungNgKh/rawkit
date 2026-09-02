@@ -479,6 +479,17 @@ struct StraightenParams {
     dy: [f32; 2],
     extent: [u32; 2],
     photograph: [f32; 2],
+    optical_centre: [f32; 2],
+    corner: f32,
+    knots: u32,
+    /// WGSL aligns an `array<vec4<f32>, 4>` to sixteen bytes and `#[repr(C)]`
+    /// does not, so without this the shader reads the curve eight bytes early
+    /// and the correction comes out as a smear.
+    _pad: [u32; 2],
+    /// The resolved curve. Sixteen floats, laid out as four `vec4` because a
+    /// uniform's arrays are padded to sixteen bytes an element and an
+    /// `array<f32, 16>` would arrive with fifteen holes in it.
+    curve: [[f32; 4]; 4],
 }
 
 /// A developed photograph: the pixels, and how wide they are.
@@ -1358,6 +1369,7 @@ impl Renderer {
             flat_origin,
         } = view;
         let [origin, dx, dy] = geometry.flat_transform(level_image);
+        let lens = geometry.distortion_map(level_image);
         let extent = canvas.size();
         let params = StraightenParams {
             straight_origin,
@@ -1369,6 +1381,22 @@ impl Renderer {
             photograph: {
                 let [pw, ph] = geometry.output_size(level_image);
                 [pw as f32, ph as f32]
+            },
+            // Zeroes when the lens has no profile, and the shader's own guard on
+            // `knots` is what turns the radial step off — rather than a branch
+            // here that could disagree with it.
+            optical_centre: lens.map(|d| d.centre).unwrap_or([0.0; 2]),
+            corner: lens.map(|d| d.corner).unwrap_or(0.0),
+            knots: lens.map(|d| d.used).unwrap_or(0),
+            _pad: [0; 2],
+            curve: {
+                let mut packed = [[0.0f32; 4]; 4];
+                if let Some(lens) = &lens {
+                    for (i, value) in lens.curve.iter().enumerate() {
+                        packed[i / 4][i % 4] = *value;
+                    }
+                }
+                packed
             },
         };
         let uniform = gpu.device.create_buffer(&wgpu::BufferDescriptor {

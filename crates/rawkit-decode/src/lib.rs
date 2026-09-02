@@ -186,6 +186,20 @@ pub struct RawImage {
     /// [`orientation_from_flip`] for what the translation is and why the four
     /// values a camera actually produces are the four it handles.
     pub orientation: Orientation,
+    /// The maker's own distortion curve for the lens that was mounted, when the
+    /// body had a profile for it.
+    ///
+    /// The third fact of this kind, beside [`RawImage::as_shot_neutral`] and
+    /// [`RawImage::orientation`]: something the file records rather than
+    /// something anybody decided, which the matching `EditState` field resolves
+    /// against. `None` means the body had no profile — an adapted or manual
+    /// lens, or one it does not know — and that is a state to *say*, because a
+    /// correction slider that silently does nothing is worse than one that
+    /// explains itself.
+    ///
+    /// See [`crate::exif::distortion`] for where the numbers come from and how
+    /// far they are trusted.
+    pub distortion: Option<[i16; 16]>,
     pub data: Vec<u16>,
 }
 
@@ -293,6 +307,7 @@ mod tests {
             },
             as_shot_neutral: [2.1, 1.0, 1.5, 1.0],
             xyz_to_camera: [[0.0; 3]; 4],
+            distortion: None,
             orientation: Orientation::AsShot,
             data: vec![1000; (width * height) as usize],
         }

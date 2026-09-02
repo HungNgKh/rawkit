@@ -140,6 +140,10 @@ pub fn decode_file(path: &Path) -> Result<RawImage, DecodeError> {
         // tempting shortcut and is wrong: a square crop, and a portrait frame
         // from a body that writes landscape pixels, both defeat it.
         orientation: crate::orientation_from_flip(data.sizes.flip),
+        // Read from the file directly rather than from LibRaw, which does not
+        // expose it: its lens structures cover *identification*, and there is no
+        // field for the correction curves in any version this binds.
+        distortion: crate::exif::distortion(path),
         data: pixels,
     };
     image.validate()?;

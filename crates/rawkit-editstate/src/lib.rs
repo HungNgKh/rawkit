@@ -26,7 +26,7 @@
 pub mod geometry;
 pub mod groups;
 
-pub use geometry::Geometry;
+pub use geometry::{DistortionMap, Geometry};
 pub use groups::Group;
 
 use schemars::JsonSchema;
@@ -749,6 +749,125 @@ impl Spot {
     }
 }
 
+/// A lens's radial distortion, as the camera that took the photograph described
+/// it.
+///
+/// # Where the numbers come from
+///
+/// Sony's maker note, deciphered — see `rawkit_decode::exif::distortion`, which
+/// also records how the format was found and how far it is trusted. Nothing here
+/// parses anything; this is the shape the answer arrives in.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Distortion {
+    /// Sixteen knots outward from the optical centre.
+    ///
+    /// The first is zero because a lens does not distort in the middle of its
+    /// own image, and the trailing zeros are padding rather than knots — a lens
+    /// that used all sixteen would have a non-zero one at the end.
+    pub knots: [i16; 16],
+    /// How much of it to apply, 0 to 1.
+    ///
+    /// A slider rather than a switch because a correction is somebody's taste as
+    /// well as a measurement: a little barrel on a portrait is often wanted, and
+    /// halfway is a legitimate place to stand.
+    pub amount: f32,
+}
+
+/// Walk a curve of `n` points spread evenly from the centre to the corner.
+///
+/// Linear between the knots, and flat outside them — a point past the corner is
+/// a corner as far as a lens is concerned.
+fn sample_curve(curve: &[f32], t: f32) -> f32 {
+    if curve.len() < 2 {
+        return 0.0;
+    }
+    let x = t.clamp(0.0, 1.0) * (curve.len() - 1) as f32;
+    let i = (x as usize).min(curve.len() - 2);
+    let f = x - i as f32;
+    curve[i] * (1.0 - f) + curve[i + 1] * f
+}
+
+impl Distortion {
+    /// What the stored numbers are a fraction of.
+    ///
+    /// **Measured, not published.** The curve was fitted against the camera's own
+    /// JPEGs — four frames of a Sony 70-350 mm at 128, 284 and 350 mm, compared
+    /// patch by patch against our render of the same RAW. The knots run out to
+    /// the half-*diagonal*, which the same fit pins to within a percent.
+    ///
+    /// The data cannot separate a divisor of 16384 from one of about 17400: 1.5
+    /// px rms against 1.2, on a 1616-pixel-wide render whose measurement floor is
+    /// 0.6 px. Two to the fourteenth is chosen from that range because it is the
+    /// sort of number a camera would store, and because at that value the
+    /// correction lands on what the body did with no further rescaling.
+    ///
+    /// What 1.5 px rms means: about 5 px on a 24 MP frame, against a distortion
+    /// whose own size is 4% of the radius — so **roughly 97% of it comes out**.
+    /// The rest is measurement noise, one frame whose patches matched poorly, and
+    /// the 0.4% the camera crops off its own JPEG, which is a thing it does to
+    /// its output rather than part of the lens.
+    pub const DIVISOR: f32 = 16384.0;
+
+    /// The knots that are knots.
+    ///
+    /// Trailing zeros are padding. At least two come back, because one point is
+    /// not a curve and the interpolation below would have nothing to walk.
+    fn curve(&self) -> &[i16] {
+        let mut end = self.knots.len();
+        while end > 2 && self.knots[end - 1] == 0 {
+            end -= 1;
+        }
+        &self.knots[..end]
+    }
+
+    /// How far out to read, for an output point `t` of the way to the corner.
+    ///
+    /// Below 1 everywhere, and that is the whole trick: the curve is shifted so
+    /// its largest value sits at exactly 1, which means the correction never
+    /// asks for a sample from outside the frame and so can never show a black
+    /// edge. Any constant added to a radial curve is a pure zoom, so shifting it
+    /// costs nothing but magnification — where the camera would instead crop.
+    /// Choosing magnification is the safer default: a correction that quietly
+    /// trimmed the frame would change what a crop means.
+    pub fn scale_at(&self, t: f32) -> f32 {
+        let (curve, used) = self.resolved();
+        1.0 + sample_curve(&curve[..used as usize], t)
+    }
+
+    /// The curve as a renderer wants it: the amount already applied, the peak
+    /// already subtracted, the divisor already divided out.
+    ///
+    /// Both the CPU resampler and the shader read *this* rather than the raw
+    /// knots, so there is one place where the anchoring and the units are
+    /// decided. Two copies of that arithmetic is how a preview ends up framing a
+    /// photograph differently from the file it exports.
+    pub fn resolved(&self) -> ([f32; 16], u32) {
+        let curve = self.curve();
+        let peak = f32::from(curve.iter().copied().max().unwrap_or(0));
+        let mut out = [0.0f32; 16];
+        for (slot, knot) in out.iter_mut().zip(curve) {
+            *slot = self.amount * (f32::from(*knot) - peak) / Self::DIVISOR;
+        }
+        (out, curve.len() as u32)
+    }
+
+    /// Whether this would move a pixel at all.
+    pub fn is_identity(&self) -> bool {
+        self.amount == 0.0 || self.knots.iter().all(|k| *k == 0)
+    }
+
+    fn validate(&self) -> Result<(), EditStateError> {
+        if !self.amount.is_finite() || !(0.0..=1.0).contains(&self.amount) {
+            return Err(EditStateError::InvalidLens(format!(
+                "distortion amount is {}, and runs from 0 to 1",
+                self.amount
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// The tone block.
 ///
 /// `exposure_ev` is applied in scene-linear light, before the tone map, and is
@@ -1116,6 +1235,18 @@ pub struct Lens {
     pub chromatic_red: f32,
     /// The same, for blue.
     pub chromatic_blue: f32,
+    /// The maker's own distortion curve for the lens that was mounted, and how
+    /// much of it to apply. `None` is a photograph nothing is correcting.
+    ///
+    /// The curve is *stored in the edit* rather than re-read from the file at
+    /// render time, and that is the same decision [`Lens::chromatic_red`]
+    /// records for a different reason. Here it buys two things: a photograph
+    /// whose body had no profile for the lens cannot silently acquire one when
+    /// the parser improves, and an edit carried to another machine reproduces
+    /// the same geometry without that machine having to read a maker note. It is
+    /// sixteen numbers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distortion: Option<Distortion>,
 }
 
 impl Lens {
@@ -1124,6 +1255,12 @@ impl Lens {
     /// Exact zeros, not a tolerance. The renderer skips the resampling entirely
     /// on this, and "close enough to zero to skip" and "small enough not to
     /// matter" are different questions that would drift apart.
+    ///
+    /// The distortion is deliberately *not* part of this: chromatic aberration
+    /// is a rescale of two channels inside the develop kernel, and a distortion
+    /// is a coordinate map that belongs with the crop and the straighten. The
+    /// two are asked about by different code at different stages, and one
+    /// answer for both would have to be the pessimistic one.
     pub fn is_identity(&self) -> bool {
         self.chromatic_red == 0.0 && self.chromatic_blue == 0.0
     }
@@ -1139,6 +1276,9 @@ impl Lens {
                     "{name} is scaled by {value}, and the range is +/-{MAX_LATERAL}"
                 )));
             }
+        }
+        if let Some(distortion) = &self.distortion {
+            distortion.validate()?;
         }
         Ok(())
     }
@@ -1723,6 +1863,112 @@ mod tests {
             !encoded.contains("refinements"),
             "an empty refinement list was written out: {encoded}"
         );
+    }
+
+    /// The Sony E 70-350 mm at 284 mm, from `DSC00775.ARW`.
+    fn measured_lens() -> Distortion {
+        Distortion {
+            knots: [
+                0, 8, 8, 24, 56, 100, 160, 236, 328, 440, 572, 724, 0, 0, 0, 0,
+            ],
+            amount: 1.0,
+        }
+    }
+
+    #[test]
+    fn the_curve_reproduces_what_the_camera_did() {
+        // The acceptance test for the whole correction, and the numbers on the
+        // right are not from a specification — there is none. They are the radial
+        // displacement measured between this frame's own out-of-camera JPEG and
+        // our render of the same RAW, on a 1616-pixel-wide comparison, averaged
+        // over every patch that matched in each hundred-pixel band.
+        //
+        // The tolerance is a pixel and a half because that is where the fit
+        // actually sits. The strongest correction measured — the same lens at
+        // 128 mm — agrees to about four, and most of that gap is one systematic
+        // percent that no choice of divisor removes from all four frames at once.
+        let lens = measured_lens();
+        let corner = (808.0f32 * 808.0 + 540.0 * 540.0).sqrt();
+        for (radius, camera) in [
+            (50.0f32, -2.02f32),
+            (150.0, -6.45),
+            (250.0, -10.58),
+            (350.0, -13.45),
+            (550.0, -17.47),
+            (750.0, -15.03),
+        ] {
+            let ours = radius * (lens.scale_at(radius / corner) - 1.0);
+            assert!(
+                (ours - camera).abs() < 1.5,
+                "at radius {radius} the camera moved the picture by {camera} and we move it by {ours}"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_is_ever_read_from_outside_the_frame() {
+        // The property that makes a black edge impossible, and it has to hold for
+        // a lens that bows the other way too — so here is one that does.
+        let barrel = Distortion {
+            knots: [
+                0, -8, -30, -70, -130, -210, -310, -430, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+            amount: 1.0,
+        };
+        for lens in [measured_lens(), barrel] {
+            for step in 0..=100 {
+                let t = step as f32 / 100.0;
+                let scale = lens.scale_at(t);
+                assert!(
+                    scale <= 1.0 + f32::EPSILON,
+                    "at {t} of the way out the correction reads from {scale} of the radius"
+                );
+            }
+            // And it reaches 1 somewhere, or the correction is cropping the frame
+            // for no reason.
+            let widest = (0..=100)
+                .map(|s| lens.scale_at(s as f32 / 100.0))
+                .fold(f32::MIN, f32::max);
+            assert!((widest - 1.0).abs() < 1e-6, "the widest read is {widest}");
+        }
+    }
+
+    #[test]
+    fn an_amount_of_zero_changes_nothing_and_says_so() {
+        let off = Distortion {
+            amount: 0.0,
+            ..measured_lens()
+        };
+        assert!(off.is_identity());
+        for step in 0..=10 {
+            assert_eq!(off.scale_at(step as f32 / 10.0), 1.0);
+        }
+        // Halfway is halfway, because a person is allowed to want some of it.
+        let half = Distortion {
+            amount: 0.5,
+            ..measured_lens()
+        };
+        let (full, part) = (measured_lens().scale_at(0.0), half.scale_at(0.0));
+        assert!(((1.0 - part) / (1.0 - full) - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn the_padding_at_the_end_is_not_a_knot() {
+        // Twelve of the sixteen slots are used by this lens. Reading the zeros as
+        // knots would bend the curve back to nothing at the corner, which is the
+        // opposite of what it does and would show as the corners staying bent.
+        let lens = measured_lens();
+        let ours = lens.scale_at(1.0);
+        assert!(
+            (ours - 1.0).abs() < 1e-6,
+            "the last real knot is the widest read, and it gave {ours}"
+        );
+        // A lens that genuinely used all sixteen keeps all sixteen.
+        let full = Distortion {
+            knots: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            amount: 1.0,
+        };
+        assert!(full.scale_at(1.0) > full.scale_at(0.9));
     }
 
     #[test]

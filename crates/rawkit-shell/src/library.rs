@@ -58,12 +58,16 @@ pub struct Loaded {
     /// `wb` because it is the same kind of fact: what the file recorded, which
     /// the matching `EditState` field resolves to.
     pub orientation: rawkit_editstate::Orientation,
+    /// The maker's own distortion curve for the lens that was mounted, when the
+    /// body had a profile for it. `None` for a lens it does not know, and for
+    /// the synthetic mosaic, which no lens drew.
+    pub distortion: Option<[i16; 16]>,
 }
 
 impl Loaded {
     /// Decode a RAW, or synthesise one when there is no file to open.
     pub fn open(path: Option<&Path>, tile: u32) -> Result<Self> {
-        let (mosaic, size, phase, wb, profile, camera, orientation) = match path {
+        let (mosaic, size, phase, wb, profile, camera, orientation, distortion) = match path {
             None => {
                 eprintln!("image      : no file given, using a synthetic mosaic");
                 let (width, height) = (2048u32, 1365u32);
@@ -75,8 +79,9 @@ impl Loaded {
                     CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
                     None,
                     // A synthetic mosaic has no camera and so nothing to say
-                    // about which way up it is.
+                    // about which way up it is, and no lens drew it.
                     rawkit_editstate::Orientation::AsShot,
+                    None,
                 )
             }
             Some(path) => {
@@ -105,6 +110,7 @@ impl Loaded {
                 let size = [raw.width, raw.height];
                 let camera = raw.camera.clone();
                 let orientation = raw.orientation;
+                let distortion = raw.distortion;
                 (
                     rawkit_engine::normalise(&raw),
                     size,
@@ -113,6 +119,7 @@ impl Loaded {
                     profile,
                     Some(camera),
                     orientation,
+                    distortion,
                 )
             }
         };
@@ -128,6 +135,7 @@ impl Loaded {
             profile,
             camera,
             orientation,
+            distortion,
         };
         loaded.levels = Pyramid::build(&loaded.frame(), tile).into_levels();
         Ok(loaded)

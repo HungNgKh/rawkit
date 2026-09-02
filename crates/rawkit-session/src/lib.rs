@@ -130,7 +130,19 @@ pub enum Command {
     /// `rawkit_engine::aberration::measure`. What arrives here is a number
     /// somebody can see, undo and overrule, which is the whole reason it is
     /// stored in the edit instead of re-derived per render.
-    SetLens(rawkit_editstate::Lens),
+    /// Boxed, like the grade and the curve: a lens now carries the maker's own
+    /// distortion curve, and sixteen knots in a command that crosses the bus
+    /// many times a second is exactly what `commands_and_events_stay_small`
+    /// exists to catch.
+    SetLens(Box<rawkit_editstate::Lens>),
+    /// How much of the lens's own distortion curve to undo.
+    ///
+    /// Separate from [`Command::SetLens`], which installs the curve and is a
+    /// discrete act — a profile arrives once, from a photograph being opened or
+    /// a switch being thrown. This is the slider on top of it, so it coalesces
+    /// the way every other slider does, and it refuses when there is no curve
+    /// rather than inventing one.
+    SetDistortionAmount(f32),
     /// Every colour equally, and the one that spares the vivid ones.
     SetSaturation(f32),
     SetVibrance(f32),
@@ -252,6 +264,7 @@ impl Command {
             Command::SetChromaNoise(_) => "set_chroma_noise",
             Command::SetDefringe(_) => "set_defringe",
             Command::SetLens(_) => "set_lens",
+            Command::SetDistortionAmount(_) => "set_distortion_amount",
             Command::SetLuminanceNoise(_) => "set_luminance_noise",
             Command::SetSaturation(_) => "set_saturation",
             Command::SetVibrance(_) => "set_vibrance",
@@ -327,6 +340,7 @@ impl Command {
             | Command::SetDefringe(_)
             | Command::SetSaturation(_)
             | Command::SetVibrance(_)
+            | Command::SetDistortionAmount(_)
             | Command::SetHsl { .. }
             | Command::SetStraighten(_) => true,
 
@@ -786,7 +800,7 @@ impl Session {
                 if let Err(e) = lens.validate() {
                     return refused(name, e.to_string());
                 }
-                self.state.lens = lens;
+                self.state.lens = *lens;
                 self.edit_changed()
             }
 
@@ -820,6 +834,18 @@ impl Session {
                 }
                 self.state = proposed;
                 self.edit_changed()
+            }
+
+            Command::SetDistortionAmount(v) => {
+                let Some(distortion) = self.state.lens.distortion else {
+                    return refused(name, "this photograph carries no lens profile");
+                };
+                self.edit(name, v, move |s, v| {
+                    s.lens.distortion = Some(rawkit_editstate::Distortion {
+                        amount: v,
+                        ..distortion
+                    });
+                })
             }
 
             Command::SetSpots { spots, .. } => {

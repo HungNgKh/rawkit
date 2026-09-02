@@ -321,6 +321,12 @@
       <button id="lens-measure">Fix colour fringing</button>
       <button id="lens-clear">Clear</button>
     </div>
+    <div class="row">
+      <button id="lens-distortion">Correct distortion</button>
+    </div>
+    <label id="lens-distortion-row" hidden><span>Amount</span>
+      <input id="lens-distortion-amount" type="range" min="0" max="1" step="0.01" value="1">
+      <output id="lens-distortion-amount-value">1.00</output></label>
     <div id="lens-reading" class="reading">no lens correction</div>
   </details>
 
@@ -764,6 +770,7 @@
     // the edit, and neither does arming a placement.
     try { showMasks(s); } catch (e) { say(`masks: ${e && e.message || e}`); }
     try { showSpots(s); } catch (e) { say(`spots: ${e && e.message || e}`); }
+    try { showLens(s); } catch (e) { say(`lens: ${e && e.message || e}`); }
     showOrientation(s.orientation);
     // Not gated on the generation: a profile is not part of the edit, so
     // choosing one does not move it.
@@ -1691,7 +1698,40 @@
       .finally(() => { e.target.disabled = false; });
   });
   document.getElementById("lens-clear").addEventListener("click", () => {
-    invoke("apply", { command: "set_lens", params: { chromatic_red: 0, chromatic_blue: 0 } })
+    // The distortion travels with it, because Clear is about the fringing and a
+    // frame springing back to bent would read as the two corrections fighting.
+    invoke("apply", { command: "set_lens", params: {
+      chromatic_red: 0, chromatic_blue: 0, distortion: lensDistortion,
+    } }).catch(say);
+  });
+
+  // ---- Lens profile ---------------------------------------------------------
+  //
+  // The curve is the camera's, and whether there is one at all depends on the
+  // lens that was mounted. A body has no profile for an adapted or third-party
+  // lens, and the button says so rather than refusing every time it is pressed.
+
+  let lensDistortion = null;
+  let lensProfile = false;
+
+  const showLens = (s) => {
+    lensProfile = !!s.lens_profile;
+    lensDistortion = (s.state && s.state.lens && s.state.lens.distortion) || null;
+    const on = !!lensDistortion;
+    const button = document.getElementById("lens-distortion");
+    button.classList.toggle("armed", on);
+    button.disabled = !lensProfile && !on;
+    button.textContent = lensProfile || on ? "Correct distortion" : "No lens profile";
+    document.getElementById("lens-distortion-row").hidden = !on;
+    if (on) setSlider("lens-distortion-amount", lensDistortion.amount, v => Number(v).toFixed(2));
+  };
+
+  document.getElementById("lens-distortion").addEventListener("click", () => {
+    invoke("set_distortion", { on: !lensDistortion }).catch(say);
+  });
+  document.getElementById("lens-distortion-amount").addEventListener("input", (e) => {
+    if (!lensDistortion) return;
+    invoke("apply", { command: "set_distortion_amount", params: Number(e.target.value) })
       .catch(say);
   });
 

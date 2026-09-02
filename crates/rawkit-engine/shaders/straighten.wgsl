@@ -30,6 +30,20 @@ struct Params {
     // photograph: the flat buffer still holds the part the crop removed, and
     // sampling it would draw the frame the straighten was meant to trim.
     photograph: vec2<f32>,
+    // The lens's own centre, in flat coordinates, and how far its corner is.
+    // A quarter turn is an isometry, so undoing a radial distortion about the
+    // image of the optical centre is the same map as undoing it in sensor
+    // coordinates -- which is why the canvas does not have to unrotate first.
+    optical_centre: vec2<f32>,
+    corner: f32,
+    // How many of the sixteen below are knots. Zero is a lens nothing is
+    // correcting, and the whole radial step is skipped.
+    knots: u32,
+    // The correction, already resolved on the CPU: the amount applied, the peak
+    // subtracted so nothing is ever read from outside the frame, the divisor
+    // divided out. Read as sixteen floats; packed in fours because that is what
+    // a uniform will hold.
+    curve: array<vec4<f32>, 4>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -51,6 +65,38 @@ fn weights(t: f32) -> vec4<f32> {
     );
 }
 
+/// One of the sixteen resolved knots.
+///
+/// Indexed rather than indexable: a uniform array of `vec4` cannot be addressed
+/// by a runtime value component-wise, so the component is picked by branching.
+fn knot(i: u32) -> f32 {
+    let v = params.curve[i >> 2u];
+    switch (i & 3u) {
+        case 0u: { return v.x; }
+        case 1u: { return v.y; }
+        case 2u: { return v.z; }
+        default: { return v.w; }
+    }
+}
+
+/// Where a point of the corrected photograph reads from on the lens's own image.
+///
+/// The same arithmetic as `Distortion::scale_at`, walking the same resolved
+/// curve, because a preview that corrected by a slightly different amount from
+/// the export would be a difference nobody could see until they compared files.
+fn undistort(at: vec2<f32>) -> vec2<f32> {
+    if (params.knots < 2u || params.corner <= 0.0) {
+        return at;
+    }
+    let offset = at - params.optical_centre;
+    let t = clamp(length(offset) / params.corner, 0.0, 1.0);
+    let x = t * f32(params.knots - 1u);
+    let i = min(u32(x), params.knots - 2u);
+    let f = x - f32(i);
+    let scale = 1.0 + knot(i) * (1.0 - f) + knot(i + 1u) * f;
+    return params.optical_centre + offset * scale;
+}
+
 @compute @workgroup_size(8, 8)
 fn straighten(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.extent.x || gid.y >= params.extent.y) {
@@ -66,10 +112,11 @@ fn straighten(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(canvas, gid.xy, vec4<f32>(0.0, 0.0, 0.0, 1.0));
         return;
     }
-    let flat = params.origin
+    var placed = params.origin
         + params.dx * straight.x
-        + params.dy * straight.y
-        - params.flat_origin;
+        + params.dy * straight.y;
+    placed = undistort(placed);
+    let flat = placed - params.flat_origin;
 
     let size = vec2<i32>(textureDimensions(flat_buffer));
     let base = floor(flat - vec2<f32>(0.5));

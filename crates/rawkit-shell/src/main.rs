@@ -310,6 +310,10 @@ fn snapshot(state: tauri::State<'_, Shared>) -> serde_json::Value {
         // say — and a button that goes on claiming to be armed is worse than
         // one that is a frame behind.
         "mode": mode_name(),
+        // Whether this photograph has a lens profile at all. A correction the
+        // body cannot make is worth saying out loud rather than offering as a
+        // control that refuses every time it is touched.
+        "lens_profile": LENS_PROFILE.lock().expect("lens profile lock").is_some(),
         // The brush's own settings, which are a tool and not an edit: each
         // stroke records the width it was drawn with, so these say what the
         // *next* one will be.
@@ -1077,6 +1081,7 @@ fn main() -> Result<()> {
             select_mask,
             place_mask,
             set_mask,
+            set_distortion,
             remove_spot,
             select_spot,
             set_spot,
@@ -1170,6 +1175,7 @@ fn main() -> Result<()> {
             app.manage(Shelf(library.clone()));
 
             let mut loaded = Loaded::open(raw.as_deref(), DEFAULT_TILE)?;
+            *LENS_PROFILE.lock().expect("lens profile lock") = loaded.distortion;
             *PROFILE_NAME.lock().expect("profile lock") =
                 apply_profile(library.as_ref(), &mut loaded);
             let mut session = Session::new(
@@ -1514,6 +1520,10 @@ fn main() -> Result<()> {
                         apply_profile(exporting_from.as_ref(), &mut next);
                     canvas_renderer.reload(&gpu, &next.frame());
                     showing.size = next.size;
+                    // Published for the commands, which run on the page's thread
+                    // and cannot see a decoded frame. The same arrangement the
+                    // profile name uses, and for the same reason.
+                    *LENS_PROFILE.lock().expect("lens profile lock") = next.distortion;
                     showing.raw = Some(next);
                     // From here on this photograph renders. Holding the preview
                     // as well would mean two answers to what is on screen.
@@ -1642,10 +1652,21 @@ fn main() -> Result<()> {
                                     // is exactly the thing being looked at.
                                     let [w, h] = loaded.size;
                                     let radius = (w as f32).hypot(h as f32) / 2.0;
-                                    shared
-                                        .lock()
-                                        .expect("session lock")
-                                        .apply(Command::SetLens(lens));
+                                    let mut session = shared.lock().expect("session lock");
+                                    // The measurement covers the two chromatic
+                                    // numbers and says nothing about distortion,
+                                    // so whatever the lens profile was doing
+                                    // carries over. Sending the measured `Lens`
+                                    // whole would switch the distortion off, and
+                                    // the symptom — the frame springing back to
+                                    // bent when you correct the fringing — would
+                                    // read as the two corrections fighting.
+                                    let carried = rawkit_editstate::Lens {
+                                        distortion: session.state().lens.distortion,
+                                        ..lens
+                                    };
+                                    session.apply(Command::SetLens(Box::new(carried)));
+                                    drop(session);
                                     notice(format!(
                                         "lens: red {:+.2} px, blue {:+.2} px at the corner ({:.0} ms)",
                                         lens.chromatic_red * radius,
@@ -2907,6 +2928,14 @@ static PLACING_MASK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// coalesce".
 const MASK_CONTROLS: u8 = 16;
 
+/// The lens profile the open photograph carries.
+///
+/// Published by the render loop when a photograph is decoded, because the
+/// commands that build a `Lens` run on the page's thread and have no way to
+/// reach the frame. `None` is a lens the body had no profile for — which is a
+/// state to show rather than a slider that silently does nothing.
+pub(crate) static LENS_PROFILE: Mutex<Option<[i16; 16]>> = Mutex::new(None);
+
 /// Which blemish the panel is showing. `usize::MAX` is "none".
 static SELECTED_SPOT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(usize::MAX);
@@ -3281,6 +3310,32 @@ fn place_mask(armed: bool) -> bool {
 }
 
 /// Move one control of one local adjustment.
+/// Turn the maker's own distortion correction on or off.
+///
+/// Installs the curve as well as the switch: the profile is a fact about the
+/// file, and the edit carries it so that the same edit on another machine
+/// renders the same geometry. Refused, with a reason, on a lens the body had no
+/// profile for — an adapted or manual one, or a third-party lens the firmware
+/// does not know.
+#[tauri::command]
+fn set_distortion(on: bool, state: tauri::State<'_, Shared>) -> Result<(), String> {
+    let knots = *LENS_PROFILE.lock().expect("lens profile lock");
+    let mut session = state.0.lock().expect("session lock");
+    let distortion = match (on, knots) {
+        (false, _) => None,
+        (true, Some(knots)) => Some(rawkit_editstate::Distortion { knots, amount: 1.0 }),
+        (true, None) => {
+            return Err("this photograph carries no lens profile to correct with".into())
+        }
+    };
+    let lens = rawkit_editstate::Lens {
+        distortion,
+        ..session.state().lens
+    };
+    session.apply(Command::SetLens(Box::new(lens)));
+    Ok(())
+}
+
 /// Throw a blemish away.
 #[tauri::command]
 fn remove_spot(index: usize, state: tauri::State<'_, Shared>) -> Result<usize, String> {
