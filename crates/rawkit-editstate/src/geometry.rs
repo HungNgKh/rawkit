@@ -35,6 +35,30 @@
 
 use crate::{Crop, Distortion, EditState, Orientation};
 
+/// Three-by-three, row major, acting on `[x, y, 1]`.
+fn mul3(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let mut out = [[0.0f32; 3]; 3];
+    for (i, row) in out.iter_mut().enumerate() {
+        for (j, cell) in row.iter_mut().enumerate() {
+            *cell = (0..3).map(|k| a[i][k] * b[k][j]).sum();
+        }
+    }
+    out
+}
+
+/// The homogeneous product, *undivided* — the third component is the divisor.
+///
+/// Kept undivided on purpose: [`Geometry::fit_scale`] needs the numerator and
+/// the denominator apart to solve for the fit, and dividing here would throw
+/// away exactly the half it works with.
+fn apply3(m: &[[f32; 3]; 3], p: [f32; 3]) -> [f32; 3] {
+    [
+        m[0][0] * p[0] + m[0][1] * p[1] + m[0][2] * p[2],
+        m[1][0] * p[0] + m[1][1] * p[1] + m[1][2] * p[2],
+        m[2][0] * p[0] + m[2][1] * p[1] + m[2][2] * p[2],
+    ]
+}
+
 /// A lens's distortion, ready for a gather that works in flat coordinates.
 ///
 /// See [`Geometry::distortion_map`]. The curve is the resolved one — amount
@@ -130,7 +154,17 @@ impl Geometry {
     /// path is worth taking whenever it is available, not only when there is
     /// nothing to do at all.
     pub fn resamples(&self) -> bool {
-        self.crop.angle_deg != 0.0 || self.distortion.is_some()
+        self.crop.angle_deg != 0.0 || self.warps() || self.distortion.is_some()
+    }
+
+    /// Whether the frame is being pushed out of its own plane, or stretched.
+    ///
+    /// Separate from the straighten because it is what makes the map projective
+    /// rather than merely rotated, and separate from
+    /// [`resamples`](Self::resamples) because a lens correction resamples
+    /// without warping.
+    fn warps(&self) -> bool {
+        self.crop.vertical != 0.0 || self.crop.horizontal != 0.0 || self.crop.aspect != 1.0
     }
 
     /// How far outside a sample the renderer's filter reaches, in pixels.
@@ -162,33 +196,110 @@ impl Geometry {
         let (cx, cy) = ((x0 + x1) as f32 / 2.0, (y0 + y1) as f32 / 2.0);
         let (hx, hy) = ((x1 - x0) as f32 / 2.0, (y1 - y0) as f32 / 2.0);
 
-        let (sin, cos) = self.angle().sin_cos();
-        // Where the crop's own centre reads from. Everything else is measured
-        // from here.
-        let (dcx, dcy) = (cx - fw / 2.0, cy - fh / 2.0);
-        let centre = [
-            fw / 2.0 + dcx * cos + dcy * sin,
-            fh / 2.0 - dcx * sin + dcy * cos,
-        ];
-
+        // A corner sits at `centre + s * offset`, so in *homogeneous*
+        // coordinates the warped corner is `w·[centre, 1] + s · w·[offset, 0]` —
+        // two matrix products, and every coordinate is then one affine function
+        // of `s` over another. That is what keeps this an exact solve rather
+        // than a search once the map stopped being affine: a ratio of affines is
+        // still linear in `s` once the inequality is cleared of its denominator,
+        // and a search here would need a tolerance, which is a sliver of empty
+        // corner in an export.
+        let w = self.warp(image);
+        let base = apply3(&w, [cx, cy, 1.0]);
         let mut scale = 1.0f32;
         for (ox, oy) in [(-hx, -hy), (hx, -hy), (-hx, hy), (hx, hy)] {
-            // The corner's offset from the centre, rotated the same way.
-            let offset = [ox * cos + oy * sin, -ox * sin + oy * cos];
+            let step = apply3(&w, [ox, oy, 0.0]);
+            // The denominator has to stay positive, or the corner has passed
+            // through the horizon and there is no picture on this side of it.
+            if step[2] < 0.0 {
+                scale = scale.min(-base[2] / step[2] * 0.99);
+            }
             for axis in 0..2 {
                 let extent = if axis == 0 { fw } else { fh };
                 // Inset by the filter's reach, not by nothing: the corner has to
                 // be far enough in that its *taps* are on the frame too.
                 let (low, high) = (Self::FILTER_MARGIN, extent - Self::FILTER_MARGIN);
-                let (at, step) = (centre[axis], offset[axis]);
-                if step > 0.0 {
-                    scale = scale.min((high - at) / step);
-                } else if step < 0.0 {
-                    scale = scale.min((low - at) / step);
+                let (n0, n1) = (base[axis], step[axis]);
+                let (d0, d1) = (base[2], step[2]);
+                for (bound, above) in [(high, true), (low, false)] {
+                    // `(n0 + s·n1) <= bound·(d0 + s·d1)`, or `>=` below the
+                    // bound, cleared of the denominator and solved for `s`.
+                    let (a, b) = if above {
+                        (n1 - bound * d1, bound * d0 - n0)
+                    } else {
+                        (bound * d1 - n1, n0 - bound * d0)
+                    };
+                    if a > 0.0 {
+                        scale = scale.min(b / a);
+                    }
                 }
             }
         }
         scale.clamp(0.0, 1.0)
+    }
+
+    /// Everything the frame does to itself, as one matrix on `[x, y, 1]`.
+    ///
+    /// Keystone then straighten, both about the frame's own centre, and the
+    /// result is still in **oriented** pixels — the crop's translation out to
+    /// flat is deliberately not here. [`fit_scale`] compares corners against the
+    /// frame's own edges, so it needs them in the frame's own coordinates; a
+    /// translation folded in here would shift every corner by the crop's origin
+    /// and the fit would solve against the wrong box.
+    ///
+    /// Independent of the fit, which is what lets [`fit_scale`] solve for the
+    /// fit by pushing two vectors through this.
+    fn warp(&self, image: [u32; 2]) -> [[f32; 3]; 3] {
+        let [fw, fh] = self.oriented_size(image);
+        let (hx, hy) = (fw as f32 / 2.0, fh as f32 / 2.0);
+        let (sin, cos) = self.angle().sin_cos();
+
+        // Normalised so both sliders mean the same thing on any frame: the
+        // keystone is expressed against half the width and half the height, not
+        // against pixels, so a portrait crop does not need different numbers
+        // from a landscape one.
+        let mut m = mul3(
+            &[[1.0, 0.0, hx], [0.0, 1.0, hy], [0.0, 0.0, 1.0]],
+            &[[hx, 0.0, 0.0], [0.0, hy, 0.0], [0.0, 0.0, 1.0]],
+        );
+        // Negated, and that is the sign convention rather than an accident. The
+        // divisor grows towards the *near* edge, so a positive coefficient would
+        // magnify the bottom and the right; a photograph is far more often shot
+        // looking up at something than down at it, so positive is made to mean
+        // "bring the top back", and the horizontal follows it.
+        m = mul3(
+            &m,
+            &[
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [-self.crop.horizontal, -self.crop.vertical, 1.0],
+            ],
+        );
+        let a = if self.crop.aspect > 0.0 {
+            self.crop.aspect
+        } else {
+            1.0
+        };
+        // The reciprocal, for the same reason: this is the map from the picture
+        // *back* to the frame, so reading from nearer the centre is what widens.
+        m = mul3(&m, &[[1.0 / a, 0.0, 0.0], [0.0, a, 0.0], [0.0, 0.0, 1.0]]);
+        m = mul3(
+            &m,
+            &[[1.0 / hx, 0.0, 0.0], [0.0, 1.0 / hy, 0.0], [0.0, 0.0, 1.0]],
+        );
+        m = mul3(&m, &[[1.0, 0.0, -hx], [0.0, 1.0, -hy], [0.0, 0.0, 1.0]]);
+
+        // The straighten, about the *frame* centre and not the crop's: a
+        // straighten levels the photograph, and moving the crop afterwards must
+        // not tilt it again.
+        let rotate = mul3(
+            &mul3(
+                &[[1.0, 0.0, hx], [0.0, 1.0, hy], [0.0, 0.0, 1.0]],
+                &[[cos, sin, 0.0], [-sin, cos, 0.0], [0.0, 0.0, 1.0]],
+            ),
+            &[[1.0, 0.0, -hx], [0.0, 1.0, -hy], [0.0, 0.0, 1.0]],
+        );
+        mul3(&rotate, &m)
     }
 
     /// Quarter-turns clockwise: the camera's, then the user's.
@@ -245,50 +356,52 @@ impl Geometry {
     /// tiles land there by permutation and stay exact. The straighten is the one
     /// step that has to be a gather, and this is the map it gathers along.
     pub fn flat_of_straight(&self, straight: [f32; 2], image: [u32; 2]) -> [f32; 2] {
-        let [fw, fh] = self.oriented_size(image);
-        let (fw, fh) = (fw as f32, fh as f32);
+        let m = self.flat_homography(image);
+        let p = apply3(&m, [straight[0], straight[1], 1.0]);
+        // Behind the horizon there is no answer, and returning a huge one would
+        // be worse than returning the centre: the resampler would read the wrong
+        // end of the frame rather than the clamped edge. `fit_scale` pulls the
+        // crop in far enough that this cannot fire for a legal edit.
+        if p[2].abs() < 1e-6 {
+            return [0.0, 0.0];
+        }
+        [p[0] / p[2], p[1] / p[2]]
+    }
+
+    /// The straight-to-flat map, as one three-by-three on `[x, y, 1]`.
+    ///
+    /// **This is the definition, and `flat_of_straight` is its application.**
+    /// It used to be the other way round — the transform was *measured* from the
+    /// map at three points, so that the GPU and the CPU could not disagree about
+    /// the algebra. Three points determine an affine map exactly and a
+    /// projective one not at all, and the moment a keystone entered the chain
+    /// the measured version was quietly wrong. Building it once and applying it
+    /// on both sides keeps the guarantee the measuring was there for, without a
+    /// number of points to get right.
+    pub fn flat_homography(&self, image: [u32; 2]) -> [[f32; 3]; 3] {
         let [x0, y0, x1, y1] = self.window(image);
-        let (cx, cy) = ((x0 + x1) as f32 / 2.0, (y0 + y1) as f32 / 2.0);
         let scale = self.fit_scale(image);
+        let (cx, cy) = ((x0 + x1) as f32 / 2.0, (y0 + y1) as f32 / 2.0);
         let (hx, hy) = (
             (x1 - x0) as f32 / 2.0 * scale,
             (y1 - y0) as f32 / 2.0 * scale,
         );
         let [ow, oh] = self.output_size(image);
-
-        // Into the shrunk rectangle, in oriented pixels.
-        let px = cx - hx + straight[0] * (2.0 * hx / ow as f32);
-        let py = cy - hy + straight[1] * (2.0 * hy / oh as f32);
-
-        // Rotate back about the *frame* centre, not the crop's: a straighten
-        // levels the photograph, and moving the crop afterwards must not tilt
-        // it again.
-        let (sin, cos) = self.angle().sin_cos();
-        let (dx, dy) = (px - fw / 2.0, py - fh / 2.0);
-        [
-            fw / 2.0 + dx * cos + dy * sin - x0 as f32,
-            fh / 2.0 - dx * sin + dy * cos - y0 as f32,
-        ]
-    }
-
-    /// The straight-to-flat map as an affine transform: `[origin, dx, dy]`.
-    ///
-    /// A point becomes `origin + dx · straight.x + dy · straight.y`. The map is
-    /// affine — a scale, a rotation and a translation — so three evaluations
-    /// determine it exactly, and **it is measured from
-    /// [`flat_of_straight`](Self::flat_of_straight) rather than derived
-    /// alongside it**. That matters: the GPU needs the transform and the CPU
-    /// needs the map, and re-deriving the same algebra in two places is how a
-    /// canvas ends up framing a photograph differently from the file it exports.
-    pub fn flat_transform(&self, image: [u32; 2]) -> [[f32; 2]; 3] {
-        let origin = self.flat_of_straight([0.0, 0.0], image);
-        let along_x = self.flat_of_straight([1.0, 0.0], image);
-        let along_y = self.flat_of_straight([0.0, 1.0], image);
-        [
-            origin,
-            [along_x[0] - origin[0], along_x[1] - origin[1]],
-            [along_y[0] - origin[0], along_y[1] - origin[1]],
-        ]
+        // Straight coordinates into the shrunk rectangle, in oriented pixels.
+        let into = [
+            [2.0 * hx / ow as f32, 0.0, cx - hx],
+            [0.0, 2.0 * hy / oh as f32, cy - hy],
+            [0.0, 0.0, 1.0],
+        ];
+        // And out to flat, which is measured from the crop's corner — the one
+        // step the warp leaves out, because the fit needs the frame's own
+        // coordinates.
+        let out = [
+            [1.0, 0.0, -(x0 as f32)],
+            [0.0, 1.0, -(y0 as f32)],
+            [0.0, 0.0, 1.0],
+        ];
+        mul3(&mul3(&out, &self.warp(image)), &into)
     }
 
     /// The flat-space rectangle covering a straight one, as `[x0, y0, x1, y1]`.
@@ -781,6 +894,7 @@ mod tests {
                 right: 0.9,
                 bottom: 0.8,
                 angle_deg: -6.0,
+                ..Crop::default()
             },
         );
         let [ow, oh] = g.output_size(image);
@@ -809,15 +923,14 @@ mod tests {
                     right: 0.85,
                     bottom: 0.95,
                     angle_deg: degrees,
+                    ..Crop::default()
                 },
             );
-            let [origin, dx, dy] = g.flat_transform(image);
+            let m = g.flat_homography(image);
             for (sx, sy) in [(0.0, 0.0), (13.0, 7.0), (60.5, 41.25), (-4.0, 120.0)] {
                 let walked = g.flat_of_straight([sx, sy], image);
-                let mapped = [
-                    origin[0] + dx[0] * sx + dy[0] * sy,
-                    origin[1] + dx[1] * sx + dy[1] * sy,
-                ];
+                let p = apply3(&m, [sx, sy, 1.0]);
+                let mapped = [p[0] / p[2], p[1] / p[2]];
                 for axis in 0..2 {
                     assert!(
                         (walked[axis] - mapped[axis]).abs() < 2e-3,
@@ -826,6 +939,104 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_keystone_never_reads_from_outside_the_frame() {
+        // What `fit_scale` is for, and the reason it solves rather than searches:
+        // a projective warp swings the corners further than a rotation does, and
+        // an output pixel whose source is off the frame is a black wedge in an
+        // export. Walked along the whole border, not just the four corners --
+        // the widest point of a keystoned edge is not always a corner.
+        let image = [1600u32, 1000];
+        for (vertical, horizontal, aspect) in [
+            (0.35f32, 0.0f32, 1.0f32),
+            (-0.35, 0.0, 1.0),
+            (0.0, 0.3, 1.0),
+            (0.2, -0.2, 1.0),
+            (0.15, 0.1, 1.4),
+            (-0.1, 0.25, 0.7),
+        ] {
+            let g = with(
+                Orientation::AsShot,
+                Crop {
+                    vertical,
+                    horizontal,
+                    aspect,
+                    angle_deg: 4.0,
+                    ..Crop::default()
+                },
+            );
+            let [ow, oh] = g.output_size(image);
+            assert!(ow > 8 && oh > 8, "the fit collapsed the frame to {ow}x{oh}");
+            for step in 0..=64 {
+                let t = step as f32 / 64.0;
+                for (x, y) in [
+                    (t * ow as f32, 0.0),
+                    (t * ow as f32, oh as f32 - 1.0),
+                    (0.0, t * oh as f32),
+                    (ow as f32 - 1.0, t * oh as f32),
+                ] {
+                    let [sx, sy] = g.source_at([x, y], image);
+                    assert!(
+                        (0.0..=image[0] as f32).contains(&sx)
+                            && (0.0..=image[1] as f32).contains(&sy),
+                        "({vertical}, {horizontal}, {aspect}) reads ({x}, {y}) from \
+                         ({sx:.1}, {sy:.1}), outside a {}x{} frame",
+                        image[0],
+                        image[1]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_keystone_is_projective_and_not_merely_a_stretch() {
+        // The property that separates this from an aspect slider: equal steps
+        // across the output map to *unequal* steps across the source, and the
+        // inequality is monotone. A map that failed this would be an affine one
+        // wearing the word "perspective", and converging verticals would stay
+        // converging.
+        let image = [1000u32, 1000];
+        let g = with(
+            Orientation::AsShot,
+            Crop {
+                vertical: 0.3,
+                ..Crop::default()
+            },
+        );
+        let [ow, oh] = g.output_size(image);
+        let column = ow as f32 / 2.0;
+        let mut steps = Vec::new();
+        for i in 0..8 {
+            let y0 = i as f32 / 8.0 * oh as f32;
+            let y1 = (i + 1) as f32 / 8.0 * oh as f32;
+            let a = g.source_at([column, y0], image);
+            let b = g.source_at([column, y1], image);
+            steps.push(b[1] - a[1]);
+        }
+        for pair in steps.windows(2) {
+            assert!(
+                pair[1] > pair[0] * 1.001,
+                "the steps down the frame are {steps:?}, which is not a perspective"
+            );
+        }
+        assert!(
+            steps[7] > steps[0] * 1.3,
+            "the map barely diverges: {steps:?}"
+        );
+    }
+
+    #[test]
+    fn a_perspective_of_nothing_never_reaches_the_resampler() {
+        // The identity claim, and the reason `aspect` defaults to one rather
+        // than to zero: an edit written before any of this existed must come
+        // back meaning "do not warp", and cost nothing to render.
+        let g = with(Orientation::AsShot, Crop::default());
+        assert!(!g.resamples());
+        assert!(g.is_identity());
+        assert_eq!(g.fit_scale([100, 100]), 1.0);
     }
 
     #[test]

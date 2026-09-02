@@ -104,6 +104,17 @@ pub enum Command {
     SetShadows(f32),
     SetWhites(f32),
     SetBlacks(f32),
+    /// One of the three perspective controls, by index: 0 vertical, 1
+    /// horizontal, 2 aspect.
+    ///
+    /// Not [`Command::SetCrop`], which installs a whole rectangle and is a
+    /// discrete act — a crop arrives from a drag on the photograph, once. These
+    /// are sliders and coalesce like every other slider, with `control` keeping
+    /// a drag on one from folding into a drag on the next.
+    SetPerspective {
+        control: u8,
+        value: f32,
+    },
     /// Local contrast at the guide's own scale, and at a few pixels.
     SetClarity(f32),
     SetTexture(f32),
@@ -114,8 +125,14 @@ pub enum Command {
     SetTemperature(Option<f32>),
     SetTint(f32),
     SetOrientation(Orientation),
-    /// The visible rectangle, as fractions of the oriented frame.
-    SetCrop(Crop),
+    /// The visible rectangle, as fractions of the oriented frame, and the warps
+    /// resolved with it.
+    ///
+    /// Boxed for the reason [`Command::SetLens`] is: a crop now carries a
+    /// keystone and an aspect as well as four edges and an angle, and a command
+    /// that crosses the bus many times a second is what
+    /// `commands_and_events_stay_small` exists to keep small.
+    SetCrop(Box<Crop>),
     /// Capture sharpening, and how wide its blur is. Refused out of range,
     /// because a radius past what the tile halo covers reads demosaic output
     /// that is wrong at a tile edge — a faint grid, not an obvious failure.
@@ -260,6 +277,7 @@ impl Command {
             Command::SetShadows(_) => "set_shadows",
             Command::SetWhites(_) => "set_whites",
             Command::SetBlacks(_) => "set_blacks",
+            Command::SetPerspective { .. } => "set_perspective",
             Command::SetClarity(_) => "set_clarity",
             Command::SetTexture(_) => "set_texture",
             Command::SetDehaze(_) => "set_dehaze",
@@ -319,6 +337,7 @@ impl Command {
             Command::SetGrade { control, .. } => *control,
             Command::SetMasks { control, .. } => *control,
             Command::SetSpots { control, .. } => *control,
+            Command::SetPerspective { control, .. } => *control,
             Command::SetHsl { band, control, .. } => {
                 let control = match control {
                     rawkit_editstate::BandControl::Hue => 0,
@@ -339,6 +358,7 @@ impl Command {
             | Command::SetShadows(_)
             | Command::SetWhites(_)
             | Command::SetBlacks(_)
+            | Command::SetPerspective { .. }
             | Command::SetClarity(_)
             | Command::SetTexture(_)
             | Command::SetDehaze(_)
@@ -752,6 +772,22 @@ impl Session {
             Command::SetShadows(v) => self.edit(name, v, |s, v| s.tone.shadows = v),
             Command::SetWhites(v) => self.edit(name, v, |s, v| s.tone.whites = v),
             Command::SetBlacks(v) => self.edit(name, v, |s, v| s.tone.blacks = v),
+            // Through `Crop::validate`, because the ranges belong to the crop
+            // and an aspect of zero would divide the map by nothing rather than
+            // merely look wrong.
+            Command::SetPerspective { control, value } => {
+                let mut crop = self.state.crop;
+                match control {
+                    0 => crop.vertical = value,
+                    1 => crop.horizontal = value,
+                    2 => crop.aspect = value,
+                    other => return refused(name, format!("{other} is not a perspective control")),
+                }
+                if let Err(e) = crop.validate() {
+                    return refused(name, e.to_string());
+                }
+                self.edit(name, value, move |s, _| s.crop = crop)
+            }
             Command::SetClarity(v) => self.edit(name, v, |s, v| s.tone.clarity = v),
             Command::SetTexture(v) => self.edit(name, v, |s, v| s.tone.texture = v),
             Command::SetDehaze(v) => self.edit(name, v, |s, v| s.tone.dehaze = v),
@@ -928,7 +964,7 @@ impl Session {
                 if let Err(e) = crop.validate() {
                     return refused(name, e.to_string());
                 }
-                self.state.crop = crop;
+                self.state.crop = *crop;
                 self.edit_changed()
             }
 
@@ -2185,13 +2221,13 @@ mod tests {
         let mut s = session();
         s.apply(Command::FitToView);
         let fitted = s.viewport().scale;
-        s.apply(Command::SetCrop(Crop {
+        s.apply(Command::SetCrop(Box::new(Crop {
             left: 0.25,
             top: 0.25,
             right: 0.75,
             bottom: 0.75,
             ..Crop::default()
-        }));
+        })));
 
         assert_eq!(s.developed_size(), [3000, 2000]);
         assert_eq!(s.image_size(), IMAGE, "the sensor did not change size");
@@ -2222,13 +2258,13 @@ mod tests {
         s.apply(Command::FitToView);
         let whole = s.visible_tiles(3).len();
 
-        s.apply(Command::SetCrop(Crop {
+        s.apply(Command::SetCrop(Box::new(Crop {
             left: 0.0,
             top: 0.0,
             right: 0.25,
             bottom: 0.25,
             ..Crop::default()
-        }));
+        })));
         s.apply(Command::FitToView);
         let corner = s.visible_tiles(3);
         assert!(
@@ -2247,13 +2283,13 @@ mod tests {
         // while looking entirely plausible.
         let mut s = session();
         s.apply(Command::SetOrientation(Orientation::Rotate90Cw));
-        s.apply(Command::SetCrop(Crop {
+        s.apply(Command::SetCrop(Box::new(Crop {
             left: 0.0,
             top: 0.0,
             right: 0.25,
             bottom: 0.25,
             ..Crop::default()
-        }));
+        })));
         s.apply(Command::FitToView);
 
         let tiles = s.visible_tiles(3);
@@ -2270,13 +2306,13 @@ mod tests {
     fn a_crop_that_is_not_a_rectangle_is_refused_and_changes_nothing() {
         let mut s = session();
         let before = s.state().clone();
-        let event = s.apply(Command::SetCrop(Crop {
+        let event = s.apply(Command::SetCrop(Box::new(Crop {
             left: 0.8,
             top: 0.0,
             right: 0.2,
             bottom: 1.0,
             ..Crop::default()
-        }));
+        })));
         assert!(matches!(event, Event::Refused { .. }), "{event:?}");
         assert_eq!(s.state(), &before);
         assert_eq!(s.developed_size(), IMAGE);

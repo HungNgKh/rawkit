@@ -975,10 +975,50 @@ pub struct Crop {
     /// quarter turns are [`Orientation`]'s job.
     #[serde(default)]
     pub angle_deg: f32,
+    /// Keystone: how far the frame is tilted away from the plane it is looking
+    /// at, up and down.
+    ///
+    /// Positive magnifies the top, which is what corrects a photograph taken
+    /// looking *up* at something — the common case by a wide margin, and the
+    /// reason that is the direction the sign points.
+    ///
+    /// Here for the same reason `angle_deg` is, and more so — a projective warp
+    /// leaves *larger* empty corners than a rotation, and the only thing that
+    /// can keep them out of the picture is the rectangle above. Stored together
+    /// because they are resolved together, by one fit.
+    #[serde(default)]
+    pub vertical: f32,
+    /// The same, left and right: positive magnifies the left.
+    #[serde(default)]
+    pub horizontal: f32,
+    /// Stretch, as a ratio: above 1 widens, below 1 heightens.
+    ///
+    /// The fourth control every editor puts beside the other three, and it is
+    /// here rather than in the crop's edges because it is a *warp* — it moves
+    /// what is inside the rectangle rather than choosing a different rectangle.
+    #[serde(default = "one")]
+    pub aspect: f32,
+}
+
+fn one() -> f32 {
+    1.0
 }
 
 /// The largest straighten this is, in degrees.
 pub const MAX_STRAIGHTEN_DEG: f32 = 15.0;
+
+/// How far a keystone may be pushed.
+///
+/// The number is the projective denominator's swing across half the frame, so
+/// 0.35 means the far edge is read from about a third nearer the centre than
+/// the near one. Past that the correction is stretching a few rows of pixels
+/// across most of the picture and no crop can hide what it costs — which is a
+/// limit of the operation rather than a taste, and so a refusal rather than a
+/// clamp.
+pub const MAX_KEYSTONE: f32 = 0.35;
+
+/// The most the frame may be stretched, and its reciprocal is the least.
+pub const MAX_ASPECT: f32 = 1.5;
 
 impl Default for Crop {
     /// The whole frame.
@@ -989,6 +1029,9 @@ impl Default for Crop {
             right: 1.0,
             bottom: 1.0,
             angle_deg: 0.0,
+            vertical: 0.0,
+            horizontal: 0.0,
+            aspect: 1.0,
         }
     }
 }
@@ -1022,6 +1065,20 @@ impl Crop {
                 "straighten is {} degrees, and runs from -{MAX_STRAIGHTEN_DEG} to \
                  {MAX_STRAIGHTEN_DEG}; whole quarter turns are the orientation's job",
                 self.angle_deg
+            )));
+        }
+        for (name, value) in [("vertical", self.vertical), ("horizontal", self.horizontal)] {
+            if !value.is_finite() || value.abs() > MAX_KEYSTONE {
+                return Err(EditStateError::InvalidCrop(format!(
+                    "{name} keystone is {value}, and runs from -{MAX_KEYSTONE} to {MAX_KEYSTONE}"
+                )));
+            }
+        }
+        if !self.aspect.is_finite() || !(1.0 / MAX_ASPECT..=MAX_ASPECT).contains(&self.aspect) {
+            return Err(EditStateError::InvalidCrop(format!(
+                "aspect is {}, and runs from {} to {MAX_ASPECT}",
+                self.aspect,
+                1.0 / MAX_ASPECT
             )));
         }
         if self.left >= self.right || self.top >= self.bottom {
@@ -1997,6 +2054,52 @@ mod tests {
             amount: 1.0,
         };
         assert!(full.scale_at(1.0) > full.scale_at(0.9));
+    }
+
+    #[test]
+    fn an_edit_written_before_the_perspective_existed_still_reads() {
+        // `aspect` is the field that makes this worth pinning: it defaults to
+        // *one* rather than to zero, and a serde default that fell back to zero
+        // would turn every stored crop into a divide by nothing. Every edit
+        // anybody has is one of these.
+        let json = r#"{
+            "schema_version": 1,
+            "crop": { "left": 0.1, "top": 0.2, "right": 0.9, "bottom": 0.8, "angle_deg": 3.0 }
+        }"#;
+        let state: EditState = serde_json::from_str(json).expect("an edit from before this");
+        assert_eq!(state.crop.aspect, 1.0);
+        assert_eq!(state.crop.vertical, 0.0);
+        assert_eq!(state.crop.horizontal, 0.0);
+        state.validate().expect("and it is still a usable edit");
+    }
+
+    #[test]
+    fn a_keystone_past_what_the_map_can_carry_is_refused() {
+        for bad in [MAX_KEYSTONE * 1.5, -MAX_KEYSTONE * 1.5, f32::NAN] {
+            let state = EditState {
+                crop: Crop {
+                    vertical: bad,
+                    ..Crop::default()
+                },
+                ..EditState::default()
+            };
+            assert!(
+                state.validate().is_err(),
+                "a keystone of {bad} was accepted"
+            );
+        }
+        // And an aspect of zero, which is the one that would divide by nothing
+        // rather than merely look wrong.
+        for bad in [0.0, -1.0, MAX_ASPECT * 2.0, f32::NAN] {
+            let state = EditState {
+                crop: Crop {
+                    aspect: bad,
+                    ..Crop::default()
+                },
+                ..EditState::default()
+            };
+            assert!(state.validate().is_err(), "an aspect of {bad} was accepted");
+        }
     }
 
     #[test]

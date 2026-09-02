@@ -468,6 +468,7 @@ mod tests {
                 right: 0.8,
                 bottom: 0.9,
                 angle_deg: 0.0,
+                ..Crop::default()
             },
             None,
         );

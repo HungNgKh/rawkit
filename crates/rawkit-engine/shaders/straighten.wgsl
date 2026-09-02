@@ -20,10 +20,15 @@ struct Params {
     straight_origin: vec2<f32>,
     // The flat-space point of the flat buffer's top-left pixel.
     flat_origin: vec2<f32>,
-    // `flat = origin + dx * straight.x + dy * straight.y`.
-    origin: vec2<f32>,
-    dx: vec2<f32>,
-    dy: vec2<f32>,
+    // `flat = (m * vec3(straight, 1)).xy / .z` -- the straight-to-flat map, as
+    // the three-by-three the Rust side builds. A homography and not an affine
+    // triple, because a keystone is a projective warp: the divide is the whole
+    // difference between "the frame is rotated" and "the frame is leaning away".
+    // Three rows of `vec4` rather than `mat3x3`, so the padding is written down
+    // rather than assumed.
+    m0: vec4<f32>,
+    m1: vec4<f32>,
+    m2: vec4<f32>,
     // How much of the canvas to fill, in pixels.
     extent: vec2<u32>,
     // The photograph's own size in straight pixels. Beyond it is not more
@@ -112,9 +117,20 @@ fn straighten(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(canvas, gid.xy, vec4<f32>(0.0, 0.0, 0.0, 1.0));
         return;
     }
-    var placed = params.origin
-        + params.dx * straight.x
-        + params.dy * straight.y;
+    let homogeneous = vec3<f32>(
+        dot(params.m0.xyz, vec3<f32>(straight, 1.0)),
+        dot(params.m1.xyz, vec3<f32>(straight, 1.0)),
+        dot(params.m2.xyz, vec3<f32>(straight, 1.0)),
+    );
+    // Behind the horizon there is no answer. The fit pulls the crop in far
+    // enough that a legal edit cannot reach here, so this is a guard rather than
+    // a behaviour -- but a divide by nothing must not become a texture read at
+    // whatever coordinate that produces.
+    if (abs(homogeneous.z) < 1e-6) {
+        textureStore(canvas, gid.xy, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+    var placed = homogeneous.xy / homogeneous.z;
     placed = undistort(placed);
     let flat = placed - params.flat_origin;
 

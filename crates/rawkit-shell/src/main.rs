@@ -2110,7 +2110,7 @@ fn main() -> Result<()> {
                                 // the photograph changes shape, so asking again
                                 // here would be a second opinion on the same
                                 // question.
-                                session.apply(Command::SetCrop(crop));
+                                session.apply(Command::SetCrop(Box::new(crop)));
                             }
                         }
                         *CANVAS_MARQUEE.lock().expect("marquee lock") = None;
@@ -4793,7 +4793,7 @@ mod gradient_tests {
                 top: 0.25,
                 right: 0.75,
                 bottom: 0.75,
-                angle_deg: 0.0,
+                ..Crop::default()
             },
             ..EditState::default()
         });

@@ -298,9 +298,19 @@
     <label><span>Straighten</span>
       <input id="straighten" type="range" min="-15" max="15" step="0.1" value="0">
       <output id="straighten-value">0.0°</output></label>
+    <label><span>Vertical</span>
+      <input id="vertical" type="range" min="-0.35" max="0.35" step="0.005" value="0">
+      <output id="vertical-value">0.000</output></label>
+    <label><span>Horizontal</span>
+      <input id="horizontal" type="range" min="-0.35" max="0.35" step="0.005" value="0">
+      <output id="horizontal-value">0.000</output></label>
+    <label><span>Aspect</span>
+      <input id="aspect" type="range" min="0.667" max="1.5" step="0.005" value="1">
+      <output id="aspect-value">1.000</output></label>
     <div class="row">
       <button data-rotate="-1">↺</button>
       <button data-rotate="1">↻</button>
+      <button id="perspective-reset">Reset perspective</button>
     </div>
   </details>
 
@@ -572,6 +582,19 @@
   slider("shadows", v => ({ command: "set_shadows", params: v }), v => v.toFixed(2));
   slider("whites", v => ({ command: "set_whites", params: v }), v => v.toFixed(2));
   slider("blacks", v => ({ command: "set_blacks", params: v }), v => v.toFixed(2));
+  // The perspective three. Indexed rather than named on the wire, because the
+  // session keys a drag's undo step on the number and a string would have to be
+  // turned back into one somewhere.
+  const PERSPECTIVE = [["vertical", 0], ["horizontal", 1], ["aspect", 2]];
+  for (const [id, control] of PERSPECTIVE) {
+    slider(id, v => ({ command: "set_perspective", params: { control, value: v } }),
+      v => v.toFixed(3));
+  }
+  document.getElementById("perspective-reset").addEventListener("click", async () => {
+    for (const [, control] of PERSPECTIVE) {
+      await send({ command: "set_perspective", params: { control, value: control === 2 ? 1 : 0 } });
+    }
+  });
   slider("clarity", v => ({ command: "set_clarity", params: v }), v => v.toFixed(2));
   slider("texture", v => ({ command: "set_texture", params: v }), v => v.toFixed(2));
   slider("dehaze", v => ({ command: "set_dehaze", params: v }), v => v.toFixed(2));
@@ -652,7 +675,7 @@
   let dragging = null;
   const TONE = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks",
                 "clarity", "texture", "dehaze"];
-  for (const id of [...TONE, "straighten", "sharpen", "sharpen_radius", "chroma_noise", "luminance_noise", "saturation", "vibrance", "temperature", "tint",
+  for (const id of [...TONE, "straighten", "vertical", "horizontal", "aspect", "sharpen", "sharpen_radius", "chroma_noise", "luminance_noise", "saturation", "vibrance", "temperature", "tint",
     "mask-exposure", "mask-warmth", "mask-tint", "mask-feather", "mask-size", "mask-from", "mask-to",
     "mask-contrast", "mask-saturation", "mask-clarity",
     "grade-shadows", "grade-midtones", "grade-highlights", "grade-blending", "grade-balance",
@@ -680,6 +703,9 @@
       setSlider(id, state.tone[id], v => Number(v).toFixed(2));
     }
     setSlider("straighten", state.crop.angle_deg, v => `${Number(v).toFixed(1)}°`);
+    for (const [id] of PERSPECTIVE) {
+      setSlider(id, state.crop[id] ?? (id === "aspect" ? 1 : 0), v => Number(v).toFixed(3));
+    }
     setSlider("sharpen", state.detail.sharpen_amount, v => Number(v).toFixed(2));
     setSlider("sharpen_radius", state.detail.sharpen_radius, v => Number(v).toFixed(2));
     setSlider("chroma_noise", state.detail.chroma_noise, v => Number(v).toFixed(2));

@@ -478,18 +478,22 @@ pub struct StraightenView {
 struct StraightenParams {
     straight_origin: [f32; 2],
     flat_origin: [f32; 2],
-    origin: [f32; 2],
-    dx: [f32; 2],
-    dy: [f32; 2],
+    /// The straight-to-flat homography, a row to a `vec4` so the padding a
+    /// uniform puts between three-vectors is written down rather than assumed.
+    m: [[f32; 4]; 3],
     extent: [u32; 2],
     photograph: [f32; 2],
     optical_centre: [f32; 2],
     corner: f32,
     knots: u32,
-    /// WGSL aligns an `array<vec4<f32>, 4>` to sixteen bytes and `#[repr(C)]`
-    /// does not, so without this the shader reads the curve eight bytes early
-    /// and the correction comes out as a smear.
-    _pad: [u32; 2],
+    // No padding here, and that is a fact about the two fields above rather than
+    // a choice: `knots` happens to end on a sixteen-byte boundary, so WGSL puts
+    // the array that follows immediately after it. There *was* padding here
+    // until the affine triple above became a homography and moved everything by
+    // eight bytes — the padding stayed correct-looking and became wrong, and the
+    // symptom was a lens correction that no longer matched the export.
+    // `the_straighten_uniform_is_laid_out_the_way_wgsl_reads_it` is what checks
+    // this now, rather than anybody re-deriving it.
     /// The resolved curve. Sixteen floats, laid out as four `vec4` because a
     /// uniform's arrays are padded to sixteen bytes an element and an
     /// `array<f32, 16>` would arrive with fifteen holes in it.
@@ -1378,15 +1382,17 @@ impl Renderer {
             straight_origin,
             flat_origin,
         } = view;
-        let [origin, dx, dy] = geometry.flat_transform(level_image);
+        let h = geometry.flat_homography(level_image);
         let lens = geometry.distortion_map(level_image);
         let extent = canvas.size();
         let params = StraightenParams {
             straight_origin,
             flat_origin,
-            origin,
-            dx,
-            dy,
+            m: [
+                [h[0][0], h[0][1], h[0][2], 0.0],
+                [h[1][0], h[1][1], h[1][2], 0.0],
+                [h[2][0], h[2][1], h[2][2], 0.0],
+            ],
             extent,
             photograph: {
                 let [pw, ph] = geometry.output_size(level_image);
@@ -1398,7 +1404,6 @@ impl Renderer {
             optical_centre: lens.map(|d| d.centre).unwrap_or([0.0; 2]),
             corner: lens.map(|d| d.corner).unwrap_or(0.0),
             knots: lens.map(|d| d.used).unwrap_or(0),
-            _pad: [0; 2],
             curve: {
                 let mut packed = [[0.0f32; 4]; 4];
                 if let Some(lens) = &lens {
@@ -2823,6 +2828,54 @@ pub fn normalise(raw: &rawkit_decode::RawImage) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
+    /// Every field of a uniform has to sit where WGSL will look for it, and
+    /// `#[repr(C)]` does not use WGSL's rules.
+    ///
+    /// The one that bites is alignment: a `vec4` and an array of them are
+    /// sixteen-byte aligned in WGSL and four-byte aligned in Rust, so a struct
+    /// that happens to agree today stops agreeing the moment anything above the
+    /// array changes size. That is not hypothetical — the straighten's map went
+    /// from an affine triple to a homography, every field after it moved eight
+    /// bytes, and a hand-written pad that had been right became wrong while
+    /// still looking deliberate. wgpu did not object, because the buffer was
+    /// *larger* than the shader needed; the lens correction simply stopped
+    /// matching the export.
+    #[test]
+    fn the_straighten_uniform_is_laid_out_the_way_wgsl_reads_it() {
+        use super::StraightenParams;
+        // Where WGSL puts each member, walked by its own rules: a member sits at
+        // the next multiple of its alignment.
+        let mut at = 0usize;
+        let mut place = |align: usize, size: usize| {
+            at = at.div_ceil(align) * align;
+            let offset = at;
+            at += size;
+            offset
+        };
+        place(8, 8); // straight_origin
+        place(8, 8); // flat_origin
+        place(16, 48); // m
+        place(8, 8); // extent
+        place(8, 8); // photograph
+        place(8, 8); // optical_centre
+        place(4, 4); // corner
+        place(4, 4); // knots
+        let curve = place(16, 64);
+
+        assert_eq!(
+            curve,
+            std::mem::offset_of!(StraightenParams, curve),
+            "the curve is not where the shader will look for it"
+        );
+        // And the struct as a whole is a multiple of its largest alignment, or
+        // an array of them would drift.
+        assert_eq!(std::mem::size_of::<StraightenParams>() % 16, 0);
+        assert_eq!(
+            std::mem::size_of::<StraightenParams>(),
+            at.div_ceil(16) * 16
+        );
+    }
+
     use super::half_to_f32;
 
     /// Hand-written bit manipulation, so it gets a test that names values rather

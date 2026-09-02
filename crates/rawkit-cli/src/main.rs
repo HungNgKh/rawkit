@@ -604,6 +604,19 @@ pub struct EditFlags {
     /// This is the only operation in the pipeline that resamples.
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     straighten: f32,
+    /// Vertical keystone, -0.35 to 0.35. Positive magnifies the top, which is
+    /// what corrects a photograph taken looking up at something.
+    ///
+    /// The crop pulls in for this the same way it does for a straighten, and
+    /// further: a projective warp swings the corners more than a rotation.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    keystone_vertical: f32,
+    /// Horizontal keystone, -0.35 to 0.35. Positive magnifies the left.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    keystone_horizontal: f32,
+    /// Stretch, as a ratio: above 1 widens, below 1 heightens. 0.67 to 1.5.
+    #[arg(long, default_value_t = 1.0)]
+    aspect: f32,
     /// Capture sharpening, 0 to 1. Zero turns it off entirely.
     ///
     /// A demosaiced frame is soft by construction, so this has a non-zero
@@ -678,13 +691,16 @@ impl EditFlags {
         };
         let crop = rawkit_editstate::Crop {
             angle_deg: self.straighten,
+            vertical: self.keystone_vertical,
+            horizontal: self.keystone_horizontal,
+            aspect: self.aspect,
             ..match self.crop.as_deref() {
                 Some(text) => parse_crop(text)?,
                 None => rawkit_editstate::Crop::default(),
             }
         };
         crop.validate()
-            .map_err(|e| anyhow!("{e}; see --crop and --straighten"))?;
+            .map_err(|e| anyhow!("{e}; see --crop, --straighten and --keystone-vertical"))?;
 
         Ok(EditState {
             tone: Tone {

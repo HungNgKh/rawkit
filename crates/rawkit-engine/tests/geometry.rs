@@ -202,6 +202,14 @@ fn the_canvas_straightens_the_same_way_the_export_does() {
         Orientation::AsShot,
         Crop {
             angle_deg: 7.5,
+            // A keystone as well, so the parity claim covers the projective
+            // half of the map. A homography that the two sides built
+            // differently would agree at the centre and diverge towards the
+            // corners, which is precisely where a rotation-only test looks
+            // least.
+            vertical: 0.18,
+            horizontal: -0.09,
+            aspect: 1.12,
             ..Crop::default()
         },
         Some(rawkit_editstate::Distortion {
