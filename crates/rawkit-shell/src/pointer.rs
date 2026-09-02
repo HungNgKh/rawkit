@@ -16,8 +16,8 @@
 //! scale factor is known rather than passing a scale around.
 
 use crate::{
-    in_crop, in_grid, picking_wb, placing_mask, targeting, Aim, Marquee, MaskDrag, CANVAS_CLICK,
-    CANVAS_MARQUEE, CANVAS_SCROLL, MASK_DRAG, TARGET_AIM, TARGET_RANGE_PX, WB_PICK,
+    in_crop, in_grid, picking_range, picking_wb, placing_mask, targeting, Aim, Marquee, MaskDrag,
+    CANVAS_CLICK, CANVAS_MARQUEE, CANVAS_SCROLL, MASK_DRAG, TARGET_AIM, TARGET_RANGE_PX, WB_PICK,
 };
 use rawkit_session::{Command, Session};
 use std::sync::{Arc, Mutex};
@@ -92,6 +92,12 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
             // press, resolves on the next frame, and does not start a pan.
             if picking_wb() && !in_grid() {
                 *WB_PICK.lock().expect("pick lock") = Some(at);
+                return;
+            }
+            // Aiming a range mask is the same gesture on the same terms: one
+            // press, resolved on the next frame, and it must not start a pan.
+            if picking_range() && !in_grid() {
+                *crate::RANGE_PICK.lock().expect("range pick lock") = Some(at);
                 return;
             }
             // Placing a gradient takes the press for the same reason aiming

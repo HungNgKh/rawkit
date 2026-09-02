@@ -8,7 +8,7 @@
 //!
 //! `cargo test -p rawkit-engine --test masks -- --ignored`
 
-use rawkit_editstate::{EditState, Mask, MaskShape, Stroke};
+use rawkit_editstate::{EditState, Mask, MaskShape, RangeChannel, Stroke};
 use rawkit_engine::{BayerPhase, CameraProfile, Frame, Gpu, Output, Renderer};
 
 const W: u32 = 512;
@@ -20,12 +20,15 @@ fn flat() -> Vec<f32> {
 }
 
 fn render(gpu: &Gpu, state: &EditState) -> Vec<f32> {
-    let cfa = flat();
+    render_frame(gpu, state, &flat())
+}
+
+fn render_frame(gpu: &Gpu, state: &EditState, cfa: &[f32]) -> Vec<f32> {
     Renderer::new(gpu)
         .run(
             gpu,
             &Frame {
-                data: &cfa,
+                data: cfa,
                 width: W,
                 height: H,
                 phase: BayerPhase::Rggb,
@@ -398,5 +401,66 @@ fn a_painted_stroke_darkens_only_what_it_covers() {
         luma(&painted, 4, H / 2),
         luma(&plain, 4, H / 2),
         "the stroke ran off its own end"
+    );
+}
+
+/// Dark on the left, bright on the right, with nothing else to tell them apart.
+fn split() -> Vec<f32> {
+    (0..W * H)
+        .map(|i| if (i % W) < W / 2 { 0.15f32 } else { 0.6 })
+        .collect()
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_range_mask_reaches_the_renderer_at_all() {
+    // The first source that is not geometry. Everything downstream was built to
+    // take it without being told -- the shader composites a texture and cannot
+    // ask what drew it -- so the claim worth checking end to end is the boring
+    // one: a band on brightness lands on the half of the picture that is that
+    // bright, and nowhere else.
+    //
+    // A flat frame cannot test this. It has one brightness, so a range over it
+    // selects all of the picture or none of it, and both would pass a test that
+    // only asked whether *something* changed.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let cfa = split();
+
+    let plain = render_frame(&gpu, &EditState::default(), &cfa);
+    let lifted = EditState {
+        masks: vec![Mask {
+            shape: MaskShape::Range {
+                channel: RangeChannel::Luminance,
+                from: 0.4,
+                to: 1.0,
+                feather: 0.02,
+            },
+            exposure_ev: 1.0,
+            ..Mask::default()
+        }],
+        ..EditState::default()
+    };
+    let masked = render_frame(&gpu, &lifted, &cfa);
+
+    let dark = (luma(&plain, W / 4, H / 2), luma(&masked, W / 4, H / 2));
+    let bright = (
+        luma(&plain, 3 * W / 4, H / 2),
+        luma(&masked, 3 * W / 4, H / 2),
+    );
+    println!(
+        "dark half {:.4} -> {:.4}, bright half {:.4} -> {:.4}",
+        dark.0, dark.1, bright.0, bright.1
+    );
+    assert!(
+        (dark.1 - dark.0).abs() < 0.002,
+        "a band on the bright half moved the dark half: {:.4} to {:.4}",
+        dark.0,
+        dark.1
+    );
+    assert!(
+        bright.1 > bright.0 * 1.2,
+        "a band on the bright half did not lift it: {:.4} to {:.4}",
+        bright.0,
+        bright.1
     );
 }

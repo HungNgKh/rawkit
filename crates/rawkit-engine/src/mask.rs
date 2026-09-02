@@ -25,7 +25,8 @@
 //! A hard-edged matte from a segmentation model would want more than this, and
 //! that is a constant to raise rather than an arrangement to redo.
 
-use rawkit_editstate::{Mask, MaskShape, Stroke};
+use crate::guide::Guide;
+use rawkit_editstate::{Mask, MaskShape, RangeChannel, Stroke};
 
 /// The longest edge a mask raster is built at.
 pub const MAX_EDGE: u32 = 1024;
@@ -51,10 +52,10 @@ pub fn dimensions(width: u32, height: u32) -> (u32, u32) {
 /// The coordinates in the shape are fractions of the sensor frame, so this needs
 /// no knowledge of the crop or the orientation — which is the reason they are
 /// stored that way.
-pub fn rasterise(mask: &Mask, width: u32, height: u32, out: &mut [f32]) {
+pub fn rasterise(mask: &Mask, width: u32, height: u32, guide: &Guide, out: &mut [f32]) {
     let (w, h) = dimensions(width, height);
     debug_assert!(out.len() >= (w * h) as usize);
-    draw(&mask.shape, w, h, out);
+    draw(&mask.shape, w, h, guide, out);
     if mask.invert {
         // Applied to the finished weight rather than inside each shape, so it
         // means the same thing for every source there will ever be — and so the
@@ -66,7 +67,7 @@ pub fn rasterise(mask: &Mask, width: u32, height: u32, out: &mut [f32]) {
     }
 }
 
-fn draw(shape: &MaskShape, w: u32, h: u32, out: &mut [f32]) {
+fn draw(shape: &MaskShape, w: u32, h: u32, guide: &Guide, out: &mut [f32]) {
     match *shape {
         MaskShape::Brush {
             ref strokes,
@@ -78,6 +79,21 @@ fn draw(shape: &MaskShape, w: u32, h: u32, out: &mut [f32]) {
             for stroke in strokes {
                 paint(stroke, feather, w, h, out);
             }
+        }
+
+        MaskShape::Range {
+            channel,
+            from,
+            to,
+            feather,
+        } => {
+            let band = Band {
+                channel,
+                from,
+                to,
+                feather,
+            };
+            draw_range(band, w, h, guide, out);
         }
 
         MaskShape::Linear { from, to } => {
@@ -159,6 +175,129 @@ fn draw(shape: &MaskShape, w: u32, h: u32, out: &mut [f32]) {
 /// texels it can *reach*. Work is proportional to the area painted rather than
 /// to the area of the frame: a stroke a thousand texels long with a twenty-texel
 /// radius touches about forty thousand of them however large the photograph is.
+/// Draw a band on what the light is, rather than on where it is.
+///
+/// # Read off the guide, and in the camera's own RGB
+///
+/// The guide is the frame reduced to a few hundred texels, in the colour the
+/// sensor recorded, and it exists already. Two consequences follow and both are
+/// choices rather than accidents.
+///
+/// **The selection is made before the profile.** "Hue" here is the hue of the
+/// sensor's response, not of the finished picture, so a band drawn around a red
+/// jacket stays around that jacket when the camera profile changes. Selecting on
+/// the developed colour would mean a mask that moved when somebody loaded a
+/// `.dcp`, which is a mask nobody could rely on.
+///
+/// **The selection is soft at a colour boundary.** A guide texel covers roughly
+/// sixteen image pixels, so the edge of a range is a gradient a few pixels wide
+/// rather than a cut. For selecting *by value* that is the behaviour anyone
+/// wants — a hard-edged selection of "the sky" is how a local adjustment
+/// announces itself — and it is why this is rasterised rather than evaluated per
+/// pixel in the shader. Evaluating it there would also make the shader ask what
+/// kind of mask it is, which is the one thing this whole module exists to avoid.
+#[derive(Clone, Copy)]
+struct Band {
+    channel: RangeChannel,
+    from: f32,
+    to: f32,
+    feather: f32,
+}
+
+fn draw_range(band: Band, w: u32, h: u32, guide: &Guide, out: &mut [f32]) {
+    let (gw, gh) = (guide.width.max(1), guide.height.max(1));
+    for y in 0..h {
+        // Nearest texel rather than bilinear: the guide is already a heavily
+        // smoothed reduction of the frame, and interpolating a smooth thing
+        // twice buys nothing a person could see.
+        let gy = ((y as u64 * gh as u64) / h.max(1) as u64).min(gh as u64 - 1) as u32;
+        for x in 0..w {
+            let gx = ((x as u64 * gw as u64) / w.max(1) as u64).min(gw as u64 - 1) as u32;
+            let i = (gy as usize * gw as usize + gx as usize) * 3;
+            let rgb = [guide.data[i], guide.data[i + 1], guide.data[i + 2]];
+            let value = match band.channel {
+                // Green, because a Bayer sensor has twice as much of it and it
+                // is most of what luminance is made of. The same choice the
+                // guide's own blur makes, and it needs no camera matrix -- which
+                // belongs to the profile and not to the mosaic.
+                RangeChannel::Luminance => rgb[1].clamp(0.0, 1.0),
+                RangeChannel::Hue => hue_of(rgb),
+            };
+            out[(y * w + x) as usize] = weight(band, value);
+        }
+    }
+}
+
+/// Hue in degrees, from camera RGB, by the usual hexagonal construction.
+///
+/// Zero for anything with no colour in it at all: a grey texel is not at any
+/// particular hue, and putting it at red would make every neutral in the frame
+/// jump into a band drawn around reds.
+fn hue_of(rgb: [f32; 3]) -> f32 {
+    let high = rgb[0].max(rgb[1]).max(rgb[2]);
+    let low = rgb[0].min(rgb[1]).min(rgb[2]);
+    let span = high - low;
+    if span <= 1e-6 {
+        return 0.0;
+    }
+    let h = if high == rgb[0] {
+        ((rgb[1] - rgb[2]) / span).rem_euclid(6.0)
+    } else if high == rgb[1] {
+        2.0 + (rgb[2] - rgb[0]) / span
+    } else {
+        4.0 + (rgb[0] - rgb[1]) / span
+    };
+    (h * 60.0).rem_euclid(360.0)
+}
+
+/// How much of the band a value falls in, from 0 outside to 1 within.
+///
+/// Feathered at both edges by a smoothstep, so a range has no more of a hard
+/// boundary than a radial does.
+fn weight(band: Band, value: f32) -> f32 {
+    let Band {
+        channel,
+        from,
+        to,
+        feather,
+    } = band;
+    let soft = feather.max(1e-6);
+    match channel {
+        RangeChannel::Luminance => {
+            smoothstep(from - soft, from, value) * (1.0 - smoothstep(to, to + soft, value))
+        }
+        RangeChannel::Hue => {
+            // Distance *around the circle* to the nearer edge of the band, so a
+            // band that runs from 350 to 10 covers red rather than everything
+            // except it.
+            let inside = if from <= to {
+                value >= from && value <= to
+            } else {
+                value >= from || value <= to
+            };
+            if inside {
+                return 1.0;
+            }
+            let gap = arc(value, from).min(arc(value, to));
+            1.0 - smoothstep(0.0, soft, gap)
+        }
+    }
+}
+
+/// The shorter way round the circle between two hues, in degrees.
+fn arc(a: f32, b: f32) -> f32 {
+    let d = (a - b).abs().rem_euclid(360.0);
+    d.min(360.0 - d)
+}
+
+fn smoothstep(edge0: f32, edge1: f32, v: f32) -> f32 {
+    if edge1 <= edge0 {
+        return if v >= edge1 { 1.0 } else { 0.0 };
+    }
+    let t = ((v - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 fn paint(stroke: &Stroke, feather: f32, w: u32, h: u32, out: &mut [f32]) {
     if stroke.points.is_empty() || stroke.radius <= 0.0 {
         return;
@@ -240,10 +379,51 @@ fn paint(stroke: &Stroke, feather: f32, w: u32, h: u32, out: &mut [f32]) {
 mod tests {
     use super::*;
 
+    /// A guide of one flat colour, for the shapes that do not read one.
+    ///
+    /// Grey rather than black: a range mask drawn against this should find a
+    /// frame with light in it and no colour, which is the least surprising thing
+    /// for a shape test to sit on top of.
+    fn flat_guide(value: f32) -> Guide {
+        Guide {
+            data: vec![value; 3],
+            chroma: [value; 3],
+            chroma_known: true,
+            width: 1,
+            height: 1,
+        }
+    }
+
+    /// A guide split down the middle: dark on the left, bright on the right.
+    fn split_guide(dark: f32, bright: f32) -> Guide {
+        let (w, h) = (32u32, 32u32);
+        let mut data = vec![0.0f32; (w * h) as usize * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let v = if x < w / 2 { dark } else { bright };
+                let i = (y * w + x) as usize * 3;
+                data[i] = v;
+                data[i + 1] = v;
+                data[i + 2] = v;
+            }
+        }
+        Guide {
+            data,
+            chroma: [1.0; 3],
+            chroma_known: true,
+            width: w,
+            height: h,
+        }
+    }
+
     fn draw(mask: &Mask, width: u32, height: u32) -> (Vec<f32>, u32, u32) {
+        draw_on(mask, width, height, &flat_guide(0.5))
+    }
+
+    fn draw_on(mask: &Mask, width: u32, height: u32, guide: &Guide) -> (Vec<f32>, u32, u32) {
         let (w, h) = dimensions(width, height);
         let mut out = vec![0.0f32; (w * h) as usize];
-        rasterise(mask, width, height, &mut out);
+        rasterise(mask, width, height, guide, &mut out);
         (out, w, h)
     }
 
@@ -564,7 +744,7 @@ mod tests {
         );
         let (w, h) = dimensions(6024, 4024);
         let mut out = vec![0.0f32; (w * h) as usize];
-        rasterise(&long, 6024, 4024, &mut out);
+        rasterise(&long, 6024, 4024, &flat_guide(0.5), &mut out);
         let elapsed = across.elapsed();
         println!("a 200-point stroke across a {w}x{h} raster: {elapsed:?}");
         assert!(
@@ -589,5 +769,159 @@ mod tests {
         };
         let (pixels, _, _) = draw(&mask, 400, 400);
         assert!(pixels.iter().all(|v| *v == 0.0));
+    }
+    #[test]
+    fn a_band_over_everything_selects_everything() {
+        // And one over nothing selects nothing. The two ends of the control,
+        // which is the first thing to be sure of before asking where the edge
+        // falls.
+        let guide = split_guide(0.2, 0.8);
+        let all = Mask {
+            shape: MaskShape::Range {
+                channel: RangeChannel::Luminance,
+                from: 0.0,
+                to: 1.0,
+                feather: 0.0,
+            },
+            ..Mask::default()
+        };
+        let none = Mask {
+            shape: MaskShape::Range {
+                channel: RangeChannel::Luminance,
+                from: 0.95,
+                to: 1.0,
+                feather: 0.0,
+            },
+            ..Mask::default()
+        };
+        let (covered, w, h) = draw_on(&all, 256, 256, &guide);
+        let (empty, _, _) = draw_on(&none, 256, 256, &guide);
+        let mean = |v: &[f32]| v[..(w * h) as usize].iter().sum::<f32>() / (w * h) as f32;
+        println!("all {:.4}, none {:.4}", mean(&covered), mean(&empty));
+        assert!(
+            mean(&covered) > 0.99,
+            "a band over the whole range missed some of it"
+        );
+        assert!(
+            mean(&empty) < 0.01,
+            "a band above everything in the frame still selected some"
+        );
+    }
+
+    #[test]
+    fn a_luminance_band_selects_the_half_it_names() {
+        // The frame is dark on the left and bright on the right, so a band that
+        // takes in the bright value and not the dark one must select exactly
+        // half the picture -- and the *right* half.
+        let guide = split_guide(0.2, 0.8);
+        let mask = Mask {
+            shape: MaskShape::Range {
+                channel: RangeChannel::Luminance,
+                from: 0.6,
+                to: 1.0,
+                feather: 0.0,
+            },
+            ..Mask::default()
+        };
+        let (out, w, h) = draw_on(&mask, 256, 256, &guide);
+        let mean = out[..(w * h) as usize].iter().sum::<f32>() / (w * h) as f32;
+        let left = at(&out, w, w / 4, h / 2);
+        let right = at(&out, w, 3 * w / 4, h / 2);
+        println!("selected {mean:.3} of the frame; left {left:.3}, right {right:.3}");
+        assert!(
+            (mean - 0.5).abs() < 0.02,
+            "selected {mean:.3} of the frame, not half"
+        );
+        assert!(
+            left < 0.01 && right > 0.99,
+            "selected the wrong half: {left:.3} / {right:.3}"
+        );
+    }
+
+    #[test]
+    fn a_hue_band_wraps_through_red() {
+        // Red sits at zero degrees, so the only way to select it is a band that
+        // runs off one end of the circle and back on at the other. A band from
+        // 350 to 10 that did not wrap would select everything *except* red,
+        // which is the failure this exists to catch.
+        let red = Guide {
+            data: vec![0.8, 0.1, 0.1],
+            chroma: [1.0; 3],
+            chroma_known: true,
+            width: 1,
+            height: 1,
+        };
+        let wrapped = Mask {
+            shape: MaskShape::Range {
+                channel: RangeChannel::Hue,
+                from: 350.0,
+                to: 10.0,
+                feather: 0.0,
+            },
+            ..Mask::default()
+        };
+        let elsewhere = Mask {
+            shape: MaskShape::Range {
+                channel: RangeChannel::Hue,
+                from: 100.0,
+                to: 200.0,
+                feather: 0.0,
+            },
+            ..Mask::default()
+        };
+        let (on, w, h) = draw_on(&wrapped, 64, 64, &red);
+        let (off, _, _) = draw_on(&elsewhere, 64, 64, &red);
+        let mean = |v: &[f32]| v[..(w * h) as usize].iter().sum::<f32>() / (w * h) as f32;
+        println!(
+            "red under a wrapped band {:.3}, under a green one {:.3}",
+            mean(&on),
+            mean(&off)
+        );
+        assert!(
+            mean(&on) > 0.99,
+            "a band from 350 to 10 did not take in red"
+        );
+        assert!(
+            mean(&off) < 0.01,
+            "a band from 100 to 200 took in red anyway"
+        );
+    }
+
+    #[test]
+    fn inverting_a_range_means_what_it_means_everywhere_else() {
+        // `invert` lives on the Mask and not on the shape, so it has to work on
+        // a source that is not geometry without anything being added for it.
+        let guide = split_guide(0.2, 0.8);
+        let shape = MaskShape::Range {
+            channel: RangeChannel::Luminance,
+            from: 0.6,
+            to: 1.0,
+            feather: 0.0,
+        };
+        let (plain, w, h) = draw_on(
+            &Mask {
+                shape: shape.clone(),
+                ..Mask::default()
+            },
+            256,
+            256,
+            &guide,
+        );
+        let (flipped, _, _) = draw_on(
+            &Mask {
+                shape,
+                invert: true,
+                ..Mask::default()
+            },
+            256,
+            256,
+            &guide,
+        );
+        for i in 0..(w * h) as usize {
+            assert!(
+                (plain[i] + flipped[i] - 1.0).abs() < 1e-5,
+                "inverted range does not complement the plain one at {i}"
+            );
+        }
     }
 }

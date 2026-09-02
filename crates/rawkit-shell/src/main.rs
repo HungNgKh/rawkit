@@ -1043,6 +1043,7 @@ fn main() -> Result<()> {
             toggle_fullscreen,
             arm_target,
             pick_white_balance,
+            pick_range,
             add_mask,
             remove_mask,
             select_mask,
@@ -1553,6 +1554,33 @@ fn main() -> Result<()> {
                                 notice(format!("white balance {kelvin:.0} K, tint {tint:.0}"));
                             }
                         },
+                    }
+                }
+
+                // Aiming a range mask's band, on the same terms as the pick
+                // above and for the same reason: it needs the mosaic, which
+                // only this loop holds.
+                if let (Some(at), Some(loaded)) = (
+                    RANGE_PICK.lock().expect("range pick lock").take(),
+                    showing.raw.as_ref(),
+                ) {
+                    let rect = {
+                        let session = shared.lock().expect("session lock");
+                        let half = WB_SAMPLE / 2.0;
+                        let a = session.viewport().image_at([at[0] - half, at[1] - half]);
+                        let b = session.viewport().image_at([at[0] + half, at[1] + half]);
+                        session
+                            .geometry()
+                            .sensor_rect([a[0], a[1], b[0], b[1]], session.image_size())
+                    };
+                    match loaded.channels_over(rect) {
+                        None => notice("that is outside the photograph"),
+                        Some(camera) => {
+                            match aim_range(camera, &shared) {
+                                Err(why) => notice(why),
+                                Ok(said) => notice(said),
+                            }
+                        }
                     }
                 }
 
@@ -2421,6 +2449,16 @@ pub(crate) fn picking_wb() -> bool {
 /// canvas position into a rectangle of sensor.
 pub(crate) static WB_PICK: Mutex<Option<[f64; 2]>> = Mutex::new(None);
 
+/// Whether the next press on the photograph aims a range mask's band.
+static PICKING_RANGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn picking_range() -> bool {
+    PICKING_RANGE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Where that press landed, waiting for a frame that has the photograph in scope.
+pub(crate) static RANGE_PICK: Mutex<Option<[f64; 2]>> = Mutex::new(None);
+
 /// Somebody has asked for the lens to be measured.
 ///
 /// A flag rather than a return value, for the same reason the white-balance
@@ -2546,6 +2584,11 @@ fn shape_from_drag(
         // is handled where the trail is drained; this arm is here so that adding
         // a fourth kind cannot quietly forget one.
         brush @ rawkit_editstate::MaskShape::Brush { .. } => brush,
+        // Nor is a range: it is a band on what the light is, so a drag across
+        // the photograph has nothing to tell it. Picking a place is how a range
+        // is *aimed* -- see the eyedropper -- and that is a different gesture
+        // from dragging out a shape.
+        range @ rawkit_editstate::MaskShape::Range { .. } => range,
     }
 }
 
@@ -2651,6 +2694,16 @@ fn add_mask(kind: Option<String>, state: tauri::State<'_, Shared>) -> Result<usi
             radii: [0.2, 0.3],
             feather: 0.5,
         },
+        // The middle of the brightness range, which is where a photograph keeps
+        // most of itself -- so the band lands on something whatever the picture
+        // is, and the sliders take it from there. Not placed by a drag: see
+        // `placed`, where the range arm returns unchanged.
+        Some("range") => rawkit_editstate::MaskShape::Range {
+            channel: rawkit_editstate::RangeChannel::Luminance,
+            from: 0.3,
+            to: 0.7,
+            feather: 0.1,
+        },
         Some(other) => return Err(format!("{other:?} is not a kind of local adjustment")),
     };
     let mut session = state.0.lock().expect("session lock");
@@ -2673,7 +2726,10 @@ fn add_mask(kind: Option<String>, state: tauri::State<'_, Shared>) -> Result<usi
     });
     drop(session);
     SELECTED_MASK.store(index, std::sync::atomic::Ordering::Relaxed);
-    PLACING_MASK.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Everything but a range is positioned by dragging it out, so the next press
+    // belongs to the mask. A range has nowhere to be dragged to.
+    let placed_by_hand = !matches!(kind.as_deref(), Some("range"));
+    PLACING_MASK.store(placed_by_hand, std::sync::atomic::Ordering::Relaxed);
     Ok(index)
 }
 
@@ -2813,13 +2869,60 @@ fn set_mask(
         }
         "feather" => match &mut mask.shape {
             rawkit_editstate::MaskShape::Radial { feather, .. }
-            | rawkit_editstate::MaskShape::Brush { feather, .. } => {
+            | rawkit_editstate::MaskShape::Brush { feather, .. }
+            | rawkit_editstate::MaskShape::Range { feather, .. } => {
                 *feather = value;
                 4
             }
             // A gradient's feather is the distance between its two ends, so
             // there is no separate number to move — said rather than ignored.
             _ => return Err("a gradient is feathered by where you drew it".into()),
+        },
+        // The two ends of a band, each moved on its own. Not clamped against
+        // each other: on hue they are *meant* to be able to cross, because that
+        // is what selects red, and on luminance the edit refuses the inversion
+        // with a reason rather than silently swapping them.
+        "from" | "to" => match &mut mask.shape {
+            rawkit_editstate::MaskShape::Range { from, to, .. } => {
+                if control == "from" {
+                    *from = value;
+                    5
+                } else {
+                    *to = value;
+                    6
+                }
+            }
+            _ => return Err("only a range has a band to move".into()),
+        },
+        "channel" => match &mut mask.shape {
+            rawkit_editstate::MaskShape::Range {
+                channel,
+                from,
+                to,
+                feather,
+                ..
+            } => {
+                // The band travels in the channel's own units, so switching
+                // channel has to bring it with it -- a 0-to-1 luminance band
+                // read as degrees would select nothing but the reddest sliver
+                // there is, and the control would look broken.
+                let (was, now) = if value == 0.0 {
+                    (*channel, rawkit_editstate::RangeChannel::Luminance)
+                } else {
+                    (*channel, rawkit_editstate::RangeChannel::Hue)
+                };
+                let full = |c| match c {
+                    rawkit_editstate::RangeChannel::Luminance => 1.0f32,
+                    rawkit_editstate::RangeChannel::Hue => 360.0,
+                };
+                let scale = full(now) / full(was);
+                *channel = now;
+                *from *= scale;
+                *to *= scale;
+                *feather *= scale;
+                u8::MAX
+            }
+            _ => return Err("only a range has a channel".into()),
         },
         // Not coalesced with anything: a tick is a discrete act, and folding it
         // into whichever slider moved last would make one undo take both.
@@ -2840,6 +2943,84 @@ fn set_mask(
         },
     });
     Ok(())
+}
+
+/// Move the selected range's band to sit around a colour, keeping its width.
+///
+/// The value is read from the camera's own RGB, which is what the mask itself
+/// is a band on -- so what you point at is what gets selected, whatever the
+/// profile later makes of it. Widths are preserved rather than reset: somebody
+/// who has narrowed a band to one shade of green means to keep it narrow while
+/// they hunt for the right green.
+fn aim_range(camera: [f32; 3], shared: &std::sync::Arc<Mutex<Session>>) -> Result<String, String> {
+    let mut session = shared.lock().expect("session lock");
+    let index = SELECTED_MASK.load(std::sync::atomic::Ordering::Relaxed);
+    let mut masks = session.state().masks.clone();
+    let mask = masks
+        .get_mut(index)
+        .ok_or_else(|| "no local adjustment is selected".to_string())?;
+    let rawkit_editstate::MaskShape::Range {
+        channel, from, to, ..
+    } = &mut mask.shape
+    else {
+        return Err("only a range has a band to aim".into());
+    };
+    let said = match channel {
+        rawkit_editstate::RangeChannel::Luminance => {
+            let half = ((*to - *from) / 2.0).max(0.01);
+            let centre = camera[1].clamp(0.0, 1.0);
+            *from = (centre - half).max(0.0);
+            *to = (centre + half).min(1.0);
+            format!("brightness around {centre:.2}")
+        }
+        rawkit_editstate::RangeChannel::Hue => {
+            // The band's width the short way round, since a hue band may already
+            // straddle red and subtracting the ends would give the long way.
+            let width = {
+                let d = (*to - *from).rem_euclid(360.0);
+                d.max(2.0)
+            };
+            let high = camera[0].max(camera[1]).max(camera[2]);
+            let low = camera[0].min(camera[1]).min(camera[2]);
+            if high - low <= 1e-4 {
+                return Err("that has no colour to make a band around".into());
+            }
+            let h = {
+                let span = high - low;
+                let raw = if high == camera[0] {
+                    ((camera[1] - camera[2]) / span).rem_euclid(6.0)
+                } else if high == camera[1] {
+                    2.0 + (camera[2] - camera[0]) / span
+                } else {
+                    4.0 + (camera[0] - camera[1]) / span
+                };
+                (raw * 60.0).rem_euclid(360.0)
+            };
+            *from = (h - width / 2.0).rem_euclid(360.0);
+            *to = (h + width / 2.0).rem_euclid(360.0);
+            format!("colour around {h:.0}°")
+        }
+    };
+    session.apply(Command::SetMasks {
+        masks,
+        control: u8::MAX,
+    });
+    Ok(said)
+}
+
+/// Centre a range mask's band on whatever is under the next press.
+///
+/// A range selects by value, so the question it needs answering is "which
+/// value?" -- and pointing at the thing you mean is a better way to answer that
+/// than moving two sliders and watching what happens. The band keeps its width
+/// and moves to sit around what was picked.
+#[tauri::command]
+fn pick_range(armed: bool) -> bool {
+    PICKING_RANGE.store(armed, std::sync::atomic::Ordering::Relaxed);
+    if !armed {
+        *RANGE_PICK.lock().expect("range pick lock") = None;
+    }
+    armed
 }
 
 /// Set the white balance from a patch that ought to be neutral.

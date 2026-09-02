@@ -275,6 +275,37 @@ pub enum MaskShape {
     /// softness changed from stroke to stroke would be a brush nobody could
     /// keep track of.
     Brush { strokes: Vec<Stroke>, feather: f32 },
+    /// Selected by what the light *is* rather than by where it is.
+    ///
+    /// The first source that is not geometry, and the one the mask array was
+    /// built to accept: a band on a per-pixel quantity, drawn into the same
+    /// raster as a gradient and composited by a shader that still cannot tell
+    /// them apart. An AI matte will arrive the same way.
+    ///
+    /// The band runs `from` to `to` in the channel's own units, with `feather`
+    /// the width of the roll-off at each edge in those units. On [`RangeChannel::Hue`]
+    /// a band with `from` above `to` wraps through red, which is the only way to
+    /// select reds at all.
+    Range {
+        channel: RangeChannel,
+        from: f32,
+        to: f32,
+        feather: f32,
+    },
+}
+
+/// What a [`MaskShape::Range`] is a band of.
+///
+/// Two, and both are read off the guide in the camera's own RGB — see
+/// `rawkit_engine::mask` for why the selection is made before the profile
+/// rather than after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RangeChannel {
+    /// How much light, 0 to 1, normalised to the sensor's own range.
+    Luminance,
+    /// Which light, 0 to 360 degrees, and circular.
+    Hue,
 }
 
 /// One pass of the brush.
@@ -406,6 +437,42 @@ impl Mask {
                             "a brush stroke passes through somewhere that is not a place".into(),
                         ));
                     }
+                }
+            }
+            MaskShape::Range {
+                channel,
+                from,
+                to,
+                feather,
+            } => {
+                if !finite(from) || !finite(to) || !finite(feather) {
+                    return Err(EditStateError::InvalidMask(format!(
+                        "a range of {from} to {to} feathered by {feather} is not a band"
+                    )));
+                }
+                let full = match channel {
+                    RangeChannel::Luminance => 1.0,
+                    RangeChannel::Hue => 360.0,
+                };
+                for (name, v) in [("from", from), ("to", to)] {
+                    if !(0.0..=full).contains(&v) {
+                        return Err(EditStateError::InvalidMask(format!(
+                            "a range's {name} is {v}, and this channel runs from 0 to {full}"
+                        )));
+                    }
+                }
+                // Only hue is circular, so only hue may run backwards. On
+                // luminance an inverted band is a mistake with a plausible
+                // meaning, which is the worst kind to accept silently.
+                if channel == RangeChannel::Luminance && from > to {
+                    return Err(EditStateError::InvalidMask(format!(
+                        "a luminance range runs from {from} down to {to}, and luminance does not wrap"
+                    )));
+                }
+                if !(0.0..=full).contains(&feather) {
+                    return Err(EditStateError::InvalidMask(format!(
+                        "a range's feather is {feather}, and runs from 0 to {full}"
+                    )));
                 }
             }
             MaskShape::Radial {

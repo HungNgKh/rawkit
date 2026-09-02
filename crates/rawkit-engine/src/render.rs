@@ -870,6 +870,7 @@ impl Renderer {
             image.phase,
             image.clip_level,
         );
+        let (guide_w, guide_h) = (guide.width, guide.height);
         gpu.queue.write_buffer(
             &cfa,
             (px * std::mem::size_of::<f32>()) as u64,
@@ -991,17 +992,16 @@ impl Renderer {
             out_size,
             table_cells,
             guide_offset: px,
-            guide_size: [guide.width, guide.height],
-            chroma: guide.chroma,
-            chroma_known: guide.chroma_known,
+            guide_size: [guide_w, guide_h],
+            guide,
             mask_texture,
             mask_bind_group,
             mask_size: [mask_w, mask_h],
             uploaded_masks: std::cell::RefCell::new(Vec::new()),
             mask_scratch: std::cell::RefCell::new(vec![0.0; (mask_w * mask_h) as usize]),
             guide_scale: [
-                guide.width as f32 / image.width.max(1) as f32,
-                guide.height as f32 / image.height.max(1) as f32,
+                guide_w as f32 / image.width.max(1) as f32,
+                guide_h as f32 / image.height.max(1) as f32,
             ],
             scratch: std::cell::RefCell::new(vec![0.0; px]),
             _held: vec![vh, helpers, ch_r, ch_g, ch_b],
@@ -1589,7 +1589,13 @@ impl Renderer {
             {
                 continue;
             }
-            crate::mask::rasterise(mask, image.width, image.height, &mut scratch);
+            crate::mask::rasterise(
+                mask,
+                image.width,
+                image.height,
+                &buffers.guide,
+                &mut scratch,
+            );
             let half: Vec<u16> = scratch[..(mask_w * mask_h) as usize]
                 .iter()
                 .map(|v| f32_to_f16(*v))
@@ -1760,10 +1766,10 @@ impl Renderer {
             ],
             defringe: [state.detail.defringe, 0.0, 0.0, 0.0],
             guide_chroma: [
-                buffers.chroma[0],
-                buffers.chroma[1],
-                buffers.chroma[2],
-                if buffers.chroma_known { 1.0 } else { 0.0 },
+                buffers.guide.chroma[0],
+                buffers.guide.chroma[1],
+                buffers.guide.chroma[2],
+                if buffers.guide.chroma_known { 1.0 } else { 0.0 },
             ],
             mask_gain: {
                 let mut gains = [[1.0f32, 1.0, 1.0, 0.0]; rawkit_editstate::MAX_MASKS];
@@ -1779,7 +1785,7 @@ impl Renderer {
                 // the same question as whether the local tone is switched on:
                 // reconstruction runs on every frame with a blown pixel in it,
                 // whatever the tone controls say.
-                if buffers.chroma_known { 1.0 } else { 0.0 },
+                if buffers.guide.chroma_known { 1.0 } else { 0.0 },
                 0.0,
             ],
             // Per-tile, and rewritten by both render paths before the develop
@@ -1905,9 +1911,15 @@ pub struct TileBuffers {
     /// edit changes. A slider move rewrites the uniform and not this.
     guide_offset: usize,
     guide_size: [u32; 2],
-    /// Whether the frame had any unclipped light to borrow a colour from.
-    chroma: [f32; 3],
-    chroma_known: bool,
+    /// The guide itself, kept on this side of the bus.
+    ///
+    /// A range mask is a band on what the light *is*, so drawing one needs the
+    /// photograph and not only the numbers in the edit — and masks are drawn on
+    /// the CPU, where the copy uploaded to `cfa` is out of reach. Under two
+    /// megabytes, held for the life of the image and never rebuilt, because the
+    /// camera's own RGB is not something an edit changes.
+    guide: crate::guide::Guide,
+
     /// One texture layer per local adjustment, and the group that binds it.
     ///
     /// Allocated for the maximum whatever the edit currently says, because a
