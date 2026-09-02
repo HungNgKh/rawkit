@@ -97,6 +97,14 @@ struct Params {
     // `.x` is the sharpening amount, `.y` its radius in pixels, `.z` the chroma
     // noise reduction. `.w` unused.
     detail: vec4<f32>,
+    // `[clarity, texture, dehaze, the airlight's level]` -- local contrast at
+    // three scales, and the one number the haze model needs that is not a
+    // colour. The level is in white-balanced camera RGB, which is where the veil
+    // is measured, so the two are comparable without a matrix.
+    local_contrast: vec4<f32>,
+    // The airlight in the profile's working space, already scaled by its level,
+    // so the shader subtracts it rather than reconstructing it. `.w` unused.
+    airlight: vec4<f32>,
     // `.x` is saturation, `.y` vibrance, `.z` whether the hue mixer does
     // anything at all. `.w` unused.
     colour: vec4<f32>,
@@ -805,7 +813,7 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
     // adjustments all ask about the same place, and asking three times invites
     // them to drift apart.
     let ixy = image_xy(x, y);
-    let looked = develop_rgb(rgba_out[p].rgb, ixy);
+    let looked = develop_rgb(rgba_out[p].rgb, ixy, true);
 
     // Stage I -- display-referred ops. The five tone controls live here and not
     // beside exposure, because the sigmoid is the boundary: exposure decides how
@@ -834,6 +842,11 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
     // and in scene-linear light they would both depend on the exposure. The
     // neighbourhood the clarity works against is the local-tone guide's, which
     // is already resolved for this pixel.
+    // Clarity: contrast against the neighbourhood rather than against a fixed
+    // grey, at the guide's own scale. Before the local half, so a mask refines
+    // what the global slider did rather than arguing with it -- the same order
+    // every other pair of global and local controls is in.
+    shaped = against_neighbourhood(shaped, local, params.local_contrast.x);
     shaped = local_look(shaped, ixy, local);
 
     // Stage J -- colour adjustments, after the tone curve for the same reason
@@ -851,7 +864,7 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// needs to know is how bright the neighbourhood *ends up*. Developing it by a
 /// second, simpler route would make the guide disagree with the picture it is
 /// describing, by an amount that changes with every slider.
-fn develop_rgb(camera: vec3<f32>, ixy: vec2<f32>) -> vec3<f32> {
+fn develop_rgb(camera: vec3<f32>, ixy: vec2<f32>, hazy: bool) -> vec3<f32> {
     // White balance is a plain multiply because the working space is
     // scene-linear. That is the payoff of the linear core, and the reason this
     // is three multiplies rather than a colour-appearance model.
@@ -899,10 +912,22 @@ fn develop_rgb(camera: vec3<f32>, ixy: vec2<f32>) -> vec3<f32> {
     // no forward matrix leaves both matrices at identity, so this is the same
     // arithmetic in the same order and the goldens do not move.
 
+    // Stage F -- the scene-linear ops, of which haze removal is one, and the
+    // only one that is not a multiply. It runs *here* and not with the other
+    // local-contrast controls because `I = J*t + A*(1 - t)` is a statement about
+    // light: airlight is added to the scene before anything renders it, and
+    // subtracting it after a tone curve subtracts a number that is no longer
+    // the light. Only the picture is dehazed, never the guide -- the guide is
+    // where the veil is *measured*, so dehazing it would be circular.
+    var lit = corrected * params.develop.x;
+    if (hazy) {
+        lit = remove_haze(lit, ixy);
+    }
+
     // Stage G -- local adjustments. Exposure has just been applied and the
     // tone map has not, which is where the declared pipeline puts this and why
     // the controls a mask carries are the ones that are multiplies here.
-    let exposed = local_adjust(corrected * params.develop.x, ixy);
+    let exposed = local_adjust(lit, ixy);
 
     // The profile's look, applied to scene-linear light and *before* the tone
     // curve, which is where the specification puts it: "it should be applied
@@ -1375,16 +1400,9 @@ fn local_look(rgb: vec3<f32>, ixy: vec2<f32>, neighbourhood: f32) -> vec3<f32> {
         }
         var v = out;
 
-        // Contrast about middle grey -- `TONE_PIVOT`, which is where
-        // scene-linear 0.18 lands once the tone map has run, so this pivots on
-        // the same grey the global contrast does and the two agree where they
-        // overlap. Below the pivot it darkens and above it brightens, which is
-        // what the word means; a power about *zero* would only have made
-        // everything brighter, which is a gamma control wearing the wrong label.
+        // Contrast about middle grey, on the same terms as the global control.
         if (look.x != 0.0) {
-            let amount = look.x * weight;
-            let ratio = max(v / TONE_PIVOT, vec3<f32>(EPS));
-            v = TONE_PIVOT * pow(ratio, vec3<f32>(1.0 + amount));
+            v = against_grey(v, look.x * weight);
         }
 
         // Saturation as distance from this pixel's own grey, in Rec. 709 --
@@ -1402,16 +1420,101 @@ fn local_look(rgb: vec3<f32>, ixy: vec2<f32>, neighbourhood: f32) -> vec3<f32> {
         // surrounds it" is the guide's own scale. Nothing new is computed for it
         // -- the local-tone guide already answers this question, and asking it
         // twice at two radii is how a clarity control turns into a halo.
-        if (look.z != 0.0 && neighbourhood >= 0.0) {
-            let amount = look.z * weight;
-            let around = max(neighbourhood, EPS);
-            let ratio = max(v / around, vec3<f32>(EPS));
-            v = around * pow(ratio, vec3<f32>(1.0 + amount));
-        }
+        v = against_neighbourhood(v, neighbourhood, look.z * weight);
 
         out = mix(out, v, 1.0);
     }
     return out;
+}
+
+/// How much of the veil is taken to be visible where the prior says it is.
+///
+/// One is the whole of it and reads as unnaturally airless -- distance is *made*
+/// of a little haze, and a photograph with none looks like a cut-out. The
+/// standard value in the literature, and it is a taste constant rather than a
+/// measured one.
+const HAZE_OMEGA: f32 = 0.95;
+/// How far the transmission may be pushed. Below this, dividing by it amplifies
+/// whatever noise was in the darkest part of the frame into colour blotches.
+const HAZE_FLOOR: f32 = 0.15;
+const HAZE_CEILING: f32 = 3.0;
+
+/// Undo the airlight, in the light it was added to.
+///
+/// The dark-channel prior: in a clear patch at least one channel goes nearly
+/// black, so wherever none does, something white is being added. `min` over the
+/// white-balanced neighbourhood is that reading, and the level it is measured
+/// against comes from the whole frame -- see `Guide::veil` for how, and for what
+/// this estimate gives up by taking the guide's blur instead of a true local
+/// minimum.
+///
+/// A negative amount puts haze back: the transmission goes above one, and
+/// `(I - A(1 - t))/t` becomes a blend towards the airlight, which is the same
+/// equation read the other way.
+fn remove_haze(rgb: vec3<f32>, ixy: vec2<f32>) -> vec3<f32> {
+    let amount = params.local_contrast.z;
+    let level = params.local_contrast.w;
+    if (amount == 0.0 || level <= 0.0 || params.guide.w == 0u) {
+        return rgb;
+    }
+    let around = guide_sample(params.guide.x, ixy) * params.wb.rgb;
+    let dark = min(around.r, min(around.g, around.b));
+    let t = clamp(
+        1.0 - HAZE_OMEGA * amount * clamp(dark / level, 0.0, 1.0),
+        HAZE_FLOOR,
+        HAZE_CEILING,
+    );
+    // Clamped at zero, because that is what the answer means: the recovered
+    // value is how much light the scene sent, and a scene cannot send less than
+    // none. Without it, a shadow darker than the airlight's own contribution
+    // comes out negative and the tone map -- `x / (x + 0.82)` -- turns it into
+    // a value larger than one, which reads as bright speckle in the shadows.
+    return max((rgb - params.airlight.rgb * (1.0 - t)) / t, vec3<f32>(0.0));
+}
+
+/// Contrast about middle grey, in the perceptual coordinate.
+///
+/// `TONE_PIVOT` is where scene-linear 0.18 lands once the tone map has run, and
+/// it is expressed in the *encoded* coordinate the tone controls work in. The
+/// picture here is linear, so it is encoded first -- without that the pivot sits
+/// at a linear 0.46, which is a good deal brighter than middle grey, and a local
+/// contrast slider disagrees with the global one about where the middle is.
+///
+/// Below the pivot it darkens and above it brightens, which is what the word
+/// means; a power about *zero* would only have made everything brighter, which
+/// is a gamma control wearing the wrong label.
+fn against_grey(rgb: vec3<f32>, amount: f32) -> vec3<f32> {
+    if (amount == 0.0) {
+        return rgb;
+    }
+    let coded = pow(max(rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / TONE_GAMMA));
+    let ratio = max(coded / TONE_PIVOT, vec3<f32>(EPS));
+    let shaped = TONE_PIVOT * pow(ratio, vec3<f32>(1.0 + amount));
+    return pow(max(shaped, vec3<f32>(0.0)), vec3<f32>(TONE_GAMMA));
+}
+
+/// Contrast about a moving pivot, in the perceptual coordinate.
+///
+/// The shared definition of clarity, global and local. Two things it settles.
+///
+/// **The coordinate.** The neighbourhood arrives gamma-encoded, because that is
+/// what the tone controls work in and what `TONE_PIVOT` is expressed in; the
+/// picture at this point is linear. Comparing the two directly would put the
+/// neutral point -- where a pixel equals what surrounds it and clarity must do
+/// nothing -- at the wrong brightness, and the control would darken a flat frame
+/// instead of leaving it alone.
+///
+/// **The direction.** Above the neighbourhood it brightens and below it darkens,
+/// which is what "local contrast" means.
+fn against_neighbourhood(rgb: vec3<f32>, neighbourhood: f32, amount: f32) -> vec3<f32> {
+    if (amount == 0.0 || neighbourhood < 0.0) {
+        return rgb;
+    }
+    let around = max(neighbourhood, EPS);
+    let coded = pow(max(rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / TONE_GAMMA));
+    let ratio = max(coded / around, vec3<f32>(EPS));
+    let shaped = around * pow(ratio, vec3<f32>(1.0 + amount));
+    return pow(max(shaped, vec3<f32>(0.0)), vec3<f32>(TONE_GAMMA));
 }
 
 /// Where a tile pixel sits in the full-resolution image.
@@ -1483,7 +1586,7 @@ fn local_tone(ixy: vec2<f32>) -> f32 {
     // The guide's own blown pixels are reconstructed against the same
     // neighbourhood the picture's are, so the two agree about how bright a
     // highlight ended up.
-    let rgb = develop_rgb(guide_sample(params.guide.x, ixy), ixy);
+    let rgb = develop_rgb(guide_sample(params.guide.x, ixy), ixy, false);
     // Rec. 709, which is what the developed values are in by this point. One
     // number for all three channels, so the control moves a colour's brightness
     // and never its hue.
@@ -1980,29 +2083,37 @@ fn luma(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// see `HALO` in `render.rs`, which carries the arithmetic.
 const SHARPEN_REACH: i32 = 2;
 
-@compute @workgroup_size(8, 8)
-fn sharpen(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let amount = params.detail.x;
-    // Exactly zero has to change exactly nothing: it is the claim that lets a
-    // stored edit turn this off completely rather than nearly.
-    if (amount <= 0.0) {
-        return;
-    }
-    let x = i32(gid.x);
-    let y = i32(gid.y);
-    if (x >= i32(params.width) || y >= i32(params.height)) {
-        return;
-    }
+/// The same, for texture, which asks a wider question.
+///
+/// Six against the sharpen's two, and the tile halo was widened from 22 to 26 to
+/// carry it — see the derivation on `HALO` in `render.rs`. The radius *is* the
+/// distinction between this control and capture sharpening, so it is not a
+/// number to trim: at ±2 the two sliders would do the same thing. Reading
+/// further than the halo covers would take pixels the demosaic got wrong at a
+/// tile boundary, which shows as a faint grid rather than as anything anyone
+/// would blame on this.
+const TEXTURE_REACH: i32 = 6;
+const TEXTURE_SIGMA: f32 = 2.5;
+/// Where detail stops and an edge begins, in display-referred luminance.
+///
+/// The one thing that makes texture a different control from sharpening rather
+/// than a second copy of it at another radius: the correction is rolled off
+/// where the local detail is large, so a hard edge is left alone. That is what
+/// lets the slider go *negative* and read as smoothing rather than as blur --
+/// small detail goes and the edges stay.
+const TEXTURE_KNEE: f32 = 0.06;
 
-    // A Gaussian whose sigma is the radius. Normalised by the weight actually
-    // used rather than by a constant, so a tap clamped at the edge of the tile
-    // does not darken the blur and turn the border into a bright line.
-    let sigma = max(params.detail.y, 0.05);
+/// The mean of `vh` over a Gaussian of this sigma.
+///
+/// Normalised by the weight actually used rather than by a constant, so a tap
+/// clamped at the edge of the tile does not darken the blur and turn the border
+/// into a bright line.
+fn blur_luma(x: i32, y: i32, reach: i32, sigma: f32) -> f32 {
     let falloff = -0.5 / (sigma * sigma);
     var blurred = 0.0;
     var total = 0.0;
-    for (var j = -SHARPEN_REACH; j <= SHARPEN_REACH; j = j + 1) {
-        for (var i = -SHARPEN_REACH; i <= SHARPEN_REACH; i = i + 1) {
+    for (var j = -reach; j <= reach; j = j + 1) {
+        for (var i = -reach; i <= reach; i = i + 1) {
             let sx = clamp(x + i, 0, i32(params.width) - 1);
             let sy = clamp(y + j, 0, i32(params.height) - 1);
             let weight = exp(f32(i * i + j * j) * falloff);
@@ -2010,10 +2121,41 @@ fn sharpen(@builtin(global_invocation_id) gid: vec3<u32>) {
             total = total + weight;
         }
     }
+    return blurred / total;
+}
+
+@compute @workgroup_size(8, 8)
+fn sharpen(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let amount = params.detail.x;
+    let texture = params.local_contrast.y;
+    // Exactly zero has to change exactly nothing: it is the claim that lets a
+    // stored edit turn this off completely rather than nearly.
+    if (amount <= 0.0 && texture == 0.0) {
+        return;
+    }
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    if (x >= i32(params.width) || y >= i32(params.height)) {
+        return;
+    }
     let p = idx(x, y);
+
+    var correction = 0.0;
+    if (amount > 0.0) {
+        let sigma = max(params.detail.y, 0.05);
+        correction = amount * (vh[p] - blur_luma(x, y, SHARPEN_REACH, sigma));
+    }
+    if (texture != 0.0) {
+        let detail = vh[p] - blur_luma(x, y, TEXTURE_REACH, TEXTURE_SIGMA);
+        // A Gaussian roll-off on the detail's own size. At the knee the
+        // correction is already down to a third, and by twice it there is
+        // essentially none -- so an edge keeps the contrast it has and only the
+        // grain of the surface moves.
+        let ratio = detail / TEXTURE_KNEE;
+        correction = correction + texture * detail * exp(-ratio * ratio);
+    }
     // The same amount added to every channel: the pixel moves along the grey
     // axis, so an edge gains contrast without gaining colour.
-    let correction = amount * (vh[p] - blurred / total);
     rgba_out[p] = vec4<f32>(rgba_out[p].rgb + vec3<f32>(correction), 1.0);
 }
 

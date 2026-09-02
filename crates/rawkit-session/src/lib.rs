@@ -104,6 +104,11 @@ pub enum Command {
     SetShadows(f32),
     SetWhites(f32),
     SetBlacks(f32),
+    /// Local contrast at the guide's own scale, and at a few pixels.
+    SetClarity(f32),
+    SetTexture(f32),
+    /// Airlight, undone in scene-linear light. See [`rawkit_editstate::Tone::dehaze`].
+    SetDehaze(f32),
     /// `None` restores the camera's own white balance. Distinct from any
     /// numeric value, because as-shot differs per file.
     SetTemperature(Option<f32>),
@@ -255,6 +260,9 @@ impl Command {
             Command::SetShadows(_) => "set_shadows",
             Command::SetWhites(_) => "set_whites",
             Command::SetBlacks(_) => "set_blacks",
+            Command::SetClarity(_) => "set_clarity",
+            Command::SetTexture(_) => "set_texture",
+            Command::SetDehaze(_) => "set_dehaze",
             Command::SetTemperature(_) => "set_temperature",
             Command::SetTint(_) => "set_tint",
             Command::SetOrientation(_) => "set_orientation",
@@ -331,6 +339,9 @@ impl Command {
             | Command::SetShadows(_)
             | Command::SetWhites(_)
             | Command::SetBlacks(_)
+            | Command::SetClarity(_)
+            | Command::SetTexture(_)
+            | Command::SetDehaze(_)
             | Command::SetTemperature(_)
             | Command::SetTint(_)
             | Command::SetSharpen(_)
@@ -741,6 +752,9 @@ impl Session {
             Command::SetShadows(v) => self.edit(name, v, |s, v| s.tone.shadows = v),
             Command::SetWhites(v) => self.edit(name, v, |s, v| s.tone.whites = v),
             Command::SetBlacks(v) => self.edit(name, v, |s, v| s.tone.blacks = v),
+            Command::SetClarity(v) => self.edit(name, v, |s, v| s.tone.clarity = v),
+            Command::SetTexture(v) => self.edit(name, v, |s, v| s.tone.texture = v),
+            Command::SetDehaze(v) => self.edit(name, v, |s, v| s.tone.dehaze = v),
             Command::SetTint(v) => self.edit(name, v, |s, v| s.white_balance.tint = v),
 
             Command::SetTemperature(None) => {
@@ -1251,6 +1265,9 @@ fn edit_is_finite(state: &EditState) -> bool {
         t.shadows,
         t.whites,
         t.blacks,
+        t.clarity,
+        t.texture,
+        t.dehaze,
         wb.tint,
     ]
     .iter()

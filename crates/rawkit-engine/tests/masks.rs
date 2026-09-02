@@ -515,15 +515,39 @@ fn the_display_referred_half_reaches_only_where_the_mask_is() {
         outside.0,
         outside.1
     );
-    // And it is *contrast*, not brightness. The frame is below middle grey, so
-    // more contrast has to darken it; a power about zero would have made it
-    // brighter and passed a test that only asked whether something moved.
+    // And it is *contrast*, not brightness -- which means it has to agree with
+    // the global control about where the middle is. This frame renders above
+    // middle grey, so both must brighten it; on a darker one both must darken
+    // it. Asserting a fixed direction instead is what let the two disagree: the
+    // local control pivoted on a *linear* 0.46 where the global one pivots on
+    // the encoded value of the same number, and a test that only asked whether
+    // something moved was happy either way.
+    let globally = render(
+        &gpu,
+        &EditState {
+            tone: rawkit_editstate::Tone {
+                contrast: 0.8,
+                ..Default::default()
+            },
+            ..EditState::default()
+        },
+    );
+    let global = luma(&globally, W / 2, 8);
+    println!(
+        "global contrast on the same frame: {:.4} -> {:.4}",
+        inside.0, global
+    );
     assert!(
-        inside.1 < inside.0 - 0.01,
-        "more local contrast on something below middle grey made it brighter: \
-         {:.4} to {:.4}",
+        (global - inside.0).abs() > 0.01,
+        "the global control did not move this frame, so there is nothing to agree with"
+    );
+    assert!(
+        (inside.1 - inside.0).signum() == (global - inside.0).signum()
+            && (inside.1 - inside.0).abs() > 0.01,
+        "local contrast moved {:.4} to {:.4} where the global control moved it to {:.4}",
         inside.0,
-        inside.1
+        inside.1,
+        global
     );
 }
 
@@ -606,6 +630,42 @@ fn a_mask_that_asks_for_nothing_new_still_changes_nothing() {
         assert!(
             (a - b).abs() < 1e-5,
             "a mask asking for nothing moved pixel {i}: {a} against {b}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn local_clarity_leaves_a_pixel_that_matches_its_surroundings_alone() {
+    // The definition of the control, and the one property that separates it from
+    // contrast: clarity is contrast against the *neighbourhood*, so on a frame
+    // with no local variation there is nothing for it to find and it must do
+    // nothing at all. Anything else means the pivot is in a different coordinate
+    // from the value being pivoted, which on a real photograph reads as clarity
+    // darkening the whole picture.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    let plain = render(&gpu, &EditState::default());
+    for amount in [1.0f32, -1.0] {
+        let edited = EditState {
+            masks: vec![Mask {
+                shape: MaskShape::Radial {
+                    centre: [0.5, 0.5],
+                    radii: [0.9, 0.9],
+                    feather: 0.0,
+                },
+                clarity: amount,
+                ..Mask::default()
+            }],
+            ..EditState::default()
+        };
+        let clarified = render(&gpu, &edited);
+        let (was, now) = (luma(&plain, W / 2, H / 2), luma(&clarified, W / 2, H / 2));
+        assert!(
+            (now - was).abs() < 1e-3,
+            "clarity of {amount} moved a flat frame from {was} to {now}"
         );
     }
 }

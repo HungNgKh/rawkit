@@ -514,6 +514,7 @@ mod tests {
                                 shadows,
                                 whites,
                                 blacks,
+                                ..Tone::default()
                             }));
                         }
                     }
@@ -640,6 +641,7 @@ mod tests {
             shadows: 0.0,
             whites: 0.0,
             blacks: 0.0,
+            ..Tone::default()
         });
         assert_eq!(c.local(), [1.0, 0.0, 0.0, 0.0]);
     }
@@ -817,6 +819,7 @@ mod tests {
             whites: f32::INFINITY,
             blacks: -3.0,
             exposure_ev: 0.0,
+            ..Tone::default()
         });
         assert_eq!(wild.contrast_exponent, 2.0);
         assert_eq!(wild.highlights, -1.0);

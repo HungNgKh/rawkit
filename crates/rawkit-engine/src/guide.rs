@@ -330,6 +330,60 @@ impl Guide {
     }
 }
 
+impl Guide {
+    /// How strong the haze veil is, in white-balanced camera RGB.
+    ///
+    /// # What this is, and what it is not
+    ///
+    /// The dark-channel prior's atmospheric light, reduced to one number. The
+    /// prior observes that in a clear patch of a photograph at least one colour
+    /// channel goes nearly black, so wherever *no* channel does, something
+    /// white is being added — and how much is the strength of the veil. Haze is
+    /// neutral once white balance has run, which is why a scalar is enough: its
+    /// colour is the frame's own white and only its magnitude is in question.
+    ///
+    /// **The spatial minimum the prior asks for is not taken here.** The guide
+    /// is already an edge-aware blur spanning about 190 image pixels, so the
+    /// per-texel minimum over the three channels stands in for a minimum over a
+    /// window. On a smooth region the two agree; at an edge the blur has already
+    /// mixed the two sides, so the estimate is *higher* than the true dark
+    /// channel and the correction it produces is weaker. Erring toward
+    /// under-correcting is the right direction for a control whose failure mode
+    /// is a halo.
+    ///
+    /// A high percentile rather than the maximum, for the reason every estimator
+    /// of a maximum uses one: a single blown specular highlight would otherwise
+    /// decide the whole frame's haze.
+    pub fn veil(&self, wb: [f32; 3]) -> f32 {
+        // A histogram, because this runs on every slider move and a sort of a
+        // hundred and fifty thousand values does not.
+        const BINS: usize = 1024;
+        const PERCENTILE: f32 = 0.999;
+        let mut counts = [0u32; BINS];
+        let mut total = 0u32;
+        for texel in self.data.chunks_exact(3) {
+            let dark = (texel[0] * wb[0])
+                .min(texel[1] * wb[1])
+                .min(texel[2] * wb[2])
+                .clamp(0.0, 1.0);
+            counts[((dark * (BINS - 1) as f32) as usize).min(BINS - 1)] += 1;
+            total += 1;
+        }
+        if total == 0 {
+            return 0.0;
+        }
+        let target = (total as f32 * PERCENTILE) as u32;
+        let mut seen = 0u32;
+        for (bin, count) in counts.iter().enumerate() {
+            seen += count;
+            if seen >= target {
+                return (bin as f32 + 0.5) / BINS as f32;
+            }
+        }
+        1.0
+    }
+}
+
 /// Separable edge-aware blur, weighted by distance and by brightness together.
 ///
 /// Green is the brightness the weights are measured on: it is what a Bayer

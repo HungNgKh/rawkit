@@ -251,6 +251,15 @@
     <label><span>Blacks</span>
       <input id="blacks" type="range" min="-1" max="1" step="0.01" value="0">
       <output id="blacks-value">0.00</output></label>
+    <label><span>Clarity</span>
+      <input id="clarity" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="clarity-value">0.00</output></label>
+    <label><span>Texture</span>
+      <input id="texture" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="texture-value">0.00</output></label>
+    <label><span>Dehaze</span>
+      <input id="dehaze" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="dehaze-value">0.00</output></label>
   </details>
 
   <details id="s-grade">
@@ -563,6 +572,9 @@
   slider("shadows", v => ({ command: "set_shadows", params: v }), v => v.toFixed(2));
   slider("whites", v => ({ command: "set_whites", params: v }), v => v.toFixed(2));
   slider("blacks", v => ({ command: "set_blacks", params: v }), v => v.toFixed(2));
+  slider("clarity", v => ({ command: "set_clarity", params: v }), v => v.toFixed(2));
+  slider("texture", v => ({ command: "set_texture", params: v }), v => v.toFixed(2));
+  slider("dehaze", v => ({ command: "set_dehaze", params: v }), v => v.toFixed(2));
   slider("straighten", v => ({ command: "set_straighten", params: v }), v => `${v.toFixed(1)}°`);
   slider("sharpen", v => ({ command: "set_sharpen", params: v }), v => v.toFixed(2));
   slider("sharpen_radius", v => ({ command: "set_sharpen_radius", params: v }), v => v.toFixed(2));
@@ -638,7 +650,8 @@
   // would update on navigation while the thumb stayed where it was — the two
   // halves of one control disagreeing, which is worse than either being wrong.
   let dragging = null;
-  const TONE = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"];
+  const TONE = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks",
+                "clarity", "texture", "dehaze"];
   for (const id of [...TONE, "straighten", "sharpen", "sharpen_radius", "chroma_noise", "luminance_noise", "saturation", "vibrance", "temperature", "tint",
     "mask-exposure", "mask-warmth", "mask-tint", "mask-feather", "mask-size", "mask-from", "mask-to",
     "mask-contrast", "mask-saturation", "mask-clarity",

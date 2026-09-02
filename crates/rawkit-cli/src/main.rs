@@ -575,6 +575,15 @@ pub struct EditFlags {
     /// Black point. Negative crushes the darkest values to black, -1 to 1.
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     blacks: f32,
+    /// Local contrast at the neighbourhood's own scale, -1 to 1.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    clarity: f32,
+    /// The same at a few pixels: fine detail rather than local tone, -1 to 1.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    texture: f32,
+    /// Haze, undone in scene-linear light. Negative adds it, -1 to 1.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    dehaze: f32,
     /// Rotate in 90-degree steps clockwise: 0, 90, 180 or 270.
     ///
     /// Applied before the crop, so a crop is always read in the frame you
@@ -685,6 +694,9 @@ impl EditFlags {
                 shadows: self.shadows,
                 whites: self.whites,
                 blacks: self.blacks,
+                clarity: self.clarity,
+                texture: self.texture,
+                dehaze: self.dehaze,
             },
             orientation,
             crop,

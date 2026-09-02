@@ -310,6 +310,10 @@ struct Params {
     tone_local: [f32; 4],
     /// `[sharpen amount, sharpen radius, chroma noise, luminance noise]`.
     detail: [f32; 4],
+    /// `[clarity, texture, dehaze, the airlight's level]`.
+    local_contrast: [f32; 4],
+    /// The airlight in the profile's working space, already scaled by its level.
+    airlight: [f32; 4],
     /// `[saturation, vibrance, hue mixer active, unused]`.
     colour: [f32; 4],
     /// The eight-band mixer, one control per array, two bands to a row: a
@@ -564,21 +568,27 @@ const SCENE_LINEAR_STAGES: usize = 11;
 /// | `defringe_scan` | RGB ±4 (itself reach 11) | 15 |
 /// | `chroma_blur` | RGB ±2 (itself reach 15) | 17 |
 /// | `luminance_blur` | RGB ±3 (itself reach 17) | 20 |
-/// | `sharpen` | `vh` ±2 (itself the denoised value, reach 20) | 22 |
+/// | `sharpen` | `vh` ±6 (itself the denoised value, reach 20) | 26 |
 ///
 /// Kept **even**, which is not cosmetic: an odd halo shifts the CFA phase inside
 /// the tile, and every pixel would come out the wrong colour.
 ///
 /// It was 12 before capture sharpening, 14 before chroma noise reduction, 16
-/// before luminance noise reduction and 18 before the defringe. That third one
-/// is why the bilateral reaches three rather than two: at ±2 the chain rounded
-/// up to the same number anyway, so the wider kernel was free. The defringe is
-/// the one that actually cost something — four more pixels of halo is 3% more
-/// work per tile, and a narrower reach would leave part of the rim behind.
+/// before luminance noise reduction, 18 before the defringe and 22 before the
+/// texture control. That third one is why the bilateral reaches three rather
+/// than two: at ±2 the chain rounded up to the same number anyway, so the wider
+/// kernel was free. The defringe is the one that actually cost something — four
+/// more pixels of halo is 3% more work per tile, and a narrower reach would
+/// leave part of the rim behind.
+///
+/// Texture cost the same again, and deliberately. It is capture sharpening's
+/// radius that makes it a different control rather than a second copy of the
+/// same one, so the reach is the control: at ±2 there would be nothing to tell
+/// the two sliders apart. Four pixels of halo is the price of the distinction.
 /// Get this wrong and the symptom is a faint grid at the tile boundaries on
 /// detailed frames — which is why `a_level_zero_tile_is_identical_to_the_whole_image_render`
 /// is the test that guards it rather than anything that looks at a photograph.
-pub const HALO: u32 = 22;
+pub const HALO: u32 = 26;
 
 /// Tile edge in pixels, excluding halo. 512 keeps every buffer far inside
 /// WebGPU's default limits while leaving the halo a small fraction of the work
@@ -1727,6 +1737,15 @@ impl Renderer {
         let hsm_cells = hsm.map(|m| m.cell_count()).unwrap_or(1);
         let look_cells = colour.look.as_ref().map(|m| m.cell_count()).unwrap_or(1);
         let tone_cells = colour.tone.as_ref().map(|lut| lut.len()).unwrap_or(1);
+        // The haze veil, measured on the guide with this edit's own white
+        // balance. Skipped entirely when nothing is asking, because it walks
+        // every guide texel and a photograph that is not dehazing should not pay
+        // for it on every slider move.
+        let veil = if state.tone.dehaze != 0.0 {
+            buffers.guide.veil(colour.multipliers)
+        } else {
+            0.0
+        };
         let params = Params {
             width: padded,
             height: padded,
@@ -1774,6 +1793,24 @@ impl Renderer {
                 state.detail.chroma_noise,
                 state.detail.luminance_noise,
             ],
+            local_contrast: [
+                state.tone.clarity,
+                state.tone.texture,
+                state.tone.dehaze,
+                veil,
+            ],
+            // The veil is neutral in white-balanced camera RGB, so its colour in
+            // the working space is that space's own white at the veil's level.
+            // Computed here rather than in the shader because it is one triple
+            // for the frame and the matrix is already resolved.
+            airlight: {
+                let white = [
+                    m[0].iter().sum::<f32>() * veil,
+                    m[1].iter().sum::<f32>() * veil,
+                    m[2].iter().sum::<f32>() * veil,
+                ];
+                [white[0], white[1], white[2], 0.0]
+            },
             colour: [
                 state.colour.saturation,
                 state.colour.vibrance,
@@ -1804,12 +1841,29 @@ impl Renderer {
                 buffers.guide_offset as u32,
                 buffers.guide_size[0],
                 buffers.guide_size[1],
-                // Off unless a local control is actually asking for it. The
-                // guide costs a develop per pixel, and a photograph whose
-                // highlights and shadows are at zero should not pay for a
-                // neighbourhood nothing consults — nor differ by one bit from a
-                // build that never had this.
-                u32::from(tone.active && (tone.highlights != 0.0 || tone.shadows != 0.0)),
+                // Off unless something is actually asking for it. The guide
+                // costs a develop per pixel, and a photograph that consults no
+                // neighbourhood should not pay for one — nor differ by one bit
+                // from a build that never had this.
+                //
+                // Everything that reads it has to be listed, and this is the
+                // list: the two spatially adaptive tone controls, and every
+                // clarity, local or global. A clarity left off it does not fail
+                // loudly — the shader reads the guide as absent and the slider
+                // silently does nothing, which is what happened to the local one
+                // between it shipping and this being noticed.
+                //
+                // Not gated on `tone.active`, which it used to be. That flag is
+                // about the tone *curve*, so a clarity on a photograph with no
+                // tone adjustment could not switch the guide on and the slider
+                // silently did nothing — which is how the local clarity shipped.
+                u32::from(
+                    tone.highlights != 0.0
+                        || tone.shadows != 0.0
+                        || state.tone.clarity != 0.0
+                        || state.tone.dehaze != 0.0
+                        || live.iter().any(|m| m.clarity != 0.0),
+                ),
             ],
             masks: [live.len() as u32, 0, 0, 0],
             mask_scale: [

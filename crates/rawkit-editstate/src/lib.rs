@@ -894,6 +894,31 @@ pub struct Tone {
     pub shadows: f32,
     pub whites: f32,
     pub blacks: f32,
+    /// Contrast against the neighbourhood rather than against a fixed grey.
+    ///
+    /// The same operation the local one performs and against the same
+    /// neighbourhood — `rawkit_engine::guide`, which spans about 190 image
+    /// pixels — so the two agree where they overlap and a mask refines what the
+    /// global slider did rather than arguing with it.
+    #[serde(default)]
+    pub clarity: f32,
+    /// The same idea at a radius of a few pixels: fine detail, not local tone.
+    ///
+    /// A separate control and not a second clarity, because the two do visibly
+    /// different things to a face — clarity hollows the cheeks, texture finds
+    /// the pores — and one slider at a compromise radius does neither.
+    #[serde(default)]
+    pub texture: f32,
+    /// Haze, undone by the strength of it rather than by more contrast.
+    ///
+    /// Runs in **scene-linear light**, before the tone map, and that placement is
+    /// the whole reason it is not a contrast slider: haze is airlight added to
+    /// the scene, `I = J·t + A·(1 - t)`, and that equation is about light. After
+    /// a tone curve the numbers are no longer the light and subtracting `A` from
+    /// them subtracts the wrong quantity — which shows up as the sky going grey
+    /// while the foreground barely moves.
+    #[serde(default)]
+    pub dehaze: f32,
 }
 
 impl Default for Tone {
@@ -905,6 +930,9 @@ impl Default for Tone {
             shadows: 0.0,
             whites: 0.0,
             blacks: 0.0,
+            clarity: 0.0,
+            texture: 0.0,
+            dehaze: 0.0,
         }
     }
 }
