@@ -358,6 +358,10 @@ struct Params {
     /// in the space the mask composites in and the shader has no reason to know
     /// which part came from which control.
     mask_gain: [[f32; 4]; rawkit_editstate::MAX_MASKS],
+    /// The display-referred half of each local adjustment: contrast, saturation
+    /// and clarity, applied on the far side of the tone map. Ordered exactly as
+    /// `mask_look` in the shader.
+    mask_look: [[f32; 4]; rawkit_editstate::MAX_MASKS],
     /// `[dest_x, dest_y, tile, halo]`. Rewritten per tile; everything above it
     /// moves only when the edit does, which is why this sits last and is
     /// patched in place rather than re-uploading the whole uniform.
@@ -1782,6 +1786,13 @@ impl Renderer {
                     gains[slot] = mask_gain(image, &colour, mask);
                 }
                 gains
+            },
+            mask_look: {
+                let mut looks = [[0.0f32; 4]; rawkit_editstate::MAX_MASKS];
+                for (slot, mask) in live.iter().enumerate() {
+                    looks[slot] = [mask.contrast, mask.saturation, mask.clarity, 0.0];
+                }
+                looks
             },
             guide_scale: [
                 buffers.guide_scale[0],

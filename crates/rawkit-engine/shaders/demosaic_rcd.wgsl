@@ -142,6 +142,12 @@ struct Params {
     // multiplies in this space and the shader has no reason to know which part
     // came from which control. `.a` unused.
     mask_gain: array<vec4<f32>, 8>,
+
+    // The display-referred half of each local adjustment: contrast in `.x`,
+    // saturation in `.y`, clarity in `.z`. A separate array because they are
+    // applied on the far side of the tone map -- the mask is one texture and is
+    // read twice, once for the multiplies before it and once for these after.
+    mask_look: array<vec4<f32>, 8>,
     // Where this tile lands in the canvas and how to trim it: `.xy` is the
     // destination pixel, `.z` the tile edge, `.w` the halo width. Rewritten per
     // tile, unlike everything above it, which moves only when the edit does.
@@ -823,6 +829,13 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
             user_curve(shaped.b),
         );
     }
+    // The display-referred half of the local adjustments, here and not beside
+    // the multiplies at stage G: contrast and saturation are about the picture,
+    // and in scene-linear light they would both depend on the exposure. The
+    // neighbourhood the clarity works against is the local-tone guide's, which
+    // is already resolved for this pixel.
+    shaped = local_look(shaped, ixy, local);
+
     // Stage J -- colour adjustments, after the tone curve for the same reason
     // the tone curve is after the tone map: this is about the picture, not the
     // light. In scene-linear it would depend on exposure, and a colour that
@@ -1330,6 +1343,73 @@ fn local_adjust(rgb: vec3<f32>, ixy: vec2<f32>) -> vec3<f32> {
             let gain = max(params.mask_gain[i].rgb, vec3<f32>(EPS));
             out = out * pow(gain, vec3<f32>(weight));
         }
+    }
+    return out;
+}
+
+
+/// The half of a local adjustment that is about the picture rather than the
+/// light.
+///
+/// Read from the same mask texture as [`local_adjust`] and applied after the
+/// tone map, because that is where these operations mean anything. Contrast in
+/// scene-linear would depend on the exposure; saturation would depend on it
+/// twice over. The mask is sampled a second time rather than carried in a
+/// register, which costs a fetch and keeps the two stages independent of each
+/// other's order.
+fn local_look(rgb: vec3<f32>, ixy: vec2<f32>, neighbourhood: f32) -> vec3<f32> {
+    let count = params.masks.x;
+    if (count == 0u) {
+        return rgb;
+    }
+    let uv = ixy * params.mask_scale.xy;
+    var out = rgb;
+    for (var i = 0u; i < count; i = i + 1u) {
+        let look = params.mask_look[i];
+        if (look.x == 0.0 && look.y == 0.0 && look.z == 0.0) {
+            continue;
+        }
+        let weight = textureSampleLevel(mask_layers, mask_sampler, uv, i, 0.0).r;
+        if (weight <= 0.0) {
+            continue;
+        }
+        var v = out;
+
+        // Contrast about middle grey -- `TONE_PIVOT`, which is where
+        // scene-linear 0.18 lands once the tone map has run, so this pivots on
+        // the same grey the global contrast does and the two agree where they
+        // overlap. Below the pivot it darkens and above it brightens, which is
+        // what the word means; a power about *zero* would only have made
+        // everything brighter, which is a gamma control wearing the wrong label.
+        if (look.x != 0.0) {
+            let amount = look.x * weight;
+            let ratio = max(v / TONE_PIVOT, vec3<f32>(EPS));
+            v = TONE_PIVOT * pow(ratio, vec3<f32>(1.0 + amount));
+        }
+
+        // Saturation as distance from this pixel's own grey, in Rec. 709 --
+        // matching what the values are in by this point, and the same rule the
+        // global control uses so the two agree where they overlap.
+        if (look.y != 0.0) {
+            let grey = dot(v, vec3<f32>(0.2126, 0.7152, 0.0722));
+            v = mix(vec3<f32>(grey), v, 1.0 + look.y * weight);
+        }
+
+        // Clarity is the operation above with a *moving* pivot: contrast against
+        // the neighbourhood rather than against a fixed grey, which is what
+        // makes it read as texture rather than as contrast: a pixel brighter
+        // than what surrounds it gets brighter still, and the size of "what
+        // surrounds it" is the guide's own scale. Nothing new is computed for it
+        // -- the local-tone guide already answers this question, and asking it
+        // twice at two radii is how a clarity control turns into a halo.
+        if (look.z != 0.0 && neighbourhood >= 0.0) {
+            let amount = look.z * weight;
+            let around = max(neighbourhood, EPS);
+            let ratio = max(v / around, vec3<f32>(EPS));
+            v = around * pow(ratio, vec3<f32>(1.0 + amount));
+        }
+
+        out = mix(out, v, 1.0);
     }
     return out;
 }

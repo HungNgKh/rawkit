@@ -521,6 +521,24 @@ pub struct Mask {
     /// Green or magenta, -1 to 1. Positive is magenta, matching
     /// [`WhiteBalance::tint`].
     pub tint: f32,
+
+    // The three below are display-referred, and that is the whole reason they
+    // are separate fields rather than more of the same. Exposure and white
+    // balance are multiplies in scene-linear light, so the mask composites them
+    // before the tone map; contrast, saturation and clarity are statements about
+    // the *picture*, so the mask has to be carried across the tone map to reach
+    // them. Optional with defaults, so an edit stored before they existed reads
+    // back unchanged.
+    /// About the mask's own midtone, -1 to 1.
+    #[serde(default)]
+    pub contrast: f32,
+    /// Distance from grey, -1 to 1. Negative to grey out, positive to lift.
+    #[serde(default)]
+    pub saturation: f32,
+    /// Local contrast at the scale of a neighbourhood, -1 to 1 — the control
+    /// people mean by "texture" or "clarity".
+    #[serde(default)]
+    pub clarity: f32,
 }
 
 impl Default for Mask {
@@ -538,6 +556,9 @@ impl Default for Mask {
             exposure_ev: 0.0,
             warmth: 0.0,
             tint: 0.0,
+            contrast: 0.0,
+            saturation: 0.0,
+            clarity: 0.0,
         }
     }
 }
@@ -553,7 +574,12 @@ impl Mask {
     /// touching a slider sees nothing happen, which is correct and is why the
     /// window draws the placement itself rather than relying on the picture.
     pub fn is_identity(&self) -> bool {
-        self.exposure_ev == 0.0 && self.warmth == 0.0 && self.tint == 0.0
+        self.exposure_ev == 0.0
+            && self.warmth == 0.0
+            && self.tint == 0.0
+            && self.contrast == 0.0
+            && self.saturation == 0.0
+            && self.clarity == 0.0
     }
 
     fn validate(&self) -> Result<(), EditStateError> {
@@ -575,7 +601,13 @@ impl Mask {
                 Self::EXPOSURE_REACH
             )));
         }
-        for (name, v) in [("warmth", self.warmth), ("tint", self.tint)] {
+        for (name, v) in [
+            ("warmth", self.warmth),
+            ("tint", self.tint),
+            ("contrast", self.contrast),
+            ("saturation", self.saturation),
+            ("clarity", self.clarity),
+        ] {
             if !finite(v) || !(-1.0..=1.0).contains(&v) {
                 return Err(EditStateError::InvalidMask(format!(
                     "local {name} is {v}, and runs from -1 to 1"

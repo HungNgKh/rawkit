@@ -464,3 +464,148 @@ fn a_range_mask_reaches_the_renderer_at_all() {
         bright.1
     );
 }
+
+/// The same gradient across the top, carrying one display-referred control.
+fn top_with(f: impl Fn(&mut Mask)) -> Mask {
+    let mut mask = Mask {
+        shape: MaskShape::Linear {
+            from: [0.5, 0.1],
+            to: [0.5, 0.4],
+        },
+        ..Mask::default()
+    };
+    f(&mut mask);
+    mask
+}
+
+fn saturation(pixels: &[f32], x: u32, y: u32) -> f32 {
+    let i = ((y * W + x) * 4) as usize;
+    let (r, g, b) = (pixels[i], pixels[i + 1], pixels[i + 2]);
+    let high = r.max(g).max(b);
+    let low = r.min(g).min(b);
+    (high - low) / high.max(1e-6)
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn the_display_referred_half_reaches_only_where_the_mask_is() {
+    // Contrast and saturation are applied on the far side of the tone map,
+    // which is a second place the mask has to be read. The claim is the same
+    // one the first half already makes and has to be made again here, because
+    // "the mask is carried across the boundary" is exactly the sort of thing
+    // that can be half-true: the top of the frame moves and the bottom does
+    // not.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let plain = render(&gpu, &EditState::default());
+
+    let darkened = EditState {
+        masks: vec![top_with(|m| m.contrast = 0.8)],
+        ..EditState::default()
+    };
+    let out = render(&gpu, &darkened);
+    let inside = (luma(&plain, W / 2, 8), luma(&out, W / 2, 8));
+    let outside = (luma(&plain, W / 2, H - 8), luma(&out, W / 2, H - 8));
+    println!(
+        "contrast: inside {:.4} -> {:.4}, outside {:.4} -> {:.4}",
+        inside.0, inside.1, outside.0, outside.1
+    );
+    assert!(
+        (outside.1 - outside.0).abs() < 0.002,
+        "local contrast reached outside its mask: {:.4} to {:.4}",
+        outside.0,
+        outside.1
+    );
+    // And it is *contrast*, not brightness. The frame is below middle grey, so
+    // more contrast has to darken it; a power about zero would have made it
+    // brighter and passed a test that only asked whether something moved.
+    assert!(
+        inside.1 < inside.0 - 0.01,
+        "more local contrast on something below middle grey made it brighter: \
+         {:.4} to {:.4}",
+        inside.0,
+        inside.1
+    );
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn local_saturation_moves_colour_and_not_brightness() {
+    // The same claim the global control is held to, and the reason saturation
+    // is measured as distance from grey rather than as a channel ratio: a
+    // control that greyed a colour out by darkening it would pass a naive test
+    // and look wrong on a photograph.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    // A frame with colour in it, so there is something to take away.
+    let cfa: Vec<f32> = (0..W * H)
+        .map(|i| {
+            let (x, y) = (i % W, i / W);
+            // Rggb, and red twice what the rest is: a warm flat field.
+            if x % 2 == 0 && y % 2 == 0 {
+                0.6
+            } else {
+                0.3
+            }
+        })
+        .collect();
+    let plain = render_frame(&gpu, &EditState::default(), &cfa);
+    let greyed = EditState {
+        masks: vec![top_with(|m| m.saturation = -1.0)],
+        ..EditState::default()
+    };
+    let out = render_frame(&gpu, &greyed, &cfa);
+
+    let inside = (
+        saturation(&plain, W / 2, 8),
+        saturation(&out, W / 2, 8),
+        luma(&plain, W / 2, 8),
+        luma(&out, W / 2, 8),
+    );
+    let outside = (
+        saturation(&plain, W / 2, H - 8),
+        saturation(&out, W / 2, H - 8),
+    );
+    println!(
+        "saturation inside {:.4} -> {:.4} at luma {:.4} -> {:.4}; outside {:.4} -> {:.4}",
+        inside.0, inside.1, inside.2, inside.3, outside.0, outside.1
+    );
+    assert!(
+        inside.1 < inside.0 * 0.2,
+        "local saturation did not take the colour out: {:.4} to {:.4}",
+        inside.0,
+        inside.1
+    );
+    assert!(
+        (inside.3 - inside.2).abs() < 0.01,
+        "taking the colour out changed the brightness: {:.4} to {:.4}",
+        inside.2,
+        inside.3
+    );
+    assert!(
+        (outside.1 - outside.0).abs() < 0.002,
+        "local saturation reached outside its mask: {:.4} to {:.4}",
+        outside.0,
+        outside.1
+    );
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_mask_that_asks_for_nothing_new_still_changes_nothing() {
+    // The three new controls all default to zero, so a mask carrying only the
+    // old ones must render exactly as it did. This is the test that would have
+    // caught a uniform written into the wrong slot -- the two `Params` structs
+    // have to agree field for field, and nothing else here would notice.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let before = render(&gpu, &EditState::default());
+    let quiet = EditState {
+        masks: vec![top_with(|_| {})],
+        ..EditState::default()
+    };
+    let after = render(&gpu, &quiet);
+    for (i, (a, b)) in before.iter().zip(&after).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-5,
+            "a mask asking for nothing moved pixel {i}: {a} against {b}"
+        );
+    }
+}

@@ -1711,7 +1711,7 @@ fn main() -> Result<()> {
                                 // however many frames it spans — and for a brush
                                 // that is one *stroke*, which is the unit anyone
                                 // would expect to take back.
-                                control: (index as u8) * 8,
+                                control: (index as u8) * MASK_CONTROLS,
                             });
                         }
                     }
@@ -2663,6 +2663,17 @@ static PLACING_MASK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// they are drawn in and the order the list shows. A mask that has never been
 /// refined has one part and this is always zero, so nothing had to change for
 /// the masks that existed before it did.
+/// How many controls one local adjustment reserves in the coalescing byte.
+///
+/// Sixteen and not ten: the byte is `mask * MASK_CONTROLS + slot`, so the stride
+/// has to be at least as large as the number of slots or one mask's controls run
+/// into the next mask's — which shows up as two unrelated sliders sharing an undo
+/// step, and would be very hard to find from that symptom. A power of two leaves
+/// room for the next control without this having to move again, and eight masks
+/// of sixteen still fits a byte with `u8::MAX` left over to mean "do not
+/// coalesce".
+const MASK_CONTROLS: u8 = 16;
+
 static SELECTED_PART: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn selected_part() -> usize {
@@ -3003,6 +3014,20 @@ fn set_mask(
             mask.tint = value;
             3
         }
+        // The display-referred three. Slots of their own so that dragging one
+        // and then another is two undo steps, the same as the multiplies above.
+        "contrast" => {
+            mask.contrast = value;
+            7
+        }
+        "saturation" => {
+            mask.saturation = value;
+            8
+        }
+        "clarity" => {
+            mask.clarity = value;
+            9
+        }
         "feather" => match part_of(mask, part).ok_or("there is no such part")? {
             rawkit_editstate::MaskShape::Radial { feather, .. }
             | rawkit_editstate::MaskShape::Brush { feather, .. }
@@ -3075,7 +3100,7 @@ fn set_mask(
         control: if slot == u8::MAX {
             u8::MAX
         } else {
-            (index as u8) * 8 + slot
+            (index as u8) * MASK_CONTROLS + slot
         },
     });
     Ok(())

@@ -382,6 +382,15 @@
       <label><span>Exposure</span>
         <input id="mask-exposure" type="range" min="-4" max="4" step="0.01" value="0">
         <output id="mask-exposure-value">0.00</output></label>
+      <label><span>Contrast</span>
+        <input id="mask-contrast" type="range" min="-1" max="1" step="0.01" value="0">
+        <output id="mask-contrast-value">0.00</output></label>
+      <label><span>Saturation</span>
+        <input id="mask-saturation" type="range" min="-1" max="1" step="0.01" value="0">
+        <output id="mask-saturation-value">0.00</output></label>
+      <label><span>Clarity</span>
+        <input id="mask-clarity" type="range" min="-1" max="1" step="0.01" value="0">
+        <output id="mask-clarity-value">0.00</output></label>
       <label><span>Warmth</span>
         <input id="mask-warmth" type="range" min="-1" max="1" step="0.01" value="0">
         <output id="mask-warmth-value">0.00</output></label>
@@ -605,6 +614,7 @@
   const TONE = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"];
   for (const id of [...TONE, "straighten", "sharpen", "sharpen_radius", "chroma_noise", "luminance_noise", "saturation", "vibrance", "temperature", "tint",
     "mask-exposure", "mask-warmth", "mask-tint", "mask-feather", "mask-size", "mask-from", "mask-to",
+    "mask-contrast", "mask-saturation", "mask-clarity",
     "grade-shadows", "grade-midtones", "grade-highlights", "grade-blending", "grade-balance",
     ...BANDS.flatMap(([band]) => HSL_CONTROLS.map(([control]) => `hsl-${band}-${control}`))]) {
     document.getElementById(id).addEventListener("pointerdown", () => (dragging = id));
@@ -1513,6 +1523,11 @@
         v => `${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(2)}`);
       setSlider("mask-warmth", mask.warmth, v => Number(v).toFixed(2));
       setSlider("mask-tint", mask.tint, v => Number(v).toFixed(2));
+      for (const [id, key] of [["mask-contrast", "contrast"],
+                               ["mask-saturation", "saturation"],
+                               ["mask-clarity", "clarity"]]) {
+        setSlider(id, mask[key] ?? 0, v => Number(v).toFixed(2));
+      }
       inverted = !!mask.invert;
       document.getElementById("mask-invert").classList.toggle("armed", inverted);
       // A gradient's feather is the distance between its two ends, so there is
@@ -1658,6 +1673,9 @@
     ["mask-feather", "feather"],
     ["mask-from", "from"],
     ["mask-to", "to"],
+    ["mask-contrast", "contrast"],
+    ["mask-saturation", "saturation"],
+    ["mask-clarity", "clarity"],
   ]) {
     document.getElementById(id).addEventListener("input", (e) => {
       if (selected === null) return;
