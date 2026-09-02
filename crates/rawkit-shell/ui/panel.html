@@ -317,9 +317,6 @@
     <label><span>Luma NR</span>
       <input id="luminance_noise" type="range" min="0" max="1" step="0.01" value="0">
       <output id="luminance_noise-value">0.00</output></label>
-    <label><span>Defringe</span>
-      <input id="defringe" type="range" min="0" max="1" step="0.01" value="1">
-      <output id="defringe-value">1.00</output></label>
     <div class="row">
       <button id="lens-measure">Fix colour fringing</button>
       <button id="lens-clear">Clear</button>
@@ -517,7 +514,6 @@
   slider("sharpen_radius", v => ({ command: "set_sharpen_radius", params: v }), v => v.toFixed(2));
   slider("chroma_noise", v => ({ command: "set_chroma_noise", params: v }), v => v.toFixed(2));
   slider("luminance_noise", v => ({ command: "set_luminance_noise", params: v }), v => v.toFixed(2));
-  slider("defringe", v => ({ command: "set_defringe", params: v }), v => v.toFixed(2));
   slider("saturation", v => ({ command: "set_saturation", params: v }), v => v.toFixed(2));
   slider("vibrance", v => ({ command: "set_vibrance", params: v }), v => v.toFixed(2));
   for (const [band] of BANDS) {
@@ -589,7 +585,7 @@
   // halves of one control disagreeing, which is worse than either being wrong.
   let dragging = null;
   const TONE = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"];
-  for (const id of [...TONE, "straighten", "sharpen", "sharpen_radius", "chroma_noise", "luminance_noise", "defringe", "saturation", "vibrance", "temperature", "tint",
+  for (const id of [...TONE, "straighten", "sharpen", "sharpen_radius", "chroma_noise", "luminance_noise", "saturation", "vibrance", "temperature", "tint",
     "mask-exposure", "mask-warmth", "mask-tint", "mask-feather", "mask-size",
     "grade-shadows", "grade-midtones", "grade-highlights", "grade-blending", "grade-balance",
     ...BANDS.flatMap(([band]) => HSL_CONTROLS.map(([control]) => `hsl-${band}-${control}`))]) {
@@ -620,7 +616,6 @@
     setSlider("sharpen_radius", state.detail.sharpen_radius, v => Number(v).toFixed(2));
     setSlider("chroma_noise", state.detail.chroma_noise, v => Number(v).toFixed(2));
     setSlider("luminance_noise", state.detail.luminance_noise, v => Number(v).toFixed(2));
-    setSlider("defringe", state.detail.defringe, v => Number(v).toFixed(2));
     // In pixels at the corner rather than as the fraction the edit stores: a
     // fraction of a radius is not something anyone has intuitions about, and the
     // pixel is exactly the thing being complained about when this is reached for.
