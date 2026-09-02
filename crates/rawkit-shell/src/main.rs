@@ -293,6 +293,7 @@ fn snapshot(state: tauri::State<'_, Shared>) -> serde_json::Value {
         // drag on the photograph redraws it. Neither is part of the *edit* —
         // they are where the hands are, not what the picture is — so they live
         // beside it rather than in it. `null` for none.
+        "selected_part": SELECTED_PART.load(std::sync::atomic::Ordering::Relaxed),
         "selected_mask": match SELECTED_MASK.load(std::sync::atomic::Ordering::Relaxed) {
             usize::MAX => None,
             index => Some(index),
@@ -1044,6 +1045,9 @@ fn main() -> Result<()> {
             arm_target,
             pick_white_balance,
             pick_range,
+            add_refinement,
+            remove_refinement,
+            select_part,
             add_mask,
             remove_mask,
             select_mask,
@@ -1649,7 +1653,8 @@ fn main() -> Result<()> {
                             ]
                         };
                         let mut masks = session.state().masks.clone();
-                        let changed = match masks.get_mut(index).map(|m| &mut m.shape) {
+                        let part = selected_part();
+                        let changed = match masks.get_mut(index).and_then(|m| part_of(m, part)) {
                             Some(rawkit_editstate::MaskShape::Brush { strokes, .. }) => {
                                 if fresh {
                                     strokes.push(rawkit_editstate::Stroke {
@@ -2652,6 +2657,29 @@ static SELECTED_MASK: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(usize::MAX);
 static PLACING_MASK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Which shape *within* the selected adjustment the panel is showing.
+///
+/// Zero is the base shape and `n` is the `n`-th refinement, which is the order
+/// they are drawn in and the order the list shows. A mask that has never been
+/// refined has one part and this is always zero, so nothing had to change for
+/// the masks that existed before it did.
+static SELECTED_PART: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn selected_part() -> usize {
+    SELECTED_PART.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The shape the panel's controls and the next drag belong to.
+fn part_of(
+    mask: &mut rawkit_editstate::Mask,
+    part: usize,
+) -> Option<&mut rawkit_editstate::MaskShape> {
+    match part {
+        0 => Some(&mut mask.shape),
+        n => mask.refinements.get_mut(n - 1).map(|r| &mut r.shape),
+    }
+}
+
 pub(crate) fn placing_mask() -> Option<usize> {
     if !PLACING_MASK.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
@@ -2676,9 +2704,9 @@ pub(crate) static MASK_DRAG: Mutex<Option<MaskDrag>> = Mutex::new(None);
 /// changes nothing is invisible, and an invisible thing that has to be dragged
 /// into position is a thing nobody can place — so the first press already shows
 /// where it is, and the sliders take it from there.
-#[tauri::command]
-fn add_mask(kind: Option<String>, state: tauri::State<'_, Shared>) -> Result<usize, String> {
-    let shape = match kind.as_deref() {
+/// A shape of the named kind, in the place a new one starts from.
+fn starting_shape(kind: Option<&str>) -> Result<rawkit_editstate::MaskShape, String> {
+    Ok(match kind {
         None | Some("") | Some("gradient") => rawkit_editstate::Mask::default().shape,
         // Nothing painted yet, so nothing happens until the hand moves — which
         // is right for a brush and would be wrong for the other two, where an
@@ -2705,7 +2733,12 @@ fn add_mask(kind: Option<String>, state: tauri::State<'_, Shared>) -> Result<usi
             feather: 0.1,
         },
         Some(other) => return Err(format!("{other:?} is not a kind of local adjustment")),
-    };
+    })
+}
+
+#[tauri::command]
+fn add_mask(kind: Option<String>, state: tauri::State<'_, Shared>) -> Result<usize, String> {
+    let shape = starting_shape(kind.as_deref())?;
     let mut session = state.0.lock().expect("session lock");
     let mut masks = session.state().masks.clone();
     if masks.len() >= rawkit_editstate::MAX_MASKS {
@@ -2726,11 +2759,105 @@ fn add_mask(kind: Option<String>, state: tauri::State<'_, Shared>) -> Result<usi
     });
     drop(session);
     SELECTED_MASK.store(index, std::sync::atomic::Ordering::Relaxed);
+    SELECTED_PART.store(0, std::sync::atomic::Ordering::Relaxed);
     // Everything but a range is positioned by dragging it out, so the next press
     // belongs to the mask. A range has nowhere to be dragged to.
     let placed_by_hand = !matches!(kind.as_deref(), Some("range"));
     PLACING_MASK.store(placed_by_hand, std::sync::atomic::Ordering::Relaxed);
     Ok(index)
+}
+
+/// Build the selected adjustment out of one more shape.
+///
+/// The op says how it joins what is already there, and the new part is selected
+/// straight away — because the next thing anyone does is put it where they meant
+/// it, and having to click it first would be a step that exists for no reason.
+#[tauri::command]
+fn add_refinement(
+    op: String,
+    kind: Option<String>,
+    state: tauri::State<'_, Shared>,
+) -> Result<usize, String> {
+    let op = match op.as_str() {
+        "add" => rawkit_editstate::MaskOp::Add,
+        "subtract" => rawkit_editstate::MaskOp::Subtract,
+        "intersect" => rawkit_editstate::MaskOp::Intersect,
+        other => return Err(format!("{other:?} is not a way of joining shapes")),
+    };
+    let shape = starting_shape(kind.as_deref())?;
+    let index = SELECTED_MASK.load(std::sync::atomic::Ordering::Relaxed);
+    let mut session = state.0.lock().expect("session lock");
+    let mut masks = session.state().masks.clone();
+    let mask = masks
+        .get_mut(index)
+        .ok_or_else(|| "no local adjustment is selected".to_string())?;
+    if mask.refinements.len() >= rawkit_editstate::MAX_REFINEMENTS {
+        return Err(format!(
+            "{} shapes past the first is the most one adjustment may be built from",
+            rawkit_editstate::MAX_REFINEMENTS
+        ));
+    }
+    mask.refinements
+        .push(rawkit_editstate::Refinement { op, shape });
+    let part = mask.refinements.len();
+    let ranged = matches!(kind.as_deref(), Some("range"));
+    session.apply(Command::SetMasks {
+        masks,
+        control: u8::MAX,
+    });
+    drop(session);
+    SELECTED_PART.store(part, std::sync::atomic::Ordering::Relaxed);
+    PLACING_MASK.store(!ranged, std::sync::atomic::Ordering::Relaxed);
+    Ok(part)
+}
+
+/// Take one of the shapes back out, leaving the adjustment itself alone.
+#[tauri::command]
+fn remove_refinement(part: usize, state: tauri::State<'_, Shared>) -> Result<usize, String> {
+    if part == 0 {
+        return Err("the first shape is what the adjustment is; remove the adjustment".into());
+    }
+    let index = SELECTED_MASK.load(std::sync::atomic::Ordering::Relaxed);
+    let mut session = state.0.lock().expect("session lock");
+    let mut masks = session.state().masks.clone();
+    let mask = masks
+        .get_mut(index)
+        .ok_or_else(|| "no local adjustment is selected".to_string())?;
+    if part > mask.refinements.len() {
+        return Err("there is no such part".into());
+    }
+    mask.refinements.remove(part - 1);
+    let remaining = mask.refinements.len();
+    session.apply(Command::SetMasks {
+        masks,
+        control: u8::MAX,
+    });
+    drop(session);
+    // Back to the part before the one that went, so the selection stays
+    // somewhere real rather than pointing past the end.
+    SELECTED_PART.store(
+        part.saturating_sub(1).min(remaining),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    Ok(remaining)
+}
+
+/// Show a different one of the shapes an adjustment is built from.
+#[tauri::command]
+fn select_part(part: usize, state: tauri::State<'_, Shared>) -> Result<usize, String> {
+    let index = SELECTED_MASK.load(std::sync::atomic::Ordering::Relaxed);
+    let session = state.0.lock().expect("session lock");
+    let mask = session
+        .state()
+        .masks
+        .get(index)
+        .ok_or_else(|| "no local adjustment is selected".to_string())?;
+    if part > mask.refinements.len() {
+        return Err("there is no such part".into());
+    }
+    drop(session);
+    SELECTED_PART.store(part, std::sync::atomic::Ordering::Relaxed);
+    Ok(part)
 }
 
 /// Throw one away.
@@ -2758,6 +2885,7 @@ fn remove_mask(index: usize, state: tauri::State<'_, Shared>) -> Result<usize, S
         },
         std::sync::atomic::Ordering::Relaxed,
     );
+    SELECTED_PART.store(0, std::sync::atomic::Ordering::Relaxed);
     PLACING_MASK.store(false, std::sync::atomic::Ordering::Relaxed);
     Ok(left)
 }
@@ -2767,6 +2895,10 @@ fn remove_mask(index: usize, state: tauri::State<'_, Shared>) -> Result<usize, S
 fn select_mask(index: Option<usize>) -> usize {
     let chosen = index.unwrap_or(usize::MAX);
     SELECTED_MASK.store(chosen, std::sync::atomic::Ordering::Relaxed);
+    // A different adjustment shows its own first shape. Carrying the part index
+    // across would land on whichever refinement happened to sit at the same
+    // number, or on nothing at all.
+    SELECTED_PART.store(0, std::sync::atomic::Ordering::Relaxed);
     if index.is_none() {
         PLACING_MASK.store(false, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2854,6 +2986,10 @@ fn set_mask(
     let mask = masks
         .get_mut(index)
         .ok_or_else(|| "there is no such local adjustment".to_string())?;
+    // The shape controls act on whichever part the panel is showing; the
+    // adjustments below act on the whole mask, because that is what an
+    // adjustment belongs to.
+    let part = selected_part();
     let slot = match control.as_str() {
         "exposure" => {
             mask.exposure_ev = value;
@@ -2867,7 +3003,7 @@ fn set_mask(
             mask.tint = value;
             3
         }
-        "feather" => match &mut mask.shape {
+        "feather" => match part_of(mask, part).ok_or("there is no such part")? {
             rawkit_editstate::MaskShape::Radial { feather, .. }
             | rawkit_editstate::MaskShape::Brush { feather, .. }
             | rawkit_editstate::MaskShape::Range { feather, .. } => {
@@ -2882,7 +3018,7 @@ fn set_mask(
         // each other: on hue they are *meant* to be able to cross, because that
         // is what selects red, and on luminance the edit refuses the inversion
         // with a reason rather than silently swapping them.
-        "from" | "to" => match &mut mask.shape {
+        "from" | "to" => match part_of(mask, part).ok_or("there is no such part")? {
             rawkit_editstate::MaskShape::Range { from, to, .. } => {
                 if control == "from" {
                     *from = value;
@@ -2894,7 +3030,7 @@ fn set_mask(
             }
             _ => return Err("only a range has a band to move".into()),
         },
-        "channel" => match &mut mask.shape {
+        "channel" => match part_of(mask, part).ok_or("there is no such part")? {
             rawkit_editstate::MaskShape::Range {
                 channel,
                 from,

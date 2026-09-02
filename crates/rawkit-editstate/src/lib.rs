@@ -308,6 +308,153 @@ pub enum RangeChannel {
     Hue,
 }
 
+/// Whether a shape is a shape at all, whichever part of a mask it is.
+///
+/// Lifted out of [`Mask::validate`] when a mask stopped being one shape: a
+/// subtracted ellipse with a negative radius is exactly as unusable as a base
+/// one, and a second copy of these rules would be a second place for them to
+/// drift.
+fn validate_shape(shape: &MaskShape) -> Result<(), EditStateError> {
+    let finite = |v: f32| v.is_finite();
+    match *shape {
+        MaskShape::Linear { from, to } => {
+            if !from.iter().chain(&to).copied().all(finite) {
+                return Err(EditStateError::InvalidMask(format!(
+                    "a gradient runs from {from:?} to {to:?}, which is not a place"
+                )));
+            }
+            if from == to {
+                return Err(EditStateError::InvalidMask(
+                    "a gradient whose ends are the same point has no direction".into(),
+                ));
+            }
+        }
+        MaskShape::Brush {
+            ref strokes,
+            feather,
+        } => {
+            if !finite(feather) || !(0.0..=1.0).contains(&feather) {
+                return Err(EditStateError::InvalidMask(format!(
+                    "feather is {feather}, and runs from 0 to 1"
+                )));
+            }
+            let total: usize = strokes.iter().map(|s| s.points.len()).sum();
+            if total > MAX_BRUSH_POINTS {
+                return Err(EditStateError::InvalidMask(format!(
+                    "{total} brush points, and {MAX_BRUSH_POINTS} is the most a mask may carry"
+                )));
+            }
+            for stroke in strokes {
+                if !finite(stroke.radius) || stroke.radius <= 0.0 || stroke.radius > 1.0 {
+                    return Err(EditStateError::InvalidMask(format!(
+                        "a brush radius of {} is not a width",
+                        stroke.radius
+                    )));
+                }
+                if !stroke.points.iter().flatten().copied().all(finite) {
+                    return Err(EditStateError::InvalidMask(
+                        "a brush stroke passes through somewhere that is not a place".into(),
+                    ));
+                }
+            }
+        }
+        MaskShape::Range {
+            channel,
+            from,
+            to,
+            feather,
+        } => {
+            if !finite(from) || !finite(to) || !finite(feather) {
+                return Err(EditStateError::InvalidMask(format!(
+                    "a range of {from} to {to} feathered by {feather} is not a band"
+                )));
+            }
+            let full = match channel {
+                RangeChannel::Luminance => 1.0,
+                RangeChannel::Hue => 360.0,
+            };
+            for (name, v) in [("from", from), ("to", to)] {
+                if !(0.0..=full).contains(&v) {
+                    return Err(EditStateError::InvalidMask(format!(
+                        "a range's {name} is {v}, and this channel runs from 0 to {full}"
+                    )));
+                }
+            }
+            // Only hue is circular, so only hue may run backwards. On
+            // luminance an inverted band is a mistake with a plausible
+            // meaning, which is the worst kind to accept silently.
+            if channel == RangeChannel::Luminance && from > to {
+                return Err(EditStateError::InvalidMask(format!(
+                    "a luminance range runs from {from} down to {to}, and luminance does not wrap"
+                )));
+            }
+            if !(0.0..=full).contains(&feather) {
+                return Err(EditStateError::InvalidMask(format!(
+                    "a range's feather is {feather}, and runs from 0 to {full}"
+                )));
+            }
+        }
+        MaskShape::Radial {
+            centre,
+            radii,
+            feather,
+        } => {
+            if !centre.iter().chain(&radii).copied().all(finite) || !finite(feather) {
+                return Err(EditStateError::InvalidMask(format!(
+                    "an ellipse at {centre:?} of {radii:?} is not a shape"
+                )));
+            }
+            if radii[0] <= 0.0 || radii[1] <= 0.0 {
+                return Err(EditStateError::InvalidMask(format!(
+                    "an ellipse needs two radii above zero, not {radii:?}"
+                )));
+            }
+            if !(0.0..=1.0).contains(&feather) {
+                return Err(EditStateError::InvalidMask(format!(
+                    "feather is {feather}, and runs from 0 to 1"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One more shape, and what it does to what is already there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Refinement {
+    pub op: MaskOp,
+    pub shape: MaskShape,
+}
+
+/// How a refinement joins what came before it.
+///
+/// The three of fuzzy set theory, and deliberately those: a mask weight is a
+/// membership in `[0, 1]`, so union is the larger of the two, intersection the
+/// smaller, and complement is one minus. Multiplying instead would be defensible
+/// for a single step and wrong over three — an intersection of three shapes that
+/// all cover a texel fully would come out at less than full, and the selection
+/// would fade as it was refined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MaskOp {
+    /// Wherever either covers: the larger of the two weights.
+    Add,
+    /// Take this shape away: the smaller of what is there and what this does not
+    /// cover.
+    Subtract,
+    /// Only where both cover: the smaller of the two weights.
+    Intersect,
+}
+
+/// How many shapes one local adjustment may be built from, beyond its first.
+///
+/// Bounded for the same reason everything else here is: a mask is redrawn from
+/// its parts on every change, and an edit is JSON somebody's catalog has to
+/// hold. Eight is past the point where a person can still say what a selection
+/// means.
+pub const MAX_REFINEMENTS: usize = 8;
+
 /// One pass of the brush.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -345,6 +492,19 @@ pub struct Stroke {
 #[serde(deny_unknown_fields)]
 pub struct Mask {
     pub shape: MaskShape,
+    /// What else the mask is made of, applied to the base shape in order.
+    ///
+    /// Optional and empty by default, which is what lets it arrive without a
+    /// schema bump: an edit written before this existed reads back as a mask of
+    /// one shape and renders exactly as it did.
+    ///
+    /// **In order, and not as a set.** A subtraction followed by an addition is
+    /// not the same picture as the addition followed by the subtraction, and a
+    /// person building a selection up out of parts is thinking in steps. A flat
+    /// set would have to pick one of those meanings and would surprise them half
+    /// the time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refinements: Vec<Refinement>,
     /// Swap what the mask covers for what it does not.
     ///
     /// On the mask rather than on the shape, deliberately. It is a fact about
@@ -373,6 +533,7 @@ impl Default for Mask {
                 from: [0.5, 0.0],
                 to: [0.5, 0.35],
             },
+            refinements: Vec::new(),
             invert: false,
             exposure_ev: 0.0,
             warmth: 0.0,
@@ -397,105 +558,15 @@ impl Mask {
 
     fn validate(&self) -> Result<(), EditStateError> {
         let finite = |v: f32| v.is_finite();
-        match self.shape {
-            MaskShape::Linear { from, to } => {
-                if !from.iter().chain(&to).copied().all(finite) {
-                    return Err(EditStateError::InvalidMask(format!(
-                        "a gradient runs from {from:?} to {to:?}, which is not a place"
-                    )));
-                }
-                if from == to {
-                    return Err(EditStateError::InvalidMask(
-                        "a gradient whose ends are the same point has no direction".into(),
-                    ));
-                }
-            }
-            MaskShape::Brush {
-                ref strokes,
-                feather,
-            } => {
-                if !finite(feather) || !(0.0..=1.0).contains(&feather) {
-                    return Err(EditStateError::InvalidMask(format!(
-                        "feather is {feather}, and runs from 0 to 1"
-                    )));
-                }
-                let total: usize = strokes.iter().map(|s| s.points.len()).sum();
-                if total > MAX_BRUSH_POINTS {
-                    return Err(EditStateError::InvalidMask(format!(
-                        "{total} brush points, and {MAX_BRUSH_POINTS} is the most a mask may carry"
-                    )));
-                }
-                for stroke in strokes {
-                    if !finite(stroke.radius) || stroke.radius <= 0.0 || stroke.radius > 1.0 {
-                        return Err(EditStateError::InvalidMask(format!(
-                            "a brush radius of {} is not a width",
-                            stroke.radius
-                        )));
-                    }
-                    if !stroke.points.iter().flatten().copied().all(finite) {
-                        return Err(EditStateError::InvalidMask(
-                            "a brush stroke passes through somewhere that is not a place".into(),
-                        ));
-                    }
-                }
-            }
-            MaskShape::Range {
-                channel,
-                from,
-                to,
-                feather,
-            } => {
-                if !finite(from) || !finite(to) || !finite(feather) {
-                    return Err(EditStateError::InvalidMask(format!(
-                        "a range of {from} to {to} feathered by {feather} is not a band"
-                    )));
-                }
-                let full = match channel {
-                    RangeChannel::Luminance => 1.0,
-                    RangeChannel::Hue => 360.0,
-                };
-                for (name, v) in [("from", from), ("to", to)] {
-                    if !(0.0..=full).contains(&v) {
-                        return Err(EditStateError::InvalidMask(format!(
-                            "a range's {name} is {v}, and this channel runs from 0 to {full}"
-                        )));
-                    }
-                }
-                // Only hue is circular, so only hue may run backwards. On
-                // luminance an inverted band is a mistake with a plausible
-                // meaning, which is the worst kind to accept silently.
-                if channel == RangeChannel::Luminance && from > to {
-                    return Err(EditStateError::InvalidMask(format!(
-                        "a luminance range runs from {from} down to {to}, and luminance does not wrap"
-                    )));
-                }
-                if !(0.0..=full).contains(&feather) {
-                    return Err(EditStateError::InvalidMask(format!(
-                        "a range's feather is {feather}, and runs from 0 to {full}"
-                    )));
-                }
-            }
-            MaskShape::Radial {
-                centre,
-                radii,
-                feather,
-            } => {
-                if !centre.iter().chain(&radii).copied().all(finite) || !finite(feather) {
-                    return Err(EditStateError::InvalidMask(format!(
-                        "an ellipse at {centre:?} of {radii:?} is not a shape"
-                    )));
-                }
-                if radii[0] <= 0.0 || radii[1] <= 0.0 {
-                    return Err(EditStateError::InvalidMask(format!(
-                        "an ellipse needs two radii above zero, not {radii:?}"
-                    )));
-                }
-                if !(0.0..=1.0).contains(&feather) {
-                    return Err(EditStateError::InvalidMask(format!(
-                        "feather is {feather}, and runs from 0 to 1"
-                    )));
-                }
-            }
+        validate_shape(&self.shape)?;
+        if self.refinements.len() > MAX_REFINEMENTS {
+            return Err(EditStateError::InvalidMask(format!(
+                "{} shapes past the first, and {MAX_REFINEMENTS} is the most one adjustment may be built from",
+                self.refinements.len()
+            )));
+        }
+        for refinement in &self.refinements {
+            validate_shape(&refinement.shape)?;
         }
         if !finite(self.exposure_ev) || self.exposure_ev.abs() > Self::EXPOSURE_REACH {
             return Err(EditStateError::InvalidMask(format!(
@@ -1458,5 +1529,75 @@ mod tests {
     fn schema_is_generatable() {
         let schema = EditState::json_schema();
         assert!(schema.get("properties").is_some());
+    }
+    #[test]
+    fn an_edit_written_before_refinements_existed_still_reads() {
+        // The whole reason `refinements` is optional with a default: an edit
+        // stored by a build that had never heard of it must come back as a mask
+        // of one shape and render exactly as it did. If this needs a schema
+        // bump, it needs a migration, and a migration has to run on strangers'
+        // catalogs for the fifteen months between the beta and 1.0.
+        let json = r#"{
+            "schema_version": 1,
+            "masks": [{
+                "shape": { "kind": "linear", "from": [0.5, 0.0], "to": [0.5, 0.4] },
+                "invert": false,
+                "exposure_ev": -1.0,
+                "warmth": 0.0,
+                "tint": 0.0
+            }]
+        }"#;
+        let state: EditState =
+            serde_json::from_str(json).expect("an edit from before this existed");
+        assert_eq!(state.schema_version, SCHEMA_VERSION);
+        assert!(state.masks[0].refinements.is_empty());
+        state.validate().expect("and it is still a usable edit");
+
+        // And it goes back out the way it came: an empty list is not written, so
+        // a catalog full of unrefined masks does not grow a field apiece.
+        let encoded = serde_json::to_string(&state).unwrap();
+        assert!(
+            !encoded.contains("refinements"),
+            "an empty refinement list was written out: {encoded}"
+        );
+    }
+
+    #[test]
+    fn a_refinement_is_held_to_the_same_rules_as_a_base_shape() {
+        // The reason shape validation was lifted out of `Mask::validate`. A
+        // subtracted ellipse with no radius is exactly as unusable as a base
+        // one, and the rule must not have two copies to drift between.
+        let mut state = EditState {
+            masks: vec![Mask {
+                refinements: vec![Refinement {
+                    op: MaskOp::Subtract,
+                    shape: MaskShape::Radial {
+                        centre: [0.5, 0.5],
+                        radii: [0.0, 0.2],
+                        feather: 0.5,
+                    },
+                }],
+                ..Mask::default()
+            }],
+            ..EditState::default()
+        };
+        let why = state
+            .validate()
+            .expect_err("a radius of zero is not a shape");
+        println!("refused with: {why}");
+
+        state.masks[0].refinements = (0..=MAX_REFINEMENTS)
+            .map(|_| Refinement {
+                op: MaskOp::Add,
+                shape: MaskShape::Linear {
+                    from: [0.0, 0.0],
+                    to: [1.0, 1.0],
+                },
+            })
+            .collect();
+        let why = state
+            .validate()
+            .expect_err("one more than the most is too many");
+        println!("refused with: {why}");
     }
 }

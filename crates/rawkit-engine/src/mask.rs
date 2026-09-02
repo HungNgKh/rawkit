@@ -26,7 +26,7 @@
 //! that is a constant to raise rather than an arrangement to redo.
 
 use crate::guide::Guide;
-use rawkit_editstate::{Mask, MaskShape, RangeChannel, Stroke};
+use rawkit_editstate::{Mask, MaskOp, MaskShape, RangeChannel, Stroke};
 
 /// The longest edge a mask raster is built at.
 pub const MAX_EDGE: u32 = 1024;
@@ -47,15 +47,42 @@ pub fn dimensions(width: u32, height: u32) -> (u32, u32) {
     (edge(width), edge(height))
 }
 
-/// Draw one mask, as a value per texel from 0 (outside) to 1 (full effect).
+/// Draw one mask — every shape it is built from — as a value per texel from 0
+/// (outside) to 1 (full effect).
 ///
 /// The coordinates in the shape are fractions of the sensor frame, so this needs
 /// no knowledge of the crop or the orientation — which is the reason they are
 /// stored that way.
-pub fn rasterise(mask: &Mask, width: u32, height: u32, guide: &Guide, out: &mut [f32]) {
+pub fn rasterise(
+    mask: &Mask,
+    width: u32,
+    height: u32,
+    guide: &Guide,
+    out: &mut [f32],
+    scratch: &mut [f32],
+) {
     let (w, h) = dimensions(width, height);
-    debug_assert!(out.len() >= (w * h) as usize);
+    let cells = (w * h) as usize;
+    debug_assert!(out.len() >= cells);
     draw(&mask.shape, w, h, guide, out);
+
+    // Each further shape drawn on its own and then joined, in the order the
+    // person built them in. The weights are memberships in `[0, 1]`, so the
+    // joins are the fuzzy-set ones: union is the larger, intersection the
+    // smaller, complement is one minus. Multiplying would fade a selection every
+    // time it was refined, which is the opposite of what refining is for.
+    for refinement in &mask.refinements {
+        debug_assert!(scratch.len() >= cells);
+        draw(&refinement.shape, w, h, guide, scratch);
+        for i in 0..cells {
+            out[i] = match refinement.op {
+                MaskOp::Add => out[i].max(scratch[i]),
+                MaskOp::Subtract => out[i].min(1.0 - scratch[i]),
+                MaskOp::Intersect => out[i].min(scratch[i]),
+            };
+        }
+    }
+
     if mask.invert {
         // Applied to the finished weight rather than inside each shape, so it
         // means the same thing for every source there will ever be — and so the
@@ -423,7 +450,8 @@ mod tests {
     fn draw_on(mask: &Mask, width: u32, height: u32, guide: &Guide) -> (Vec<f32>, u32, u32) {
         let (w, h) = dimensions(width, height);
         let mut out = vec![0.0f32; (w * h) as usize];
-        rasterise(mask, width, height, guide, &mut out);
+        let mut joining = vec![0.0f32; (w * h) as usize];
+        rasterise(mask, width, height, guide, &mut out, &mut joining);
         (out, w, h)
     }
 
@@ -744,7 +772,8 @@ mod tests {
         );
         let (w, h) = dimensions(6024, 4024);
         let mut out = vec![0.0f32; (w * h) as usize];
-        rasterise(&long, 6024, 4024, &flat_guide(0.5), &mut out);
+        let mut joining = vec![0.0f32; (w * h) as usize];
+        rasterise(&long, 6024, 4024, &flat_guide(0.5), &mut out, &mut joining);
         let elapsed = across.elapsed();
         println!("a 200-point stroke across a {w}x{h} raster: {elapsed:?}");
         assert!(
@@ -923,5 +952,145 @@ mod tests {
                 "inverted range does not complement the plain one at {i}"
             );
         }
+    }
+    /// A gradient covering the left half, hard-edged, for combining with.
+    fn left_half() -> MaskShape {
+        MaskShape::Linear {
+            from: [0.5, 0.5],
+            to: [0.5001, 0.5],
+        }
+    }
+
+    /// A range that takes the bright half of [`split_guide`].
+    fn bright_half() -> MaskShape {
+        MaskShape::Range {
+            channel: RangeChannel::Luminance,
+            from: 0.4,
+            to: 1.0,
+            feather: 0.0,
+        }
+    }
+
+    #[test]
+    fn the_three_joins_do_what_their_names_say() {
+        // Two shapes that each cover half the frame, and they are *different*
+        // halves: the range takes the right, the gradient the top. So union is
+        // three quarters, intersection is one, and subtraction is the half that
+        // is left after the range is taken out of the gradient.
+        let guide = split_guide(0.2, 0.8);
+        let top = MaskShape::Linear {
+            from: [0.5, 0.5],
+            to: [0.5, 0.4999],
+        };
+        let with = |op| {
+            let mask = Mask {
+                shape: top.clone(),
+                refinements: vec![rawkit_editstate::Refinement {
+                    op,
+                    shape: bright_half(),
+                }],
+                ..Mask::default()
+            };
+            let (out, w, h) = draw_on(&mask, 256, 256, &guide);
+            out[..(w * h) as usize].iter().sum::<f32>() / (w * h) as f32
+        };
+        let (add, subtract, intersect) = (
+            with(MaskOp::Add),
+            with(MaskOp::Subtract),
+            with(MaskOp::Intersect),
+        );
+        println!("add {add:.3}, subtract {subtract:.3}, intersect {intersect:.3}");
+        assert!(
+            (add - 0.75).abs() < 0.02,
+            "union of two different halves is {add:.3}, not three quarters"
+        );
+        assert!(
+            (intersect - 0.25).abs() < 0.02,
+            "intersection is {intersect:.3}, not a quarter"
+        );
+        assert!(
+            (subtract - 0.25).abs() < 0.02,
+            "subtraction is {subtract:.3}, not a quarter"
+        );
+    }
+
+    #[test]
+    fn refining_a_selection_does_not_fade_it() {
+        // The reason the joins are min and max rather than multiplies. Three
+        // intersections of shapes that all cover a texel fully must leave it
+        // fully covered -- under multiplication it would come out at whatever
+        // the softness of each edge multiplied to, and a selection would get
+        // weaker every time somebody narrowed it.
+        let guide = split_guide(0.2, 0.8);
+        let mask = Mask {
+            shape: bright_half(),
+            refinements: vec![
+                rawkit_editstate::Refinement {
+                    op: MaskOp::Intersect,
+                    shape: bright_half(),
+                },
+                rawkit_editstate::Refinement {
+                    op: MaskOp::Intersect,
+                    shape: bright_half(),
+                },
+                rawkit_editstate::Refinement {
+                    op: MaskOp::Intersect,
+                    shape: bright_half(),
+                },
+            ],
+            ..Mask::default()
+        };
+        let (out, w, h) = draw_on(&mask, 256, 256, &guide);
+        let inside = at(&out, w, 3 * w / 4, h / 2);
+        println!("a texel inside four stacked intersections: {inside:.4}");
+        assert!(
+            inside > 0.99,
+            "four intersections faded a fully covered texel to {inside:.4}"
+        );
+    }
+
+    #[test]
+    fn the_order_of_the_parts_is_the_order_they_were_built_in() {
+        // Subtract-then-add is not add-then-subtract, and a mask that treated
+        // its parts as a set would have to pretend otherwise. Here the same two
+        // operations in the two orders give the whole left half or none of it.
+        let guide = split_guide(0.2, 0.8);
+        let whole = MaskShape::Range {
+            channel: RangeChannel::Luminance,
+            from: 0.0,
+            to: 1.0,
+            feather: 0.0,
+        };
+        let build = |ops: [MaskOp; 2]| {
+            let mask = Mask {
+                shape: left_half(),
+                refinements: vec![
+                    rawkit_editstate::Refinement {
+                        op: ops[0],
+                        shape: whole.clone(),
+                    },
+                    rawkit_editstate::Refinement {
+                        op: ops[1],
+                        shape: whole.clone(),
+                    },
+                ],
+                ..Mask::default()
+            };
+            let (out, w, h) = draw_on(&mask, 256, 256, &guide);
+            out[..(w * h) as usize].iter().sum::<f32>() / (w * h) as f32
+        };
+        let taken_then_given = build([MaskOp::Subtract, MaskOp::Add]);
+        let given_then_taken = build([MaskOp::Add, MaskOp::Subtract]);
+        println!(
+            "subtract then add {taken_then_given:.3}, add then subtract {given_then_taken:.3}"
+        );
+        assert!(
+            taken_then_given > 0.99,
+            "adding everything back left {taken_then_given:.3}"
+        );
+        assert!(
+            given_then_taken < 0.01,
+            "taking everything away left {given_then_taken:.3}"
+        );
     }
 }

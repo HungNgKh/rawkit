@@ -348,6 +348,13 @@
     <div class="row" id="mask-list"></div>
     <p class="empty" id="mask-empty">Nothing local yet.</p>
     <div id="mask-controls" hidden>
+      <div class="row" id="mask-parts"></div>
+      <div class="row">
+        <button id="part-add">Add to</button>
+        <button id="part-subtract">Subtract</button>
+        <button id="part-intersect">Intersect</button>
+        <button id="part-remove">Remove part</button>
+      </div>
       <div class="row">
         <button id="mask-place" class="target">Redraw on the photograph</button>
         <button id="mask-invert">Invert</button>
@@ -1449,6 +1456,10 @@
   let erasing = false;
   /// Which channel the selected range is a band on, or null when it is not one.
   let rangeChannel = null;
+  /// Which shape of the selected adjustment the controls belong to.
+  let part = 0;
+  /// What the parts list is currently showing, so it is not rebuilt every frame.
+  let shownParts = "";
   let shownMasks = null;
 
   const place = (on) => {
@@ -1462,6 +1473,7 @@
     const masks = (s.state && s.state.masks) || [];
     selected = s.selected_mask ?? null;
     placing = !!s.placing_mask;
+    part = s.selected_part ?? 0;
     const shape = `${masks.length}:${selected}`;
     if (shape !== shownMasks) {
       shownMasks = shape;
@@ -1478,6 +1490,25 @@
     document.getElementById("mask-place").classList.toggle("armed", placing);
     const mask = selected === null ? null : masks[selected];
     if (mask) {
+      // What the adjustment is made of, in the order the shapes are joined —
+      // which is the order they were built in, and the order they are applied.
+      const parts = [{ kind: mask.shape.kind, op: null }]
+        .concat((mask.refinements || []).map(r => ({ kind: r.shape.kind, op: r.op })));
+      const SIGN = { add: "\u2295", subtract: "\u2296", intersect: "\u2297" };
+      const key = `${selected}:${part}:${parts.map(p => `${p.op || "base"}/${p.kind}`).join(",")}`;
+      if (key !== shownParts) {
+        shownParts = key;
+        document.getElementById("mask-parts").replaceChildren(...parts.map((p, i) => {
+          const button = document.createElement("button");
+          button.textContent = `${p.op ? SIGN[p.op] : "\u25cf"} ${p.kind}`;
+          button.className = i === part ? "armed" : "";
+          button.addEventListener("click", () => invoke("select_part", { part: i }).catch(say));
+          return button;
+        }));
+        // The first shape is what the adjustment *is*, so there is nothing to
+        // take away from it — removing that is removing the adjustment.
+        document.getElementById("part-remove").disabled = part === 0;
+      }
       setSlider("mask-exposure", mask.exposure_ev,
         v => `${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(2)}`);
       setSlider("mask-warmth", mask.warmth, v => Number(v).toFixed(2));
@@ -1487,10 +1518,14 @@
       // A gradient's feather is the distance between its two ends, so there is
       // no separate number to show — the row goes rather than sitting there
       // greyed out with nothing to say.
-      const kind = mask.shape && mask.shape.kind;
+      // The shape controls belong to the part the list has selected, not to the
+      // adjustment: the feather of a subtracted brush is that brush's.
+      const shapeOf = i => (i === 0 ? mask.shape : (mask.refinements || [])[i - 1]?.shape);
+      const chosen = shapeOf(part) || mask.shape;
+      const kind = chosen && chosen.kind;
       document.getElementById("mask-feather-row").hidden = kind === "linear";
       if (kind !== "linear" && kind !== "range") {
-        setSlider("mask-feather", mask.shape.feather, v => Number(v).toFixed(2));
+        setSlider("mask-feather", chosen.feather, v => Number(v).toFixed(2));
       }
       const brush = kind === "brush";
       document.getElementById("mask-brush-row").hidden = !brush;
@@ -1503,10 +1538,10 @@
         document.getElementById(id).hidden = !range;
       }
       document.getElementById("mask-place").hidden = range;
-      rangeChannel = range ? mask.shape.channel : null;
+      rangeChannel = range ? chosen.channel : null;
       if (!range && pickingRange) pickRange(false);
       if (range) {
-        const hue = mask.shape.channel === "hue";
+        const hue = chosen.channel === "hue";
         const full = hue ? 360 : 1;
         const step = hue ? 1 : 0.005;
         const show = v => hue ? `${Math.round(Number(v))}°` : Number(v).toFixed(2);
@@ -1516,9 +1551,9 @@
           el.step = step;
         }
         document.getElementById("mask-channel").textContent = hue ? "Colour" : "Brightness";
-        setSlider("mask-from", mask.shape.from, show);
-        setSlider("mask-to", mask.shape.to, show);
-        setSlider("mask-feather", mask.shape.feather, show);
+        setSlider("mask-from", chosen.from, show);
+        setSlider("mask-to", chosen.to, show);
+        setSlider("mask-feather", chosen.feather, show);
       }
       // A brush is painted rather than placed, and the button says so — the
       // same arming, a different verb, because "redraw" on a brush would read
@@ -1566,6 +1601,21 @@
   document.getElementById("mask-add-radial").addEventListener("click", () => addMask("radial"));
   document.getElementById("mask-add-brush").addEventListener("click", () => addMask("brush"));
   document.getElementById("mask-add-range").addEventListener("click", () => addMask("range"));
+  for (const [id, op] of [["part-add", "add"], ["part-subtract", "subtract"], ["part-intersect", "intersect"]]) {
+    document.getElementById(id).addEventListener("click", () => {
+      if (selected === null) return;
+      if (pickingRange) pickRange(false);
+      // A refinement starts as a brush: it is the shape somebody reaches for to
+      // take a corner off a gradient, and it needs no placement to be visible.
+      invoke("add_refinement", { op, kind: "brush" })
+        .then(() => say(`${op} — paint on the photograph`))
+        .catch(say);
+    });
+  }
+  document.getElementById("part-remove").addEventListener("click", () => {
+    if (selected === null || part === 0) return;
+    invoke("remove_refinement", { part }).catch(say);
+  });
   document.getElementById("mask-pick-range").addEventListener("click", () => {
     if (selected === null || rangeChannel === null) return;
     if (!pickingRange && armed !== null) arm(null);

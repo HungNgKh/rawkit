@@ -999,6 +999,7 @@ impl Renderer {
             mask_size: [mask_w, mask_h],
             uploaded_masks: std::cell::RefCell::new(Vec::new()),
             mask_scratch: std::cell::RefCell::new(vec![0.0; (mask_w * mask_h) as usize]),
+            mask_joining: std::cell::RefCell::new(vec![0.0; (mask_w * mask_h) as usize]),
             guide_scale: [
                 guide_w as f32 / image.width.max(1) as f32,
                 guide_h as f32 / image.height.max(1) as f32,
@@ -1577,6 +1578,9 @@ impl Renderer {
         let mut uploaded = buffers.uploaded_masks.borrow_mut();
         let [mask_w, mask_h] = buffers.mask_size;
         let mut scratch = buffers.mask_scratch.borrow_mut();
+        // A second raster, for the shapes a mask is refined with: joining two
+        // weights needs both of them at once, and a render does not allocate.
+        let mut joining = buffers.mask_joining.borrow_mut();
         for (slot, mask) in live.iter().enumerate() {
             // The shape and the inversion decide the texels; everything else
             // about a mask lives in the uniform, so a slider that moves neither
@@ -1595,6 +1599,7 @@ impl Renderer {
                 image.height,
                 &buffers.guide,
                 &mut scratch,
+                &mut joining,
             );
             let half: Vec<u16> = scratch[..(mask_w * mask_h) as usize]
                 .iter()
@@ -1932,6 +1937,8 @@ pub struct TileBuffers {
     uploaded_masks: std::cell::RefCell<Vec<rawkit_editstate::Mask>>,
     /// CPU staging for one mask layer.
     mask_scratch: std::cell::RefCell<Vec<f32>>,
+    /// Where a refinement is drawn before it is joined to what came before.
+    mask_joining: std::cell::RefCell<Vec<f32>>,
     /// Guide texels per image pixel. Carried rather than recomputed so the
     /// uniform and the buffer can never describe different mappings.
     guide_scale: [f32; 2],
