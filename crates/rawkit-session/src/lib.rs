@@ -115,6 +115,21 @@ pub enum Command {
         control: u8,
         value: f32,
     },
+    /// One of the effects, by index: 0 vignette, 1 midpoint, 2 roundness,
+    /// 3 feather, 4 grain, 5 grain size.
+    ///
+    /// Indexed the way the perspective controls are, and for the same reason: a
+    /// slider's undo step is keyed on the number, so a name would have to become
+    /// one somewhere.
+    SetEffect {
+        control: u8,
+        value: f32,
+    },
+    /// How much of the lens's own corner falloff to undo.
+    ///
+    /// Beside the effects rather than in them, because it corrects the glass and
+    /// they decide the picture — see [`rawkit_editstate::Effects`].
+    SetLensVignette(f32),
     /// Local contrast at the guide's own scale, and at a few pixels.
     SetClarity(f32),
     SetTexture(f32),
@@ -278,6 +293,8 @@ impl Command {
             Command::SetWhites(_) => "set_whites",
             Command::SetBlacks(_) => "set_blacks",
             Command::SetPerspective { .. } => "set_perspective",
+            Command::SetEffect { .. } => "set_effect",
+            Command::SetLensVignette(_) => "set_lens_vignette",
             Command::SetClarity(_) => "set_clarity",
             Command::SetTexture(_) => "set_texture",
             Command::SetDehaze(_) => "set_dehaze",
@@ -338,6 +355,7 @@ impl Command {
             Command::SetMasks { control, .. } => *control,
             Command::SetSpots { control, .. } => *control,
             Command::SetPerspective { control, .. } => *control,
+            Command::SetEffect { control, .. } => *control,
             Command::SetHsl { band, control, .. } => {
                 let control = match control {
                     rawkit_editstate::BandControl::Hue => 0,
@@ -359,6 +377,8 @@ impl Command {
             | Command::SetWhites(_)
             | Command::SetBlacks(_)
             | Command::SetPerspective { .. }
+            | Command::SetEffect { .. }
+            | Command::SetLensVignette(_)
             | Command::SetClarity(_)
             | Command::SetTexture(_)
             | Command::SetDehaze(_)
@@ -787,6 +807,34 @@ impl Session {
                     return refused(name, e.to_string());
                 }
                 self.edit(name, value, move |s, _| s.crop = crop)
+            }
+            // Through `Effects::validate`, so the ranges are stated once rather
+            // than once per control.
+            Command::SetEffect { control, value } => {
+                let mut effects = self.state.effects;
+                match control {
+                    0 => effects.vignette = value,
+                    1 => effects.midpoint = value,
+                    2 => effects.roundness = value,
+                    3 => effects.feather = value,
+                    4 => effects.grain = value,
+                    5 => effects.grain_size = value,
+                    other => return refused(name, format!("{other} is not an effect")),
+                }
+                if let Err(e) = effects.validate() {
+                    return refused(name, e.to_string());
+                }
+                self.edit(name, value, move |s, _| s.effects = effects)
+            }
+            Command::SetLensVignette(v) => {
+                let lens = rawkit_editstate::Lens {
+                    vignette: v,
+                    ..self.state.lens
+                };
+                if let Err(e) = lens.validate() {
+                    return refused(name, e.to_string());
+                }
+                self.edit(name, v, move |s, _| s.lens = lens)
             }
             Command::SetClarity(v) => self.edit(name, v, |s, v| s.tone.clarity = v),
             Command::SetTexture(v) => self.edit(name, v, |s, v| s.tone.texture = v),

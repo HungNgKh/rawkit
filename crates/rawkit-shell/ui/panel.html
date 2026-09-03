@@ -343,6 +343,9 @@
     <div class="row">
       <button id="lens-distortion">Correct distortion</button>
     </div>
+    <label><span>Corner brightness</span>
+      <input id="lens_vignette" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="lens_vignette-value">0.00</output></label>
     <label id="lens-distortion-row" hidden><span>Amount</span>
       <input id="lens-distortion-amount" type="range" min="0" max="1" step="0.01" value="1">
       <output id="lens-distortion-amount-value">1.00</output></label>
@@ -444,6 +447,27 @@
         <input id="spot-feather" type="range" min="0" max="1" step="0.01" value="0.5">
         <output id="spot-feather-value">0.50</output></label>
     </div>
+  </details>
+
+  <details id="s-effects"><summary>Effects</summary>
+    <label><span>Vignette</span>
+      <input id="vignette" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="vignette-value">0.00</output></label>
+    <label><span>Midpoint</span>
+      <input id="midpoint" type="range" min="0" max="1" step="0.01" value="0.5">
+      <output id="midpoint-value">0.50</output></label>
+    <label><span>Roundness</span>
+      <input id="roundness" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="roundness-value">0.00</output></label>
+    <label><span>Feather</span>
+      <input id="feather" type="range" min="0" max="1" step="0.01" value="0.5">
+      <output id="feather-value">0.50</output></label>
+    <label><span>Grain</span>
+      <input id="grain" type="range" min="0" max="1" step="0.01" value="0">
+      <output id="grain-value">0.00</output></label>
+    <label><span>Grain size</span>
+      <input id="grain_size" type="range" min="0.5" max="12" step="0.1" value="2">
+      <output id="grain_size-value">2.0</output></label>
   </details>
 
   <details id="s-profile">
@@ -595,6 +619,14 @@
       await send({ command: "set_perspective", params: { control, value: control === 2 ? 1 : 0 } });
     }
   });
+  // The effects, indexed on the wire the way the perspective three are.
+  const EFFECTS = [["vignette", 0], ["midpoint", 1], ["roundness", 2],
+                   ["feather", 3], ["grain", 4], ["grain_size", 5]];
+  for (const [id, control] of EFFECTS) {
+    slider(id, v => ({ command: "set_effect", params: { control, value: v } }),
+      v => id === "grain_size" ? v.toFixed(1) : v.toFixed(2));
+  }
+  slider("lens_vignette", v => ({ command: "set_lens_vignette", params: v }), v => v.toFixed(2));
   slider("clarity", v => ({ command: "set_clarity", params: v }), v => v.toFixed(2));
   slider("texture", v => ({ command: "set_texture", params: v }), v => v.toFixed(2));
   slider("dehaze", v => ({ command: "set_dehaze", params: v }), v => v.toFixed(2));
@@ -675,7 +707,8 @@
   let dragging = null;
   const TONE = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks",
                 "clarity", "texture", "dehaze"];
-  for (const id of [...TONE, "straighten", "vertical", "horizontal", "aspect", "sharpen", "sharpen_radius", "chroma_noise", "luminance_noise", "saturation", "vibrance", "temperature", "tint",
+  for (const id of [...TONE, "straighten", "vertical", "horizontal", "aspect",
+    ...EFFECTS.map(([id]) => id), "lens_vignette", "sharpen", "sharpen_radius", "chroma_noise", "luminance_noise", "saturation", "vibrance", "temperature", "tint",
     "mask-exposure", "mask-warmth", "mask-tint", "mask-feather", "mask-size", "mask-from", "mask-to",
     "mask-contrast", "mask-saturation", "mask-clarity",
     "grade-shadows", "grade-midtones", "grade-highlights", "grade-blending", "grade-balance",
@@ -703,6 +736,12 @@
       setSlider(id, state.tone[id], v => Number(v).toFixed(2));
     }
     setSlider("straighten", state.crop.angle_deg, v => `${Number(v).toFixed(1)}°`);
+    for (const [id] of EFFECTS) {
+      const value = (state.effects || {})[id];
+      setSlider(id, value ?? (id === "grain_size" ? 2 : id === "vignette" || id === "roundness" || id === "grain" ? 0 : 0.5),
+        v => id === "grain_size" ? Number(v).toFixed(1) : Number(v).toFixed(2));
+    }
+    setSlider("lens_vignette", state.lens.vignette ?? 0, v => Number(v).toFixed(2));
     for (const [id] of PERSPECTIVE) {
       setSlider(id, state.crop[id] ?? (id === "aspect" ? 1 : 0), v => Number(v).toFixed(3));
     }

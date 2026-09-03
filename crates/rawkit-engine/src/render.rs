@@ -314,6 +314,12 @@ struct Params {
     local_contrast: [f32; 4],
     /// The airlight in the profile's working space, already scaled by its level.
     airlight: [f32; 4],
+    /// `[vignette, midpoint, roundness, feather]`.
+    effects: [f32; 4],
+    /// `[grain amount, grain size in image pixels, lens vignette, unused]`.
+    grain: [f32; 4],
+    /// The crop in image pixels: `[centre x, centre y, half width, half height]`.
+    vignette_frame: [f32; 4],
     /// `[saturation, vibrance, hue mixer active, unused]`.
     colour: [f32; 4],
     /// The eight-band mixer, one control per array, two bands to a row: a
@@ -1815,6 +1821,37 @@ impl Renderer {
                     m[2].iter().sum::<f32>() * veil,
                 ];
                 [white[0], white[1], white[2], 0.0]
+            },
+            effects: [
+                state.effects.vignette,
+                state.effects.midpoint,
+                state.effects.roundness,
+                state.effects.feather,
+            ],
+            grain: [
+                state.effects.grain,
+                state.effects.grain_size,
+                state.lens.vignette,
+                0.0,
+            ],
+            // The crop, in the *sensor's* coordinates rather than the developed
+            // frame's — which is the space the kernel indexes everything else
+            // in, and the only one available before the geometry has run. A
+            // straighten or a keystone moves the rectangle's corners about; its
+            // centre and its reach are what a vignette needs, and those survive.
+            vignette_frame: {
+                let geometry = Geometry::new(state, image.recorded_orientation);
+                let [ow, oh] = geometry.output_size([image.width, image.height]);
+                let r = geometry.sensor_rect(
+                    [0.0, 0.0, ow as f64, oh as f64],
+                    [image.width, image.height],
+                );
+                [
+                    ((r[0] + r[2]) / 2.0) as f32,
+                    ((r[1] + r[3]) / 2.0) as f32,
+                    ((r[2] - r[0]) / 2.0) as f32,
+                    ((r[3] - r[1]) / 2.0) as f32,
+                ]
             },
             colour: [
                 state.colour.saturation,

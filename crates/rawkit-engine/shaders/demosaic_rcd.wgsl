@@ -105,6 +105,14 @@ struct Params {
     // The airlight in the profile's working space, already scaled by its level,
     // so the shader subtracts it rather than reconstructing it. `.w` unused.
     airlight: vec4<f32>,
+    // `[vignette, midpoint, roundness, feather]` -- the post-crop vignette.
+    effects: vec4<f32>,
+    // `[grain amount, grain size in image pixels, lens vignette, unused]`.
+    grain: vec4<f32>,
+    // The crop in image pixels: `[centre x, centre y, half width, half height]`.
+    // The vignette is centred here and not on the sensor, which is the whole
+    // difference between it and the lens correction above.
+    vignette_frame: vec4<f32>,
     // `.x` is saturation, `.y` vibrance, `.z` whether the hue mixer does
     // anything at all. `.w` unused.
     colour: vec4<f32>,
@@ -854,7 +862,11 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
     // light. In scene-linear it would depend on exposure, and a colour that
     // changed when you brightened the frame is not a colour control.
     // Stage K -- the look, and the last thing that touches colour.
-    rgba_out[p] = vec4<f32>(grade_colour(mix_bands(saturate_colour(shaped))), 1.0);
+    // Stage L -- the effects. A vignette and grain are the last decisions about
+    // the picture, and they go on after the look for the same reason a frame
+    // goes on after the painting.
+    let finished = grade_colour(mix_bands(saturate_colour(shaped)));
+    rgba_out[p] = vec4<f32>(apply_effects(finished, ixy), 1.0);
 }
 
 /// The camera's RGB to a rendered picture, short of the user's tone controls.
@@ -876,7 +888,17 @@ fn develop_rgb(camera: vec3<f32>, ixy: vec2<f32>, hazy: bool) -> vec3<f32> {
     // it is only visible while the channels are still the sensor's own. One
     // matrix multiply later they are mixed and there is no longer any such
     // thing as "the green channel clipped".
-    let recovered = reconstruct_highlights(balanced, ixy);
+    var recovered = reconstruct_highlights(balanced, ixy);
+
+    // The lens's own falloff, undone where the lens caused it: a plain multiply
+    // about the *sensor's* centre, in scene-linear light, because attenuation is
+    // what glass does and undoing an attenuation is a division. After the
+    // highlight reconstruction and not before it -- the sensor clipped the light
+    // the lens had already dimmed, so lifting the corners first would hand the
+    // reconstruction a frame whose clipping had moved.
+    if (params.grain.z != 0.0) {
+        recovered = recovered * lens_falloff(ixy);
+    }
 
     let display = vec3<f32>(
         dot(params.cam_to_display[0].rgb, recovered),
@@ -1516,6 +1538,135 @@ fn against_neighbourhood(rgb: vec3<f32>, neighbourhood: f32, amount: f32) -> vec
     let shaped = around * pow(ratio, vec3<f32>(1.0 + amount));
     return pow(max(shaped, vec3<f32>(0.0)), vec3<f32>(TONE_GAMMA));
 }
+
+/// How much to scale a pixel by, to undo the lens's corner falloff.
+///
+/// A cosine-fourth-ish curve, which is what an unremarkable lens does: the
+/// falloff goes as the fourth power of the cosine of the angle off axis, and
+/// `1 - k*r^4` is that to the accuracy anybody can see, with one number for how
+/// deep it goes. Measured against the sensor's own diagonal, so it does not
+/// change when the picture is cropped.
+fn lens_falloff(ixy: vec2<f32>) -> f32 {
+    let amount = params.grain.z;
+    // The image's own size, from the reciprocal the masks are indexed by rather
+    // than from a second uniform saying the same thing.
+    let half = 0.5 / params.mask_scale.xy;
+    let corner = length(half);
+    if (corner <= 0.0) {
+        return 1.0;
+    }
+    let r = length(ixy - half) / corner;
+    let r4 = r * r * r * r;
+    // Positive lifts the corners and leaves the centre alone; negative dims
+    // them. Clamped away from zero because dividing a black corner by nothing
+    // is not a correction.
+    return max(1.0 + amount * r4, 0.05);
+}
+
+/// How far this pixel is towards a corner of the *crop*, from 0 to 1.
+///
+/// A superellipse, whose exponent is the roundness: two is an ellipse in the
+/// crop's own proportions, larger is a rectangle, smaller a diamond. Normalised
+/// by the shape's own corner so that the midpoint slider means the same thing
+/// whatever the roundness is — otherwise changing the shape would move the
+/// vignette as well.
+fn vignette_radius(ixy: vec2<f32>) -> f32 {
+    let centre = params.vignette_frame.xy;
+    let half = max(params.vignette_frame.zw, vec2<f32>(1.0));
+    let n = exp2(1.0 + params.effects.z * 2.0);
+    let d = abs(ixy - centre) / half;
+    let raw = pow(pow(d.x, n) + pow(d.y, n), 1.0 / n);
+    return raw / pow(2.0, 1.0 / n);
+}
+
+/// How much of the vignette applies here, from 0 at the middle to 1 outside.
+fn vignette_weight(ixy: vec2<f32>) -> f32 {
+    let midpoint = params.effects.y;
+    // A width rather than an edge, so feather and midpoint are two independent
+    // numbers: the band is centred on the midpoint and the feather is how wide
+    // it is. Never exactly zero, or the smoothstep divides by nothing and a hard
+    // edge becomes a NaN rather than a hard edge.
+    let width = max(params.effects.w, 0.004);
+    let r = vignette_radius(ixy);
+    return smoothstep(midpoint - width * 0.5, midpoint + width * 0.5, r);
+}
+
+/// How much a bright pixel is spared, as an exponent on its own luminance.
+///
+/// Two, measured off nothing but the eye: it leaves a corner of sky within a few
+/// percent of where it was while a corner of rock takes the whole darkening.
+/// This is what makes a vignette read as a lens rather than as a grey wash --
+/// the answer to "what does this do to a bright sky" is "almost nothing".
+const VIGNETTE_HOLD: f32 = 2.0;
+
+/// Value noise: a hash per cell, smoothly interpolated.
+///
+/// Interpolated rather than sampled per cell because a per-cell hash is
+/// *square*, and film grain is not. The hash is the usual cheap sine-free one;
+/// what matters here is that it is a pure function of the cell, so the same
+/// photograph grains the same way every time it is rendered.
+fn hash21(p: vec2<f32>) -> f32 {
+    var q = fract(p * vec2<f32>(0.1031, 0.1030));
+    q = q + dot(q, q.yx + 33.33);
+    return fract((q.x + q.y) * q.x);
+}
+
+fn value_noise(p: vec2<f32>) -> f32 {
+    let cell = floor(p);
+    let f = fract(p);
+    let w = f * f * (3.0 - 2.0 * f);
+    let a = hash21(cell);
+    let b = hash21(cell + vec2<f32>(1.0, 0.0));
+    let c = hash21(cell + vec2<f32>(0.0, 1.0));
+    let d = hash21(cell + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
+}
+
+/// The vignette and the grain, in that order, at the very end.
+///
+/// Both are decisions about the picture rather than about the light, so they are
+/// after the look and after everything that touches colour.
+fn apply_effects(rgb: vec3<f32>, ixy: vec2<f32>) -> vec3<f32> {
+    var out = rgb;
+    let amount = params.effects.x;
+    if (amount != 0.0) {
+        let weight = vignette_weight(ixy);
+        // Off the luminance and applied to all three channels, so a corner keeps
+        // its hue -- the same rule the sharpening and the grain follow.
+        let luma = clamp(dot(out, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+        // Negative darkens. `1 + amount * weight` is the plain answer; mixing it
+        // towards 1 by the pixel's own brightness is what holds the highlights
+        // back, and at luminance 1 it does nothing at all.
+        let plain = 1.0 + amount * weight;
+        let gain = mix(plain, 1.0, pow(luma, VIGNETTE_HOLD));
+        out = out * max(gain, 0.0);
+    }
+
+    let grain = params.grain.x;
+    if (grain > 0.0) {
+        // Sized in *image* pixels, so an export and a preview carry the same
+        // film. A coarse level covers several image pixels per output pixel, so
+        // the cell is never allowed below one output pixel -- grain finer than
+        // that is not visible, it is aliasing, and it would flicker as the view
+        // zoomed.
+        let step = max(f32(params.source.z), 1.0);
+        let size = max(params.grain.y, step);
+        let n = value_noise(ixy / size) - 0.5;
+        // Loudest in the midtones, which is where film's own grain lives: black
+        // has no silver to clump and white has all of it. Also keeps the control
+        // from speckling a clipped sky.
+        let luma = clamp(dot(out, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+        let where_it_shows = 4.0 * luma * (1.0 - luma);
+        out = out + vec3<f32>(n * grain * GRAIN_REACH * where_it_shows);
+    }
+    return out;
+}
+
+/// How far a full-strength grain moves a midtone.
+///
+/// Display-referred, so this is a fraction of the whole range. A tenth is
+/// plainly visible at 1:1 and stops well short of looking broken.
+const GRAIN_REACH: f32 = 0.1;
 
 /// Where a tile pixel sits in the full-resolution image.
 ///

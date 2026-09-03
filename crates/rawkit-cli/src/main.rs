@@ -584,6 +584,32 @@ pub struct EditFlags {
     /// Haze, undone in scene-linear light. Negative adds it, -1 to 1.
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     dehaze: f32,
+    /// Vignette, centred on the crop. Negative darkens the corners, -1 to 1.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    vignette: f32,
+    /// Where the vignette is half done, as a fraction of the way to a corner.
+    #[arg(long, default_value_t = 0.5)]
+    vignette_midpoint: f32,
+    /// The vignette's shape: -1 a diamond, 0 an ellipse, 1 a rectangle.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    vignette_roundness: f32,
+    /// How wide the vignette's transition is, 0 to 1.
+    #[arg(long, default_value_t = 0.5)]
+    vignette_feather: f32,
+    /// Grain, 0 to 1. Luminance only, so nothing gains colour.
+    #[arg(long, default_value_t = 0.0)]
+    grain: f32,
+    /// How big a grain is, in *sensor* pixels — so a small export and a
+    /// full-resolution one carry the same film.
+    #[arg(long, default_value_t = 2.0)]
+    grain_size: f32,
+    /// Undo the lens's own corner falloff. Positive lifts the corners, -1 to 1.
+    ///
+    /// Centred on the sensor rather than on the crop, unlike `--vignette`: the
+    /// falloff is about the optical axis, and a crop moves the picture without
+    /// moving the glass.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    lens_vignette: f32,
     /// Rotate in 90-degree steps clockwise: 0, 90, 180 or 270.
     ///
     /// Applied before the crop, so a crop is always read in the frame you
@@ -716,6 +742,18 @@ impl EditFlags {
             },
             orientation,
             crop,
+            effects: rawkit_editstate::Effects {
+                vignette: self.vignette,
+                midpoint: self.vignette_midpoint,
+                roundness: self.vignette_roundness,
+                feather: self.vignette_feather,
+                grain: self.grain,
+                grain_size: self.grain_size,
+            },
+            lens: rawkit_editstate::Lens {
+                vignette: self.lens_vignette,
+                ..Default::default()
+            },
             detail: rawkit_editstate::Detail {
                 sharpen_amount: self.sharpen,
                 sharpen_radius: self.sharpen_radius,

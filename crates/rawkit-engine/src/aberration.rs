@@ -219,6 +219,7 @@ pub fn estimate(rgba: &[f32], width: u32, height: u32) -> Lens {
         chromatic_red: solve(fit[0]),
         chromatic_blue: solve(fit[1]),
         distortion: None,
+        vignette: 0.0,
     }
 }
 

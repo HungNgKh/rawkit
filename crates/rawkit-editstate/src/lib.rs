@@ -57,6 +57,8 @@ pub enum EditStateError {
     InvalidMask(String),
     #[error("{0} local adjustments, and {MAX_MASKS} is the most a frame may carry")]
     TooManyMasks(usize),
+    #[error("an effect is out of range: {0}")]
+    InvalidEffects(String),
     #[error("spot is not usable: {0}")]
     InvalidSpot(String),
     #[error("more spots than a photograph may carry: {0}")]
@@ -98,6 +100,9 @@ pub struct EditState {
     pub curve: Curve,
     #[serde(default)]
     pub grade: Grade,
+    /// The vignette and the grain, which go on after everything else.
+    #[serde(default)]
+    pub effects: Effects,
     /// Local adjustments: what changes, and where.
     #[serde(default)]
     pub masks: Vec<Mask>,
@@ -131,6 +136,7 @@ impl Default for EditState {
             hsl: Hsl::default(),
             curve: Curve::default(),
             grade: Grade::default(),
+            effects: Effects::default(),
         }
     }
 }
@@ -181,6 +187,7 @@ impl EditState {
         self.hsl.validate()?;
         self.curve.validate()?;
         self.grade.validate()?;
+        self.effects.validate()?;
         Ok(())
     }
 
@@ -868,6 +875,112 @@ impl Distortion {
     }
 }
 
+/// The effects that go on last: a vignette, and grain.
+///
+/// # Why these are not the lens's
+///
+/// [`Lens::vignette`] undoes what the glass did, so it is a plain multiply in
+/// scene-linear light about the *optical axis*. This is a decision about the
+/// picture: it is centred on the **crop**, because a vignette that stayed where
+/// the sensor was would sit off-centre the moment somebody trimmed one side —
+/// and it *holds the highlights back* rather than scaling everything equally,
+/// which is what makes it read as a lens rather than as a grey wash laid over
+/// the corner.
+///
+/// The two do meet in the middle: a negative corner brightness and a positive
+/// vignette both darken corners. They are still different operations, in
+/// different light, about different centres, and a single control could only be
+/// wrong about one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Effects {
+    /// Negative darkens the corners, positive lifts them.
+    #[serde(default)]
+    pub vignette: f32,
+    /// Where the falloff is half done, as a fraction of the way to a corner.
+    #[serde(default = "half")]
+    pub midpoint: f32,
+    /// The shape it falls off along: -1 is a diamond, 0 an ellipse in the
+    /// crop's own proportions, 1 a rectangle.
+    ///
+    /// The exponent of a superellipse, which is the one number that carries all
+    /// three and everything between them.
+    #[serde(default)]
+    pub roundness: f32,
+    /// How wide the transition is, as a fraction of the radius. Zero is a hard
+    /// edge, which is a thing somebody might want and is never an accident.
+    #[serde(default = "half")]
+    pub feather: f32,
+    /// How much grain to add, 0 to 1.
+    ///
+    /// Luminance only — the same amount to all three channels, so the pixel
+    /// moves along the grey axis and nothing gains colour. That is what film
+    /// grain looks like, and it is the rule capture sharpening already follows;
+    /// per-channel noise reads as a high-ISO sensor, which is usually the thing
+    /// grain is being added to disguise.
+    #[serde(default)]
+    pub grain: f32,
+    /// How big a grain is, in **sensor pixels**.
+    ///
+    /// Sensor and not output pixels, and that is the whole reason it is a number
+    /// rather than a constant: a 2000-pixel export and a full-resolution one
+    /// would otherwise carry visibly different films, and the same edit would
+    /// mean two things.
+    #[serde(default = "two")]
+    pub grain_size: f32,
+}
+
+fn half() -> f32 {
+    0.5
+}
+
+fn two() -> f32 {
+    2.0
+}
+
+impl Default for Effects {
+    fn default() -> Self {
+        Self {
+            vignette: 0.0,
+            midpoint: 0.5,
+            roundness: 0.0,
+            feather: 0.5,
+            grain: 0.0,
+            grain_size: 2.0,
+        }
+    }
+}
+
+impl Effects {
+    /// The largest a grain may be, in sensor pixels.
+    pub const MAX_GRAIN_SIZE: f32 = 12.0;
+
+    /// Whether this leaves every pixel exactly where it found it.
+    pub fn is_identity(&self) -> bool {
+        self.vignette == 0.0 && self.grain == 0.0
+    }
+
+    pub fn validate(&self) -> Result<(), EditStateError> {
+        for (name, value, range) in [
+            ("vignette", self.vignette, -1.0..=1.0),
+            ("roundness", self.roundness, -1.0..=1.0),
+            ("midpoint", self.midpoint, 0.0..=1.0),
+            ("feather", self.feather, 0.0..=1.0),
+            ("grain", self.grain, 0.0..=1.0),
+            ("grain size", self.grain_size, 0.5..=Self::MAX_GRAIN_SIZE),
+        ] {
+            if !value.is_finite() || !range.contains(&value) {
+                return Err(EditStateError::InvalidEffects(format!(
+                    "{name} is {value}, and runs from {} to {}",
+                    range.start(),
+                    range.end()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The tone block.
 ///
 /// `exposure_ev` is applied in scene-linear light, before the tone map, and is
@@ -1320,6 +1433,18 @@ pub struct Lens {
     pub chromatic_red: f32,
     /// The same, for blue.
     pub chromatic_blue: f32,
+    /// How much to lift the corners, to undo the lens's own falloff.
+    ///
+    /// Positive brightens them, negative darkens. A **plain multiply in
+    /// scene-linear light**, because that is what a lens does: it attenuates,
+    /// and undoing an attenuation is a division. The creative vignette in
+    /// [`Effects`] is a different operation for a different reason — see there.
+    ///
+    /// Centred on the sensor and not on the crop. The falloff is about the
+    /// optical axis, so a crop moves the picture and leaves the darkening where
+    /// the lens put it.
+    #[serde(default)]
+    pub vignette: f32,
     /// The maker's own distortion curve for the lens that was mounted, and how
     /// much of it to apply. `None` is a photograph nothing is correcting.
     ///
@@ -1347,7 +1472,7 @@ impl Lens {
     /// two are asked about by different code at different stages, and one
     /// answer for both would have to be the pessimistic one.
     pub fn is_identity(&self) -> bool {
-        self.chromatic_red == 0.0 && self.chromatic_blue == 0.0
+        self.chromatic_red == 0.0 && self.chromatic_blue == 0.0 && self.vignette == 0.0
     }
 
     /// Refused rather than clamped, like a sharpening radius and for the same
@@ -1361,6 +1486,12 @@ impl Lens {
                     "{name} is scaled by {value}, and the range is +/-{MAX_LATERAL}"
                 )));
             }
+        }
+        if !self.vignette.is_finite() || self.vignette.abs() > 1.0 {
+            return Err(EditStateError::InvalidLens(format!(
+                "corner brightness is {}, and runs from -1 to 1",
+                self.vignette
+            )));
         }
         if let Some(distortion) = &self.distortion {
             distortion.validate()?;
