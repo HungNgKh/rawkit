@@ -354,33 +354,71 @@ impl Guide {
     /// A high percentile rather than the maximum, for the reason every estimator
     /// of a maximum uses one: a single blown specular highlight would otherwise
     /// decide the whole frame's haze.
+    ///
+    /// # What is returned, and the mistake it corrects
+    ///
+    /// The **intensity** at the haziest texels, not the dark channel's own value
+    /// there. The prior locates the airlight by finding where the dark channel is
+    /// highest — that is the haziest part of the frame — and then reads the
+    /// *brightness* at those texels. Returning the dark channel instead is a
+    /// shortcut that reads far too low, because the whole point of the haziest
+    /// region is that its darkest channel is still well below its brightest.
+    ///
+    /// The consequence was measurable and large: `t = 1 - w * amount * dark / A`
+    /// with `A` too small drives the transmission to its floor, and dehaze
+    /// overshot by about five times. A synthetic veil that took 45% of the light
+    /// was undone at an amount of **0.2**, and full strength put the frame seven
+    /// times further from the truth than the veil had.
     pub fn veil(&self, wb: [f32; 3]) -> f32 {
-        // A histogram, because this runs on every slider move and a sort of a
+        // Histograms, because this runs on every slider move and a sort of a
         // hundred and fifty thousand values does not.
         const BINS: usize = 1024;
         const PERCENTILE: f32 = 0.999;
+        let dark_of = |t: &[f32]| {
+            (t[0] * wb[0])
+                .min(t[1] * wb[1])
+                .min(t[2] * wb[2])
+                .clamp(0.0, 1.0)
+        };
         let mut counts = [0u32; BINS];
         let mut total = 0u32;
         for texel in self.data.chunks_exact(3) {
-            let dark = (texel[0] * wb[0])
-                .min(texel[1] * wb[1])
-                .min(texel[2] * wb[2])
-                .clamp(0.0, 1.0);
-            counts[((dark * (BINS - 1) as f32) as usize).min(BINS - 1)] += 1;
+            counts[((dark_of(texel) * (BINS - 1) as f32) as usize).min(BINS - 1)] += 1;
             total += 1;
         }
         if total == 0 {
             return 0.0;
         }
+        // Where the dark channel's top tenth of a percent begins.
         let target = (total as f32 * PERCENTILE) as u32;
         let mut seen = 0u32;
+        let mut threshold = 1.0f32;
         for (bin, count) in counts.iter().enumerate() {
             seen += count;
             if seen >= target {
-                return (bin as f32 + 0.5) / BINS as f32;
+                threshold = bin as f32 / BINS as f32;
+                break;
             }
         }
-        1.0
+        // And how bright the frame is there. The brightest channel, because the
+        // airlight is what a fully hazy pixel would read and haze is neutral
+        // once white balance has run — so its channels agree, and the largest is
+        // the least corrupted by whatever scene is showing through.
+        let mut sum = 0.0f64;
+        let mut n = 0u32;
+        for texel in self.data.chunks_exact(3) {
+            if dark_of(texel) >= threshold {
+                let bright = (texel[0] * wb[0])
+                    .max(texel[1] * wb[1])
+                    .max(texel[2] * wb[2]);
+                sum += f64::from(bright);
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return threshold.max(1e-4);
+        }
+        ((sum / f64::from(n)) as f32).max(1e-4)
     }
 }
 

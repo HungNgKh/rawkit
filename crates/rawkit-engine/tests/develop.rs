@@ -68,11 +68,16 @@ fn mid_grey_survives_the_tone_map() {
     // brightness.
     let gpu = Gpu::new().expect("no usable GPU adapter");
     let renderer = Renderer::new(&gpu);
-    let out = develop(&gpu, &renderer, 0.18, &EditState::default());
+    // 0.072 and not 0.18, and that is the correction rather than a fudge: a
+    // camera meters below the middle to keep its highlights, so a *photographed*
+    // mid-grey lands near 7% of the sensor's full scale, not 18%. Measured
+    // across ten frames against this body's own rendering of them. Asserting
+    // 0.18 here is what let every default render sit 1.3 stops dark.
+    let out = develop(&gpu, &renderer, 0.072, &EditState::default());
     for (c, v) in out.iter().enumerate() {
         assert!(
             (v - 0.18).abs() < 0.005,
-            "scene mid-grey rendered to {v} in channel {c}, not 0.18"
+            "a photographed mid-grey rendered to {v} in channel {c}, not 0.18"
         );
     }
 }

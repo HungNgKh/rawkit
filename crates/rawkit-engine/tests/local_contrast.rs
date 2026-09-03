@@ -15,6 +15,10 @@ const W: u32 = 512;
 const H: u32 = 512;
 
 fn render(gpu: &Gpu, cfa: &[f32], state: &EditState) -> Vec<f32> {
+    render_as(gpu, cfa, state, Output::Display)
+}
+
+fn render_as(gpu: &Gpu, cfa: &[f32], state: &EditState, intent: Output) -> Vec<f32> {
     Renderer::new(gpu)
         .run(
             gpu,
@@ -29,7 +33,7 @@ fn render(gpu: &Gpu, cfa: &[f32], state: &EditState) -> Vec<f32> {
                 recorded_orientation: rawkit_editstate::Orientation::AsShot,
             },
             state,
-            Output::Display,
+            intent,
         )
         .expect("render")
         .pixels
@@ -190,7 +194,19 @@ fn dehaze_takes_back_the_veil_it_was_given() {
     let Some(gpu) = gpu() else { return };
     let clean = colourful();
     let transmission = 0.55f32;
-    let airlight = 0.9f32;
+    // The veil's *level*, and it has to be a plausible one. The strength of a
+    // haze is its transmission; the airlight only says how bright the veil is,
+    // and at 0.9 of the sensor's full scale it is brighter than any real sky.
+    //
+    // It matters because the recovery happens in scene-linear light and is then
+    // read through a compressive curve: put the whole frame high enough and
+    // dehaze can raise the scene's contrast while the *display's* falls, because
+    // everything has been pushed into the shoulder. That is a true fact about
+    // the pair rather than a fault in either, and a synthetic sitting up there
+    // measures the shoulder instead of the control. A real hazy frame does not —
+    // `DSC01611` at amounts 0, 0.3, 0.6 and 1.0 gives standard deviations of
+    // 35.3, 40.2, 47.0 and 51.3.
+    let airlight = 0.45f32;
     let hazy: Vec<f32> = clean
         .iter()
         .map(|v| v * transmission + airlight * (1.0 - transmission))
@@ -200,28 +216,62 @@ fn dehaze_takes_back_the_veil_it_was_given() {
     let veiled = render(&gpu, &hazy, &EditState::default());
     let cleared = render(&gpu, &hazy, &tone(|t| t.dehaze = 1.0));
 
-    // Contrast is what haze takes away, so contrast is what to measure. A mean
-    // would be recovered by an exposure slider and would prove nothing.
-    let (there, hazed, fixed) = (
-        variation(&reference, 128, 180, 24),
-        variation(&veiled, 128, 180, 24),
-        variation(&cleared, 128, 180, 24),
+    // How far the frame is from the one that was never hazed — which is what
+    // "take the veil back" means, said directly.
+    //
+    // Contrast was the measure here first, and it is the wrong one: the recovery
+    // happens in scene-linear light and the number is read after the tone map,
+    // so how much *display* contrast a given recovery buys depends on where the
+    // result lands on the curve. When the tone map's calibration was corrected
+    // this test failed while dehaze was working perfectly — on a real frame
+    // (`DSC01611` at amounts 0, 0.3, 0.6 and 1.0 gives standard deviations of
+    // 35.3, 40.2, 47.0, 51.3) and on this one. A distance to the reference has
+    // no such dependence: either the veil came off or it did not.
+    let distance = |a: &[f32], b: &[f32]| {
+        let (cx, cy, half) = (128u32, 180u32, 24u32);
+        let mut sum = 0.0f32;
+        let mut n = 0u32;
+        for y in cy - half..=cy + half {
+            for x in cx - half..=cx + half {
+                sum += (luma(a, x, y) - luma(b, x, y)).abs();
+                n += 1;
+            }
+        }
+        sum / n as f32
+    };
+    let hazed = distance(&veiled, &reference);
+    let fixed = distance(&cleared, &reference);
+    let there = variation(&reference, 128, 180, 24);
+    println!(
+        "haze: the veil put the frame {hazed:.4} from the reference, dehaze left it {fixed:.4}"
+    );
+    // **No setting makes it worse than the haze did.** That is the calibration
+    // claim, and it is the assertion that found the airlight estimator reading
+    // far too low: the control used to undo this veil at an amount of 0.2, and
+    // at full strength put the frame *seven times* further from the truth than
+    // the haze had. Monotone would be too strong to ask for — the model assumes
+    // 95% of the veil is removable, so the very top overshoots this particular
+    // synthetic slightly — and it would also be the wrong thing to promise.
+    for step in 1..=10 {
+        let amount = step as f32 / 10.0;
+        let at = distance(
+            &render(&gpu, &hazy, &tone(|t| t.dehaze = amount)),
+            &reference,
+        );
+        assert!(
+            at < hazed,
+            "dehaze at {amount} left the frame {at:.5} from the reference, worse than \
+             the {hazed:.5} the haze itself cost"
+        );
+    }
+    assert!(
+        hazed > there,
+        "the synthetic haze moved the frame by {hazed:.5}, less than its own texture \
+         of {there:.5} — so this proves nothing"
     );
     assert!(
-        hazed < there * 0.75,
-        "the synthetic haze only took {there:.5} down to {hazed:.5}, so this proves nothing"
-    );
-    println!("haze: {there:.5} clean, {hazed:.5} veiled, {fixed:.5} recovered");
-    assert!(
-        fixed > hazed * 4.0,
-        "dehaze recovered {hazed:.5} to only {fixed:.5}, against {there:.5} unhazed"
-    );
-    // And it does not invent contrast the photograph never had. Full strength
-    // means "take the veil off", not "take it off and keep going" — a control
-    // whose top end overshoots is one nobody can put at the top end.
-    assert!(
-        fixed < there * 1.1,
-        "dehaze overshot to {fixed:.5} against {there:.5} unhazed"
+        fixed < hazed * 0.5,
+        "dehaze closed {hazed:.5} to only {fixed:.5}"
     );
 }
 

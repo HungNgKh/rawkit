@@ -123,12 +123,19 @@ fn a_clipped_green_channel_no_longer_goes_magenta() {
     println!("with reconstruction   : {fixed:?} cast {:.3}", cast(fixed));
 
     assert!(
-        cast(raw) > 0.15,
+        cast(raw) > 0.05,
         "the test case does not actually produce a cast: {raw:?}"
     );
+    // Absolute, not a fraction of what the defect happened to be. The fraction
+    // was the weaker claim and it was also tied to the tone map's calibration:
+    // a brighter curve compresses channel ratios in the highlights, so the very
+    // same sensor data renders a *smaller* cast — this case went from 0.19 to
+    // 0.08 when `k` was corrected, and the precondition above failed while
+    // reconstruction was working perfectly. What matters is that the cast is
+    // gone, and it is: 0.084 to 0.000.
     assert!(
-        cast(fixed) < cast(raw) * 0.5,
-        "reconstruction barely helped: cast went {:.3} -> {:.3}",
+        cast(fixed) < 0.01,
+        "reconstruction left a cast behind: {:.3} -> {:.3}",
         cast(raw),
         cast(fixed)
     );
@@ -177,11 +184,12 @@ fn a_blue_subject_does_not_turn_cyan_when_green_clips() {
     println!("with reconstruction   : {fixed:?} cast {:.3}", cast(fixed));
 
     assert!(
-        cast(raw) > 0.15,
+        cast(raw) > 0.05,
         "the test case does not actually produce a cast: {raw:?}"
     );
+    // Absolute, for the reason given on the test above.
     assert!(
-        cast(fixed) < cast(raw) * 0.5,
+        cast(fixed) < 0.01,
         "a clipped blue sky kept its cast: {:.3} -> {:.3} ({fixed:?})",
         cast(raw),
         cast(fixed)

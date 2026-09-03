@@ -1489,7 +1489,7 @@ fn remove_haze(rgb: vec3<f32>, ixy: vec2<f32>) -> vec3<f32> {
     // Clamped at zero, because that is what the answer means: the recovered
     // value is how much light the scene sent, and a scene cannot send less than
     // none. Without it, a shadow darker than the airlight's own contribution
-    // comes out negative and the tone map -- `x / (x + 0.82)` -- turns it into
+    // comes out negative and the tone map -- `x / (x + k)` -- turns it into
     // a value larger than one, which reads as bright speckle in the shadows.
     return max((rgb - params.airlight.rgb * (1.0 - t)) / t, vec3<f32>(0.0));
 }
@@ -2064,8 +2064,34 @@ fn reconstruct_highlights(balanced: vec3<f32>, ixy: vec2<f32>) -> vec3<f32> {
 
 /// Fixed sigmoid roll-off, applied per channel.
 ///
-/// `y = x / (x + k)` with `k` chosen so that scene mid-grey (0.18) lands on
-/// display mid-grey (0.18): 0.18 = 0.18 / (0.18 + k) gives k = 0.82.
+/// `y = x / (x + k)` with `k` chosen so that **a photographed** mid-grey lands
+/// on display mid-grey.
+///
+/// `k` was 0.82, from assuming a photographed mid-grey sits at 0.18 of the
+/// sensor's full scale — 0.18 = 0.18 / (0.18 + k). It does not. A camera meters
+/// below that to keep its highlights, and measured against ten frames and this
+/// body's own JPEG rendering of them, mid-grey sits at about **0.072**:
+/// 0.18 = 0.072 / (0.072 + k) gives k = 0.33.
+///
+/// The consequence of the old value was not subtle. Every default render was
+/// **1.3 stops dark**, and because the curve is asymptotic a fully clipped
+/// sensor value could only reach 0.75 — 196 of 255 — so the top of every
+/// histogram was empty. Over those ten frames the error against the camera's own
+/// rendering falls from **46.5 levels rms to 31.5**, and a clipped highlight now
+/// reaches 226.
+///
+/// **The curve's shape is untouched**, and so is everything asserted about it:
+/// it still never clips, is still monotonic, and 40x full scale still renders
+/// below white. What moved is where it sits.
+///
+/// What is left at 31.5 is the *shape*: a hyperbolic has no shoulder, so it
+/// still runs about 30 levels short of a camera's rendering in the brightest
+/// tones. That is hard-list item 2 — a curve that feels right — and it is a
+/// question of taste and iteration rather than a constant to measure.
+///
+/// A profile's own tone curve substitutes for this one rather than composing
+/// with it, so none of this reaches a render with a `.dcp` loaded: those already
+/// matched the camera to within a few levels and are unmoved.
 ///
 /// Three properties matter more than the exact curve:
 ///
@@ -2154,7 +2180,7 @@ fn sample_curve(base: u32, entries: u32, v: f32) -> f32 {
 }
 
 fn tone_map(x: vec3<f32>) -> vec3<f32> {
-    let k = 0.82;
+    let k = 0.33;
     let clamped = max(x, vec3<f32>(0.0));
     return clamped / (clamped + vec3<f32>(k));
 }
