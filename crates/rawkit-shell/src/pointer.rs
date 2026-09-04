@@ -105,6 +105,22 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
             // photograph the mask is being drawn on. A press with no motion
             // after it leaves the gradient where it was, which is what makes a
             // mis-click harmless.
+            // A handle takes the press before anything else, including a pan:
+            // grabbing the shape and dragging the photograph out from under it
+            // are the two things that must never be confused, and the handle is
+            // the smaller and more deliberate target.
+            if !in_grid() {
+                if let Some(grab) = crate::handle_under(at) {
+                    *crate::MASK_GRAB.lock().expect("mask grab lock") = Some(grab);
+                    *MASK_DRAG.lock().expect("mask drag lock") = Some(MaskDrag {
+                        start: at,
+                        now: at,
+                        trail: Vec::new(),
+                        fresh: true,
+                    });
+                    return;
+                }
+            }
             if placing_mask().is_some() && !in_grid() {
                 *MASK_DRAG.lock().expect("mask drag lock") = Some(MaskDrag {
                     start: at,
@@ -197,6 +213,7 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
             // Disarming here as well would make placing a second gradient need
             // a trip back to the panel between every attempt.
             *MASK_DRAG.lock().expect("mask drag lock") = None;
+            *crate::MASK_GRAB.lock().expect("mask grab lock") = None;
             // A spot that was being sized now needs somewhere to borrow from,
             // and the search wants the radius the hand settled on rather than
             // the one it passed through. The render loop does it, because that

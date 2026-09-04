@@ -253,6 +253,7 @@ fn in_the_middle(exposure_ev: f32) -> Mask {
             centre: [0.5, 0.5],
             radii: [0.2, 0.2],
             feather: 0.4,
+            angle_deg: 0.0,
         },
         exposure_ev,
         ..Mask::default()
@@ -655,6 +656,7 @@ fn local_clarity_leaves_a_pixel_that_matches_its_surroundings_alone() {
                     centre: [0.5, 0.5],
                     radii: [0.9, 0.9],
                     feather: 0.0,
+                    angle_deg: 0.0,
                 },
                 clarity: amount,
                 ..Mask::default()

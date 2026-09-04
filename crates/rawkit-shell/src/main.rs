@@ -299,6 +299,7 @@ fn snapshot(state: tauri::State<'_, Shared>) -> serde_json::Value {
             index => Some(index),
         },
         "placing_mask": PLACING_MASK.load(std::sync::atomic::Ordering::Relaxed),
+        "showing_mask": SHOW_MASK.load(std::sync::atomic::Ordering::Relaxed),
         "selected_spot": match selected_spot() {
             usize::MAX => None,
             index => Some(index),
@@ -1082,6 +1083,7 @@ fn main() -> Result<()> {
             place_mask,
             set_mask,
             set_distortion,
+            show_mask,
             remove_spot,
             select_spot,
             set_spot,
@@ -1287,6 +1289,13 @@ fn main() -> Result<()> {
             // worse here than the clone, because being wrong means stale rings
             // left painted on the canvas.
             let mut last_spots: Option<(Vec<rawkit_editstate::Spot>, usize)> = None;
+            // The coverage overlay, and what it was built for. Rebuilt when the
+            // edit or the view moves and reused otherwise: it costs a resample of
+            // a few hundred thousand texels, which is nothing once but something
+            // every frame of a drag.
+            let mut last_coverage: Option<((usize, u64, rawkit_session::Viewport), rawkit_engine::PreviewImage)> = None;
+            let mut coverage_scratch: (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
+            let mut last_outline: Option<(usize, usize, u64, rawkit_session::Viewport)> = None;
             // When the histogram was last recomputed. See `SURVEY_INTERVAL`.
             let mut last_survey: Option<std::time::Instant> = None;
             // What the coarse-while-dragging decision is made from: the edit
@@ -1683,7 +1692,69 @@ fn main() -> Result<()> {
                 // white-balance pick is: turning canvas positions into places on
                 // the *sensor* needs the viewport and the geometry, and this is
                 // where both are to hand.
-                if let Some(index) = placing_mask() {
+                // A handle being dragged. Before the placement branch below,
+                // which is the other thing a drag on the photograph can mean:
+                // one reshapes what is there, the other draws it from scratch.
+                let grabbed = *MASK_GRAB.lock().expect("mask grab lock");
+                if let (Some(grab), Some(index)) = (grabbed, match SELECTED_MASK
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    usize::MAX => None,
+                    index => Some(index),
+                }) {
+                    let taken = MASK_DRAG
+                        .lock()
+                        .expect("mask drag lock")
+                        .as_mut()
+                        .map(|d| (d.start, d.now, std::mem::replace(&mut d.fresh, false)));
+                    if let Some((start, now, fresh)) = taken {
+                        let mut session = shared.lock().expect("session lock");
+                        let size = session.image_size();
+                        let geometry = session.geometry();
+                        let sensor = |at: [f64; 2]| {
+                            let p = session.viewport().image_at(at);
+                            let r = geometry.sensor_rect([p[0], p[1], p[0], p[1]], size);
+                            [
+                                (r[0] / size[0] as f64) as f32,
+                                (r[1] / size[1] as f64) as f32,
+                            ]
+                        };
+                        // Where the shape was when the press landed, so a move is
+                        // relative to the grab rather than to the shape's own
+                        // middle — otherwise it jumps to the pointer.
+                        if fresh {
+                            *MASK_ANCHOR.lock().expect("mask anchor lock") = session
+                                .state()
+                                .masks
+                                .get(index)
+                                .and_then(|m| match selected_part() {
+                                    0 => Some(m.shape.clone()),
+                                    n => m.refinements.get(n - 1).map(|r| r.shape.clone()),
+                                })
+                                .map(|shape| (shape, sensor(start)));
+                        }
+                        let anchor = MASK_ANCHOR.lock().expect("mask anchor lock").clone();
+                        let mut masks = session.state().masks.clone();
+                        let part = selected_part();
+                        let at = sensor(now);
+                        let changed = match (anchor, masks.get_mut(index).and_then(|m| part_of(m, part)))
+                        {
+                            (Some((was, from)), Some(shape)) => {
+                                let next = reshape(&was, grab, from, at, size);
+                                let moved = *shape != next;
+                                *shape = next;
+                                moved
+                            }
+                            _ => false,
+                        };
+                        if changed {
+                            session.apply(Command::SetMasks {
+                                masks,
+                                control: (index as u8) * MASK_CONTROLS,
+                            });
+                        }
+                    }
+                } else if let Some(index) = placing_mask() {
                     // Drained rather than read: everything the hand did since
                     // the last frame belongs to this one, and leaving it behind
                     // would turn a fast stroke into a dotted line.
@@ -2161,6 +2232,94 @@ fn main() -> Result<()> {
                         canvas_renderer.invalidate();
                     }
                 } else if last_spots.take().is_some() {
+                    canvas_renderer.invalidate();
+                }
+                // Where the selected adjustment reaches. On automatically while a
+                // shape is being dragged — that is when the selection is the
+                // thing being decided — and on a key otherwise, because a tint
+                // laid over the photograph is exactly what stops you judging the
+                // edit underneath it.
+                let showing_mask = match SELECTED_MASK.load(std::sync::atomic::Ordering::Relaxed) {
+                    usize::MAX => None,
+                    index => Some(index),
+                }
+                .and_then(|index| {
+                    let dragging = MASK_DRAG.lock().expect("mask drag lock").is_some();
+                    (dragging || SHOW_MASK.load(std::sync::atomic::Ordering::Relaxed))
+                        .then_some(index)
+                });
+                if let Some(index) = showing_mask {
+                    let session = shared.lock().expect("session lock");
+                    let key = (
+                        index,
+                        session.generation(),
+                        session.viewport(),
+                    );
+                    if last_coverage.as_ref().map(|(k, _)| k) != Some(&key) {
+                        last_coverage = draw_mask_coverage(
+                            &gpu,
+                            &blit,
+                            &canvas_renderer,
+                            &session,
+                            index,
+                            &mut coverage_scratch,
+                        )
+                        .map(|image| (key, image));
+                        canvas_renderer.invalidate();
+                    }
+                    if let Some((_, image)) = &last_coverage {
+                        let dest = visible_canvas_rect(&session);
+                        blit.draw_tinted(
+                            &gpu,
+                            canvas_renderer.canvas(),
+                            &[rawkit_engine::Cell {
+                                image,
+                                dest,
+                                tint: MASK_TINT,
+                                edge: ([0.0; 3], 0.0),
+                                inner: ([0.0; 3], 0.0),
+                                round: false,
+                                tinted: true,
+                            }],
+                        );
+                    }
+                } else if last_coverage.take().is_some() {
+                    canvas_renderer.invalidate();
+                }
+                // The outline and its handles, always while an adjustment is
+                // selected — unlike the tint, which hides the picture. This is
+                // what you grab; the tint is what you are grabbing it *for*.
+                if let Some(index) = match SELECTED_MASK.load(std::sync::atomic::Ordering::Relaxed) {
+                    usize::MAX => None,
+                    index => Some(index),
+                } {
+                    let session = shared.lock().expect("session lock");
+                    let shape = session
+                        .state()
+                        .masks
+                        .get(index)
+                        .and_then(|m| match selected_part() {
+                            0 => Some(m.shape.clone()),
+                            n => m.refinements.get(n - 1).map(|r| r.shape.clone()),
+                        });
+                    if let Some(shape) = shape {
+                        draw_mask_outline(
+                            &gpu,
+                            &blit,
+                            &white,
+                            &canvas_renderer,
+                            &session,
+                            &shape,
+                        );
+                        let drawn = (index, selected_part(), session.generation(), session.viewport());
+                        drop(session);
+                        if last_outline.as_ref() != Some(&drawn) {
+                            last_outline = Some(drawn);
+                            canvas_renderer.invalidate();
+                        }
+                    }
+                } else if last_outline.take().is_some() {
+                    MASK_HANDLES.lock().expect("mask handles lock").clear();
                     canvas_renderer.invalidate();
                 }
                 let cost = started.elapsed();
@@ -2836,6 +2995,7 @@ fn shape_from_drag(
                 centre: a,
                 radii: [(b[0] - a[0]).abs().max(1e-3), (b[1] - a[1]).abs().max(1e-3)],
                 feather,
+                angle_deg: 0.0,
             }
         }
         // A brush is not *placed* by a drag, it is painted by one — every point
@@ -3057,6 +3217,7 @@ fn starting_shape(kind: Option<&str>) -> Result<rawkit_editstate::MaskShape, Str
             centre: [0.5, 0.5],
             radii: [0.2, 0.3],
             feather: 0.5,
+            angle_deg: 0.0,
         },
         // The middle of the brightness range, which is where a photograph keeps
         // most of itself -- so the band lands on something whatever the picture
@@ -3310,6 +3471,18 @@ fn place_mask(armed: bool) -> bool {
 }
 
 /// Move one control of one local adjustment.
+/// Show or hide the tint that says where the selected adjustment reaches.
+///
+/// A drag turns it on by itself, so this is for looking at a selection you are
+/// not moving. It is deliberately not on all the time: the tint is there to be
+/// judged *against* the photograph, and one that never went away would make the
+/// edit underneath it impossible to see.
+#[tauri::command]
+fn show_mask(on: bool) -> bool {
+    SHOW_MASK.store(on, std::sync::atomic::Ordering::Relaxed);
+    on
+}
+
 /// Turn the maker's own distortion correction on or off.
 ///
 /// Installs the curve as well as the switch: the profile is a fact about the
@@ -4249,6 +4422,7 @@ fn draw_grid(
             edge,
             inner,
             round: false,
+            tinted: false,
         });
     }
 
@@ -4460,9 +4634,497 @@ fn draw_marquee(
             edge: (colour, t as f32),
             inner: ([0.0; 3], 0.0),
             round: false,
+            tinted: false,
         })
         .collect();
     blit.draw_over(gpu, canvas_renderer.canvas(), &cells);
+}
+
+/// Where the visible part of the photograph sits on the canvas, in canvas pixels.
+///
+/// The same arithmetic the spot markers use, one step shorter: an overlay built
+/// in *straight* coordinates does not need the sensor's frame at all.
+fn visible_canvas_rect(session: &Session) -> [i32; 4] {
+    let viewport = session.viewport();
+    let level = viewport.level(session.max_level());
+    let step = (1u32 << level) as f64;
+    let [x0, y0, x1, y1] = viewport.visible_rect(session.developed_size());
+    let at = |v: f64, centre: f64, extent: u32| {
+        ((v - centre) * viewport.scale + extent as f64 / 2.0) / (viewport.scale * step)
+    };
+    let left = at(x0, viewport.center[0], viewport.size[0]);
+    let top = at(y0, viewport.center[1], viewport.size[1]);
+    let right = at(x1, viewport.center[0], viewport.size[0]);
+    let bottom = at(y1, viewport.center[1], viewport.size[1]);
+    [
+        left.round() as i32,
+        top.round() as i32,
+        (right - left).round().max(1.0) as i32,
+        (bottom - top).round().max(1.0) as i32,
+    ]
+}
+
+/// Whether the coverage tint is being asked for by hand.
+///
+/// A drag turns it on by itself — you are changing the selection, so seeing it
+/// is the point — and this is the other half: a key to look at a selection you
+/// are not currently moving.
+pub(crate) static SHOW_MASK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// How strongly the coverage tint is laid over the photograph.
+///
+/// Enough to read at a glance and not enough to hide what is underneath — the
+/// tint is there to be judged *against* the picture, and one that buried it
+/// would make the judgement impossible.
+const MASK_TINT: [f32; 3] = [1.0, 0.30, 0.34];
+const MASK_TINT_STRENGTH: f32 = 0.55;
+/// The longest edge the overlay is built at.
+///
+/// The tint is a soft, low-frequency thing and this is rebuilt on the interface's
+/// own thread while somebody is dragging, so it is capped well below the canvas.
+/// Sharper would cost milliseconds a frame to say the same thing.
+const MASK_OVERLAY_EDGE: u32 = 512;
+
+/// Paint where the selected adjustment reaches, over the photograph.
+///
+/// # Why this is resampled rather than blitted
+///
+/// The mask is rasterised in **sensor** coordinates, because that is the only
+/// frame that does not move when the photograph is turned or trimmed. The canvas
+/// shows the *developed* frame — rotated, cropped, straightened, keystoned, lens
+/// corrected. Laying the raster over it as a rectangle would be right only on an
+/// unedited photograph. So each overlay texel asks the geometry where it came
+/// from, which is the same question the renderer asks, and gets the same answer
+/// under every one of those.
+#[allow(clippy::too_many_arguments)]
+fn draw_mask_coverage(
+    gpu: &Gpu,
+    blit: &rawkit_engine::PreviewBlit,
+    canvas_renderer: &session_canvas::CanvasRenderer,
+    session: &Session,
+    index: usize,
+    scratch: &mut (Vec<f32>, Vec<f32>),
+) -> Option<rawkit_engine::PreviewImage> {
+    let mask = session.state().masks.get(index)?;
+    let image = session.image_size();
+    let (mw, mh) = rawkit_engine::mask::dimensions(image[0], image[1]);
+    let cells = (mw * mh) as usize;
+    scratch.0.resize(cells.max(1), 0.0);
+    scratch.1.resize(cells.max(1), 0.0);
+    rawkit_engine::mask::rasterise(
+        mask,
+        image[0],
+        image[1],
+        canvas_renderer.guide(),
+        &mut scratch.0,
+        &mut scratch.1,
+    );
+    let coverage = &scratch.0[..cells];
+
+    // Only the part of the photograph that is on screen, at about one texel per
+    // canvas pixel. Building it over the whole frame instead would be a blurred
+    // smear the moment anybody zoomed in.
+    let viewport = session.viewport();
+    let developed = session.developed_size();
+    let [vx0, vy0, vx1, vy1] = viewport.visible_rect(developed);
+    if vx1 <= vx0 || vy1 <= vy0 {
+        return None;
+    }
+    let (sw, sh) = ((vx1 - vx0) as f32, (vy1 - vy0) as f32);
+    let scale = MASK_OVERLAY_EDGE as f32 / sw.max(sh);
+    let (ow, oh) = (
+        ((sw * scale) as u32).clamp(1, MASK_OVERLAY_EDGE),
+        ((sh * scale) as u32).clamp(1, MASK_OVERLAY_EDGE),
+    );
+    let geometry = session.geometry();
+    let (gw, gh) = (mw as f32, mh as f32);
+    let mut rgba = vec![0u8; (ow * oh) as usize * 4];
+    for y in 0..oh {
+        for x in 0..ow {
+            let straight = [
+                vx0 as f32 + (x as f32 + 0.5) / ow as f32 * sw,
+                vy0 as f32 + (y as f32 + 0.5) / oh as f32 * sh,
+            ];
+            let at = geometry.source_at(straight, image);
+            // The raster is indexed in fractions of the sensor, so the sample is
+            // a plain scale — bilinear, because a mask is smooth and nearest
+            // would show its own texels as steps in the tint.
+            let (u, v) = (
+                (at[0] / image[0] as f32 * gw - 0.5).clamp(0.0, gw - 1.0),
+                (at[1] / image[1] as f32 * gh - 0.5).clamp(0.0, gh - 1.0),
+            );
+            let (x0, y0) = (u.floor() as u32, v.floor() as u32);
+            let (x1, y1) = ((x0 + 1).min(mw - 1), (y0 + 1).min(mh - 1));
+            let (fx, fy) = (u - x0 as f32, v - y0 as f32);
+            let get = |cx: u32, cy: u32| coverage[(cy * mw + cx) as usize];
+            let top = get(x0, y0) * (1.0 - fx) + get(x1, y0) * fx;
+            let bottom = get(x0, y1) * (1.0 - fx) + get(x1, y1) * fx;
+            let weight = (top * (1.0 - fy) + bottom * fy).clamp(0.0, 1.0);
+            let i = ((y * ow + x) * 4) as usize;
+            rgba[i] = 255;
+            rgba[i + 1] = 255;
+            rgba[i + 2] = 255;
+            rgba[i + 3] = (weight * MASK_TINT_STRENGTH * 255.0) as u8;
+        }
+    }
+    blit.upload(gpu, &rgba, ow, oh).ok()
+}
+
+/// How many marks an outline is drawn from.
+///
+/// Every outline here is a run of small squares rather than a line, and that is
+/// the reason it can be turned at all: a cell is axis-aligned, so a rotated
+/// ellipse or a slanted gradient cannot be one rectangle. Placing the marks on
+/// this side costs a handful of draws and needs nothing new from the shader —
+/// and a dashed outline is what a graduated filter looks like in every editor
+/// anyway, so the cheap answer is also the familiar one.
+const OUTLINE_MARKS: usize = 72;
+/// The side of an outline mark and of a handle, in screen pixels.
+const OUTLINE_MARK: f64 = 2.0;
+const HANDLE_SIZE: f64 = 9.0;
+
+/// What a drag on a handle is doing to the selected shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaskGrab {
+    /// The whole shape, by its middle.
+    Move,
+    /// One of an ellipse's four axis ends, by index: 0 right, 1 down, 2 left,
+    /// 3 up — in the shape's own turned frame, not the screen's.
+    Stretch(u8),
+    /// The ellipse's turn.
+    Rotate,
+    /// A gradient's near or far edge.
+    Edge(bool),
+}
+
+pub(crate) static MASK_GRAB: Mutex<Option<MaskGrab>> = Mutex::new(None);
+
+/// The shape as it was when a handle was grabbed, and where the grab landed.
+///
+/// Held so that every step of a drag is measured from the *original* shape
+/// rather than from the one the last step produced. Accumulating instead is how
+/// a stretch drifts: each step rounds, and the rounding compounds.
+pub(crate) static MASK_ANCHOR: Mutex<Option<(rawkit_editstate::MaskShape, [f32; 2])>> =
+    Mutex::new(None);
+
+/// What a handle drag makes of the shape it started from.
+///
+/// All of it in **pixels**, because that is the frame these shapes are shapes
+/// in: the two radii are fractions of different extents, so an angle or a
+/// distance computed in the normalised frame is neither.
+fn reshape(
+    was: &rawkit_editstate::MaskShape,
+    grab: MaskGrab,
+    from: [f32; 2],
+    to: [f32; 2],
+    image: [u32; 2],
+) -> rawkit_editstate::MaskShape {
+    let (w, h) = (image[0] as f32, image[1] as f32);
+    let shift = [to[0] - from[0], to[1] - from[1]];
+    match (was.clone(), grab) {
+        (rawkit_editstate::MaskShape::Linear { from: a, to: b }, MaskGrab::Move) => {
+            rawkit_editstate::MaskShape::Linear {
+                from: [a[0] + shift[0], a[1] + shift[1]],
+                to: [b[0] + shift[0], b[1] + shift[1]],
+            }
+        }
+        (rawkit_editstate::MaskShape::Linear { from: a, to: b }, MaskGrab::Edge(near)) => {
+            // The end being dragged goes to the pointer and the other stays, so
+            // one gesture sets both the direction and how wide the falloff is.
+            if near {
+                rawkit_editstate::MaskShape::Linear { from: to, to: b }
+            } else {
+                rawkit_editstate::MaskShape::Linear { from: a, to }
+            }
+        }
+        (
+            rawkit_editstate::MaskShape::Radial {
+                centre,
+                radii,
+                feather,
+                angle_deg,
+            },
+            grab,
+        ) => {
+            let offset = [(to[0] - centre[0]) * w, (to[1] - centre[1]) * h];
+            match grab {
+                MaskGrab::Move => rawkit_editstate::MaskShape::Radial {
+                    centre: [centre[0] + shift[0], centre[1] + shift[1]],
+                    radii,
+                    feather,
+                    angle_deg,
+                },
+                MaskGrab::Rotate => rawkit_editstate::MaskShape::Radial {
+                    centre,
+                    radii,
+                    feather,
+                    angle_deg: offset[1].atan2(offset[0]).to_degrees(),
+                },
+                MaskGrab::Stretch(axis) => {
+                    // Projected onto the axis being dragged, in the shape's own
+                    // turned frame — so pulling a handle changes that radius and
+                    // leaves the other one and the angle alone.
+                    let (sin, cos) = angle_deg.to_radians().sin_cos();
+                    let along = [
+                        offset[0] * cos + offset[1] * sin,
+                        -offset[0] * sin + offset[1] * cos,
+                    ];
+                    let smallest = 4.0;
+                    let mut radii = radii;
+                    if axis % 2 == 0 {
+                        radii[0] = (along[0].abs().max(smallest)) / w;
+                    } else {
+                        radii[1] = (along[1].abs().max(smallest)) / h;
+                    }
+                    rawkit_editstate::MaskShape::Radial {
+                        centre,
+                        radii,
+                        feather,
+                        angle_deg,
+                    }
+                }
+                MaskGrab::Edge(_) => rawkit_editstate::MaskShape::Radial {
+                    centre,
+                    radii,
+                    feather,
+                    angle_deg,
+                },
+            }
+        }
+        (other, _) => other,
+    }
+}
+
+/// Where the selected shape's handles are on screen, in **surface** pixels.
+///
+/// Published by the render loop every frame, because that is the only place that
+/// holds the viewport and the geometry — and read by the pointer routing, which
+/// runs on whichever thread delivered the event and must decide *immediately*
+/// whether a press belongs to a handle or to a pan. A frame's staleness is a
+/// handle that moves with the picture and answers where it was a sixtieth of a
+/// second ago, which no hand can notice.
+pub(crate) static MASK_HANDLES: Mutex<Vec<(MaskGrab, [f64; 2])>> = Mutex::new(Vec::new());
+
+/// Which handle a press at this point lands on, if any.
+pub(crate) fn handle_under(at: [f64; 2]) -> Option<MaskGrab> {
+    let handles = MASK_HANDLES.lock().expect("mask handles lock");
+    handles
+        .iter()
+        .map(|(grab, p)| (grab, (p[0] - at[0]).hypot(p[1] - at[1])))
+        // Generous, because a handle is a small target and the cost of missing
+        // is panning the photograph out from under the shape being adjusted.
+        .filter(|(_, d)| *d <= HANDLE_SIZE * 1.6)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(grab, _)| *grab)
+}
+
+/// Where each of the selected shape's handles sits, in sensor fractions.
+///
+/// One function so the drawing and the hit test cannot disagree about where a
+/// handle is — which is the bug that makes a handle you can see and cannot grab.
+fn mask_handles(shape: &rawkit_editstate::MaskShape, image: [u32; 2]) -> Vec<(MaskGrab, [f32; 2])> {
+    let (w, h) = (image[0] as f32, image[1] as f32);
+    match shape {
+        rawkit_editstate::MaskShape::Linear { from, to } => vec![
+            (MaskGrab::Edge(true), *from),
+            (MaskGrab::Edge(false), *to),
+            (
+                MaskGrab::Move,
+                [(from[0] + to[0]) / 2.0, (from[1] + to[1]) / 2.0],
+            ),
+        ],
+        rawkit_editstate::MaskShape::Radial {
+            centre,
+            radii,
+            angle_deg,
+            ..
+        } => {
+            let (sin, cos) = angle_deg.to_radians().sin_cos();
+            // The axis ends, turned with the shape. In pixels, because that is
+            // the frame the ellipse is a shape in.
+            let at = |ax: f32, ay: f32| {
+                let (px, py) = (ax * radii[0] * w, ay * radii[1] * h);
+                [
+                    centre[0] + (px * cos - py * sin) / w,
+                    centre[1] + (px * sin + py * cos) / h,
+                ]
+            };
+            vec![
+                (MaskGrab::Stretch(0), at(1.0, 0.0)),
+                (MaskGrab::Stretch(1), at(0.0, 1.0)),
+                (MaskGrab::Stretch(2), at(-1.0, 0.0)),
+                (MaskGrab::Stretch(3), at(0.0, -1.0)),
+                // Outside the shape, so it cannot be confused with a stretch.
+                (MaskGrab::Rotate, at(1.45, 0.0)),
+                (MaskGrab::Move, *centre),
+            ]
+        }
+        // A brush has no shape to grab and a range has no shape at all. The tint
+        // is the indicator for both, which is what it is for.
+        _ => Vec::new(),
+    }
+}
+
+/// The outline of the selected shape, as points in sensor fractions.
+fn mask_outline(shape: &rawkit_editstate::MaskShape, image: [u32; 2]) -> Vec<[f32; 2]> {
+    let (w, h) = (image[0] as f32, image[1] as f32);
+    match shape {
+        rawkit_editstate::MaskShape::Linear { from, to } => {
+            // Two lines across the frame: where the effect is whole and where it
+            // has gone. Perpendicular in *pixels*, or they would not look square
+            // to the gradient on anything but a square photograph.
+            let d = [(to[0] - from[0]) * w, (to[1] - from[1]) * h];
+            let length = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-6);
+            let perp = [-d[1] / length, d[0] / length];
+            let reach = (w + h) * 1.5;
+            let mut points = Vec::new();
+            for (edge, end) in [(0usize, from), (1, to)] {
+                for i in 0..OUTLINE_MARKS {
+                    let t = (i as f32 / (OUTLINE_MARKS - 1) as f32 - 0.5) * 2.0 * reach;
+                    // The far edge is drawn at half the density, so the two are
+                    // told apart without a legend.
+                    if edge == 1 && i % 2 == 1 {
+                        continue;
+                    }
+                    points.push([end[0] + perp[0] * t / w, end[1] + perp[1] * t / h]);
+                }
+            }
+            points
+        }
+        rawkit_editstate::MaskShape::Radial {
+            centre,
+            radii,
+            angle_deg,
+            ..
+        } => {
+            let (sin, cos) = angle_deg.to_radians().sin_cos();
+            (0..OUTLINE_MARKS)
+                .map(|i| {
+                    let t = i as f32 / OUTLINE_MARKS as f32 * std::f32::consts::TAU;
+                    let (px, py) = (t.cos() * radii[0] * w, t.sin() * radii[1] * h);
+                    [
+                        centre[0] + (px * cos - py * sin) / w,
+                        centre[1] + (px * sin + py * cos) / h,
+                    ]
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// A sensor fraction to a canvas pixel.
+///
+/// The inverse of the very map the pointer uses on the way in — deriving it the
+/// other way round is how a marker ends up somewhere a click on it would not
+/// land. `None` when the map is degenerate, which a zero-sized viewport gives.
+fn canvas_mapper(session: &Session) -> Option<impl Fn([f32; 2]) -> [f64; 2] + '_> {
+    let viewport = session.viewport();
+    let level = viewport.level(session.max_level());
+    let step = (1u32 << level) as f64;
+    if viewport.scale <= 0.0 {
+        return None;
+    }
+    let size = session.image_size();
+    let geometry = session.geometry();
+    let straight = straight_of_sensor(geometry, size)?;
+    Some(move |at: [f32; 2]| {
+        let [sx, sy] = straight([at[0] * size[0] as f32, at[1] * size[1] as f32]);
+        [
+            ((sx as f64 - viewport.center[0]) * viewport.scale + viewport.size[0] as f64 / 2.0)
+                / (viewport.scale * step),
+            ((sy as f64 - viewport.center[1]) * viewport.scale + viewport.size[1] as f64 / 2.0)
+                / (viewport.scale * step),
+        ]
+    })
+}
+
+/// How many canvas pixels a screen pixel is, at this zoom.
+fn canvas_per_screen(session: &Session) -> f64 {
+    let viewport = session.viewport();
+    let level = viewport.level(session.max_level());
+    (1.0 / (viewport.scale * (1u32 << level) as f64)).max(1.0)
+}
+
+/// The selected shape's outline and handles, over the photograph.
+fn draw_mask_outline(
+    gpu: &Gpu,
+    blit: &rawkit_engine::PreviewBlit,
+    white: &rawkit_engine::PreviewImage,
+    canvas_renderer: &session_canvas::CanvasRenderer,
+    session: &Session,
+    shape: &rawkit_editstate::MaskShape,
+) {
+    let Some(at) = canvas_mapper(session) else {
+        return;
+    };
+    let image = session.image_size();
+    let thin = canvas_per_screen(session);
+    let canvas = canvas_renderer.canvas().size();
+    let mut cells = Vec::new();
+    let mut rects: Vec<([i32; 4], f32, f64)> = Vec::new();
+
+    for point in mask_outline(shape, image) {
+        let p = at(point);
+        let side = (OUTLINE_MARK * thin).max(1.0);
+        // Dropped rather than clamped when it is off the canvas: a mark clamped
+        // to the edge would draw a line along the border that is not the shape.
+        if p[0] < -side
+            || p[1] < -side
+            || p[0] > canvas[0] as f64 + side
+            || p[1] > canvas[1] as f64 + side
+        {
+            continue;
+        }
+        rects.push((
+            [
+                (p[0] - side / 2.0).round() as i32,
+                (p[1] - side / 2.0).round() as i32,
+                side.round().max(1.0) as i32,
+                side.round().max(1.0) as i32,
+            ],
+            0.95,
+            side,
+        ));
+    }
+    let mut published = Vec::new();
+    for (grab, point) in mask_handles(shape, image) {
+        let p = at(point);
+        // Surface pixels for the pointer, canvas pixels for the draw: the two
+        // differ by the zoom, and publishing the wrong one is a handle that can
+        // be seen where it cannot be grabbed.
+        published.push((grab, [p[0] / thin, p[1] / thin]));
+        let side = (HANDLE_SIZE * thin).max(2.0);
+        // The turn handle is drawn darker, so the one that does something
+        // different does not look like the three that do the same thing.
+        let shade = if grab == MaskGrab::Rotate { 0.55 } else { 0.99 };
+        rects.push((
+            [
+                (p[0] - side / 2.0).round() as i32,
+                (p[1] - side / 2.0).round() as i32,
+                side.round() as i32,
+                side.round() as i32,
+            ],
+            shade,
+            side,
+        ));
+    }
+    for (dest, shade, side) in &rects {
+        cells.push(rawkit_engine::Cell {
+            image: white,
+            dest: *dest,
+            tint: [1.0; 3],
+            edge: ([*shade; 3], *side as f32),
+            inner: ([0.0; 3], 0.0),
+            round: false,
+            tinted: false,
+        });
+    }
+    *MASK_HANDLES.lock().expect("mask handles lock") = published;
+    if !cells.is_empty() {
+        blit.draw_over(gpu, canvas_renderer.canvas(), &cells);
+    }
 }
 
 /// The spot markers, as rings drawn over the photograph.
@@ -4490,7 +5152,7 @@ fn draw_spots(
     }
     let size = session.image_size();
     let geometry = session.geometry();
-    let Some(straight) = straight_of_sensor(&geometry, size) else {
+    let Some(straight) = straight_of_sensor(geometry, size) else {
         return;
     };
 
@@ -4548,6 +5210,7 @@ fn draw_spots(
             edge: ([*colour; 3], (thin * weight).ceil() as f32),
             inner: ([0.0; 3], 0.0),
             round: true,
+            tinted: false,
         });
     }
     blit.draw_over(gpu, canvas_renderer.canvas(), &cells);
@@ -4561,9 +5224,9 @@ fn draw_spots(
 /// [`rawkit_editstate::Geometry::flat_transform`]. `None` when the map is
 /// degenerate, which a zero-sized viewport can produce.
 fn straight_of_sensor(
-    geometry: &rawkit_editstate::Geometry,
+    geometry: rawkit_editstate::Geometry,
     size: [u32; 2],
-) -> Option<impl Fn([f32; 2]) -> [f32; 2] + '_> {
+) -> Option<impl Fn([f32; 2]) -> [f32; 2]> {
     let sensor_of = |x: f64, y: f64| {
         let r = geometry.sensor_rect([x, y, x, y], size);
         [r[0] as f32, r[1] as f32]
@@ -4861,6 +5524,7 @@ mod radial_tests {
         centre: [0.5, 0.5],
         radii: [0.2, 0.3],
         feather: 0.5,
+        angle_deg: 0.0,
     };
 
     fn fitted() -> Session {
@@ -4885,6 +5549,7 @@ mod radial_tests {
                 centre,
                 radii,
                 feather,
+                angle_deg: 0.0,
             } => (centre, radii, feather),
             other => panic!("a radial drag produced {other:?}"),
         }
@@ -4956,6 +5621,7 @@ mod radial_tests {
                     centre: [0.5, 0.5],
                     radii,
                     feather: 0.5,
+                    angle_deg: 0.0,
                 },
                 ..rawkit_editstate::Mask::default()
             }],

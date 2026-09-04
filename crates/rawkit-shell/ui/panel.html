@@ -386,6 +386,7 @@
       <div class="row">
         <button id="mask-place" class="target">Redraw on the photograph</button>
         <button id="mask-invert">Invert</button>
+        <button id="mask-show">Show coverage</button>
       </div>
       <div class="row" id="mask-brush-row">
         <button id="mask-erase">Erase</button>
@@ -496,7 +497,7 @@
   </details>
   <details id="s-keys">
     <summary>Keys</summary>
-    <div id="keys">G grid · E loupe · R crop · Q spots · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · Z undo cull · ⌃Z undo edit · ⌃E export · F11 fullscreen</div>
+    <div id="keys">G grid · E loupe · R crop · Q spots · O mask · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · Z undo cull · ⌃Z undo edit · ⌃E export · F11 fullscreen</div>
   </details>
 </main>
 </div>
@@ -1578,6 +1579,7 @@
   /// What the parts list is currently showing, so it is not rebuilt every frame.
   let shownParts = "";
   let shownMasks = null;
+  let showingMask = false;
 
   const place = (on) => {
     placing = on;
@@ -1605,6 +1607,8 @@
       document.getElementById("mask-empty").hidden = masks.length > 0;
     }
     document.getElementById("mask-place").classList.toggle("armed", placing);
+    showingMask = !!s.showing_mask;
+    document.getElementById("mask-show").classList.toggle("armed", showingMask);
     const mask = selected === null ? null : masks[selected];
     if (mask) {
       // What the adjustment is made of, in the order the shapes are joined —
@@ -1851,6 +1855,9 @@
   });
   document.getElementById("mask-size").addEventListener("input", (e) => {
     invoke("set_brush", { radius: Number(e.target.value) }).catch(say);
+  });
+  document.getElementById("mask-show").addEventListener("click", () => {
+    invoke("show_mask", { on: !showingMask }).catch(say);
   });
   document.getElementById("mask-invert").addEventListener("click", () => {
     if (selected === null) return say("nothing selected to invert");
@@ -2154,6 +2161,8 @@
       case "r": act("crop"); break;
       // Q for the spot tool, as in Lightroom.
       case "q": act("spot"); break;
+      // O for the coverage tint, which is the other half of seeing a mask.
+      case "o": invoke("show_mask", { on: !showingMask }).catch(say); break;
       case "[": send({ command: "rotate_by", params: -1 }); break;
       case "]": send({ command: "rotate_by", params: 1 }); break;
       // L adds a graduated local adjustment and arms the drag that places it;

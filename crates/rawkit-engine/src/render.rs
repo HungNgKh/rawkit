@@ -2061,6 +2061,19 @@ impl Renderer {
     }
 }
 
+impl TileBuffers {
+    /// The whole frame at a few hundred pixels, in the camera's own RGB.
+    ///
+    /// Exposed because a *range* mask is a band on what the light is, so
+    /// anything that wants to draw where a mask reaches — the interface's
+    /// overlay, not the renderer — needs the same photograph the rasteriser
+    /// consulted. Rebuilding it on that side would be a second answer to the
+    /// same question, and the two would drift apart the moment either changed.
+    pub fn guide(&self) -> &crate::guide::Guide {
+        &self.guide
+    }
+}
+
 /// GPU buffers for one tile. See [`Renderer::allocate`].
 pub struct TileBuffers {
     params: wgpu::Buffer,

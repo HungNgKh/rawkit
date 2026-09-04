@@ -160,6 +160,12 @@ impl CanvasRenderer {
         )?)
     }
 
+    /// The guide the renderer built for this photograph, so an overlay can ask
+    /// the same question the rasteriser did. See `TileBuffers::guide`.
+    pub fn guide(&self) -> &rawkit_engine::guide::Guide {
+        self.buffers.guide()
+    }
+
     pub fn canvas(&self) -> &Canvas {
         &self.canvas
     }

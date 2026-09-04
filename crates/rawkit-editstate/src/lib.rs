@@ -289,6 +289,15 @@ pub enum MaskShape {
         centre: [f32; 2],
         radii: [f32; 2],
         feather: f32,
+        /// Clockwise, in degrees, about the ellipse's own centre.
+        ///
+        /// Applied in **pixels** rather than in the fractions the radii are
+        /// stored as. A rotation of a shape whose axes are scaled differently is
+        /// not a rotation — it is a shear — so an ellipse turned in the
+        /// normalised frame would come out the wrong shape on any photograph
+        /// that is not square.
+        #[serde(default)]
+        angle_deg: f32,
     },
     /// Painted by hand: a list of strokes, applied in the order they were made.
     ///
@@ -424,6 +433,7 @@ fn validate_shape(shape: &MaskShape) -> Result<(), EditStateError> {
             centre,
             radii,
             feather,
+            angle_deg,
         } => {
             if !centre.iter().chain(&radii).copied().all(finite) || !finite(feather) {
                 return Err(EditStateError::InvalidMask(format!(
@@ -439,6 +449,14 @@ fn validate_shape(shape: &MaskShape) -> Result<(), EditStateError> {
                 return Err(EditStateError::InvalidMask(format!(
                     "feather is {feather}, and runs from 0 to 1"
                 )));
+            }
+            // Unbounded but finite: an ellipse turned by 400 degrees is the same
+            // ellipse, so there is nothing here to refuse except a number that
+            // is not one.
+            if !finite(angle_deg) {
+                return Err(EditStateError::InvalidMask(
+                    "an ellipse turned by something that is not a number".into(),
+                ));
             }
         }
     }
@@ -2321,6 +2339,7 @@ mod tests {
                         centre: [0.5, 0.5],
                         radii: [0.0, 0.2],
                         feather: 0.5,
+                        angle_deg: 0.0,
                     },
                 }],
                 ..Mask::default()

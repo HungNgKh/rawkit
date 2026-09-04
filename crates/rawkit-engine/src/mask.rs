@@ -154,6 +154,7 @@ fn draw(shape: &MaskShape, w: u32, h: u32, guide: &Guide, out: &mut [f32]) {
             centre,
             radii,
             feather,
+            angle_deg,
         } => {
             if radii[0] <= 0.0 || radii[1] <= 0.0 {
                 out[..(w * h) as usize].fill(0.0);
@@ -163,10 +164,20 @@ fn draw(shape: &MaskShape, w: u32, h: u32, guide: &Guide, out: &mut [f32]) {
             // circle on the photograph comes back a circle: the frame's own
             // proportions are already in the numbers.
             let inner = (1.0 - feather).clamp(0.0, 1.0);
+            // The turn is undone in *pixels*, because that is the frame the
+            // ellipse is a shape in. Rotating in the normalised frame instead
+            // would shear it: the two axes are scaled by different amounts, and a
+            // rotation only commutes with a scale when the scale is uniform.
+            let (sin, cos) = (-angle_deg.to_radians()).sin_cos();
+            let aspect = h as f32 / w as f32;
             for y in 0..h {
-                let v = ((y as f32 + 0.5) / h as f32 - centre[1]) / radii[1];
+                let dv = (y as f32 + 0.5) / h as f32 - centre[1];
                 for x in 0..w {
-                    let u = ((x as f32 + 0.5) / w as f32 - centre[0]) / radii[0];
+                    let du = (x as f32 + 0.5) / w as f32 - centre[0];
+                    // Into pixel proportions, turned, and back out again.
+                    let (px, py) = (du, dv * aspect);
+                    let (rx, ry) = (px * cos - py * sin, px * sin + py * cos);
+                    let (u, v) = (rx / radii[0], ry / (radii[1] * aspect));
                     // One at the centre, one at the edge of the ellipse, so the
                     // feather is a fraction of the radius wherever it is
                     // measured — which is what keeps the falloff even round an
@@ -542,14 +553,89 @@ mod tests {
     }
 
     fn ellipse(centre: [f32; 2], radii: [f32; 2], feather: f32) -> Mask {
+        turned(centre, radii, feather, 0.0)
+    }
+
+    fn turned(centre: [f32; 2], radii: [f32; 2], feather: f32, angle_deg: f32) -> Mask {
         Mask {
             shape: MaskShape::Radial {
                 centre,
                 radii,
                 feather,
+                angle_deg,
             },
             ..Mask::default()
         }
+    }
+
+    #[test]
+    fn a_quarter_turn_swaps_an_ellipses_axes_and_nothing_else() {
+        // Rotation done in the *normalised* frame would be a shear, so this is
+        // checked on a square image where the two readings agree about what a
+        // quarter turn means: a long-and-thin ellipse turned by ninety degrees
+        // has to be the same shape as a thin-and-long one that was never turned.
+        let long = turned([0.5, 0.5], [0.30, 0.10], 0.3, 90.0);
+        let tall = ellipse([0.5, 0.5], [0.10, 0.30], 0.3);
+        let (a, w, h) = draw(&long, 600, 600);
+        let (b, _, _) = draw(&tall, 600, 600);
+        let mut worst = 0.0f32;
+        for (x, y) in a.iter().zip(&b) {
+            worst = worst.max((x - y).abs());
+        }
+        assert!(worst < 0.02, "the turned ellipse differs by {worst}");
+
+        // And it is a real turn rather than a relabelling: against the *unturned*
+        // long ellipse the two disagree completely.
+        let (c, _, _) = draw(&ellipse([0.5, 0.5], [0.30, 0.10], 0.3), 600, 600);
+        let apart = a
+            .iter()
+            .zip(&c)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(apart > 0.9, "turning it changed nothing: {apart}");
+        assert_eq!((w, h), (600, 600));
+    }
+
+    #[test]
+    fn a_turn_on_a_wide_frame_is_a_turn_and_not_a_shear() {
+        // The mistake this guards, and it took two goes to write. On a 3:2 frame
+        // the two radii are fractions of *different* extents, so a rotation done
+        // in that normalised frame stretches the shape as it goes round.
+        //
+        // **Area cannot see it.** That was the first version of this test, and it
+        // passed with the shear deliberately put back: a rotation in either frame
+        // is area-preserving, so the two agree exactly. What differs is the
+        // *shape*, so the extents are what to measure.
+        //
+        // An ellipse 0.20 of the width by 0.08 of the height on a 900x600 frame
+        // is 360 by 96 pixels. Turned a quarter it must be 96 by 360. Sheared
+        // instead it comes out 144 by 240 — the same area, the wrong picture.
+        let extent = |angle: f32| {
+            let (pixels, w, h) = draw(&turned([0.5, 0.5], [0.20, 0.08], 0.0, angle), 900, 600);
+            let (mut x0, mut x1, mut y0, mut y1) = (w, 0u32, h, 0u32);
+            for y in 0..h {
+                for x in 0..w {
+                    if pixels[(y * w + x) as usize] > 0.5 {
+                        x0 = x0.min(x);
+                        x1 = x1.max(x);
+                        y0 = y0.min(y);
+                        y1 = y1.max(y);
+                    }
+                }
+            }
+            (x1 + 1 - x0, y1 + 1 - y0)
+        };
+        let flat = extent(0.0);
+        assert!(
+            flat.0.abs_diff(360) < 8 && flat.1.abs_diff(96) < 8,
+            "the unturned ellipse is {flat:?}, not about 360x96"
+        );
+        let quarter = extent(90.0);
+        assert!(
+            quarter.0.abs_diff(96) < 8 && quarter.1.abs_diff(360) < 8,
+            "turned a quarter it is {quarter:?}, not about 96x360 — 144x240 would mean \
+             it was turned in the normalised frame, which is a shear"
+        );
     }
 
     #[test]

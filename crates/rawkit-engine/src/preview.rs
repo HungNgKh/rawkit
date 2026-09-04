@@ -44,6 +44,12 @@ pub struct Cell<'a> {
     /// A second band just inside the first — a colour label, which a frame can
     /// carry at the same time as a flag.
     pub inner: ([f32; 3], f32),
+    /// Take the alpha from the image rather than forcing it to one.
+    ///
+    /// For [`draw_tinted`](PreviewBlit::draw_tinted): the cell carries a coverage
+    /// in its alpha channel and a colour in `tint`, and what lands on the canvas
+    /// is that colour in proportion to the coverage.
+    pub tinted: bool,
     /// Draw only a ring inscribed in the rectangle, and discard the rest.
     ///
     /// For a marker that stands for a round thing — the spot tool's — where a
@@ -66,6 +72,9 @@ pub struct PreviewImage {
 /// Draws a [`PreviewImage`] into a [`Canvas`].
 pub struct PreviewBlit {
     pipeline: wgpu::RenderPipeline,
+    /// The same shader with alpha blending on, for cells that describe the
+    /// photograph rather than replace it.
+    blended: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     region: wgpu::Buffer,
@@ -120,6 +129,40 @@ impl PreviewBlit {
                 bind_group_layouts: &[Some(&layout)],
                 immediate_size: 0,
             });
+        // Two pipelines off one shader and one layout, differing only in whether
+        // the target blends. A cell that covers the photograph to *say* something
+        // about it — where a mask reaches — has to let the photograph through,
+        // and a cell that draws a thumbnail must not: blending a preview over
+        // whatever was in the canvas would show the last frame through this one.
+        let make = |label: &str, blend: Option<wgpu::BlendState>| {
+            gpu.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &module,
+                        entry_point: Some("vs"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &module,
+                        entry_point: Some("fs"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: CANVAS_FORMAT,
+                            blend,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+        };
+        let blended = make("preview overlay", Some(wgpu::BlendState::ALPHA_BLENDING));
         let pipeline = gpu
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -171,6 +214,7 @@ impl PreviewBlit {
 
         Self {
             pipeline,
+            blended,
             layout,
             sampler,
             region,
@@ -251,7 +295,7 @@ impl PreviewBlit {
     /// What a grid wants: every cell is redrawn each frame, and the gaps between
     /// them are background rather than whatever the last view left.
     pub fn draw_grid(&self, gpu: &Gpu, canvas: &Canvas, cells: &[Cell<'_>]) {
-        self.render(gpu, canvas, cells, true);
+        self.render(gpu, canvas, cells, true, false);
     }
 
     /// Draw cells *onto* what is already on the canvas.
@@ -260,11 +304,20 @@ impl PreviewBlit {
     /// only difference from [`draw_grid`](Self::draw_grid) is the load: clearing
     /// first would leave four white lines on an empty canvas, which is what
     /// happened before this existed.
-    pub fn draw_over(&self, gpu: &Gpu, canvas: &Canvas, cells: &[Cell<'_>]) {
-        self.render(gpu, canvas, cells, false);
+    /// Draw cells over the canvas, letting what is already there show through.
+    ///
+    /// The alpha comes from the cell's own image, so this is for saying
+    /// something *about* the photograph — where a mask reaches — rather than for
+    /// putting a picture on top of it.
+    pub fn draw_tinted(&self, gpu: &Gpu, canvas: &Canvas, cells: &[Cell<'_>]) {
+        self.render(gpu, canvas, cells, false, true);
     }
 
-    fn render(&self, gpu: &Gpu, canvas: &Canvas, cells: &[Cell<'_>], clear: bool) {
+    pub fn draw_over(&self, gpu: &Gpu, canvas: &Canvas, cells: &[Cell<'_>]) {
+        self.render(gpu, canvas, cells, false, false);
+    }
+
+    fn render(&self, gpu: &Gpu, canvas: &Canvas, cells: &[Cell<'_>], clear: bool, blend: bool) {
         let [canvas_w, canvas_h] = canvas.size();
         let mut regions = vec![0.0f32; cells.len() * (REGION_STRIDE as usize / 4)];
         let mut placed: Vec<([u32; 4], usize)> = Vec::with_capacity(cells.len());
@@ -328,7 +381,7 @@ impl PreviewBlit {
             ]);
             regions[at + 16..at + 20].copy_from_slice(&[
                 if cell.round { 1.0 } else { 0.0 },
-                0.0,
+                if cell.tinted { 1.0 } else { 0.0 },
                 0.0,
                 0.0,
             ]);
@@ -417,7 +470,7 @@ impl PreviewBlit {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(if blend { &self.blended } else { &self.pipeline });
             for (group, ([x, y, w, h], _)) in groups.iter().zip(&placed) {
                 // The viewport maps the triangle onto the cell; the scissor stops
                 // the oversized part of it reaching anything else.
