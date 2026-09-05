@@ -486,8 +486,12 @@ pub struct MaskOverlay {
     pub straight_origin: [f32; 2],
     /// Which layer of the mask texture to read.
     pub layer: u32,
-    /// How strongly to lay the tint on, 0 to 1.
+    /// How strongly to lay the tint on, 0 to 1. Zero draws the border alone.
     pub strength: f32,
+    /// How wide the border is in canvas pixels, and how bright. A width of zero
+    /// draws none.
+    pub border: f32,
+    pub brightness: f32,
     /// In the canvas's own linear light.
     pub tint: [f32; 3],
 }
@@ -504,6 +508,8 @@ struct OverlayParams {
     inverse_image: [f32; 2],
     layer: u32,
     strength: f32,
+    border: f32,
+    brightness: f32,
     tint: [f32; 4],
     curve: [[f32; 4]; 4],
 }
@@ -1509,6 +1515,8 @@ impl Renderer {
             inverse_image: [1.0 / image[0].max(1) as f32, 1.0 / image[1].max(1) as f32],
             layer: view.layer,
             strength: view.strength,
+            border: view.border,
+            brightness: view.brightness,
             tint: [view.tint[0], view.tint[1], view.tint[2], 0.0],
             curve: {
                 let mut packed = [[0.0f32; 4]; 4];

@@ -671,3 +671,130 @@ fn local_clarity_leaves_a_pixel_that_matches_its_surroundings_alone() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn an_adjustment_stops_at_the_edge_of_a_hard_mask() {
+    // Reported as the effect "flowing outside the mask". The existing test above
+    // samples one pixel deep inside and one far outside, which cannot see a
+    // spill of a few pixels at the boundary — so this walks outward from the
+    // rim and reports how far the adjustment actually reaches.
+    //
+    // A hard-edged radial, so anything past its rim is spill rather than
+    // feather, and a large exposure so a small leak is still visible.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    let plain = render(&gpu, &EditState::default());
+    let radius = 0.25f32;
+    println!(
+        "a {W}-wide frame rasterises its masks at {:?}",
+        rawkit_engine::mask::dimensions(W, H)
+    );
+    let edited = EditState {
+        masks: vec![Mask {
+            shape: MaskShape::Radial {
+                centre: [0.5, 0.5],
+                radii: [radius, radius],
+                feather: 0.0,
+                angle_deg: 0.0,
+            },
+            exposure_ev: 3.0,
+            ..Mask::default()
+        }],
+        ..EditState::default()
+    };
+    let masked = render(&gpu, &edited);
+
+    let inside = luma(&masked, W / 2, H / 2) - luma(&plain, W / 2, H / 2);
+    assert!(inside > 0.05, "the mask did nothing inside: {inside}");
+
+    // Along the horizontal radius, outward from the rim, in pixels.
+    let rim = (radius * W as f32) as u32;
+    let mut reach = 0i32;
+    let mut profile = Vec::new();
+    for step in 0..40u32 {
+        let x = W / 2 + rim + step;
+        if x >= W {
+            break;
+        }
+        let lifted = (luma(&masked, x, H / 2) - luma(&plain, x, H / 2)) / inside;
+        if step % 4 == 0 {
+            profile.push(format!("{step}:{lifted:.3}"));
+        }
+        // A hundredth of the effect is the threshold for "still doing something".
+        if lifted > 0.01 {
+            reach = step as i32 + 1;
+        }
+    }
+    println!("past the rim: {}", profile.join("  "));
+    println!("the adjustment reaches {reach} px past a {W}-wide frame's mask edge");
+    assert!(
+        reach <= 8,
+        "the adjustment reaches {reach} px outside a hard mask: {}",
+        profile.join("  ")
+    );
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn the_effect_is_half_on_where_the_border_is_drawn() {
+    // The claim the border is now built to make, and the reason it is derived
+    // from the mask's own coverage rather than drawn from the ellipse's
+    // parameters.
+    //
+    // The raster is capped at 1024 on its longest edge, so on a 24 megapixel
+    // frame one texel is about six image pixels and a mask set to no feather
+    // still fades across that. An outline drawn at the exact ellipse therefore
+    // sat *inside* where the adjustment stopped, and the effect visibly ran past
+    // its own border. Drawing the border at the half-coverage contour instead
+    // makes "half the effect inside, half outside" true by construction, at any
+    // raster resolution.
+    //
+    // Measured here on the coverage the renderer samples, which is the same
+    // texture the overlay pass reads.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    let plain = render(&gpu, &EditState::default());
+    let radius = 0.25f32;
+    let edited = EditState {
+        masks: vec![Mask {
+            shape: MaskShape::Radial {
+                centre: [0.5, 0.5],
+                radii: [radius, radius],
+                feather: 0.0,
+                angle_deg: 0.0,
+            },
+            exposure_ev: 3.0,
+            ..Mask::default()
+        }],
+        ..EditState::default()
+    };
+    let masked = render(&gpu, &edited);
+    let full = luma(&masked, W / 2, H / 2) - luma(&plain, W / 2, H / 2);
+    assert!(full > 0.05, "the mask did nothing inside: {full}");
+
+    // Walk the horizontal radius and find where the effect passes half.
+    let mut half_at = None;
+    for x in W / 2..W {
+        let lifted = (luma(&masked, x, H / 2) - luma(&plain, x, H / 2)) / full;
+        if lifted < 0.5 {
+            half_at = Some(x - W / 2);
+            break;
+        }
+    }
+    let half_at = half_at.expect("the effect never fell below half");
+    let rim = (radius * W as f32) as u32;
+    println!("the effect is half on at {half_at} px; the ellipse's rim is at {rim} px");
+    // The two must agree to within a texel of the raster, which on this frame is
+    // one pixel. A border drawn from the parameters would be at `rim`; a border
+    // drawn from the coverage is at `half_at`. They are the same place.
+    let texel = (W / rawkit_engine::mask::dimensions(W, H).0).max(1);
+    assert!(
+        half_at.abs_diff(rim) <= texel + 1,
+        "the effect is half on at {half_at} px where the shape's rim is {rim}"
+    );
+}

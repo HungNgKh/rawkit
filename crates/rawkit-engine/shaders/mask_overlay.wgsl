@@ -33,9 +33,14 @@ struct Overlay {
     // One over the image's size, so a sensor pixel becomes the fraction the
     // mask texture is indexed by.
     inverse_image: vec2<f32>,
-    // Which layer to read, and how strongly to lay it on.
+    // Which layer to read, and how strongly to lay the tint on. A strength of
+    // zero draws the border and nothing else, which is what a selected mask
+    // looks like when the coverage tint is not being asked for.
     layer: u32,
     strength: f32,
+    // How wide the border is, in canvas pixels, and how bright. Zero draws none.
+    border: f32,
+    brightness: f32,
     // The tint, in the canvas's own linear light.
     tint: vec4<f32>,
     // The lens's curve, resolved: amount applied, peak subtracted, divisor
@@ -117,14 +122,48 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
 
-    let weight = textureSampleLevel(mask_layers, mask_sampler, uv, overlay.layer, 0.0).r;
-    let alpha = clamp(weight, 0.0, 1.0) * overlay.strength;
+    let weight = clamp(
+        textureSampleLevel(mask_layers, mask_sampler, uv, overlay.layer, 0.0).r,
+        0.0,
+        1.0,
+    );
+
+    // The border is the **half-coverage contour of the mask itself**, not a
+    // shape drawn from the numbers in the edit. Three things follow, and they
+    // are the reason it is done here rather than by placing marks on the CPU:
+    //
+    // - It cannot disagree with the effect. An outline drawn from the ellipse's
+    //   own parameters sits at the exact ellipse, while the adjustment fades
+    //   across the raster's resolution — about six image pixels on a 24 MP
+    //   frame — so the effect visibly ran past its own border. Here the border
+    //   *is* where the mask is half on, so the adjustment is half inside it and
+    //   half out, by construction.
+    // - It is a **line**, continuous at any zoom and any rotation, rather than a
+    //   run of small squares standing in for one.
+    // - A brush and a range mask get one too. They have no shape to draw from,
+    //   which is why they had no outline at all.
+    //
+    // `fwidth` is how far the coverage moves between neighbouring pixels, so
+    // dividing by it turns a distance in coverage into a distance in *pixels* —
+    // which is what makes the line the same width whatever the zoom is and
+    // however soft the mask.
+    var border = 0.0;
+    if (overlay.border > 0.0) {
+        let slope = max(fwidth(weight), 1e-5);
+        border = 1.0 - smoothstep(0.0, overlay.border, abs(weight - 0.5) / slope);
+    }
+
+    let tint = weight * overlay.strength;
+    // The border sits on top of the tint rather than adding to it, so a bright
+    // line stays bright over a covered area instead of blowing out.
+    let alpha = max(tint, border * overlay.brightness);
     if (alpha <= 0.0) {
         discard;
     }
+    let colour = mix(overlay.tint.rgb, vec3<f32>(1.0), border);
     // **Premultiplied**, matching a premultiplied blend state, so the alpha is
     // applied exactly once. The canvas holds linear half floats and the tint is
     // in the same light, so nothing here is gamma-aware: the overlay is a mark
     // on the picture rather than a colour in it.
-    return vec4<f32>(overlay.tint.rgb * alpha, alpha);
+    return vec4<f32>(colour * alpha, alpha);
 }

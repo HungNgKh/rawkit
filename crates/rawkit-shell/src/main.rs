@@ -1299,6 +1299,7 @@ fn main() -> Result<()> {
                 Option<rawkit_editstate::Mask>,
                 rawkit_session::Viewport,
                 u8,
+                bool,
             );
             let mut last_overlay: Option<OverlayKey> = None;
             let mut last_outline: Option<(usize, usize, u64, rawkit_session::Viewport)> = None;
@@ -2258,14 +2259,17 @@ fn main() -> Result<()> {
                 // second time on the CPU and resampled it per texel — 28 ms on a
                 // plain frame, 76 with a straighten and a lens, on every frame of
                 // a drag.
-                let showing_mask = match SELECTED_MASK.load(std::sync::atomic::Ordering::Relaxed) {
+                // The border is drawn whenever an adjustment is selected; the
+                // tint only while it is being dragged or asked for. One pass
+                // either way, because the border comes off the same texture the
+                // tint does.
+                let selected = match SELECTED_MASK.load(std::sync::atomic::Ordering::Relaxed) {
                     usize::MAX => None,
                     index => Some(index),
-                }
-                .and_then(|index| {
-                    let dragging = MASK_DRAG.lock().expect("mask drag lock").is_some();
-                    (dragging || SHOW_MASK.load(std::sync::atomic::Ordering::Relaxed))
-                        .then_some(index)
+                };
+                let tinting = selected.is_some_and(|_| {
+                    MASK_DRAG.lock().expect("mask drag lock").is_some()
+                        || SHOW_MASK.load(std::sync::atomic::Ordering::Relaxed)
                 });
                 //
                 // **Painted only onto a canvas that was just filled.** The tint
@@ -2282,20 +2286,21 @@ fn main() -> Result<()> {
                 // is over a hundred milliseconds on a 24 MP frame, so the loop
                 // never finishes one before starting the next and the whole
                 // interface stops moving.
-                let overlay_key = showing_mask.map(|index| {
+                let overlay_key = selected.map(|index| {
                     let session = shared.lock().expect("session lock");
                     (
                         index,
                         session.state().masks.get(index).cloned(),
                         session.viewport(),
                         session.level(),
+                        tinting,
                     )
                 });
                 if overlay_key != last_overlay {
                     last_overlay = overlay_key.clone();
                     canvas_renderer.invalidate();
                 }
-                if let (Some(index), true) = (showing_mask, drawn > 0) {
+                if let (Some(index), true) = (selected, drawn > 0) {
                     let session = shared.lock().expect("session lock");
                     if index < session.state().masks.len().min(rawkit_editstate::MAX_MASKS) {
                         let viewport = session.viewport();
@@ -2314,7 +2319,9 @@ fn main() -> Result<()> {
                                     (origin[1] / step).floor() as f32,
                                 ],
                                 layer: index as u32,
-                                strength: MASK_TINT_STRENGTH,
+                                strength: if tinting { MASK_TINT_STRENGTH } else { 0.0 },
+                                border: MASK_BORDER,
+                                brightness: MASK_BORDER_BRIGHTNESS,
                                 tint: MASK_TINT,
                             },
                         );
@@ -4688,18 +4695,23 @@ pub(crate) static SHOW_MASK: std::sync::atomic::AtomicBool =
 /// would make the judgement impossible.
 const MASK_TINT: [f32; 3] = [1.0, 0.30, 0.34];
 const MASK_TINT_STRENGTH: f32 = 0.55;
-
-/// How many marks an outline is drawn from.
+/// How wide the border is, in canvas pixels either side of the half-coverage
+/// contour, and how solid.
 ///
-/// Every outline here is a run of small squares rather than a line, and that is
-/// the reason it can be turned at all: a cell is axis-aligned, so a rotated
-/// ellipse or a slanted gradient cannot be one rectangle. Placing the marks on
-/// this side costs a handful of draws and needs nothing new from the shader —
-/// and a dashed outline is what a graduated filter looks like in every editor
-/// anyway, so the cheap answer is also the familiar one.
-const OUTLINE_MARKS: usize = 72;
-/// The side of an outline mark and of a handle, in screen pixels.
-const OUTLINE_MARK: f64 = 2.0;
+/// Two pixels rather than one: at one it aliases into a dotted line on a curve,
+/// which is the appearance this replaced.
+const MASK_BORDER: f32 = 2.0;
+const MASK_BORDER_BRIGHTNESS: f32 = 0.9;
+
+/// The side of a handle, in screen pixels.
+///
+/// The outline itself is no longer made of these. It used to be a run of small
+/// squares, because a cell is axis-aligned and a rotated ellipse cannot be one
+/// rectangle — which read as a dotted line, and sat at the shape's exact
+/// parameters while the adjustment faded across the raster's own resolution, so
+/// the effect visibly ran past its own border. It is drawn in the overlay pass
+/// now, off the very coverage the render samples: a continuous line, and one
+/// that cannot disagree with the effect.
 const HANDLE_SIZE: f64 = 9.0;
 
 /// What a drag on a handle is doing to the selected shape.
@@ -4889,54 +4901,6 @@ fn mask_handles(shape: &rawkit_editstate::MaskShape, image: [u32; 2]) -> Vec<(Ma
     }
 }
 
-/// The outline of the selected shape, as points in sensor fractions.
-fn mask_outline(shape: &rawkit_editstate::MaskShape, image: [u32; 2]) -> Vec<[f32; 2]> {
-    let (w, h) = (image[0] as f32, image[1] as f32);
-    match shape {
-        rawkit_editstate::MaskShape::Linear { from, to } => {
-            // Two lines across the frame: where the effect is whole and where it
-            // has gone. Perpendicular in *pixels*, or they would not look square
-            // to the gradient on anything but a square photograph.
-            let d = [(to[0] - from[0]) * w, (to[1] - from[1]) * h];
-            let length = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-6);
-            let perp = [-d[1] / length, d[0] / length];
-            let reach = (w + h) * 1.5;
-            let mut points = Vec::new();
-            for (edge, end) in [(0usize, from), (1, to)] {
-                for i in 0..OUTLINE_MARKS {
-                    let t = (i as f32 / (OUTLINE_MARKS - 1) as f32 - 0.5) * 2.0 * reach;
-                    // The far edge is drawn at half the density, so the two are
-                    // told apart without a legend.
-                    if edge == 1 && i % 2 == 1 {
-                        continue;
-                    }
-                    points.push([end[0] + perp[0] * t / w, end[1] + perp[1] * t / h]);
-                }
-            }
-            points
-        }
-        rawkit_editstate::MaskShape::Radial {
-            centre,
-            radii,
-            angle_deg,
-            ..
-        } => {
-            let (sin, cos) = angle_deg.to_radians().sin_cos();
-            (0..OUTLINE_MARKS)
-                .map(|i| {
-                    let t = i as f32 / OUTLINE_MARKS as f32 * std::f32::consts::TAU;
-                    let (px, py) = (t.cos() * radii[0] * w, t.sin() * radii[1] * h);
-                    [
-                        centre[0] + (px * cos - py * sin) / w,
-                        centre[1] + (px * sin + py * cos) / h,
-                    ]
-                })
-                .collect()
-        }
-        _ => Vec::new(),
-    }
-}
-
 /// A sensor fraction to a canvas pixel.
 ///
 /// The inverse of the very map the pointer uses on the way in — deriving it the
@@ -5021,33 +4985,9 @@ fn draw_mask_outline(
     let image = session.image_size();
     let thin = canvas_per_screen(session);
     let to_surface = surface_per_canvas(session);
-    let canvas = canvas_renderer.canvas().size();
     let mut cells = Vec::new();
     let mut rects: Vec<([i32; 4], f32, f64)> = Vec::new();
 
-    for point in mask_outline(shape, image) {
-        let p = at(point);
-        let side = (OUTLINE_MARK * display_scale() * thin).max(1.0);
-        // Dropped rather than clamped when it is off the canvas: a mark clamped
-        // to the edge would draw a line along the border that is not the shape.
-        if p[0] < -side
-            || p[1] < -side
-            || p[0] > canvas[0] as f64 + side
-            || p[1] > canvas[1] as f64 + side
-        {
-            continue;
-        }
-        rects.push((
-            [
-                (p[0] - side / 2.0).round() as i32,
-                (p[1] - side / 2.0).round() as i32,
-                side.round().max(1.0) as i32,
-                side.round().max(1.0) as i32,
-            ],
-            0.95,
-            side,
-        ));
-    }
     let mut published = Vec::new();
     for (grab, point) in mask_handles(shape, image) {
         let p = at(point);
