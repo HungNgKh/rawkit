@@ -312,6 +312,13 @@ pub enum CullAction {
     /// sends what they now say, rather than the shell keeping a second copy that
     /// could disagree with them.
     SetFilter(Filter),
+    /// A second interpretation of this photograph, carrying the edit that is on
+    /// screen. Resolved in the command handler, which is the only place that can
+    /// see the session.
+    MakeCopy,
+    /// Throw away the copy under the cursor. Refused on a photograph that is not
+    /// one.
+    RemoveCopy,
     /// Move the selection without loading anything — what a grid does. The
     /// loupe uses `Next`/`Previous`, which ask for the photograph as well.
     SelectNext,
@@ -330,6 +337,10 @@ pub enum CullAction {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CullView {
     pub filename: String,
+    /// Which interpretation is on screen — `None` for the photograph itself.
+    /// Beside `filename` rather than folded into it, because the page shows the
+    /// two differently and an export names them differently.
+    pub copy: Option<String>,
     /// One-based, because it is shown to a person.
     pub position: usize,
     pub total: usize,
@@ -561,6 +572,77 @@ impl Library {
         &self.filter
     }
 
+    /// A second interpretation of the photograph under the cursor.
+    ///
+    /// `state` is what is on screen, not what the catalog last wrote: sliders
+    /// that have moved and not yet settled into a version are part of the look
+    /// somebody is forking, and a copy of the last saved moment is a copy of a
+    /// moment nobody chose.
+    ///
+    /// The cursor lands on the copy, which is where anybody who just made one is
+    /// looking. It sits immediately after its original — the sequence sorts by
+    /// capture time, then filename, then id, and a copy shares the first two.
+    ///
+    /// Reported by name so the interface can say which one it made.
+    pub fn add_copy(&mut self, state: &EditState) -> Result<String> {
+        let source = self.current().id;
+        let id = rawkit_catalog::copies::create(&self.catalog, source, None, state)?;
+        // A copy starts undecided, so a filter on flag or rating will not have
+        // it. Rather than making something the user cannot see, the filter comes
+        // off — the same rule as a filter that empties, and for the same reason:
+        // the view has to be able to explain itself, and the chips follow it.
+        self.resequence(Some(id))?;
+        let name = self
+            .position_of(id)
+            .and_then(|at| self.images[at].copy_name.clone())
+            .unwrap_or_default();
+        Ok(name)
+    }
+
+    /// Throw away the copy under the cursor.
+    ///
+    /// Its edit history, snapshots and preview rows go with it; the preview
+    /// files are left for the sweep, which is where every other orphan is dealt
+    /// with. Refused on a photograph that is not a copy — see
+    /// [`rawkit_catalog::copies::delete`] for what deleting that would cost.
+    pub fn remove_copy(&mut self) -> Result<String> {
+        let image = self.current().clone();
+        rawkit_catalog::copies::delete(&self.catalog, image.id)?;
+        // Anything still naming it would act on a row that is gone: a mark would
+        // show an empty cell, and an undo would try to put a judgement back on
+        // nothing.
+        self.marked.retain(|marked| *marked != image.id);
+        self.undo.retain(|undone| match undone {
+            Undone::Judged { image: id, .. } => *id != image.id,
+            Undone::Pasted { frames } => !frames.iter().any(|(id, _)| *id == image.id),
+        });
+        self.resequence(None)?;
+        Ok(image.label())
+    }
+
+    /// Re-read the sequence after the library itself changed, and stand
+    /// somewhere sensible.
+    ///
+    /// Keeps the filter only while it has something to show *and*, when a
+    /// particular photograph is what the action was about, while it can show
+    /// that one. Everything else about a filter is the user's decision; this is
+    /// the case where honouring it would mean acting and showing nothing.
+    fn resequence(&mut self, prefer: Option<i64>) -> Result<()> {
+        let mut images = cull::sequence(&self.catalog, &self.filter)?;
+        let hidden = prefer.is_some_and(|id| !images.iter().any(|image| image.id == id));
+        if images.is_empty() || hidden {
+            self.filter = Filter::default();
+            images = cull::sequence(&self.catalog, &self.filter)?;
+        }
+        self.images = images;
+        self.index = match prefer.and_then(|id| self.images.iter().position(|i| i.id == id)) {
+            Some(at) => at,
+            None => self.index.min(self.images.len() - 1),
+        };
+        self.request = Some(self.index);
+        Ok(())
+    }
+
     /// Look at a narrower part of the library.
     ///
     /// The photograph under the cursor is kept when the new filter admits it,
@@ -725,6 +807,9 @@ impl Library {
             // which is what has kept this match honest.
             CullAction::Crop | CullAction::CropApply | CullAction::CropCancel => {}
             CullAction::SetFilter(filter) => self.narrow(filter)?,
+            // Both are resolved before they arrive: making one needs the
+            // session's edit, which only the command handler can see.
+            CullAction::MakeCopy | CullAction::RemoveCopy => {}
             CullAction::Spot => {}
             // The clipboard is filled in the command handler, which is the only
             // place that can see the session — this frame's edit is what is on
@@ -977,6 +1062,7 @@ impl Library {
         let (in_library, picks, rejects) = cull::tally(&self.catalog)?;
         Ok(CullView {
             filename: image.filename.clone(),
+            copy: image.copy_name.clone(),
             position: self.index + 1,
             total: self.images.len(),
             rating: judgement.rating,
@@ -1236,6 +1322,125 @@ mod tests {
         let view = serde_json::to_value(library.view().unwrap()).unwrap();
         assert_eq!(view["filter"]["flagged"], serde_json::Value::Null);
         assert_eq!(view["in_library"], 1);
+    }
+
+    #[test]
+    fn a_copy_stands_beside_its_original_and_carries_the_edit() {
+        let dir = Scratch::new("copy-make");
+        let mut library = library_at(&dir.0, 3);
+        library.select(1);
+        let mut look = EditState::default();
+        look.tone.exposure_ev = 1.25;
+
+        let name = library.add_copy(&look).unwrap();
+        assert_eq!(name, "copy 1");
+        let view = library.view().unwrap();
+        assert_eq!(view.total, 4, "a fourth image over three files");
+        assert_eq!(view.filename, "DSC00001.ARW", "the same file");
+        assert_eq!(
+            view.copy.as_deref(),
+            Some("copy 1"),
+            "and we are on the copy"
+        );
+        assert_eq!(
+            view.position, 3,
+            "immediately after the photograph it came from"
+        );
+        assert!(
+            library.take_request().is_some(),
+            "the copy has its own edit, so the loop has to restore it"
+        );
+
+        let id = library.current().id;
+        let (_, state) = rawkit_catalog::edits::latest(library.catalog(), id)
+            .unwrap()
+            .expect("the copy's edit");
+        assert_eq!(state.tone.exposure_ev, 1.25);
+    }
+
+    #[test]
+    fn a_copy_is_judged_apart_from_the_photograph_it_came_from() {
+        // The reason it is an image and not a file. Two interpretations, two
+        // decisions — and the export follows the flag, so this is what stops one
+        // of them being delivered because the other was liked.
+        let dir = Scratch::new("copy-judge");
+        let mut library = library_at(&dir.0, 2);
+        library.act(CullAction::Rate(5)).unwrap();
+        library.act(CullAction::Pick).unwrap();
+        library.select(0);
+
+        library.add_copy(&EditState::default()).unwrap();
+        let view = library.view().unwrap();
+        assert_eq!(view.rating, None, "a copy arrives undecided");
+        assert_eq!(view.flag, None);
+
+        library.act(CullAction::Reject).unwrap();
+        library.select(0);
+        let original = library.view().unwrap();
+        assert_eq!(
+            original.flag,
+            Some("pick"),
+            "judging the copy reached the original"
+        );
+        assert_eq!(original.rating, Some(5));
+    }
+
+    #[test]
+    fn making_a_copy_a_filter_would_hide_takes_the_filter_off() {
+        // A copy starts undecided, so "picks" will not have it — and creating
+        // something the user cannot see is worse than changing the view they
+        // asked for. The same rule as a filter that empties: the shell may drop
+        // one, and the view carries that back so the chips follow.
+        let dir = Scratch::new("copy-filtered");
+        let mut library = library_at(&dir.0, 3);
+        library.act(CullAction::Pick).unwrap();
+        library.select(0);
+        library
+            .act(CullAction::SetFilter(Filter::flagged(Flagged::Pick)))
+            .unwrap();
+        assert_eq!(library.view().unwrap().total, 1);
+
+        library.add_copy(&EditState::default()).unwrap();
+        let view = library.view().unwrap();
+        assert!(
+            view.filter.is_everything(),
+            "the filter hid what was just made"
+        );
+        assert_eq!(
+            view.copy.as_deref(),
+            Some("copy 1"),
+            "and we are looking at it"
+        );
+    }
+
+    #[test]
+    fn removing_a_copy_leaves_the_photograph_and_forgets_what_named_it() {
+        let dir = Scratch::new("copy-remove");
+        let mut library = library_at(&dir.0, 2);
+        library.add_copy(&EditState::default()).unwrap();
+        library.act(CullAction::Mark).unwrap();
+        library.act(CullAction::Rate(3)).unwrap();
+        assert_eq!(library.view().unwrap().marked, 1);
+        assert!(library.view().unwrap().undoable);
+
+        let gone = library.remove_copy().unwrap();
+        assert_eq!(gone, "DSC00000.ARW · copy 1");
+        let view = library.view().unwrap();
+        assert_eq!(view.total, 2, "the two photographs are still there");
+        assert_eq!(view.copy, None);
+        assert_eq!(view.marked, 0, "a mark on a row that is gone");
+        assert!(
+            !view.undoable,
+            "an undo that would put a judgement back on nothing"
+        );
+    }
+
+    #[test]
+    fn the_photograph_itself_cannot_be_removed_by_the_copy_key() {
+        let dir = Scratch::new("copy-refuse");
+        let mut library = library_at(&dir.0, 2);
+        assert!(library.remove_copy().is_err());
+        assert_eq!(library.view().unwrap().total, 2);
     }
 
     #[test]

@@ -27,6 +27,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod backup;
+pub mod copies;
 pub mod cull;
 pub mod db;
 pub mod edits;

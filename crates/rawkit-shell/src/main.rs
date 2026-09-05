@@ -877,6 +877,28 @@ fn cull(
             library.lock().expect("library lock").copy_edit(state);
             CullAction::SelectBy(0)
         }
+        // A virtual copy forks the session's edit for the same reason: what is
+        // worth a second interpretation is what is on screen, sliders that have
+        // not settled into a saved version included.
+        CullAction::MakeCopy => {
+            let state = session.0.lock().expect("session lock").state().clone();
+            let name = library
+                .lock()
+                .expect("library lock")
+                .add_copy(&state)
+                .map_err(|e| e.to_string())?;
+            eprintln!("copy       : made {name}");
+            CullAction::SelectBy(0)
+        }
+        CullAction::RemoveCopy => {
+            let gone = library
+                .lock()
+                .expect("library lock")
+                .remove_copy()
+                .map_err(|e| e.to_string())?;
+            eprintln!("copy       : removed {gone}");
+            CullAction::SelectBy(0)
+        }
         // Crop is a mode of the loupe rather than a view of its own: the same
         // photograph, at the same zoom, with a rectangle on it.
         CullAction::Crop => {

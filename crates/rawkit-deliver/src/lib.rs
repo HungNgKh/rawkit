@@ -278,14 +278,13 @@ pub fn write(
                     break;
                 };
                 let destination = match to {
-                    Destination::Folder(dir) => dir.join(format!(
-                        "{}.{}",
-                        Path::new(&image.filename)
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| image.filename.clone()),
-                        delivery.format.extension()
-                    )),
+                    // `stem` rather than the file's own name, because a virtual
+                    // copy shares that name: two interpretations of one frame
+                    // would write one file, and the second would be skipped as
+                    // already there — an export that quietly lost half its work.
+                    Destination::Folder(dir) => {
+                        dir.join(format!("{}.{}", image.stem(), delivery.format.extension()))
+                    }
                     Destination::File(path) => path.clone(),
                 };
                 let outcome = if destination.exists() && !delivery.overwrite {
@@ -441,6 +440,7 @@ mod tests {
                     id: i,
                     path: format!("/nowhere/{i}.arw"),
                     filename: format!("{i}.arw"),
+                    copy_name: None,
                 },
                 state: EditState::default(),
                 profile: None,
@@ -482,5 +482,41 @@ mod tests {
 
         drop(catalog);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod copy_naming_tests {
+    use rawkit_catalog::cull::LibraryImage;
+
+    fn image(filename: &str, copy: Option<&str>) -> LibraryImage {
+        LibraryImage {
+            id: 1,
+            path: format!("/nowhere/{filename}"),
+            filename: filename.into(),
+            copy_name: copy.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_copy_and_its_original_do_not_write_the_same_file() {
+        // The whole reason the copy name has to reach this far. Without it the
+        // second file is skipped as already there, and an export of six picks
+        // quietly writes four.
+        assert_eq!(image("DSC00775.ARW", None).stem(), "DSC00775");
+        assert_eq!(image("DSC00775.ARW", Some("mono")).stem(), "DSC00775-mono");
+        assert_ne!(
+            image("DSC00775.ARW", None).stem(),
+            image("DSC00775.ARW", Some("copy 1")).stem()
+        );
+    }
+
+    #[test]
+    fn a_name_a_person_typed_cannot_write_outside_the_folder_they_chose() {
+        // A copy is named in a text field. A separator in it would put the file
+        // somewhere nobody asked for, and a space merely makes a name awkward.
+        assert_eq!(image("a.ARW", Some("copy 1")).stem(), "a-copy-1");
+        assert_eq!(image("a.ARW", Some("../etc")).stem(), "a-..-etc");
+        assert_eq!(image("a.ARW", Some("high\tkey")).stem(), "a-high-key");
     }
 }

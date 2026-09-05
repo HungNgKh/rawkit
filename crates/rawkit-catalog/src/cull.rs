@@ -175,6 +175,48 @@ pub struct LibraryImage {
     pub path: String,
     /// What to call it in the interface.
     pub filename: String,
+    /// Which interpretation of that file this is, and `None` for the photograph
+    /// itself. Two rows here can name the same `path` and the same `filename`;
+    /// this is the only thing that tells them apart.
+    pub copy_name: Option<String>,
+}
+
+impl LibraryImage {
+    /// What to show a person: the file, and which version of it.
+    pub fn label(&self) -> String {
+        match &self.copy_name {
+            Some(name) => format!("{} · {name}", self.filename),
+            None => self.filename.clone(),
+        }
+    }
+
+    /// The stem an exported file gets.
+    ///
+    /// A copy has to reach the filename or two interpretations of one frame
+    /// write the same file and the second is skipped as already there — which
+    /// looks like an export that quietly lost half its work.
+    ///
+    /// Whitespace becomes a hyphen and separators are dropped: a copy is named
+    /// by a person, in a text field, and a name with a slash in it would write
+    /// outside the folder that was chosen.
+    pub fn stem(&self) -> String {
+        let base = std::path::Path::new(&self.filename)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.filename.clone());
+        let Some(name) = &self.copy_name else {
+            return base;
+        };
+        let suffix: String = name
+            .chars()
+            .map(|c| match c {
+                c if c.is_whitespace() => '-',
+                '/' | '\\' | ':' => '-',
+                c => c,
+            })
+            .collect();
+        format!("{base}-{suffix}")
+    }
 }
 
 /// The highest rating that can be stored, matching the schema's `CHECK`.
@@ -190,12 +232,20 @@ pub const MAX_RATING: u8 = 5;
 /// Order is not a parameter. A cull is a pass through a shoot, and the shoot
 /// happened in one order; narrowing *which* photographs is a different question
 /// from re-arranging them, and only the first one has turned out to be missed.
+///
+/// The trailing `i.id` is what puts a virtual copy immediately after the
+/// photograph it was made from: the two share a capture time and a filename, so
+/// the id is the first key that separates them, and a copy is always the newer
+/// row. That was already true before copies existed — it was there to make the
+/// order total rather than host-dependent — and it is worth naming now that
+/// something depends on it.
 pub fn sequence(catalog: &Catalog, filter: &Filter) -> Result<Vec<LibraryImage>, CatalogError> {
     let (narrowed, values) = narrowing(filter);
     let mut statement = catalog.connection().prepare(&format!(
         "SELECT i.id,
                 v.last_mount_path || '/' || d.relative_path || '/' || f.filename,
-                f.filename
+                f.filename,
+                i.copy_name
            FROM images i
            JOIN files f ON f.id = i.file_id
            JOIN folders d ON d.id = f.folder_id
@@ -209,6 +259,7 @@ pub fn sequence(catalog: &Catalog, filter: &Filter) -> Result<Vec<LibraryImage>,
                 id: r.get(0)?,
                 path: r.get::<_, String>(1)?.replace("//", "/"),
                 filename: r.get(2)?,
+                copy_name: r.get(3)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

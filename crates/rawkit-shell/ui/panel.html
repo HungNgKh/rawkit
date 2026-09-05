@@ -174,6 +174,9 @@
   #stars { letter-spacing: 2px; color: #d8bf63; margin-left: auto; flex-shrink: 0; }
   #mode { color: #8e8e98; text-transform: uppercase; letter-spacing: .08em; font-size: 11px;
           border: 1px solid #3a3a44; border-radius: 3px; padding: 1px 6px; flex-shrink: 0; }
+  #copy { color: #17171b; background: #7d8ec2; border-radius: 3px;
+          padding: 0 5px; font-size: 11px; flex-shrink: 0; }
+  #copy.hidden { display: none; }
   #flag.pick { color: #6fc27a; }
   #flag.reject { color: #e0705f; }
 
@@ -208,6 +211,7 @@
 <div id="cull" class="hidden">
   <div class="line">
     <span id="frame"></span>
+    <span id="copy" class="hidden" title="a virtual copy: one RAW, a second interpretation"></span>
     <span id="stars"></span>
   </div>
   <div class="line">
@@ -524,7 +528,7 @@
   </details>
   <details id="s-keys">
     <summary>Keys</summary>
-    <div id="keys">G grid · E loupe · R crop · Q spots · O mask · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · 0–5 rate · 6–9 label · \ filter · Z undo cull · ⌃Z undo edit · ⌃E export · ⌃⇧E export what is shown · F11 fullscreen</div>
+    <div id="keys">G grid · E loupe · R crop · Q spots · O mask · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · 0–5 rate · 6–9 label · V copy · \ filter · Z undo cull · ⌃Z undo edit · ⌃E export · ⌃⇧E export what is shown · F11 fullscreen</div>
   </details>
 </main>
 </div>
@@ -2027,6 +2031,12 @@
     if (!view) return;
     strip.classList.remove("hidden");
     document.getElementById("frame").textContent = view.filename;
+    // Two rows can carry the same filename, and the copy name is the only thing
+    // that tells them apart — in the readout, and in the name of anything
+    // exported.
+    const copy = document.getElementById("copy");
+    copy.textContent = view.copy ?? "";
+    copy.classList.toggle("hidden", !view.copy);
     // "3 / 12 of 47" when a filter is on. A bare count on a narrowed library
     // reads as a library that has lost something.
     document.getElementById("position").textContent =
@@ -2306,6 +2316,12 @@
       case "\\":
         if (narrowing(filter)) act("set_filter", {});
         else if (remembered) act("set_filter", remembered);
+        break;
+      // V for a virtual copy, shift-V to throw one away. Not Lightroom's
+      // ⌃-apostrophe, which needs two hands on a keyboard whose other culling
+      // keys need one.
+      case "v":
+        act(event.shiftKey ? "remove_copy" : "make_copy");
         break;
       case "p": act("pick"); break;
       case "x": act("reject"); break;
