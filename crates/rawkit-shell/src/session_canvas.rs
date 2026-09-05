@@ -21,8 +21,8 @@
 use anyhow::Result;
 use rawkit_editstate::EditState;
 use rawkit_engine::{
-    render::DEFAULT_TILE, Canvas, Frame, Gpu, Output, Presenter, PreviewBlit, PreviewImage,
-    Pyramid, Renderer, TileBuffers,
+    render::DEFAULT_TILE, Canvas, Frame, Gpu, Output, Overlay, Presenter, PreviewBlit,
+    PreviewImage, Pyramid, Renderer, TileBuffers,
 };
 use rawkit_session::{Session, TileId, Viewport};
 
@@ -32,6 +32,13 @@ pub struct CanvasRenderer {
     presenter: Presenter,
     buffers: TileBuffers,
     canvas: Canvas,
+    /// What the interface draws over the photograph, in a layer of its own.
+    ///
+    /// Always the same size as `canvas` — created with it, by the one method
+    /// that is allowed to replace either — because the presenter samples both
+    /// with a single set of coordinates. See [`rawkit_engine::Overlay`] for why
+    /// it is not simply drawn into the canvas, which is what it used to be.
+    overlay: Overlay,
     /// The viewport the canvas currently shows. When this changes, every tile in
     /// the canvas is in the wrong place even if it is still fresh for the edit —
     /// so the canvas is redrawn wholesale rather than patched.
@@ -60,12 +67,15 @@ impl CanvasRenderer {
     pub fn new(gpu: &Gpu, frame: &Frame<'_>, surface: [u32; 2]) -> Self {
         let renderer = Renderer::new(gpu);
         let buffers = renderer.allocate(gpu, frame);
-        let canvas = renderer.create_canvas(gpu, surface[0].max(1), surface[1].max(1));
+        let (width, height) = (surface[0].max(1), surface[1].max(1));
+        let canvas = renderer.create_canvas(gpu, width, height);
+        let overlay = renderer.create_overlay(gpu, width, height);
         Self {
             presenter: Presenter::new(gpu, rawkit_engine::CANVAS_FORMAT),
             renderer,
             buffers,
             canvas,
+            overlay,
             shown: None,
             uploaded: None,
             geometry: None,
@@ -173,11 +183,37 @@ impl CanvasRenderer {
         view: rawkit_engine::MaskOverlay,
     ) {
         self.renderer
-            .overlay_mask(gpu, &self.buffers, &self.canvas, geometry, image, view);
+            .overlay_mask(gpu, &self.buffers, &self.overlay, geometry, image, view);
     }
 
     pub fn canvas(&self) -> &Canvas {
         &self.canvas
+    }
+
+    /// The layer everything drawn *over* the photograph goes into.
+    pub fn overlay(&self) -> &Overlay {
+        &self.overlay
+    }
+
+    /// Empty the overlay, once at the top of a frame.
+    ///
+    /// This is what replaced the bookkeeping. Nothing has to work out whether an
+    /// outline has moved since last time, because last time is gone: the layer
+    /// is cleared and whatever is still true is drawn again, at the cost of one
+    /// screen-sized write and no tile work at all.
+    pub fn clear_overlay(&self, gpu: &Gpu) {
+        self.overlay.clear(gpu);
+    }
+
+    /// Replace the canvas, and the overlay with it.
+    ///
+    /// The only place either is created after construction. Separately would be
+    /// two chances to resize one and forget the other, which the presenter
+    /// refuses — correctly, and at the worst possible moment.
+    fn resize(&mut self, gpu: &Gpu, width: u32, height: u32) {
+        self.canvas = self.renderer.create_canvas(gpu, width, height);
+        self.overlay = self.renderer.create_overlay(gpu, width, height);
+        self.shown = None;
     }
 
     pub fn presenter(&self) -> &Presenter {
@@ -205,8 +241,7 @@ impl CanvasRenderer {
         let geometry = session.geometry();
         if self.geometry != Some(geometry) {
             self.geometry = Some(geometry);
-            self.canvas = self.renderer.create_canvas(gpu, 1, 1);
-            self.shown = None;
+            self.resize(gpu, 1, 1);
         }
 
         // Canvas in level pixels, so tiles land 1:1 in it and the presenter does
@@ -225,8 +260,7 @@ impl CanvasRenderer {
             ((surface[1] as f64 / scale).ceil() as u32).clamp(1, largest),
         ];
         if self.canvas.size() != wanted {
-            self.canvas = self.renderer.create_canvas(gpu, wanted[0], wanted[1]);
-            self.shown = None;
+            self.resize(gpu, wanted[0], wanted[1]);
         }
         level
     }
@@ -248,7 +282,7 @@ impl CanvasRenderer {
     pub fn fit_surface(&mut self, gpu: &Gpu, surface: [u32; 2]) {
         let wanted = [surface[0].max(1), surface[1].max(1)];
         if self.canvas.size() != wanted {
-            self.canvas = self.renderer.create_canvas(gpu, wanted[0], wanted[1]);
+            self.resize(gpu, wanted[0], wanted[1]);
         }
         // Whatever is in the canvas belongs to another view entirely.
         self.shown = None;

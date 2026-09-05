@@ -1286,28 +1286,11 @@ fn main() -> Result<()> {
             let mut canvas_rect = [0, 0, layout.canvas.width, layout.canvas.height];
             let mut stats = FrameStats::default();
             let navigating = library.clone();
-            // The rectangle the canvas currently carries, so a settled one is
-            // not redrawn on every frame. See the crop block below.
-            let mut last_marquee: Option<[f64; 4]> = None;
-            // What the spot rings were last drawn from. Compared rather than
-            // hashed: the list is short, and an equality that can be wrong is
-            // worse here than the clone, because being wrong means stale rings
-            // left painted on the canvas.
-            let mut last_spots: Option<(Vec<rawkit_editstate::Spot>, usize)> = None;
-            // The coverage overlay, and what it was built for. Rebuilt when the
-            // edit or the view moves and reused otherwise: it costs a resample of
-            // a few hundred thousand texels, which is nothing once but something
-            // every frame of a drag.
-            // What the coverage tint last showed. `None` is not showing it.
-            type OverlayKey = (
-                usize,
-                Option<rawkit_editstate::Mask>,
-                rawkit_session::Viewport,
-                u8,
-                bool,
-            );
-            let mut last_overlay: Option<OverlayKey> = None;
-            let mut last_outline: Option<(usize, usize, u64, rawkit_session::Viewport)> = None;
+            // Four caches used to live here — the crop rectangle, the spot
+            // list, the coverage tint and the mask outline — each remembering
+            // what it drew last frame so it could tell whether the canvas
+            // needed rebuilding underneath it. All four are gone with the layer
+            // they were about. See `rawkit_engine::Overlay`.
             // When the histogram was last recomputed. See `SURVEY_INTERVAL`.
             let mut last_survey: Option<std::time::Instant> = None;
             // What the coarse-while-dragging decision is made from: the edit
@@ -1387,11 +1370,17 @@ fn main() -> Result<()> {
                             &mut grid,
                             surface_size,
                         )?;
+                        // A grid draws nothing over the photograph, so the
+                        // layer is emptied *before* presenting rather than
+                        // after: anything the loupe left in it belongs to a
+                        // view that is no longer on screen.
+                        canvas_renderer.clear_overlay(&gpu);
                         paint(
                             &gpu,
                             &surface,
                             canvas_renderer.presenter(),
                             canvas_renderer.canvas(),
+                            canvas_renderer.overlay(),
                             canvas_rect,
                         )?;
                         stats.record(drawn, started.elapsed());
@@ -2175,8 +2164,14 @@ fn main() -> Result<()> {
                     &surface,
                     canvas_renderer.presenter(),
                     canvas_renderer.canvas(),
+                    canvas_renderer.overlay(),
                     canvas_rect,
                 )?;
+                // Emptied for this frame's marks, *after* presenting the last
+                // frame's. The loop renders after it presents, so the overlay
+                // drawn below is what the next pass through here will show —
+                // and clearing before the present would blank it every frame.
+                canvas_renderer.clear_overlay(&gpu);
                 let rendering = std::time::Instant::now();
                 let drawn = match (&showing.raw, &showing.preview) {
                     (Some(loaded), _) => {
@@ -2231,49 +2226,25 @@ fn main() -> Result<()> {
                     } else if let Some(marquee) = marquee {
                         let session = shared.lock().expect("session lock");
                         draw_marquee(&gpu, &blit, &white, &canvas_renderer, &session, &marquee);
-                        // Only when the rectangle actually moved. The outline is
-                        // drawn into the canvas, so erasing the old one means
-                        // redrawing every visible tile — the cost of a pan. Doing
-                        // that unconditionally is a full redraw every frame
-                        // forever, and since this loop is GTK's main thread, the
-                        // window stops answering: it does not look like a slow
-                        // canvas, it looks like the application has hung.
-                        let rect = marquee.rect();
-                        if last_marquee != Some(rect) {
-                            last_marquee = Some(rect);
-                            canvas_renderer.invalidate();
-                        }
-                    } else {
-                        last_marquee = None;
                     }
-                } else if last_marquee.take().is_some() {
-                    // Escape left crop mode, and the outline is still painted
-                    // into the canvas. One redraw takes it off; without this it
-                    // stays until something else happens to move the view.
-                    canvas_renderer.invalidate();
                 }
-                // The spot markers, on the same terms as the crop outline: drawn
-                // into the canvas after the tiles, so anything that moves them
-                // has to redraw the tiles underneath or the old rings stay.
+                // The spot markers, on the same terms as the crop outline: into
+                // the overlay, unconditionally, every frame they should be
+                // visible. Neither asks whether it has moved since last time —
+                // the layer was emptied above, so the only question left is
+                // whether it should be on screen now.
                 if in_spot() {
                     let session = shared.lock().expect("session lock");
-                    let drawn = (session.state().spots.clone(), selected_spot());
+                    let spots = session.state().spots.clone();
                     draw_spots(
                         &gpu,
                         &blit,
                         &white,
                         &canvas_renderer,
                         &session,
-                        &drawn.0,
-                        drawn.1,
+                        &spots,
+                        selected_spot(),
                     );
-                    drop(session);
-                    if last_spots.as_ref() != Some(&drawn) {
-                        last_spots = Some(drawn);
-                        canvas_renderer.invalidate();
-                    }
-                } else if last_spots.take().is_some() {
-                    canvas_renderer.invalidate();
                 }
                 // Where the selected adjustment reaches. On automatically while a
                 // shape is being dragged — that is when the selection is the
@@ -2300,35 +2271,16 @@ fn main() -> Result<()> {
                         || SHOW_MASK.load(std::sync::atomic::Ordering::Relaxed)
                 });
                 //
-                // **Painted only onto a canvas that was just filled.** The tint
-                // blends, so painting it twice over the same tiles darkens it —
-                // and taking it off again means redrawing the tiles underneath,
-                // because it lives in the canvas rather than over it. So the rule
-                // is: when what the tint shows changes, ask for the tiles back
-                // and paint on the frame they arrive; when nothing has changed,
-                // the canvas already holds the right answer and this does
-                // nothing at all.
-                //
-                // Invalidating unconditionally instead — which is what this did
-                // first — asks for every visible tile on every frame. A full pass
-                // is over a hundred milliseconds on a 24 MP frame, so the loop
-                // never finishes one before starting the next and the whole
-                // interface stops moving.
-                let overlay_key = selected.map(|index| {
-                    let session = shared.lock().expect("session lock");
-                    (
-                        index,
-                        session.state().masks.get(index).cloned(),
-                        session.viewport(),
-                        session.level(),
-                        tinting,
-                    )
-                });
-                if overlay_key != last_overlay {
-                    last_overlay = overlay_key.clone();
-                    canvas_renderer.invalidate();
-                }
-                if let (Some(index), true) = (selected, drawn > 0) {
+                // Onto the overlay, every frame, with no question asked about
+                // whether anything moved. That is the whole of what changed
+                // here: the tint used to be painted *into* the canvas, so
+                // taking it off again meant re-rendering the tiles underneath —
+                // over a hundred milliseconds at 24 megapixels, on a loop that
+                // is GTK's main thread. Three separate rules existed to avoid
+                // paying it (paint only onto tiles that just arrived; remember
+                // what the tint showed last frame; invalidate when that
+                // changes), and six bugs lived in them.
+                if let Some(index) = selected {
                     let session = shared.lock().expect("session lock");
                     if index < session.state().masks.len().min(rawkit_editstate::MAX_MASKS) {
                         let viewport = session.viewport();
@@ -2382,16 +2334,14 @@ fn main() -> Result<()> {
                             &session,
                             &shape,
                         );
-                        let drawn = (index, selected_part(), session.generation(), session.viewport());
-                        drop(session);
-                        if last_outline.as_ref() != Some(&drawn) {
-                            last_outline = Some(drawn);
-                            canvas_renderer.invalidate();
-                        }
                     }
-                } else if last_outline.take().is_some() {
+                } else {
+                    // Nothing selected, so nothing to grab. The handles are gone
+                    // from the layer already — it was emptied at the top of the
+                    // frame — but what the *pointer* can reach is a separate
+                    // list, and it has to be emptied by hand or a click still
+                    // finds a handle that is no longer drawn.
                     MASK_HANDLES.lock().expect("mask handles lock").clear();
-                    canvas_renderer.invalidate();
                 }
                 let cost = started.elapsed();
                 // Only frames that drew tiles say anything about what rendering
@@ -4595,6 +4545,7 @@ fn paint(
     surface: &wgpu::Surface<'static>,
     presenter: &Presenter,
     canvas: &rawkit_engine::Canvas,
+    overlay: &rawkit_engine::Overlay,
     at: [u32; 4],
 ) -> Result<()> {
     use wgpu::CurrentSurfaceTexture as Current;
@@ -4633,7 +4584,7 @@ fn paint(
         });
         gpu.queue.submit([encoder.finish()]);
     } else {
-        presenter.draw_into(gpu, canvas, &view, at)?;
+        presenter.draw_into(gpu, canvas, Some(overlay), &view, at)?;
     }
     frame.present();
     Ok(())
@@ -4722,7 +4673,7 @@ fn draw_marquee(
             round: false,
         })
         .collect();
-    blit.draw_over(gpu, canvas_renderer.canvas(), &cells);
+    blit.draw_over(gpu, canvas_renderer.overlay(), &cells);
 }
 
 /// Whether the coverage tint is being asked for by hand.
@@ -5096,7 +5047,7 @@ fn draw_mask_handles(
     }
     *MASK_HANDLES.lock().expect("mask handles lock") = published;
     if !cells.is_empty() {
-        blit.draw_over(gpu, canvas_renderer.canvas(), &cells);
+        blit.draw_over(gpu, canvas_renderer.overlay(), &cells);
     }
 }
 
@@ -5184,7 +5135,7 @@ fn draw_spots(
             round: true,
         });
     }
-    blit.draw_over(gpu, canvas_renderer.canvas(), &cells);
+    blit.draw_over(gpu, canvas_renderer.overlay(), &cells);
 }
 
 /// The map from a sensor pixel to a point of the straightened photograph.

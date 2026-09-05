@@ -63,9 +63,51 @@ pub struct PreviewImage {
     pub height: u32,
 }
 
-/// Draws a [`PreviewImage`] into a [`Canvas`].
+/// Where cells can be drawn: the canvas itself, or the overlay above it.
+///
+/// A trait rather than two methods, because the choice is a property of the
+/// destination and not of the drawing. Grid thumbnails are the photograph and
+/// belong in the canvas; a crop rectangle, a handle and a spot marker are
+/// drawn on top of one and belong in the overlay — and the only difference at
+/// this level is which texture format the pipeline was built for.
+pub trait Layer {
+    fn attachment(&self) -> wgpu::TextureView;
+    fn extent(&self) -> [u32; 2];
+    fn format(&self) -> wgpu::TextureFormat;
+}
+
+impl Layer for Canvas {
+    fn attachment(&self) -> wgpu::TextureView {
+        self.texture()
+            .create_view(&wgpu::TextureViewDescriptor::default())
+    }
+    fn extent(&self) -> [u32; 2] {
+        self.size()
+    }
+    fn format(&self) -> wgpu::TextureFormat {
+        CANVAS_FORMAT
+    }
+}
+
+impl Layer for crate::render::Overlay {
+    fn attachment(&self) -> wgpu::TextureView {
+        self.view().clone()
+    }
+    fn extent(&self) -> [u32; 2] {
+        self.size()
+    }
+    fn format(&self) -> wgpu::TextureFormat {
+        crate::render::OVERLAY_FORMAT
+    }
+}
+
+/// Draws a [`PreviewImage`] into a [`Canvas`] or an overlay above one.
 pub struct PreviewBlit {
     pipeline: wgpu::RenderPipeline,
+    /// The same pipeline built for the overlay's format. Two pipelines rather
+    /// than one, because a render pipeline names the format it writes to and
+    /// wgpu will not accept a pass whose attachment disagrees.
+    overlay_pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     region: wgpu::Buffer,
@@ -120,35 +162,40 @@ impl PreviewBlit {
                 bind_group_layouts: &[Some(&layout)],
                 immediate_size: 0,
             });
-        let pipeline = gpu
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("preview"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some("vs"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some("fs"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        // The canvas: linear half floats, which is what makes the
-                        // sRGB texture format above the whole of the conversion.
-                        format: CANVAS_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
+        let build = |format: wgpu::TextureFormat| {
+            gpu.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("preview"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &module,
+                        entry_point: Some("vs"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &module,
+                        entry_point: Some("fs"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+        };
+        // The canvas: linear half floats, which is what makes the sRGB texture
+        // format above the whole of the conversion. The overlay: eight bits,
+        // and the fragment shader returns an alpha of 1 for everything it does
+        // not discard, so a cell lands opaque on a transparent layer.
+        let pipeline = build(CANVAS_FORMAT);
+        let overlay_pipeline = build(crate::render::OVERLAY_FORMAT);
 
         let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("preview"),
@@ -171,6 +218,7 @@ impl PreviewBlit {
 
         Self {
             pipeline,
+            overlay_pipeline,
             layout,
             sampler,
             region,
@@ -260,12 +308,12 @@ impl PreviewBlit {
     /// only difference from [`draw_grid`](Self::draw_grid) is the load: clearing
     /// first would leave four white lines on an empty canvas, which is what
     /// happened before this existed.
-    pub fn draw_over(&self, gpu: &Gpu, canvas: &Canvas, cells: &[Cell<'_>]) {
-        self.render(gpu, canvas, cells, false);
+    pub fn draw_over<L: Layer>(&self, gpu: &Gpu, target: &L, cells: &[Cell<'_>]) {
+        self.render(gpu, target, cells, false);
     }
 
-    fn render(&self, gpu: &Gpu, canvas: &Canvas, cells: &[Cell<'_>], clear: bool) {
-        let [canvas_w, canvas_h] = canvas.size();
+    fn render<L: Layer>(&self, gpu: &Gpu, target: &L, cells: &[Cell<'_>], clear: bool) {
+        let [canvas_w, canvas_h] = target.extent();
         let mut regions = vec![0.0f32; cells.len() * (REGION_STRIDE as usize / 4)];
         let mut placed: Vec<([u32; 4], usize)> = Vec::with_capacity(cells.len());
 
@@ -381,9 +429,7 @@ impl PreviewBlit {
             })
             .collect();
 
-        let target = canvas
-            .texture()
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let attachment = target.attachment();
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -393,7 +439,7 @@ impl PreviewBlit {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("preview grid"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target,
+                    view: &attachment,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -417,7 +463,11 @@ impl PreviewBlit {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(if target.format() == CANVAS_FORMAT {
+                &self.pipeline
+            } else {
+                &self.overlay_pipeline
+            });
             for (group, ([x, y, w, h], _)) in groups.iter().zip(&placed) {
                 // The viewport maps the triangle onto the cell; the scissor stops
                 // the oversized part of it reaching anything else.

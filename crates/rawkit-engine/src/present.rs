@@ -58,6 +58,12 @@ pub struct Presenter {
     /// dummy texel is cheaper than a second pipeline layout.
     lut: wgpu::TextureView,
     lut_sampler: wgpu::Sampler,
+    /// One transparent texel, for presenting with no overlay.
+    ///
+    /// A bind group cannot have holes, and the same trick the display LUT
+    /// already uses is cheaper than a second pipeline layout: the shader
+    /// samples it, gets an alpha of zero, and composites nothing.
+    empty: wgpu::TextureView,
 }
 
 impl Presenter {
@@ -133,6 +139,20 @@ impl Presenter {
                         binding: 3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    // What the interface drew over the photograph, composited
+                    // here rather than painted into the canvas. Sampled with the
+                    // canvas's own sampler: same size, same coordinates, and one
+                    // filtering decision for both.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
                         count: None,
                     },
                 ],
@@ -254,12 +274,34 @@ impl Presenter {
             ..Default::default()
         });
 
+        use wgpu::util::DeviceExt;
+        let empty = gpu.device.create_texture_with_data(
+            &gpu.queue,
+            &wgpu::TextureDescriptor {
+                label: Some("no overlay"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: crate::render::OVERLAY_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &[0, 0, 0, 0],
+        );
+
         Self {
             pipeline,
             layout,
             sampler,
             lut: texture.create_view(&wgpu::TextureViewDescriptor::default()),
             lut_sampler,
+            empty: empty.create_view(&wgpu::TextureViewDescriptor::default()),
         }
     }
 
@@ -275,7 +317,7 @@ impl Presenter {
         target: &wgpu::TextureView,
     ) -> Result<(), EngineError> {
         let [w, h] = canvas.size();
-        self.draw_into(gpu, canvas, target, [0, 0, w, h])
+        self.draw_into(gpu, canvas, None, target, [0, 0, w, h])
     }
 
     /// Draw `canvas` into one rectangle of `target`, leaving the rest alone.
@@ -287,13 +329,30 @@ impl Presenter {
     ///
     /// Outside the rectangle nothing is written, so whatever the window already
     /// had stays — which is the chrome, painted by the webview on top.
+    /// `overlay` is what an interface has drawn over the photograph — the same
+    /// size as `canvas`, sampled with the same coordinates, and composited on
+    /// top **before** the output transform, so a tint is encoded exactly as it
+    /// would have been when it lived in the canvas. `None` for a plain blit.
     pub fn draw_into(
         &self,
         gpu: &Gpu,
         canvas: &Canvas,
+        overlay: Option<&crate::render::Overlay>,
         target: &wgpu::TextureView,
         at: [u32; 4],
     ) -> Result<(), EngineError> {
+        if let Some(overlay) = overlay {
+            // Caught here rather than showing as an overlay that has slid: the
+            // shader samples both with one set of texture coordinates, so a
+            // layer of a different size is a drawing at the wrong scale.
+            if overlay.size() != canvas.size() {
+                return Err(EngineError::WrongSize(format!(
+                    "an overlay of {:?} cannot be composited onto a canvas of {:?}",
+                    overlay.size(),
+                    canvas.size()
+                )));
+            }
+        }
         let view = canvas
             .texture()
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -316,6 +375,12 @@ impl Presenter {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::Sampler(&self.lut_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(
+                        overlay.map_or(&self.empty, |o| o.view()),
+                    ),
                 },
             ],
         });

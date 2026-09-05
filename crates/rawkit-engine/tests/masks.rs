@@ -847,10 +847,12 @@ fn the_overlay_pass_runs_and_tints_where_the_mask_is() {
     canvas.write(&gpu, &vec![0.5f32; (W * H) as usize * 4]);
     let before = canvas.read_back(&gpu).expect("read back");
 
+    let overlay = renderer.create_overlay(&gpu, W, H);
+    overlay.clear(&gpu);
     renderer.overlay_mask(
         &gpu,
         &buffers,
-        &canvas,
+        &overlay,
         &rawkit_editstate::Geometry::new(&state, rawkit_editstate::Orientation::AsShot),
         [W, H],
         rawkit_engine::MaskOverlay {
@@ -863,35 +865,52 @@ fn the_overlay_pass_runs_and_tints_where_the_mask_is() {
             tint: [1.0, 0.0, 0.0],
         },
     );
-    let after = canvas.read_back(&gpu).expect("read back");
 
-    let green = |px: &[f32], x: u32, y: u32| px[((y * W + x) * 4 + 1) as usize];
-    // Inside the mask: the tint is red, so the ground's green is taken down.
-    let inside = green(&after, W / 4, H / 2);
-    assert!(
-        inside < green(&before, W / 4, H / 2) * 0.6,
-        "the tint did not reach the middle of the mask: {} from {}",
-        inside,
-        green(&before, W / 4, H / 2)
-    );
-    // Outside it: untouched, bit for bit. An overlay that dimmed the whole
-    // picture would be worse than one that did nothing.
-    let far = ((3 * W) / 4, H / 2);
+    // The photograph is not written at all. This is the property the layer
+    // exists for: before it, taking the tint off again meant re-rendering every
+    // tile it covered, and every rule about *when* to paint it followed from
+    // that. Bit for bit, so a pass that touched the canvas and happened to
+    // write the same values would still fail.
     assert_eq!(
-        green(&after, far.0, far.1),
-        green(&before, far.0, far.1),
-        "the tint reached outside the mask"
+        canvas.read_back(&gpu).expect("read back"),
+        before,
+        "the overlay pass wrote to the photograph"
     );
-    // And the border is drawn: at the rim there is a line brighter than the
-    // tinted interior, because it is white rather than red.
-    let rim = W / 4 + (0.2 * W as f32) as u32;
-    let at_rim = (rim.saturating_sub(3)..=rim + 3)
-        .map(|x| green(&after, x, H / 2))
-        .fold(0.0f32, f32::max);
+
+    let drawn = overlay.read_back(&gpu).expect("overlay read back");
+    let at = |x: u32, y: u32| {
+        let i = ((y * W + x) * 4) as usize;
+        [drawn[i], drawn[i + 1], drawn[i + 2], drawn[i + 3]]
+    };
+    // Inside the mask: red, and covering. Premultiplied, so the red channel is
+    // the tint times its own coverage and the alpha is that coverage.
+    let inside = at(W / 4, H / 2);
     assert!(
-        at_rim > inside * 1.2,
-        "no border at the mask's rim: {at_rim} against {inside} inside"
+        inside[3] > 100,
+        "the tint did not reach the middle of the mask: {inside:?}"
     );
+    assert!(
+        inside[0] > inside[1] && inside[0] > inside[2],
+        "the tint is not the colour it was asked for: {inside:?}"
+    );
+    // Outside it: nothing at all, so the photograph shows through untouched.
+    let far = at((3 * W) / 4, H / 2);
+    assert_eq!(far, [0, 0, 0, 0], "the tint reached outside the mask");
+    // No border is asserted here, and that is a correction rather than an
+    // omission. This test used to claim one, by finding a pixel near the rim
+    // whose green was higher than the tinted interior's — on a grey ground,
+    // with the tint painted into the canvas, the pixels just *outside* the mask
+    // satisfied that, so the check passed whether or not a border was drawn.
+    // Reading the layer directly is what exposed it: along this row the mask
+    // steps from covered to not in one pixel and no white is drawn anywhere.
+    //
+    // Which is honest. `border` is the half-coverage contour found through
+    // `fwidth`, and here the mask raster is finer than the canvas — a 512-pixel
+    // frame against a raster bounded at 1024 — so coverage has no intermediate
+    // value to take a derivative of. At the resolutions a window actually uses
+    // the raster is the coarser of the two and the contour is found; that is
+    // what `the_overlay_draws_the_mask_where_the_mask_is` measures, on the
+    // border's own bounding box, and it is where the claim belongs.
 }
 
 #[test]
@@ -939,12 +958,12 @@ fn the_overlay_draws_the_mask_where_the_mask_is() {
         .set_edit(&gpu, &buffers, &frame, &state)
         .expect("set edit");
 
-    let canvas = renderer.create_canvas(&gpu, W, H);
-    canvas.write(&gpu, &vec![0.0f32; (W * H) as usize * 4]);
+    let overlay = renderer.create_overlay(&gpu, W, H);
+    overlay.clear(&gpu);
     renderer.overlay_mask(
         &gpu,
         &buffers,
-        &canvas,
+        &overlay,
         &rawkit_editstate::Geometry::new(&state, rawkit_editstate::Orientation::AsShot),
         [W, H],
         rawkit_engine::MaskOverlay {
@@ -957,8 +976,8 @@ fn the_overlay_draws_the_mask_where_the_mask_is() {
             tint: [1.0, 0.0, 0.0],
         },
     );
-    let drawn = canvas.read_back(&gpu).expect("read back");
-    let lit = |x: u32, y: u32| drawn[((y * W + x) * 4) as usize];
+    let drawn = overlay.read_back(&gpu).expect("overlay read back");
+    let lit = |x: u32, y: u32| drawn[((y * W + x) * 4) as usize] as f32 / 255.0;
 
     // The border's own bounding box, against the ellipse's. Measured this way
     // rather than by walking out along each axis: at the extremes the contour is

@@ -851,7 +851,7 @@ impl Renderer {
                         entry_point: Some("fs"),
                         compilation_options: Default::default(),
                         targets: &[Some(wgpu::ColorTargetState {
-                            format: CANVAS_FORMAT,
+                            format: OVERLAY_FORMAT,
                             // Premultiplied, matching what the shader returns, so
                             // the coverage is applied exactly once.
                             blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
@@ -1513,13 +1513,13 @@ impl Renderer {
         &self,
         gpu: &Gpu,
         buffers: &TileBuffers,
-        canvas: &Canvas,
+        overlay: &Overlay,
         geometry: &Geometry,
         image: [u32; 2],
         view: MaskOverlay,
     ) {
         let map = geometry.sensor_map(image);
-        let extent = canvas.size();
+        let extent = overlay.size();
         let params = OverlayParams {
             straight_origin: view.straight_origin,
             extent,
@@ -1555,9 +1555,7 @@ impl Renderer {
         });
         gpu.queue
             .write_buffer(&uniform, 0, bytemuck::bytes_of(&params));
-        let target = canvas
-            .texture()
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let target = overlay.view();
         let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mask overlay"),
             layout: &self.overlay_canvas_layout,
@@ -1575,11 +1573,14 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("mask overlay"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target,
+                    view: target,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        // Onto the photograph, never over it.
+                        // Onto whatever else the overlay already carries — the
+                        // handles are drawn in the same layer — and never onto
+                        // the photograph, which is a texture this pass cannot
+                        // reach.
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
@@ -1691,6 +1692,41 @@ impl Renderer {
             pass.dispatch_workgroups(extent[0].div_ceil(8), extent[1].div_ceil(8), 1);
         }
         gpu.queue.submit(Some(encoder.finish()));
+    }
+
+    /// A layer the size of a canvas, for what gets drawn over the photograph.
+    ///
+    /// Sized by the caller to match the canvas exactly. Nothing enforces that
+    /// here because nothing here knows which canvas it belongs to — the
+    /// presenter is where a mismatch would show, and it samples both with the
+    /// same coordinates.
+    pub fn create_overlay(&self, gpu: &Gpu, width: u32, height: u32) -> Overlay {
+        let size = [width.max(1), height.max(1)];
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("overlay"),
+            size: wgpu::Extent3d {
+                width: size[0],
+                height: size[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: OVERLAY_FORMAT,
+            // No STORAGE, unlike the canvas: nothing computes an overlay, it is
+            // only ever drawn into by a render pass and sampled by the present.
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Overlay {
+            texture,
+            view,
+            size,
+        }
     }
 
     pub fn create_canvas(&self, gpu: &Gpu, width: u32, height: u32) -> Canvas {
@@ -2361,6 +2397,158 @@ pub struct TileBuffers {
 /// more precision than a display can resolve and a canvas spends its budget on
 /// bandwidth.
 pub const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// Eight bits, unlike the canvas, and unsigned rather than float.
+///
+/// An overlay carries flat interface colour — a coverage tint, a handle, a
+/// crop rectangle — none of which has any use for a half float's range. The
+/// canvas is a photograph and needs headroom; this is a drawing on top of one,
+/// and at a canvas that can reach forty megapixels the difference is a hundred
+/// and ninety megabytes of graphics memory against three hundred and eighty.
+pub const OVERLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// What is drawn *over* the photograph, kept out of it.
+///
+/// # Why this is a texture of its own
+///
+/// Everything an interface draws on a photograph used to be drawn **into** the
+/// canvas, and that has one consequence which shaped a great deal of code: to
+/// take a mark off again you have to redraw the pixels it covered, which means
+/// re-rendering tiles. A mask outline that moved with the pointer therefore
+/// asked for a full render on every frame — over a hundred milliseconds at 24
+/// megapixels — and the loop never finished one before starting the next.
+///
+/// The rule that avoided that was "paint only onto a canvas that was just
+/// filled", enforced by hand at five call sites, each of which had to work out
+/// whether what it drew had changed since the last frame. Six consecutive bugs
+/// lived in that arrangement: a tint painted twice and darkened, an outline left
+/// behind at its previous position, a full render forced every frame.
+///
+/// Here the two are separate surfaces and the presenter composites them. The
+/// overlay is cleared and redrawn every frame, which costs a screen-sized write
+/// and no tile work at all; the photograph is re-rendered only when the
+/// photograph changes. Nothing has to remember what was drawn last frame,
+/// because nothing survives a frame.
+///
+/// Same dimensions as the canvas it accompanies, deliberately: every coordinate
+/// an overlay is drawn at is already worked out in canvas pixels, and a layer at
+/// a different resolution would mean converting all of it — which is precisely
+/// where those six bugs were.
+pub struct Overlay {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    size: [u32; 2],
+}
+
+impl Overlay {
+    pub fn size(&self) -> [u32; 2] {
+        self.size
+    }
+
+    /// The underlying texture, for a test that wants to put something in it
+    /// without going through a render pass.
+    pub fn texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+
+    /// The view a render pass draws into, and the presenter samples.
+    pub fn view(&self) -> &wgpu::TextureView {
+        &self.view
+    }
+
+    /// Empty it — every texel transparent, so the photograph shows through.
+    ///
+    /// Once a frame, before anything is drawn. A clear is a fixed cost in the
+    /// size of the window and buys the absence of every "has this changed since
+    /// last time" question, which is the trade this type exists to make.
+    pub fn clear(&self, gpu: &Gpu) {
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("overlay clear"),
+            });
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("overlay clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        gpu.queue.submit([encoder.finish()]);
+    }
+
+    /// Every texel, as straight RGBA bytes. For tests: nothing on the
+    /// interactive path reads an overlay back.
+    pub fn read_back(&self, gpu: &Gpu) -> Result<Vec<u8>, EngineError> {
+        const BYTES_PER_PIXEL: u32 = 4;
+        let [w, h] = self.size;
+        let padded_row = (w * BYTES_PER_PIXEL).div_ceil(256) * 256;
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("overlay readback"),
+            size: (padded_row * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("overlay readback"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        gpu.queue.submit([encoder.finish()]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| EngineError::DeviceRequest(e.to_string()))?;
+        rx.recv()
+            .map_err(|_| EngineError::DeviceRequest("readback never completed".into()))?
+            .map_err(|e| EngineError::DeviceRequest(e.to_string()))?;
+
+        let mut pixels = Vec::with_capacity((w * h * BYTES_PER_PIXEL) as usize);
+        {
+            let view = staging.slice(..).get_mapped_range();
+            for row in 0..h as usize {
+                let start = row * padded_row as usize;
+                pixels.extend_from_slice(&view[start..start + (w * BYTES_PER_PIXEL) as usize]);
+            }
+        }
+        staging.unmap();
+        Ok(pixels)
+    }
+}
 
 /// A GPU-resident destination for rendered tiles.
 ///

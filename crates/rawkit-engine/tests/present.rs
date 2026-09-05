@@ -349,7 +349,7 @@ fn drawing_into_a_rectangle_leaves_the_rest_of_the_window_alone() {
 
     let strip = SIZE / 4;
     presenter
-        .draw_into(&gpu, &canvas, &view, [0, strip, SIZE, SIZE - strip])
+        .draw_into(&gpu, &canvas, None, &view, [0, strip, SIZE, SIZE - strip])
         .expect("present into a rectangle");
     let pixels = read_back(&gpu, &target);
 
@@ -368,4 +368,205 @@ fn drawing_into_a_rectangle_leaves_the_rest_of_the_window_alone() {
         let got = at(SIZE / 2, y);
         assert!(got[0] > 100, "row {y} is {got:?}, not the canvas");
     }
+}
+
+/// A canvas of mid-grey and a target to present it into, both `SIZE` square.
+fn grey_canvas(gpu: &Gpu, renderer: &Renderer) -> rawkit_engine::Canvas {
+    let canvas = renderer.create_canvas(gpu, SIZE, SIZE);
+    let halves: Vec<u16> = (0..SIZE * SIZE)
+        .flat_map(|_| [to_half(0.5), to_half(0.5), to_half(0.5), to_half(1.0)])
+        .collect();
+    gpu.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: canvas.texture(),
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::cast_slice(&halves),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(SIZE * 8),
+            rows_per_image: Some(SIZE),
+        },
+        wgpu::Extent3d {
+            width: SIZE,
+            height: SIZE,
+            depth_or_array_layers: 1,
+        },
+    );
+    canvas
+}
+
+fn blank_target(gpu: &Gpu, format: wgpu::TextureFormat) -> wgpu::Texture {
+    gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("target"),
+        size: wgpu::Extent3d {
+            width: SIZE,
+            height: SIZE,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn the_overlay_is_composited_over_the_photograph_and_only_where_it_is() {
+    // The seam the overlay layer created: everything an interface draws now
+    // lives in a second texture, and this pass is the only thing that puts the
+    // two together. If it were wrong the photograph would look right and every
+    // mark would be invisible — or, worse, the marks would be right and the
+    // photograph would be dimmed everywhere by a layer that is transparent.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+    let presenter = Presenter::new(&gpu, format);
+    let renderer = Renderer::new(&gpu);
+    let canvas = grey_canvas(&gpu, &renderer);
+    let target = blank_target(&gpu, format);
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+    // With no overlay at all: the photograph, unchanged. 0.5 linear is 188 on
+    // an encoding target, which the tests above pin down on their own.
+    presenter
+        .draw_into(&gpu, &canvas, None, &view, [0, 0, SIZE, SIZE])
+        .expect("present with no overlay");
+    let plain = read_back(&gpu, &target);
+    let at = |pixels: &[u8], x: u32, y: u32| {
+        let i = ((y * SIZE + x) * 4) as usize;
+        [pixels[i], pixels[i + 1], pixels[i + 2]]
+    };
+
+    // An empty overlay must be indistinguishable from no overlay. This is the
+    // idle case — most frames draw nothing over the photograph — and a layer
+    // that tinted or dimmed by even one level would show as the whole picture
+    // changing the moment a mask was deselected.
+    let overlay = renderer.create_overlay(&gpu, SIZE, SIZE);
+    overlay.clear(&gpu);
+    presenter
+        .draw_into(&gpu, &canvas, Some(&overlay), &view, [0, 0, SIZE, SIZE])
+        .expect("present with an empty overlay");
+    assert_eq!(
+        read_back(&gpu, &target),
+        plain,
+        "a transparent overlay changed the photograph"
+    );
+
+    // Now paint the left half of the layer opaque red, the way a cell is drawn:
+    // straight colour with an alpha of one.
+    let half = SIZE / 2;
+    let mut bytes = vec![0u8; (SIZE * SIZE * 4) as usize];
+    for y in 0..SIZE {
+        for x in 0..half {
+            let i = ((y * SIZE + x) * 4) as usize;
+            bytes[i..i + 4].copy_from_slice(&[255, 0, 0, 255]);
+        }
+    }
+    gpu.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: overlay.texture(),
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &bytes,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(SIZE * 4),
+            rows_per_image: Some(SIZE),
+        },
+        wgpu::Extent3d {
+            width: SIZE,
+            height: SIZE,
+            depth_or_array_layers: 1,
+        },
+    );
+    presenter
+        .draw_into(&gpu, &canvas, Some(&overlay), &view, [0, 0, SIZE, SIZE])
+        .expect("present with an overlay");
+    let composited = read_back(&gpu, &target);
+
+    // The target is BGRA, so index 2 is red and 0 is blue.
+    let covered = at(&composited, 1, SIZE / 2);
+    assert!(
+        covered[2] > 200 && covered[0] < 60,
+        "the covered half is {covered:?}, not the overlay's red"
+    );
+    let uncovered = at(&composited, SIZE - 1, SIZE / 2);
+    assert_eq!(
+        uncovered,
+        at(&plain, SIZE - 1, SIZE / 2),
+        "the overlay reached the half it does not cover"
+    );
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn an_overlay_of_the_wrong_size_is_refused_rather_than_drawn() {
+    // Both are sampled with one set of texture coordinates, so a layer of a
+    // different size is a drawing at the wrong scale — handles a few pixels
+    // away from where a click on them would land, which is a bug this project
+    // has already shipped once by a different route.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+    let presenter = Presenter::new(&gpu, format);
+    let renderer = Renderer::new(&gpu);
+    let canvas = grey_canvas(&gpu, &renderer);
+    let overlay = renderer.create_overlay(&gpu, SIZE * 2, SIZE);
+    let target = blank_target(&gpu, format);
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let refused = presenter.draw_into(&gpu, &canvas, Some(&overlay), &view, [0, 0, SIZE, SIZE]);
+    assert!(refused.is_err(), "a mismatched overlay was composited");
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn clearing_a_window_sized_overlay_costs_less_than_a_frame() {
+    // The trade this whole arrangement makes: a screen-sized clear on every
+    // frame, in exchange for never re-rendering tiles to take a mark off. That
+    // is only a good trade while the clear is small against a frame — so the
+    // number is measured rather than assumed, and asserted loosely enough to be
+    // about the design and not about this particular GPU.
+    //
+    // For scale: a full-resolution tile pass on a 24 MP frame is about 150 ms,
+    // and it is what this replaced on every frame of a drag.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    let renderer = Renderer::new(&gpu);
+    // A 4K window with the canvas at its largest: the level rule sizes it up to
+    // twice the surface per axis, so this is the worst case a loupe can ask for.
+    let overlay = renderer.create_overlay(&gpu, 4400, 2720);
+    // Once to warm up, so the measurement is not of a first allocation.
+    overlay.clear(&gpu);
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("warm-up");
+
+    let runs = 30;
+    let started = std::time::Instant::now();
+    for _ in 0..runs {
+        overlay.clear(&gpu);
+    }
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("clears");
+    let each = started.elapsed() / runs;
+    println!("clearing a 4400x2720 overlay: {each:?} each over {runs} runs");
+    assert!(
+        each < std::time::Duration::from_millis(8),
+        "a per-frame overlay clear costs {each:?}, which is a frame at 120 Hz"
+    );
 }

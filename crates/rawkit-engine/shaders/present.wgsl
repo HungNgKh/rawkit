@@ -27,6 +27,23 @@ fn vs(@builtin(vertex_index) index: u32) -> VsOut {
 
 @group(0) @binding(0) var canvas: texture_2d<f32>;
 @group(0) @binding(1) var canvas_sampler: sampler;
+@group(0) @binding(4) var overlay: texture_2d<f32>;
+
+// The photograph with whatever the interface drew on top of it.
+//
+// Premultiplied `over`: the overlay's colour is already scaled by its own
+// coverage — that is what the mask pass writes and what a cell writes with an
+// alpha of one — so compositing is an add and a fade, not a mix.
+//
+// **Before the encode, deliberately.** These marks used to live in the canvas
+// and went through the transfer function with the photograph; doing it here
+// keeps them looking exactly as they did, which is what makes moving them out
+// of the canvas a change in structure and not in appearance.
+fn composited(uv: vec2<f32>) -> vec3<f32> {
+    let photograph = textureSample(canvas, canvas_sampler, uv);
+    let over = textureSample(overlay, canvas_sampler, uv);
+    return photograph.rgb * (1.0 - over.a) + over.rgb;
+}
 
 /// For an `-Srgb` target format, where the hardware encodes on write.
 ///
@@ -35,15 +52,14 @@ fn vs(@builtin(vertex_index) index: u32) -> VsOut {
 /// for a grading problem.
 @fragment
 fn fs_hardware_encode(in: VsOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(textureSample(canvas, canvas_sampler, in.uv).rgb, 1.0);
+    return vec4<f32>(composited(in.uv), 1.0);
 }
 
 /// For a target that is not `-Srgb`. Surfaces do not always offer one, and a
 /// linear image written to a non-encoding target is the too-dark failure above.
 @fragment
 fn fs_shader_encode(in: VsOut) -> @location(0) vec4<f32> {
-    let linear = textureSample(canvas, canvas_sampler, in.uv).rgb;
-    return vec4<f32>(encode_srgb(linear), 1.0);
+    return vec4<f32>(encode_srgb(composited(in.uv)), 1.0);
 }
 
 @group(0) @binding(2) var display_lut: texture_3d<f32>;
@@ -62,11 +78,7 @@ fn fs_shader_encode(in: VsOut) -> @location(0) vec4<f32> {
 /// an 8-bit framebuffer can show.
 @fragment
 fn fs_display_lut(in: VsOut) -> @location(0) vec4<f32> {
-    let linear = clamp(
-        textureSample(canvas, canvas_sampler, in.uv).rgb,
-        vec3<f32>(0.0),
-        vec3<f32>(1.0),
-    );
+    let linear = clamp(composited(in.uv), vec3<f32>(0.0), vec3<f32>(1.0));
     // Sample at texel centres: a value of 0 must land on the first entry and 1
     // on the last, not half a texel outside either.
     let size = vec3<f32>(textureDimensions(display_lut));
