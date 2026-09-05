@@ -2032,6 +2032,29 @@ fn main() -> Result<()> {
                     }
                 }
 
+                // A placement drag that has ended. Everything but a brush is
+                // placed once and adjusted with its handles afterwards, so the
+                // arming is spent here rather than lasting until somebody goes
+                // back to the panel.
+                if PLACED_BY_DRAG.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    let session = shared.lock().expect("session lock");
+                    let painted = session
+                        .state()
+                        .masks
+                        .get(SELECTED_MASK.load(std::sync::atomic::Ordering::Relaxed))
+                        .and_then(|m| match selected_part() {
+                            0 => Some(&m.shape),
+                            n => m.refinements.get(n - 1).map(|r| &r.shape),
+                        })
+                        .is_some_and(|s| {
+                            matches!(s, rawkit_editstate::MaskShape::Brush { .. })
+                        });
+                    drop(session);
+                    if !painted {
+                        PLACING_MASK.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+
                 // An aim taken but not yet resolved: the press said where, and
                 // this is the only place that holds the canvas and can say what
                 // colour is there. One small readback per gesture, not per
@@ -2345,7 +2368,7 @@ fn main() -> Result<()> {
                             n => m.refinements.get(n - 1).map(|r| r.shape.clone()),
                         });
                     if let Some(shape) = shape {
-                        draw_mask_outline(
+                        draw_mask_handles(
                             &gpu,
                             &blit,
                             &white,
@@ -4746,6 +4769,15 @@ pub(crate) enum MaskGrab {
 
 pub(crate) static MASK_GRAB: Mutex<Option<MaskGrab>> = Mutex::new(None);
 
+/// A placement drag has finished, and the shape it placed should stop being
+/// placed by every press that follows.
+///
+/// Set by the pointer, which knows a drag ended and how far it went, and
+/// consumed by the render loop, which knows what kind of shape it was — a brush
+/// is painted by many drags and has to stay armed.
+pub(crate) static PLACED_BY_DRAG: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The shape as it was when a handle was grabbed, and where the grab landed.
 ///
 /// Held so that every step of a drag is measured from the *original* shape
@@ -5007,7 +5039,7 @@ fn display_scale() -> f64 {
 }
 
 /// The selected shape's outline and handles, over the photograph.
-fn draw_mask_outline(
+fn draw_mask_handles(
     gpu: &Gpu,
     blit: &rawkit_engine::PreviewBlit,
     white: &rawkit_engine::PreviewImage,
@@ -5496,7 +5528,7 @@ mod radial_tests {
 
             for point in [[0.5f32, 0.5], [0.42, 0.61], [0.55, 0.47]] {
                 let canvas = to_canvas(point);
-                // What `draw_mask_outline` publishes for the pointer.
+                // What `draw_mask_handles` publishes for the pointer.
                 let published = [canvas[0] * to_surface, canvas[1] * to_surface];
                 // And what the pointer makes of a press exactly there — the same
                 // arithmetic the drag uses to turn a press into a place on the
@@ -5650,6 +5682,63 @@ mod radial_tests {
     /// A point in sensor pixels, as the fractions a shape stores.
     fn sensor(px: [f32; 2]) -> [f32; 2] {
         [px[0] / SENSOR[0] as f32, px[1] / SENSOR[1] as f32]
+    }
+
+    #[test]
+    fn a_placement_drag_is_spent_once_it_has_placed_something() {
+        // The bug this exists for, and it was in the *arming* rather than in any
+        // of the arithmetic the other tests here check.
+        //
+        // A drag places a mask. Nothing then disarmed the placement, so the very
+        // next press on the photograph that did not land on a handle threw the
+        // shape away and drew a new one centred where the press was. Adjusting a
+        // mask, or panning to look at it, re-placed it — which is what "the
+        // position and size go weird while dragging" was, and why fixing the
+        // handles twice did not help.
+        //
+        // Driven through `pointer::route`, which is the path a real press takes,
+        // rather than through the pieces.
+        let session = std::sync::Arc::new(std::sync::Mutex::new(fitted()));
+        SELECTED_MASK.store(0, std::sync::atomic::Ordering::Relaxed);
+        SELECTED_PART.store(0, std::sync::atomic::Ordering::Relaxed);
+        MASK_HANDLES.lock().expect("handles").clear();
+        PLACED_BY_DRAG.store(false, std::sync::atomic::Ordering::Relaxed);
+        PLACING_MASK.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        for event in [
+            crate::pointer::Pointer::Press {
+                at: [500.0, 400.0],
+                double: false,
+            },
+            crate::pointer::Pointer::Motion { at: [700.0, 560.0] },
+            crate::pointer::Pointer::Release,
+        ] {
+            crate::pointer::route(event, &session);
+        }
+        assert!(
+            PLACED_BY_DRAG.load(std::sync::atomic::Ordering::Relaxed),
+            "a placement drag that travelled 256 px did not report itself as spent"
+        );
+
+        // A press that barely moves is a slip, not a placement, and must leave
+        // the arming alone — otherwise one twitch disarms the tool.
+        PLACED_BY_DRAG.store(false, std::sync::atomic::Ordering::Relaxed);
+        for event in [
+            crate::pointer::Pointer::Press {
+                at: [500.0, 400.0],
+                double: false,
+            },
+            crate::pointer::Pointer::Motion { at: [502.0, 401.0] },
+            crate::pointer::Pointer::Release,
+        ] {
+            crate::pointer::route(event, &session);
+        }
+        assert!(
+            !PLACED_BY_DRAG.load(std::sync::atomic::Ordering::Relaxed),
+            "a two-pixel twitch counted as having placed the mask"
+        );
+        PLACING_MASK.store(false, std::sync::atomic::Ordering::Relaxed);
+        SELECTED_MASK.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[test]

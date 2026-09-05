@@ -209,9 +209,29 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
         Pointer::Release => {
             *DRAG.lock().expect("drag lock") = None;
             *TARGET_AIM.lock().expect("aim lock") = None;
-            // The gradient stays where the drag left it; only the drag ends.
-            // Disarming here as well would make placing a second gradient need
-            // a trip back to the panel between every attempt.
+            // A placement drag that actually travelled has placed the thing,
+            // so the next press must not place it again.
+            //
+            // This used to stay armed on purpose — "placing a second gradient
+            // would need a trip back to the panel between every attempt" — and
+            // that reasoning was sound while a drag was the only way to shape a
+            // mask. It is not any more: the shape has handles now, so a press
+            // after the placement is meant to *adjust* it, or to pan the
+            // photograph. Staying armed meant every such press instead threw the
+            // mask away and drew a new one centred where you had pressed, which
+            // is what "the position and size go weird while dragging" was.
+            //
+            // Only the shape's own drag disarms. A brush is painted by many
+            // drags and must stay armed, which is why the render loop makes that
+            // distinction rather than this does.
+            let travelled = MASK_DRAG
+                .lock()
+                .expect("mask drag lock")
+                .as_ref()
+                .is_some_and(|d| (d.now[0] - d.start[0]).hypot(d.now[1] - d.start[1]) > 4.0);
+            if travelled && crate::MASK_GRAB.lock().expect("mask grab lock").is_none() {
+                crate::PLACED_BY_DRAG.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             *MASK_DRAG.lock().expect("mask drag lock") = None;
             *crate::MASK_GRAB.lock().expect("mask grab lock") = None;
             // A spot that was being sized now needs somewhere to borrow from,
