@@ -79,7 +79,10 @@ fn an_export_carries_the_stored_edit_rather_than_the_photograph_as_shot() {
     // Now store an edit the way the shell does, and export again.
     {
         let catalog = rawkit_catalog::db::Catalog::open(&library).unwrap();
-        let image = rawkit_catalog::cull::sequence(&catalog).unwrap()[0].id;
+        let image =
+            rawkit_catalog::cull::sequence(&catalog, &rawkit_catalog::cull::Filter::default())
+                .unwrap()[0]
+                .id;
         let state = rawkit_editstate::EditState {
             tone: rawkit_editstate::Tone {
                 exposure_ev: 2.0,

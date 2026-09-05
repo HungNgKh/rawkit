@@ -24,7 +24,7 @@
 //! and here it is the absence of code rather than the presence of it.
 
 use anyhow::{anyhow, Context, Result};
-use rawkit_catalog::cull::{self, Flag, Judgement, LibraryImage};
+use rawkit_catalog::cull::{self, Filter, Flag, Judgement, LibraryImage};
 use rawkit_catalog::db::Catalog;
 use rawkit_catalog::previews;
 use rawkit_editstate::EditState;
@@ -250,17 +250,21 @@ pub struct Decoded {
 /// A judgement and a paste are different in shape but the same to a user: the
 /// previous action. Two stacks would mean two keys, and the second one would be
 /// pressed by accident.
+/// Frames are named by catalog id rather than by position, and that is not a
+/// matter of taste: a filter changes what position 12 means, so an undo stack
+/// holding positions would put a rating back on whichever photograph had moved
+/// into the slot.
 #[derive(Debug)]
 enum Undone {
     Judged {
-        index: usize,
+        image: i64,
         before: Judgement,
     },
     /// What each frame's edit was before the paste. `None` means it had none —
     /// restoring that writes the identity edit rather than deleting a version,
     /// because the history is append-only and an undo is itself a decision.
     Pasted {
-        frames: Vec<(usize, Option<EditState>)>,
+        frames: Vec<(i64, Option<EditState>)>,
     },
 }
 
@@ -303,6 +307,11 @@ pub enum CullAction {
     /// Take the rectangle that was drawn, or throw it away.
     CropApply,
     CropCancel,
+    /// Look at a narrower part of the library. The whole filter at once, for the
+    /// same reason a judgement is written whole: the page holds the controls and
+    /// sends what they now say, rather than the shell keeping a second copy that
+    /// could disagree with them.
+    SetFilter(Filter),
     /// Move the selection without loading anything — what a grid does. The
     /// loupe uses `Next`/`Previous`, which ask for the photograph as well.
     SelectNext,
@@ -341,13 +350,26 @@ pub struct CullView {
     /// double-click on a cell opens the loupe — and the page would otherwise go
     /// on claiming the grid was up.
     pub mode: &'static str,
+    /// What is being looked at. Sent back rather than assumed, because the shell
+    /// can change it without being asked: a filter that would leave nothing on
+    /// screen is turned off, and the controls have to follow.
+    pub filter: Filter,
+    /// How many photographs there are altogether, against `total`'s "how many
+    /// the filter admits". Both, because "12 of 47" is the only honest way to
+    /// show a narrowed library — a bare count reads as a library that lost
+    /// something.
+    pub in_library: usize,
 }
 
 /// An open catalog and where we are in it.
 pub struct Library {
     catalog: Catalog,
+    /// The photographs the filter admits, in shoot order. Never empty — see
+    /// [`Library::narrow`] for what that costs and why it is worth it.
     images: Vec<LibraryImage>,
     index: usize,
+    /// Which part of the library is being looked at.
+    filter: Filter,
     /// What each judgement replaced, most recent last.
     ///
     /// Bounded because it is a convenience, not a history: the versioned record
@@ -355,10 +377,15 @@ pub struct Library {
     undo: Vec<Undone>,
     /// A navigation the render loop has not acted on yet.
     request: Option<usize>,
-    /// Frames set aside to compare against each other, as positions in the
-    /// sequence, kept in order so a survey reads left to right the way the shoot
-    /// happened.
-    marked: Vec<usize>,
+    /// Frames set aside to compare against each other, by catalog id, kept in
+    /// shoot order so a survey reads left to right the way the day did.
+    ///
+    /// Ids rather than positions for the reason [`Undone`] uses them: a filter
+    /// renumbers the sequence, and a comparison built out of positions would
+    /// quietly become a comparison of different photographs. A marked frame the
+    /// filter no longer admits stays marked and is simply not shown — narrowing
+    /// the view is not a decision about the comparison.
+    marked: Vec<i64>,
     /// The look taken from a frame, waiting to be applied to the marked ones.
     ///
     /// Held rather than re-read from the source frame, so navigating away — or
@@ -382,7 +409,7 @@ impl Library {
     /// Open a catalog and stand at the first photograph in it.
     pub fn open(path: &Path) -> Result<Self> {
         let catalog = Catalog::open(path)?;
-        let images = cull::sequence(&catalog)?;
+        let images = cull::sequence(&catalog, &Filter::default())?;
         if images.is_empty() {
             return Err(anyhow!(
                 "{} has no images; run `rawkit catalog <path> --scan <folder>` first",
@@ -398,6 +425,7 @@ impl Library {
             catalog,
             images,
             index: 0,
+            filter: Filter::default(),
             undo: Vec::new(),
             copied: None,
             paste_requested: false,
@@ -467,8 +495,7 @@ impl Library {
 
         let mut undo = Vec::new();
         let mut changed = 0;
-        for index in self.marked.clone() {
-            let id = self.images[index].id;
+        for id in self.marked.clone() {
             let before = rawkit_catalog::edits::latest(&self.catalog, id)?.map(|(_, state)| state);
             let merged = EditState {
                 tone: look.tone,
@@ -490,7 +517,7 @@ impl Library {
             )?
             .is_some()
             {
-                undo.push((index, before));
+                undo.push((id, before));
                 changed += 1;
             }
         }
@@ -503,8 +530,75 @@ impl Library {
         Ok(changed)
     }
 
-    pub fn marked(&self) -> &[usize] {
-        &self.marked
+    /// The frames set aside, as positions in what is on screen, in shoot order.
+    ///
+    /// Computed rather than stored. A mark names a photograph and a position
+    /// names a slot, and the filter decides which slot a photograph is in — so
+    /// the only way for the two to stay in step is for one of them to be
+    /// derived. Marked frames the filter excludes are absent here and still
+    /// marked: narrowing the view is not a decision about the comparison.
+    pub fn marked(&self) -> Vec<usize> {
+        let mut positions: Vec<usize> = self
+            .marked
+            .iter()
+            .filter_map(|id| self.position_of(*id))
+            .collect();
+        // Sorted here rather than kept sorted, because ids run in the order the
+        // files were scanned and the sequence runs in the order the shutter
+        // fired. Those are usually the same and are not the same thing.
+        positions.sort_unstable();
+        positions
+    }
+
+    /// Where a photograph sits in the sequence, if the filter admits it.
+    fn position_of(&self, id: i64) -> Option<usize> {
+        self.images.iter().position(|image| image.id == id)
+    }
+
+    /// Which part of the library is on screen — what an export of "what is
+    /// shown" is an export of.
+    pub fn filter(&self) -> &Filter {
+        &self.filter
+    }
+
+    /// Look at a narrower part of the library.
+    ///
+    /// The photograph under the cursor is kept when the new filter admits it,
+    /// and otherwise the cursor moves to the first frame *after* it that the
+    /// filter does admit. Not to the start: where you had got to in a shoot is
+    /// worth more than the tidiness of beginning again, and a filter is usually
+    /// set in the middle of a pass rather than before one.
+    ///
+    /// A filter nothing matches is refused, and that is the rule the rest of
+    /// this file leans on: the sequence is never empty, so `current` always
+    /// names a photograph. "No photographs" is a message, not a view — a window
+    /// showing nothing cannot say why it is showing nothing.
+    pub fn narrow(&mut self, filter: Filter) -> Result<()> {
+        let standing = self.current().id;
+        let images = cull::sequence(&self.catalog, &filter)?;
+        if images.is_empty() {
+            return Err(anyhow!("no photograph matches that filter"));
+        }
+        // Both sequences are in shoot order, so the first of the remaining
+        // frames that survives is the nearest one forward. Indexed first so
+        // this stays linear on a library that has twenty thousand of them.
+        let where_now: std::collections::HashMap<i64, usize> = images
+            .iter()
+            .enumerate()
+            .map(|(at, image)| (image.id, at))
+            .collect();
+        let index = self.images[self.index..]
+            .iter()
+            .find_map(|image| where_now.get(&image.id).copied())
+            .unwrap_or(images.len() - 1);
+        let moved = images[index].id != standing;
+        self.filter = filter;
+        self.images = images;
+        self.index = index;
+        if moved {
+            self.request = Some(index);
+        }
+        Ok(())
     }
 
     pub fn count(&self) -> usize {
@@ -630,6 +724,7 @@ impl Library {
             // wildcard so adding a cull action still fails to compile here,
             // which is what has kept this match honest.
             CullAction::Crop | CullAction::CropApply | CullAction::CropCancel => {}
+            CullAction::SetFilter(filter) => self.narrow(filter)?,
             CullAction::Spot => {}
             // The clipboard is filled in the command handler, which is the only
             // place that can see the session — this frame's edit is what is on
@@ -651,19 +746,27 @@ impl Library {
                 let rating = (stars > 0).then_some(stars);
                 self.judge(|j| Judgement { rating, ..j })?;
             }
+            // A frame that leaves the filter has already carried the cursor
+            // forward — everything after it moved up a place — so advancing as
+            // well would step over its neighbour. That is the one thing a
+            // filtered pass must not do: skip a photograph silently.
             CullAction::Pick => {
-                self.judge(|j| Judgement {
+                let dropped = self.judge(|j| Judgement {
                     flag: Some(Flag::Pick),
                     ..j
                 })?;
-                self.go(self.index + 1);
+                if !dropped {
+                    self.go(self.index + 1);
+                }
             }
             CullAction::Reject => {
-                self.judge(|j| Judgement {
+                let dropped = self.judge(|j| Judgement {
                     flag: Some(Flag::Reject),
                     ..j
                 })?;
-                self.go(self.index + 1);
+                if !dropped {
+                    self.go(self.index + 1);
+                }
             }
             CullAction::ClearFlag => {
                 self.judge(|j| Judgement { flag: None, ..j })?;
@@ -687,28 +790,26 @@ impl Library {
             // Handled by the shell, which owns the layout and the render loop.
             // Listed here so the page has one vocabulary rather than two.
             CullAction::Grid | CullAction::Loupe | CullAction::Survey | CullAction::Cells(_) => {}
-            CullAction::Mark => match self.marked.iter().position(|i| *i == self.index) {
-                Some(at) => {
-                    self.marked.remove(at);
+            CullAction::Mark => {
+                let id = self.current().id;
+                match self.marked.iter().position(|marked| *marked == id) {
+                    Some(at) => {
+                        self.marked.remove(at);
+                    }
+                    None => self.marked.push(id),
                 }
-                None => {
-                    self.marked.push(self.index);
-                    self.marked.sort_unstable();
-                }
-            },
+            }
             CullAction::ClearMarks => self.marked.clear(),
             CullAction::SelectMarked(step) => {
-                if !self.marked.is_empty() {
-                    let at = self
-                        .marked
-                        .iter()
-                        .position(|i| *i == self.index)
-                        .unwrap_or(0) as i64;
-                    let next = (at + step as i64).rem_euclid(self.marked.len() as i64);
-                    self.index = self.marked[next as usize];
+                let shown = self.marked();
+                if !shown.is_empty() {
+                    let at = shown.iter().position(|i| *i == self.index).unwrap_or(0) as i64;
+                    let next = (at + step as i64).rem_euclid(shown.len() as i64);
+                    self.index = shown[next as usize];
                 }
             }
             CullAction::SurveyJudge(keep) => {
+                let id = self.current().id;
                 let flag = if keep { Flag::Pick } else { Flag::Reject };
                 self.judge(|j| Judgement {
                     flag: Some(flag),
@@ -717,46 +818,66 @@ impl Library {
                 // Out of the comparison, and the cursor lands on whatever is
                 // still in it — which is what makes this a winnowing rather
                 // than a survey you have to leave and re-enter.
-                if let Some(at) = self.marked.iter().position(|i| *i == self.index) {
+                if let Some(at) = self.marked.iter().position(|marked| *marked == id) {
                     self.marked.remove(at);
-                    if let Some(next) = self.marked.get(at).or_else(|| self.marked.last()) {
+                    let shown = self.marked();
+                    // The nearest one still being compared, forward first. The
+                    // judged frame may also have left the filter, in which case
+                    // the positions moved under this — which is why it asks
+                    // where the marks are now rather than where they were.
+                    if let Some(next) = shown
+                        .iter()
+                        .find(|position| **position >= self.index)
+                        .or_else(|| shown.last())
+                    {
                         self.index = *next;
                     }
                 }
             }
             CullAction::Undo => match self.undo.pop() {
                 Some(Undone::Pasted { frames }) => {
-                    for (index, before) in &frames {
+                    for (id, before) in &frames {
                         let state = before.clone().unwrap_or_default();
                         rawkit_catalog::edits::save(
                             &self.catalog,
-                            self.images[*index].id,
+                            *id,
                             &state,
                             rawkit_editstate::EditSource::User,
                         )?;
                     }
                     // Back to a frame it touched, so the reversal is visible
                     // rather than something the user has to go and check.
-                    if let Some((index, _)) = frames.first() {
-                        self.go(*index);
-                        self.index = *index;
+                    if let Some(index) = frames.first().and_then(|(id, _)| self.position_of(*id)) {
+                        self.go(index);
+                        self.index = index;
                     }
                 }
                 Some(Undone::Judged {
-                    index,
+                    image,
                     before: previous,
                 }) => {
-                    cull::set(&self.catalog, self.images[index].id, &previous)?;
-                    // A survey drops what it judges, so undoing a judgement has
-                    // to put the frame back where it was being compared —
-                    // otherwise the key that reverses a mistake leaves you
-                    // looking at a comparison the mistake is missing from.
-                    if !self.marked.is_empty() && !self.marked.contains(&index) {
-                        self.marked.push(index);
-                        self.marked.sort_unstable();
+                    cull::set(&self.catalog, image, &previous)?;
+                    // Putting the judgement back can put the *frame* back: a
+                    // filtered pass drops what it judges, and an undo that could
+                    // not return you to the photograph you were wrong about
+                    // would be no use at all.
+                    self.images = cull::sequence(&self.catalog, &self.filter)?;
+                    // A survey drops what it judges too, so the same keypress
+                    // has to restore the comparison — otherwise the key that
+                    // reverses a mistake leaves you looking at a comparison the
+                    // mistake is missing from.
+                    if !self.marked.is_empty() && !self.marked.contains(&image) {
+                        self.marked.push(image);
                     }
-                    self.go(index);
-                    self.index = index;
+                    if let Some(index) = self.position_of(image) {
+                        self.go(index);
+                        self.index = index;
+                    } else {
+                        // Only reachable if the frame went missing from disk
+                        // between the judgement and the undo. The judgement is
+                        // restored either way; the cursor stays where it can be.
+                        self.index = self.index.min(self.images.len() - 1);
+                    }
                 }
                 None => {}
             },
@@ -766,22 +887,64 @@ impl Library {
 
     /// Apply a change to the current image's judgement, remembering what it
     /// replaced.
-    fn judge(&mut self, change: impl FnOnce(Judgement) -> Judgement) -> Result<()> {
+    ///
+    /// Reports whether the judgement pushed the frame out of the filter, which
+    /// is the one thing its callers need to know: a frame that left has already
+    /// moved the cursor on.
+    fn judge(&mut self, change: impl FnOnce(Judgement) -> Judgement) -> Result<bool> {
         let id = self.current().id;
         let before = cull::judgement(&self.catalog, id)?;
         let after = change(before.clone());
         if after == before {
-            return Ok(());
+            return Ok(false);
         }
         cull::set(&self.catalog, id, &after)?;
-        self.undo.push(Undone::Judged {
-            index: self.index,
-            before,
-        });
+        self.undo.push(Undone::Judged { image: id, before });
         if self.undo.len() > UNDO_DEPTH {
             self.undo.remove(0);
         }
-        Ok(())
+        self.settle(id)
+    }
+
+    /// Put the sequence and the cursor back in agreement after a judgement.
+    ///
+    /// Standing in "picks" and rejecting the frame in front of you means it has
+    /// just left the set you are walking through. It goes, and the cursor stays
+    /// on the number it was already on — which is now the frame that came next,
+    /// so a filtered pass moves forward exactly the way an unfiltered one does
+    /// and for the same reason.
+    ///
+    /// Asked of the catalog rather than worked out from the [`Judgement`] just
+    /// written, so that "would this still be shown" is answered by the query
+    /// that decides what *is* shown. A second opinion here is a second chance
+    /// to disagree.
+    fn settle(&mut self, judged: i64) -> Result<bool> {
+        if self.filter.is_everything() || cull::matches(&self.catalog, judged, &self.filter)? {
+            return Ok(false);
+        }
+        let images = cull::sequence(&self.catalog, &self.filter)?;
+        if images.is_empty() {
+            // The end of a pass, and the ordinary way one ends: nothing is
+            // unflagged any more, or the last pick has been taken back. The
+            // filter goes rather than the window emptying — an empty sequence
+            // is a state `current` cannot answer for, and a blank canvas cannot
+            // explain itself. The view carries the filter back to the page, so
+            // the controls follow rather than going on claiming to be set.
+            self.filter = Filter::default();
+            self.images = cull::sequence(&self.catalog, &self.filter)?;
+            self.index = self.position_of(judged).unwrap_or(0);
+            return Ok(true);
+        }
+        self.images = images;
+        self.index = self.index.min(self.images.len() - 1);
+        // Only when a different photograph is now under the cursor. Judging the
+        // last frame of a filtered set leaves you standing on the one before
+        // it, which is already on screen, and asking for it again would decode
+        // a RAW to redraw what is already there.
+        if self.images[self.index].id != judged {
+            self.request = Some(self.index);
+        }
+        Ok(true)
     }
 
     /// Move to an image, clamped to the ends.
@@ -807,7 +970,11 @@ impl Library {
     pub fn view(&self) -> Result<CullView> {
         let image = self.current();
         let judgement = cull::judgement(&self.catalog, image.id)?;
-        let (_, picks, rejects) = cull::tally(&self.catalog)?;
+        // The tally counts the library, not the filter. It is the progress
+        // indicator for a cull — how much of the shoot has been decided about —
+        // and one that shrank as you narrowed the view would be measuring the
+        // view instead of the work.
+        let (in_library, picks, rejects) = cull::tally(&self.catalog)?;
         Ok(CullView {
             filename: image.filename.clone(),
             position: self.index + 1,
@@ -819,9 +986,11 @@ impl Library {
             rejects,
             undoable: !self.undo.is_empty(),
             copied: self.copied.is_some(),
-            marked: self.marked.len(),
-            is_marked: self.marked.contains(&self.index),
+            marked: self.marked().len(),
+            is_marked: self.marked.contains(&image.id),
             mode: crate::mode_name(),
+            filter: self.filter.clone(),
+            in_library,
         })
     }
 }
@@ -1009,6 +1178,267 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    use rawkit_catalog::cull::Flagged;
+
+    fn picks() -> Filter {
+        Filter::flagged(Flagged::Pick)
+    }
+
+    fn filenames(library: &Library) -> Vec<String> {
+        library
+            .images
+            .iter()
+            .map(|image| image.filename.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_page_can_say_what_it_means_by_a_filter() {
+        // The seam between the page and the shell, tested with the literal
+        // payloads the page sends. Everything else here is Rust talking to
+        // Rust; this is the one place a rename or a missing field would show up
+        // only as a key that quietly did nothing.
+        let parse = |json: &str| serde_json::from_str::<CullAction>(json).expect(json);
+
+        let CullAction::SetFilter(all) = parse(r#"{"action":"set_filter","value":{}}"#) else {
+            panic!("not a filter");
+        };
+        assert!(all.is_everything(), "an empty object is the whole library");
+
+        let CullAction::SetFilter(picks) = parse(
+            r#"{"action":"set_filter","value":{"flagged":"pick","min_rating":null,"colour":null}}"#,
+        ) else {
+            panic!("not a filter");
+        };
+        assert_eq!(picks, Filter::flagged(Flagged::Pick));
+
+        let CullAction::SetFilter(narrow) = parse(
+            r#"{"action":"set_filter","value":
+                 {"flagged":"unflagged","min_rating":3,"colour":"red"}}"#,
+        ) else {
+            panic!("not a filter");
+        };
+        assert_eq!(
+            narrow,
+            Filter {
+                flagged: Some(Flagged::Unflagged),
+                min_rating: Some(3),
+                colour: Some("red".into()),
+            }
+        );
+
+        // And back the other way, because the page draws its chips from what
+        // the shell reports rather than from what it asked for.
+        let dir = Scratch::new("filter-json");
+        let library = library_at(&dir.0, 1);
+        let view = serde_json::to_value(library.view().unwrap()).unwrap();
+        assert_eq!(view["filter"]["flagged"], serde_json::Value::Null);
+        assert_eq!(view["in_library"], 1);
+    }
+
+    #[test]
+    fn a_filter_narrows_the_sequence_the_arrows_walk() {
+        // The whole point: marking a shoot up and then being able to look at
+        // what you marked. Position and total describe the filtered set, not
+        // the library, because that is what the arrows now move through.
+        let dir = Scratch::new("filter-narrows");
+        let mut library = library_at(&dir.0, 5);
+        library.act(CullAction::Pick).unwrap(); // 0
+        library.act(CullAction::Pick).unwrap(); // 1
+        library.select(4);
+        library.act(CullAction::Pick).unwrap(); // 4
+
+        let view = library.act(CullAction::SetFilter(picks())).unwrap();
+        assert_eq!(view.total, 3, "three picks");
+        assert_eq!(view.in_library, 5, "out of five photographs");
+        assert_eq!(
+            filenames(&library),
+            ["DSC00000.ARW", "DSC00001.ARW", "DSC00004.ARW"]
+        );
+
+        // And the sequence is still a sequence: the arrow key steps over the
+        // frames the filter left out rather than stopping at them.
+        library.select(1);
+        let next = library.act(CullAction::Next).unwrap();
+        assert_eq!(next.filename, "DSC00004.ARW");
+        assert_eq!(next.position, 3);
+    }
+
+    #[test]
+    fn setting_a_filter_keeps_the_frame_you_were_on() {
+        let dir = Scratch::new("filter-stays");
+        let mut library = library_at(&dir.0, 6);
+        for at in [1usize, 3, 5] {
+            library.select(at);
+            library.act(CullAction::Pick).unwrap();
+        }
+        library.select(3);
+        let view = library.act(CullAction::SetFilter(picks())).unwrap();
+        assert_eq!(view.filename, "DSC00003.ARW", "the same photograph");
+        assert_eq!(view.position, 2, "at a new place in a shorter sequence");
+    }
+
+    #[test]
+    fn a_filter_that_excludes_where_you_stand_moves_forward_not_home() {
+        // Where you had got to in a shoot is worth more than the tidiness of
+        // starting again — and a filter is usually set in the middle of a pass.
+        let dir = Scratch::new("filter-forward");
+        let mut library = library_at(&dir.0, 6);
+        library.select(0);
+        library.act(CullAction::Pick).unwrap();
+        library.select(4);
+        library.act(CullAction::Pick).unwrap();
+
+        library.select(2); // Unflagged, so the filter is about to exclude it.
+        let view = library.act(CullAction::SetFilter(picks())).unwrap();
+        assert_eq!(
+            view.filename, "DSC00004.ARW",
+            "the next pick forward, not the first one"
+        );
+        assert!(
+            library.take_request().is_some(),
+            "a different photograph has to be loaded"
+        );
+    }
+
+    #[test]
+    fn judging_a_frame_out_of_the_filter_advances_exactly_one() {
+        // The bug this shape exists to prevent: the frame leaves, everything
+        // after it moves up a place, and an advance on top of that steps over
+        // its neighbour — a photograph silently skipped in a pass whose whole
+        // job is to look at every photograph.
+        let dir = Scratch::new("filter-drop");
+        let mut library = library_at(&dir.0, 4);
+        let view = library
+            .act(CullAction::SetFilter(Filter::flagged(Flagged::Unflagged)))
+            .unwrap();
+        assert_eq!(view.total, 4);
+
+        let after = library.act(CullAction::Pick).unwrap();
+        assert_eq!(after.total, 3, "the frame left the set");
+        assert_eq!(
+            after.filename, "DSC00001.ARW",
+            "and the cursor is on the next one, not the one after it"
+        );
+        assert_eq!(after.position, 1);
+
+        let after = library.act(CullAction::Reject).unwrap();
+        assert_eq!(after.filename, "DSC00002.ARW");
+    }
+
+    #[test]
+    fn a_rating_can_drop_a_frame_out_even_though_it_does_not_advance() {
+        // Rating is the considered judgement that stays put — but standing in
+        // "three stars and better" and pressing 1 still means the frame has
+        // gone, and the cursor has to be somewhere real afterwards.
+        let dir = Scratch::new("filter-rating");
+        let mut library = library_at(&dir.0, 3);
+        for at in 0..3 {
+            library.select(at);
+            library.act(CullAction::Rate(4)).unwrap();
+        }
+        library.select(1);
+        library
+            .act(CullAction::SetFilter(Filter::rated(3)))
+            .unwrap();
+
+        let after = library.act(CullAction::Rate(1)).unwrap();
+        assert_eq!(after.total, 2);
+        assert_eq!(after.filename, "DSC00002.ARW");
+        assert_eq!(after.rating, Some(4), "and it is the new frame's rating");
+    }
+
+    #[test]
+    fn undo_brings_back_a_frame_the_filter_had_dropped() {
+        // Otherwise the key that reverses a mistake leaves you unable to see
+        // what it reversed, which is the same as not having it.
+        let dir = Scratch::new("filter-undo");
+        let mut library = library_at(&dir.0, 3);
+        library
+            .act(CullAction::SetFilter(Filter::flagged(Flagged::Unflagged)))
+            .unwrap();
+        library.act(CullAction::Pick).unwrap();
+        assert_eq!(library.view().unwrap().total, 2);
+
+        let back = library.act(CullAction::Undo).unwrap();
+        assert_eq!(back.total, 3);
+        assert_eq!(back.filename, "DSC00000.ARW", "and we are looking at it");
+        assert_eq!(back.flag, None);
+    }
+
+    #[test]
+    fn a_filter_nothing_matches_is_refused_rather_than_shown_empty() {
+        // A window showing nothing cannot say why it is showing nothing. The
+        // refusal is a message; an empty sequence would be a blank canvas and a
+        // `current` with no photograph to name.
+        let dir = Scratch::new("filter-empty");
+        let mut library = library_at(&dir.0, 3);
+        let refused = library.act(CullAction::SetFilter(picks()));
+        assert!(refused.is_err(), "no photograph is picked");
+        let view = library.view().unwrap();
+        assert_eq!(view.total, 3, "and the library is still what it was");
+        assert!(view.filter.is_everything());
+    }
+
+    #[test]
+    fn the_last_frame_leaving_a_filter_turns_the_filter_off() {
+        // The ordinary end of a pass: filter to the undecided, decide the last
+        // one. The alternative to this is a blank window at the exact moment
+        // the user has finished, which reads as a crash rather than as success.
+        let dir = Scratch::new("filter-exhausted");
+        let mut library = library_at(&dir.0, 2);
+        library
+            .act(CullAction::SetFilter(Filter::flagged(Flagged::Unflagged)))
+            .unwrap();
+        library.act(CullAction::Pick).unwrap();
+        let view = library.act(CullAction::Pick).unwrap();
+        assert!(
+            view.filter.is_everything(),
+            "the filter cannot survive emptying the sequence"
+        );
+        assert_eq!(view.total, 2);
+        assert_eq!(
+            view.filename, "DSC00001.ARW",
+            "standing on the frame that was just judged"
+        );
+    }
+
+    #[test]
+    fn a_mark_follows_its_photograph_through_a_filter() {
+        // Marks are stored as ids for this: a filter renumbers the sequence, and
+        // a comparison built out of positions would quietly become a comparison
+        // of different photographs.
+        let dir = Scratch::new("filter-marks");
+        let mut library = library_at(&dir.0, 5);
+        library.select(1);
+        library.act(CullAction::Pick).unwrap();
+        library.select(3);
+        library.act(CullAction::Pick).unwrap();
+        library.select(1);
+        library.act(CullAction::Mark).unwrap();
+        library.select(3);
+        library.act(CullAction::Mark).unwrap();
+        library.select(4);
+        let unfiltered = library.act(CullAction::Mark).unwrap();
+        assert_eq!(unfiltered.marked, 3);
+
+        library.act(CullAction::SetFilter(picks())).unwrap();
+        assert_eq!(
+            library.marked(),
+            [0, 1],
+            "the two picks, at their new positions"
+        );
+        let view = library.view().unwrap();
+        assert_eq!(view.marked, 2, "the third is marked and not on screen");
+
+        // And it is still marked when the filter comes off: narrowing the view
+        // is not a decision about the comparison.
+        library
+            .act(CullAction::SetFilter(Filter::default()))
+            .unwrap();
+        assert_eq!(library.marked(), [1, 3, 4]);
     }
 
     #[test]

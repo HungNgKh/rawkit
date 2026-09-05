@@ -176,6 +176,23 @@
           border: 1px solid #3a3a44; border-radius: 3px; padding: 1px 6px; flex-shrink: 0; }
   #flag.pick { color: #6fc27a; }
   #flag.reject { color: #e0705f; }
+
+  /* The filter row. Chips rather than a menu, because what is being looked at
+     has to be readable without opening anything — a narrowed library that does
+     not say so is a library with photographs missing from it. */
+  #filter { flex-wrap: wrap; gap: 6px; }
+  #filter.narrowed { color: #d8bf63; }
+  #filter button { font: inherit; font-size: 11px; line-height: 1.5;
+                   background: none; color: #7d7d87; border: 1px solid #3a3a44;
+                   border-radius: 3px; padding: 0 6px; cursor: pointer; }
+  #filter button:hover { color: #c8c8d0; border-color: #55555f; }
+  #filter button.on { color: #17171b; background: #d8bf63; border-color: #d8bf63; }
+  #filter .set { display: flex; gap: 3px; }
+  #filter .dot { width: 13px; padding: 0; text-align: center; }
+  /* The label chips carry their own colour, so "on" cannot borrow the shared
+     yellow without saying the wrong thing. */
+  #filter .dot.on { background: currentColor; border-color: currentColor; }
+  #filter-stars button { letter-spacing: 0; padding: 0 3px; }
 </style>
 
 <div id="chrome">
@@ -201,6 +218,16 @@
   </div>
   <div class="line">
     <span id="counts"></span>
+  </div>
+  <div class="line" id="filter" title="what the arrows walk through, and what ⌃⇧E exports">
+    <span class="set" id="filter-flags">
+      <button data-flag="">all</button>
+      <button data-flag="pick">picks</button>
+      <button data-flag="reject">rejects</button>
+      <button data-flag="unflagged">undecided</button>
+    </span>
+    <span class="set" id="filter-stars" title="at least this many stars"></span>
+    <span class="set" id="filter-colours"></span>
   </div>
 </div>
 
@@ -497,7 +524,7 @@
   </details>
   <details id="s-keys">
     <summary>Keys</summary>
-    <div id="keys">G grid · E loupe · R crop · Q spots · O mask · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · Z undo cull · ⌃Z undo edit · ⌃E export · F11 fullscreen</div>
+    <div id="keys">G grid · E loupe · R crop · Q spots · O mask · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · 0–5 rate · 6–9 label · \ filter · Z undo cull · ⌃Z undo edit · ⌃E export · ⌃⇧E export what is shown · F11 fullscreen</div>
   </details>
 </main>
 </div>
@@ -2000,7 +2027,12 @@
     if (!view) return;
     strip.classList.remove("hidden");
     document.getElementById("frame").textContent = view.filename;
-    document.getElementById("position").textContent = `${view.position} / ${view.total}`;
+    // "3 / 12 of 47" when a filter is on. A bare count on a narrowed library
+    // reads as a library that has lost something.
+    document.getElementById("position").textContent =
+      view.total === view.in_library
+        ? `${view.position} / ${view.total}`
+        : `${view.position} / ${view.total} of ${view.in_library}`;
     document.getElementById("stars").textContent =
       "★".repeat(view.rating ?? 0) + "☆".repeat(5 - (view.rating ?? 0));
     const flag = document.getElementById("flag");
@@ -2014,8 +2046,82 @@
       (view.marked ? ` · ${view.marked} marked${view.is_marked ? " ✓" : ""}` : "") +
       // A clipboard nobody can see is a key that sometimes does nothing.
       (view.copied ? " · settings copied" : "");
+    drawFilter(view.filter ?? {});
     setMode(view.mode);
   };
+
+  // ---- The filter ----------------------------------------------------------
+  //
+  // The page holds the controls and sends what they now say; the shell answers
+  // with what it is actually showing, and that answer is what gets drawn. One
+  // way round, deliberately: the shell can change the filter without being
+  // asked — one that would leave nothing on screen is turned off — so a page
+  // that drew its own intentions would keep a chip lit for a filter nobody has.
+
+  const LABELS = [["red", "#e0705f"], ["yellow", "#d8bf63"],
+                  ["green", "#6fc27a"], ["blue", "#6f9ade"]];
+  const starRow = document.getElementById("filter-stars");
+  for (let n = 1; n <= 5; n++) {
+    const button = document.createElement("button");
+    button.dataset.stars = String(n);
+    button.textContent = "★";
+    button.title = `${n} star${n > 1 ? "s" : ""} or better`;
+    starRow.append(button);
+  }
+  const colourRow = document.getElementById("filter-colours");
+  for (const [name, colour] of LABELS) {
+    const button = document.createElement("button");
+    button.className = "dot";
+    button.dataset.colour = name;
+    button.style.color = colour;
+    button.textContent = "●";
+    button.title = `labelled ${name}`;
+    colourRow.append(button);
+  }
+
+  let filter = {};
+  // What the backslash key puts back. A toggle that forgot what it was toggling
+  // would be a clear button with an extra press.
+  let remembered = null;
+
+  const narrowing = f => !!(f.flagged || f.min_rating || f.colour);
+  const narrow = extra => act("set_filter", { ...filter, ...extra });
+
+  const drawFilter = shown => {
+    filter = {
+      flagged: shown.flagged ?? null,
+      min_rating: shown.min_rating ?? null,
+      colour: shown.colour ?? null,
+    };
+    const on = narrowing(filter);
+    document.getElementById("filter").classList.toggle("narrowed", on);
+    if (on) remembered = { ...filter };
+    for (const button of document.querySelectorAll("#filter-flags button"))
+      button.classList.toggle("on", (button.dataset.flag || null) === filter.flagged);
+    for (const button of starRow.children)
+      button.classList.toggle("on", Number(button.dataset.stars) <= (filter.min_rating ?? 0));
+    for (const button of colourRow.children)
+      button.classList.toggle("on", button.dataset.colour === filter.colour);
+  };
+
+  document.getElementById("filter").addEventListener("click", event => {
+    const button = event.target.closest("button");
+    if (!button) return;
+    // Handed straight back, because a focused control owns the keyboard here
+    // and a chip that kept focus would eat the next P or X — the keys somebody
+    // narrowed the library in order to press.
+    button.blur();
+    if (button.dataset.flag !== undefined) narrow({ flagged: button.dataset.flag || null });
+    // Clicking the star already filtered at clears it, which is the only way
+    // back to "any rating" that does not need a sixth chip meaning "none".
+    else if (button.dataset.stars) {
+      const stars = Number(button.dataset.stars);
+      narrow({ min_rating: filter.min_rating === stars ? null : stars });
+    } else if (button.dataset.colour) {
+      const name = button.dataset.colour;
+      narrow({ colour: filter.colour === name ? null : name });
+    }
+  });
 
   // Told by the Rust side which arrangement this is. Route 3 hands the canvas
   // its own window and the page keeps its background; a cutout needs the page
@@ -2083,6 +2189,11 @@
     } catch (e) {
       log.className = "refused";
       log.textContent = String(e);
+      // A refusal means the controls and the library may now disagree — a
+      // filter nothing matches is not applied. Redraw from what the shell is
+      // actually showing rather than leaving a chip lit for a filter that never
+      // took.
+      invoke("cull_view").then(show).catch(() => {});
     }
   };
 
@@ -2117,7 +2228,7 @@
       // The picker decides the rest: a name for one photograph, a folder for a
       // set, so the two cannot be asked for the wrong thing.
       if (held === "e") {
-        invoke("export", { scope: event.shiftKey ? "picks" : "current" }).catch(e => {
+        invoke("export", { scope: event.shiftKey ? "shown" : "current" }).catch(e => {
           log.className = "refused";
           log.textContent = String(e);
         });
@@ -2188,6 +2299,14 @@
       case "arrowup": act("select_by", -1); break;
       case "-": act("cells", -1); break;
       case "=": case "+": act("cells", 1); break;
+      // Backslash puts the filter down and picks it up again, which is the key
+      // Lightroom uses for the same gesture. Toggling rather than clearing,
+      // because looking at the whole shoot for a moment and going back to what
+      // you had narrowed to is the reason anyone reaches for it.
+      case "\\":
+        if (narrowing(filter)) act("set_filter", {});
+        else if (remembered) act("set_filter", remembered);
+        break;
       case "p": act("pick"); break;
       case "x": act("reject"); break;
       case "u": act("clear_flag"); break;

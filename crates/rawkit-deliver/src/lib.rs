@@ -39,7 +39,7 @@
 //! application gets to do exactly once.
 
 use anyhow::{bail, Context, Result};
-use rawkit_catalog::cull::{self, Flag};
+use rawkit_catalog::cull::{self, Filter, Flagged};
 use rawkit_catalog::db::Catalog;
 use rawkit_editstate::EditState;
 use rawkit_engine::{render::DEFAULT_TILE, BayerPhase, Frame, Gpu, Output, Renderer};
@@ -56,16 +56,39 @@ use std::path::Path;
 const EXPORT_QUALITY: u8 = 92;
 
 /// Which photographs to write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Two cases, not four. "Everything", "the picks" and "three stars or better"
+/// are the same kind of question asked with different terms, and that question
+/// is [`Filter`] — the one the window narrows a cull with. Keeping them as
+/// separate variants meant this file re-deciding what a pick is, in Rust, while
+/// the library decided it in SQL; the two agreed until one of them learnt
+/// something, and then an interface could show a set it would not export.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
-    /// Everything present in the library.
-    All,
-    /// What survived a cull.
-    Picks,
-    /// At least this many stars.
-    Rated(u8),
-    /// One image, by its catalog id.
+    /// Everything the filter admits — the whole library, for a filter that
+    /// narrows nothing.
+    Matching(Filter),
+    /// One image, by its catalog id. Not expressible as a filter: an id is not
+    /// a judgement, and an export of *this frame* must not depend on how it was
+    /// judged.
     Image(i64),
+}
+
+impl Selection {
+    /// Every present photograph.
+    pub fn all() -> Self {
+        Selection::Matching(Filter::default())
+    }
+
+    /// What survived a cull.
+    pub fn picks() -> Self {
+        Selection::Matching(Filter::flagged(Flagged::Pick))
+    }
+
+    /// At least this many stars.
+    pub fn rated(stars: u8) -> Self {
+        Selection::Matching(Filter::rated(stars))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -120,17 +143,17 @@ pub fn gather(catalog: &Catalog, selection: Selection) -> Result<Vec<Chosen>> {
     let mut chosen = Vec::new();
     let mut parsed: std::collections::HashMap<String, Option<rawkit_engine::CameraProfile>> =
         std::collections::HashMap::new();
-    for image in cull::sequence(catalog)? {
-        let judgement = cull::judgement(catalog, image.id)?;
-        let wanted = match selection {
-            Selection::All => true,
-            Selection::Picks => judgement.flag == Some(Flag::Pick),
-            Selection::Rated(stars) => judgement.rating.unwrap_or(0) >= stars,
-            Selection::Image(id) => image.id == id,
-        };
-        if !wanted {
-            continue;
-        }
+    // The selection is resolved by the catalog, in one query, rather than by
+    // walking the library and asking about each judgement here. That is what
+    // makes this and the window agree about what they are looking at.
+    let images = match &selection {
+        Selection::Matching(filter) => cull::sequence(catalog, filter)?,
+        Selection::Image(id) => cull::sequence(catalog, &Filter::default())?
+            .into_iter()
+            .filter(|image| image.id == *id)
+            .collect(),
+    };
+    for image in images {
         // The edit as it stands, or as shot for a photograph nobody has touched.
         let state = rawkit_catalog::edits::latest(catalog, image.id)?
             .map(|(_, state)| state)

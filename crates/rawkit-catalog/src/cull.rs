@@ -19,6 +19,7 @@
 //! frame that will not open.
 
 use crate::{db::Catalog, CatalogError};
+use rusqlite::types::Value;
 
 /// The keep/discard decision, which is deliberately not a rating.
 ///
@@ -50,6 +51,113 @@ impl Flag {
     }
 }
 
+/// Which flag a photograph must carry to survive a [`Filter`].
+///
+/// Three cases rather than `Option<Flag>`, because "carries no flag" is a thing
+/// somebody asks for — it is the pile a cull has not reached yet — and `None`
+/// already means "do not ask".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Flagged {
+    Pick,
+    Reject,
+    /// Neither picked nor rejected.
+    Unflagged,
+}
+
+/// Which photographs to look at.
+///
+/// # One predicate, two callers
+///
+/// A window narrows a cull with this and an export chooses files with it, and
+/// those have to be the same question. An interface that shows a set it cannot
+/// then deliver is worse than one that never filtered, and two implementations
+/// of "what counts as a pick" is how that happens — one of them acquiring a rule
+/// about missing files, or about zero stars, that the other never hears of.
+///
+/// So the question is expressed once, as SQL, by [`narrowing`]. [`sequence`]
+/// asks it of the library and [`matches`] asks it of a single image by adding a
+/// clause to the same query, rather than by re-deciding it in Rust.
+///
+/// Every field is an `Option`, and they combine with AND. All-`None` is the
+/// whole library, which is what [`Filter::default`] is.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+// A field left out is a field not asked about, which is what the whole library
+// is. Without this the page would have to send three nulls to say "everything",
+// and forgetting one would be a deserialisation error rather than a filter.
+#[serde(default)]
+pub struct Filter {
+    pub flagged: Option<Flagged>,
+    /// Stars, at least this many.
+    pub min_rating: Option<u8>,
+    /// One colour label, by the name it is stored under.
+    pub colour: Option<String>,
+}
+
+impl Filter {
+    /// A filter that lets everything through — the same thing as no filter, and
+    /// worth being able to ask because an interface has to say which it is.
+    ///
+    /// Not derived from `== Filter::default()`: zero stars is not a constraint,
+    /// so `min_rating: Some(0)` is also everything and would compare unequal.
+    pub fn is_everything(&self) -> bool {
+        self.flagged.is_none() && self.min_rating.unwrap_or(0) == 0 && self.colour.is_none()
+    }
+
+    /// Only the photographs carrying this flag.
+    pub fn flagged(flagged: Flagged) -> Self {
+        Self {
+            flagged: Some(flagged),
+            ..Self::default()
+        }
+    }
+
+    /// Only the photographs with at least this many stars.
+    pub fn rated(stars: u8) -> Self {
+        Self {
+            min_rating: Some(stars),
+            ..Self::default()
+        }
+    }
+}
+
+/// The `WHERE` terms a filter adds, and the values to bind to them.
+///
+/// Positional `?` throughout, so a caller that binds something of its own must
+/// bind it first. [`matches`] is the only one that does.
+fn narrowing(filter: &Filter) -> (String, Vec<Value>) {
+    let mut sql = String::new();
+    let mut values = Vec::new();
+    match filter.flagged {
+        None => {}
+        Some(Flagged::Unflagged) => sql.push_str(" AND i.flag IS NULL"),
+        Some(Flagged::Pick) | Some(Flagged::Reject) => {
+            let flag = if filter.flagged == Some(Flagged::Pick) {
+                Flag::Pick
+            } else {
+                Flag::Reject
+            };
+            sql.push_str(" AND i.flag = ?");
+            // Through `column` rather than as a literal, for the reason `set`
+            // writes it that way: the schema's CHECK and this string are the
+            // same fact and must not be typed twice.
+            values.push(Value::Text(flag.column().to_string()));
+        }
+    }
+    // Zero stars is everybody. An unrated photograph stores NULL, and `NULL >= 0`
+    // is NULL rather than true — so binding it would make "no fewer than zero
+    // stars" exclude most of a library, which is the opposite of what it says.
+    if let Some(stars) = filter.min_rating.filter(|s| *s > 0) {
+        sql.push_str(" AND i.rating >= ?");
+        values.push(Value::Integer(stars.into()));
+    }
+    if let Some(colour) = &filter.colour {
+        sql.push_str(" AND i.colour_label = ?");
+        values.push(Value::Text(colour.clone()));
+    }
+    (sql, values)
+}
+
 /// Everything decided about one image. `None` throughout means undecided, which
 /// is a different thing from rejected and is why every field is an `Option`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -72,13 +180,19 @@ pub struct LibraryImage {
 /// The highest rating that can be stored, matching the schema's `CHECK`.
 pub const MAX_RATING: u8 = 5;
 
-/// Every present image, in the order a photographer went through the day.
+/// Every present image the filter admits, in the order a photographer went
+/// through the day.
 ///
 /// Capture time first, then filename — and files with no capture time sort
 /// *after* the dated ones rather than before, because a handful of undatable
 /// files should not be the first thing a cull opens onto.
-pub fn sequence(catalog: &Catalog) -> Result<Vec<LibraryImage>, CatalogError> {
-    let mut statement = catalog.connection().prepare(
+///
+/// Order is not a parameter. A cull is a pass through a shoot, and the shoot
+/// happened in one order; narrowing *which* photographs is a different question
+/// from re-arranging them, and only the first one has turned out to be missed.
+pub fn sequence(catalog: &Catalog, filter: &Filter) -> Result<Vec<LibraryImage>, CatalogError> {
+    let (narrowed, values) = narrowing(filter);
+    let mut statement = catalog.connection().prepare(&format!(
         "SELECT i.id,
                 v.last_mount_path || '/' || d.relative_path || '/' || f.filename,
                 f.filename
@@ -86,11 +200,11 @@ pub fn sequence(catalog: &Catalog) -> Result<Vec<LibraryImage>, CatalogError> {
            JOIN files f ON f.id = i.file_id
            JOIN folders d ON d.id = f.folder_id
            JOIN volumes v ON v.id = d.volume_id
-          WHERE f.missing = 0
-          ORDER BY f.captured_at IS NULL, f.captured_at, f.filename, i.id",
-    )?;
+          WHERE f.missing = 0{narrowed}
+          ORDER BY f.captured_at IS NULL, f.captured_at, f.filename, i.id"
+    ))?;
     let rows = statement
-        .query_map([], |r| {
+        .query_map(rusqlite::params_from_iter(values), |r| {
             Ok(LibraryImage {
                 id: r.get(0)?,
                 path: r.get::<_, String>(1)?.replace("//", "/"),
@@ -99,6 +213,32 @@ pub fn sequence(catalog: &Catalog) -> Result<Vec<LibraryImage>, CatalogError> {
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Whether one image would appear in a filtered [`sequence`].
+///
+/// The question a cull asks the moment after a keypress. Rating a frame down to
+/// two stars while standing in "four and better" means it has just left the set
+/// under your feet, and the interface has to know that before it decides where
+/// to put you next.
+///
+/// Asked as a count of the same query rather than by testing a [`Judgement`] in
+/// Rust, so that it cannot answer differently from the sequence it is about — a
+/// missing file included.
+pub fn matches(catalog: &Catalog, image_id: i64, filter: &Filter) -> Result<bool, CatalogError> {
+    let (narrowed, mut values) = narrowing(filter);
+    values.insert(0, Value::Integer(image_id));
+    let found: i64 = catalog.connection().query_row(
+        &format!(
+            "SELECT count(*)
+               FROM images i
+               JOIN files f ON f.id = i.file_id
+              WHERE i.id = ? AND f.missing = 0{narrowed}"
+        ),
+        rusqlite::params_from_iter(values),
+        |r| r.get(0),
+    )?;
+    Ok(found > 0)
 }
 
 /// What has been decided about one image.
@@ -210,7 +350,11 @@ mod tests {
     }
 
     fn names(catalog: &Catalog) -> Vec<String> {
-        sequence(catalog)
+        filtered(catalog, &Filter::default())
+    }
+
+    fn filtered(catalog: &Catalog, filter: &Filter) -> Vec<String> {
+        sequence(catalog, filter)
             .unwrap()
             .into_iter()
             .map(|i| i.filename)
@@ -282,18 +426,192 @@ mod tests {
         // opens nothing.
         let dir = tempdir();
         let catalog = library(&dir, &[("a.ARW", Some(1))]);
-        let image = &sequence(&catalog).unwrap()[0];
+        let image = &sequence(&catalog, &Filter::default()).unwrap()[0];
         assert_eq!(
             Path::new(&image.path).canonicalize().unwrap(),
             dir.join("photos/a.ARW").canonicalize().unwrap()
         );
     }
 
+    /// A library of four, judged: two picks (one of them four stars and red),
+    /// one reject, one untouched.
+    fn judged(dir: &Scratch) -> (Catalog, Vec<i64>) {
+        let catalog = library(
+            dir,
+            &[
+                ("a.ARW", Some(1)),
+                ("b.ARW", Some(2)),
+                ("c.ARW", Some(3)),
+                ("d.ARW", Some(4)),
+            ],
+        );
+        let ids: Vec<i64> = sequence(&catalog, &Filter::default())
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        set(
+            &catalog,
+            ids[0],
+            &Judgement {
+                flag: Some(Flag::Pick),
+                rating: Some(4),
+                colour: Some("red".into()),
+            },
+        )
+        .unwrap();
+        set(
+            &catalog,
+            ids[1],
+            &Judgement {
+                flag: Some(Flag::Pick),
+                rating: Some(2),
+                colour: None,
+            },
+        )
+        .unwrap();
+        set(
+            &catalog,
+            ids[2],
+            &Judgement {
+                flag: Some(Flag::Reject),
+                ..Judgement::default()
+            },
+        )
+        .unwrap();
+        (catalog, ids)
+    }
+
+    #[test]
+    fn each_axis_narrows_on_its_own() {
+        let dir = tempdir();
+        let (catalog, _) = judged(&dir);
+        assert_eq!(names(&catalog), ["a.ARW", "b.ARW", "c.ARW", "d.ARW"]);
+        assert_eq!(
+            filtered(&catalog, &Filter::flagged(Flagged::Pick)),
+            ["a.ARW", "b.ARW"]
+        );
+        assert_eq!(
+            filtered(&catalog, &Filter::flagged(Flagged::Reject)),
+            ["c.ARW"]
+        );
+        // The one nobody has decided about — not the same as "not picked",
+        // which would also hand back the reject.
+        assert_eq!(
+            filtered(&catalog, &Filter::flagged(Flagged::Unflagged)),
+            ["d.ARW"]
+        );
+        assert_eq!(filtered(&catalog, &Filter::rated(3)), ["a.ARW"]);
+        assert_eq!(
+            filtered(
+                &catalog,
+                &Filter {
+                    colour: Some("red".into()),
+                    ..Filter::default()
+                }
+            ),
+            ["a.ARW"]
+        );
+    }
+
+    #[test]
+    fn the_axes_combine_with_and_rather_than_or() {
+        // Picks *and* two stars or better, not picks plus everything rated —
+        // an OR here would quietly widen every filter anyone set.
+        let dir = tempdir();
+        let (catalog, _) = judged(&dir);
+        assert_eq!(
+            filtered(
+                &catalog,
+                &Filter {
+                    flagged: Some(Flagged::Pick),
+                    min_rating: Some(3),
+                    ..Filter::default()
+                }
+            ),
+            ["a.ARW"]
+        );
+        // A combination nothing satisfies comes back empty rather than falling
+        // back to something wider.
+        assert!(filtered(
+            &catalog,
+            &Filter {
+                flagged: Some(Flagged::Reject),
+                min_rating: Some(3),
+                ..Filter::default()
+            }
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn zero_stars_asks_for_everything_including_the_unrated() {
+        // `rating` is NULL until somebody presses a digit, and `NULL >= 0` is
+        // NULL rather than true. Bound literally, "no fewer than zero stars"
+        // would hide most of a library — which is the reverse of what it says,
+        // and the sort of thing nobody notices until a filter is already on.
+        let dir = tempdir();
+        let (catalog, _) = judged(&dir);
+        assert_eq!(filtered(&catalog, &Filter::rated(0)), names(&catalog));
+        assert!(Filter::rated(0).is_everything());
+        assert!(!Filter::rated(1).is_everything());
+    }
+
+    #[test]
+    fn one_image_is_tested_by_the_same_question_the_sequence_asks() {
+        // The pair that must not drift: what the window shows and what it
+        // believes about the frame under the cursor.
+        let dir = tempdir();
+        let (catalog, ids) = judged(&dir);
+        for filter in [
+            Filter::default(),
+            Filter::flagged(Flagged::Pick),
+            Filter::flagged(Flagged::Unflagged),
+            Filter::rated(3),
+            Filter {
+                flagged: Some(Flagged::Pick),
+                min_rating: Some(2),
+                colour: Some("red".into()),
+            },
+        ] {
+            let shown: Vec<i64> = sequence(&catalog, &filter)
+                .unwrap()
+                .into_iter()
+                .map(|i| i.id)
+                .collect();
+            for id in &ids {
+                assert_eq!(
+                    matches(&catalog, *id, &filter).unwrap(),
+                    shown.contains(id),
+                    "image {id} disagrees with the sequence under {filter:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_file_is_absent_however_it_was_judged() {
+        // A filter must not be a way back to a frame that will not open: the
+        // presence rule belongs to the sequence, and every narrowing of it is
+        // still a narrowing.
+        let dir = tempdir();
+        let (catalog, ids) = judged(&dir);
+        catalog
+            .connection()
+            .execute("UPDATE files SET missing = 1 WHERE filename = 'a.ARW'", [])
+            .unwrap();
+        assert_eq!(
+            filtered(&catalog, &Filter::flagged(Flagged::Pick)),
+            ["b.ARW"]
+        );
+        assert!(!matches(&catalog, ids[0], &Filter::flagged(Flagged::Pick)).unwrap());
+    }
+
     #[test]
     fn a_judgement_survives_being_read_back() {
         let dir = tempdir();
         let catalog = library(&dir, &[("a.ARW", Some(1))]);
-        let id = sequence(&catalog).unwrap()[0].id;
+        let id = sequence(&catalog, &Filter::default()).unwrap()[0].id;
         assert_eq!(judgement(&catalog, id).unwrap(), Judgement::default());
 
         let decided = Judgement {
@@ -312,7 +630,7 @@ mod tests {
         // that a filter would then have to know about.
         let dir = tempdir();
         let catalog = library(&dir, &[("a.ARW", Some(1))]);
-        let id = sequence(&catalog).unwrap()[0].id;
+        let id = sequence(&catalog, &Filter::default()).unwrap()[0].id;
 
         set(
             &catalog,
@@ -332,7 +650,7 @@ mod tests {
         // Six stars stored as five is a number the interface never showed.
         let dir = tempdir();
         let catalog = library(&dir, &[("a.ARW", Some(1))]);
-        let id = sequence(&catalog).unwrap()[0].id;
+        let id = sequence(&catalog, &Filter::default()).unwrap()[0].id;
         let too_many = Judgement {
             rating: Some(6),
             ..Judgement::default()
@@ -347,7 +665,7 @@ mod tests {
         // the last thing, because a rating has no history worth a table.
         let dir = tempdir();
         let catalog = library(&dir, &[("a.ARW", Some(1))]);
-        let id = sequence(&catalog).unwrap()[0].id;
+        let id = sequence(&catalog, &Filter::default()).unwrap()[0].id;
         for rating in 1..=5 {
             set(
                 &catalog,
@@ -374,7 +692,7 @@ mod tests {
             &dir,
             &[("a.ARW", Some(1)), ("b.ARW", Some(2)), ("c.ARW", Some(3))],
         );
-        let images = sequence(&catalog).unwrap();
+        let images = sequence(&catalog, &Filter::default()).unwrap();
         set(
             &catalog,
             images[0].id,

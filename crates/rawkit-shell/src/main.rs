@@ -406,11 +406,16 @@ fn export(
                     Some(format!("{stem}.jpg")),
                 )
             }
-            // Picks rather than the marked set: a pick is the culling verdict and
-            // it is stored, while marking is the transient "these ones" gesture
-            // that compare and paste already use. Delivering the keepers is what
-            // the flag is for.
-            "picks" => (rawkit_deliver::Selection::Picks, None),
+            // Whatever the library is currently showing — which with no filter
+            // set is the whole of it, and with one set is exactly the frames on
+            // screen. Not the marked set: marking is the transient "these ones"
+            // gesture that compare and paste already use, while a filter is what
+            // the window is *about*, and an interface that can show you a set it
+            // will not deliver is the mismatch this replaced.
+            "shown" => (
+                rawkit_deliver::Selection::Matching(library.filter().clone()),
+                None,
+            ),
             other => return Err(format!("{other} is not something to export")),
         }
     };

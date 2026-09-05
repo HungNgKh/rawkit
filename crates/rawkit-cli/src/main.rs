@@ -440,10 +440,10 @@ fn main() -> Result<()> {
             jobs,
         } => {
             let selection = match (picks, rated, image, all) {
-                (true, _, _, _) => rawkit_deliver::Selection::Picks,
-                (_, Some(stars), _, _) => rawkit_deliver::Selection::Rated(stars),
+                (true, _, _, _) => rawkit_deliver::Selection::picks(),
+                (_, Some(stars), _, _) => rawkit_deliver::Selection::rated(stars),
                 (_, _, Some(id), _) => rawkit_deliver::Selection::Image(id),
-                (_, _, _, true) => rawkit_deliver::Selection::All,
+                (_, _, _, true) => rawkit_deliver::Selection::all(),
                 _ => {
                     anyhow::bail!("say what to export: --picks, --rated <n>, --image <id> or --all")
                 }

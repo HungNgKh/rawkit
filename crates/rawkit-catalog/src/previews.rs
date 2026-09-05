@@ -277,7 +277,7 @@ pub fn outstanding(
     renderer: &str,
 ) -> Result<Vec<Wanted>, CatalogError> {
     let mut wanted = Vec::new();
-    for image in crate::cull::sequence(catalog)? {
+    for image in crate::cull::sequence(catalog, &crate::cull::Filter::default())? {
         // The edit the photograph currently has — the stored one, or as shot.
         let state = crate::edits::latest(catalog, image.id)?
             .map(|(_, state)| state)
@@ -419,7 +419,7 @@ mod tests {
         // variant, it is the old one that should have gone.
         let dir = tempdir();
         let catalog = library(&dir, &["a.ARW"]);
-        let id = crate::cull::sequence(&catalog).unwrap()[0].id;
+        let id = crate::cull::sequence(&catalog, &crate::cull::Filter::default()).unwrap()[0].id;
 
         record(&catalog, id, &sample("first")).unwrap();
         record(&catalog, id, &sample("second")).unwrap();
@@ -440,7 +440,7 @@ mod tests {
         // knows it is wrong.
         let dir = tempdir();
         let catalog = library(&dir, &["a.ARW"]);
-        let id = crate::cull::sequence(&catalog).unwrap()[0].id;
+        let id = crate::cull::sequence(&catalog, &crate::cull::Filter::default()).unwrap()[0].id;
 
         let as_shot = EditState::default();
         for &level in Level::BULK {
@@ -492,7 +492,7 @@ mod tests {
     fn the_cheapest_preview_that_is_big_enough_is_the_one_chosen() {
         let dir = tempdir();
         let catalog = library(&dir, &["a.ARW"]);
-        let id = crate::cull::sequence(&catalog).unwrap()[0].id;
+        let id = crate::cull::sequence(&catalog, &crate::cull::Filter::default()).unwrap()[0].id;
         let hash = EditState::default().content_hash();
         for (level, width, height) in [
             (Level::Thumb, 256, 171),
@@ -535,7 +535,7 @@ mod tests {
         // screen, which is worse than waiting for a decode.
         let dir = tempdir();
         let catalog = library(&dir, &["a.ARW"]);
-        let id = crate::cull::sequence(&catalog).unwrap()[0].id;
+        let id = crate::cull::sequence(&catalog, &crate::cull::Filter::default()).unwrap()[0].id;
         record(
             &catalog,
             id,
@@ -563,7 +563,7 @@ mod tests {
         // there is nothing about it on screen to say so.
         let dir = tempdir();
         let catalog = library(&dir, &["a.ARW"]);
-        let id = crate::cull::sequence(&catalog).unwrap()[0].id;
+        let id = crate::cull::sequence(&catalog, &crate::cull::Filter::default()).unwrap()[0].id;
         let hash = EditState::default().content_hash();
         record(
             &catalog,
@@ -598,7 +598,7 @@ mod tests {
         // rebuilds rather than trusting previews whose provenance is unknown.
         let dir = tempdir();
         let catalog = library(&dir, &["a.ARW"]);
-        let id = crate::cull::sequence(&catalog).unwrap()[0].id;
+        let id = crate::cull::sequence(&catalog, &crate::cull::Filter::default()).unwrap()[0].id;
         let hash = EditState::default().content_hash();
         record(
             &catalog,
@@ -654,7 +654,7 @@ mod tests {
         // the catalog actually refers to.
         let dir = tempdir();
         let catalog = library(&dir, &["a.ARW"]);
-        let id = crate::cull::sequence(&catalog).unwrap()[0].id;
+        let id = crate::cull::sequence(&catalog, &crate::cull::Filter::default()).unwrap()[0].id;
         let previews = dir.join("previews");
         std::fs::create_dir_all(previews.join("00")).unwrap();
 
