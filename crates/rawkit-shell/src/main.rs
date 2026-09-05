@@ -1315,6 +1315,12 @@ fn main() -> Result<()> {
             // the value is captured here rather than re-read so that nothing
             // half-handles it.
             let scale = window_handle.scale_factor()?;
+            // Published so the overlay can size a handle in *millimetres of
+            // glass* rather than in pixels. Everything the pointer deals in is
+            // physical, so on a 2x display an untouched 9-pixel handle is four
+            // and a half logical pixels — about a millimetre, which is what
+            // "the handles are hard to hit" means.
+            DISPLAY_SCALE.store(scale.max(1.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
             // Only the native-child canvas has a window of its own to move; a
             // cutout's surface is the toplevel's and the layout is all there is.
             #[cfg(target_os = "linux")]
@@ -4909,12 +4915,17 @@ pub(crate) static MASK_HANDLES: Mutex<Vec<(MaskGrab, [f64; 2])>> = Mutex::new(Ve
 /// Which handle a press at this point lands on, if any.
 pub(crate) fn handle_under(at: [f64; 2]) -> Option<MaskGrab> {
     let handles = MASK_HANDLES.lock().expect("mask handles lock");
+    // Generous, and in the display's own pixels: the cost of missing is panning
+    // the photograph out from under the very shape being adjusted, and the cost
+    // of an over-large target is nothing, because a press that is not on a
+    // handle is a pan and a press near one almost always meant the handle.
+    // Comfortably larger than the drawn square, which is the usual advice for a
+    // pointer target and the reason a handle can be *drawn* small.
+    let reach = HANDLE_SIZE * display_scale() * 2.2;
     handles
         .iter()
         .map(|(grab, p)| (grab, (p[0] - at[0]).hypot(p[1] - at[1])))
-        // Generous, because a handle is a small target and the cost of missing
-        // is panning the photograph out from under the shape being adjusted.
-        .filter(|(_, d)| *d <= HANDLE_SIZE * 1.6)
+        .filter(|(_, d)| *d <= reach)
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(grab, _)| *grab)
 }
@@ -5040,11 +5051,38 @@ fn canvas_mapper(session: &Session) -> Option<impl Fn([f32; 2]) -> [f64; 2] + '_
     })
 }
 
-/// How many canvas pixels a screen pixel is, at this zoom.
-fn canvas_per_screen(session: &Session) -> f64 {
+/// How many surface pixels one canvas pixel covers, at this zoom.
+///
+/// **Not clamped**, and that is the whole point of it being separate from
+/// [`canvas_per_screen`]. This is a coordinate conversion — it has to be the
+/// true ratio in both directions, or a handle is published somewhere a click on
+/// it will not land. The clamped version below is a *drawing* size, where the
+/// floor is right because a mark thinner than a canvas pixel is invisible.
+///
+/// Using one number for both is what put every handle in the wrong place once
+/// the view was zoomed past 1:1: there the ratio is above one, the clamp took
+/// hold, and the published positions came out un-scaled.
+fn surface_per_canvas(session: &Session) -> f64 {
     let viewport = session.viewport();
     let level = viewport.level(session.max_level());
-    (1.0 / (viewport.scale * (1u32 << level) as f64)).max(1.0)
+    viewport.scale * (1u32 << level) as f64
+}
+
+/// How many canvas pixels one screen pixel covers, for sizing a drawn mark.
+fn canvas_per_screen(session: &Session) -> f64 {
+    (1.0 / surface_per_canvas(session)).max(1.0)
+}
+
+/// The display's HiDPI factor, as the window reported it.
+///
+/// Bits of an `f64`, because there is no atomic float and this is written once
+/// by the render loop and read by the pointer routing on whichever thread
+/// delivered the event.
+static DISPLAY_SCALE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1.0f64.to_bits());
+
+fn display_scale() -> f64 {
+    f64::from_bits(DISPLAY_SCALE.load(std::sync::atomic::Ordering::Relaxed)).clamp(1.0, 4.0)
 }
 
 /// The selected shape's outline and handles, over the photograph.
@@ -5061,13 +5099,14 @@ fn draw_mask_outline(
     };
     let image = session.image_size();
     let thin = canvas_per_screen(session);
+    let to_surface = surface_per_canvas(session);
     let canvas = canvas_renderer.canvas().size();
     let mut cells = Vec::new();
     let mut rects: Vec<([i32; 4], f32, f64)> = Vec::new();
 
     for point in mask_outline(shape, image) {
         let p = at(point);
-        let side = (OUTLINE_MARK * thin).max(1.0);
+        let side = (OUTLINE_MARK * display_scale() * thin).max(1.0);
         // Dropped rather than clamped when it is off the canvas: a mark clamped
         // to the edge would draw a line along the border that is not the shape.
         if p[0] < -side
@@ -5094,8 +5133,8 @@ fn draw_mask_outline(
         // Surface pixels for the pointer, canvas pixels for the draw: the two
         // differ by the zoom, and publishing the wrong one is a handle that can
         // be seen where it cannot be grabbed.
-        published.push((grab, [p[0] / thin, p[1] / thin]));
-        let side = (HANDLE_SIZE * thin).max(2.0);
+        published.push((grab, [p[0] * to_surface, p[1] * to_surface]));
+        let side = (HANDLE_SIZE * display_scale() * thin).max(3.0);
         // The turn handle is drawn darker, so the one that does something
         // different does not look like the three that do the same thing.
         let shade = if grab == MaskGrab::Rotate { 0.55 } else { 0.99 };
@@ -5534,6 +5573,55 @@ mod radial_tests {
             height: 800,
         });
         session
+    }
+
+    #[test]
+    fn a_handle_is_published_where_a_click_on_it_will_land() {
+        // The bug this exists for. A handle is *drawn* in canvas pixels and
+        // *hit* in surface pixels, and the two differ by the zoom. One number
+        // was doing both jobs, and it carried a `.max(1.0)` that is right for a
+        // drawn size — a mark thinner than a canvas pixel is invisible — and
+        // wrong for a coordinate. Past 1:1 the clamp took hold and every handle
+        // was published un-scaled: visible, and ungrabbable.
+        //
+        // The claim is a round trip. A point on the sensor goes out through the
+        // map the overlay draws with, back through the one the pointer uses on
+        // the way in, and has to arrive where it started.
+        let mut session = fitted();
+        for scale in [0.2f64, 0.5, 1.0, 2.0, 4.0] {
+            session.apply(Command::ZoomTo {
+                scale,
+                anchor: [600.0, 400.0],
+            });
+            let Some(to_canvas) = canvas_mapper(&session) else {
+                panic!("no map at a scale of {scale}");
+            };
+            let to_surface = surface_per_canvas(&session);
+            let size = session.image_size();
+            let geometry = session.geometry();
+
+            for point in [[0.5f32, 0.5], [0.42, 0.61], [0.55, 0.47]] {
+                let canvas = to_canvas(point);
+                // What `draw_mask_outline` publishes for the pointer.
+                let published = [canvas[0] * to_surface, canvas[1] * to_surface];
+                // And what the pointer makes of a press exactly there — the same
+                // arithmetic the drag uses to turn a press into a place on the
+                // sensor.
+                let p = session.viewport().image_at(published);
+                let r = geometry.sensor_rect([p[0], p[1], p[0], p[1]], size);
+                let back = [
+                    (r[0] / size[0] as f64) as f32,
+                    (r[1] / size[1] as f64) as f32,
+                ];
+                // Half a sensor pixel, which is as exact as this can be.
+                let slack = 0.5 / size[0] as f32;
+                assert!(
+                    (back[0] - point[0]).abs() < slack && (back[1] - point[1]).abs() < slack,
+                    "at a zoom of {scale} a handle drawn for {point:?} is published at \
+                     {published:?}, which the pointer reads as {back:?}"
+                );
+            }
+        }
     }
 
     fn dragged(session: &Session, from: [f64; 2], to: [f64; 2]) -> ([f32; 2], [f32; 2], f32) {
