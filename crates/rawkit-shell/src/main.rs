@@ -1293,7 +1293,12 @@ fn main() -> Result<()> {
             // edit or the view moves and reused otherwise: it costs a resample of
             // a few hundred thousand texels, which is nothing once but something
             // every frame of a drag.
-            let mut last_coverage: Option<((usize, u64, rawkit_session::Viewport), rawkit_engine::PreviewImage)> = None;
+            type CoverageKey = (
+                usize,
+                Option<rawkit_editstate::Mask>,
+                rawkit_session::Viewport,
+            );
+            let mut last_coverage: Option<(CoverageKey, rawkit_engine::PreviewImage)> = None;
             let mut coverage_scratch: (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
             let mut last_outline: Option<(usize, usize, u64, rawkit_session::Viewport)> = None;
             // When the histogram was last recomputed. See `SURVEY_INTERVAL`.
@@ -2256,9 +2261,16 @@ fn main() -> Result<()> {
                 });
                 if let Some(index) = showing_mask {
                     let session = shared.lock().expect("session lock");
+                    // Keyed on what the overlay actually depends on — the mask
+                    // and where the view is — rather than on the generation,
+                    // which moves on *any* edit. Rebuilding a mask's coverage
+                    // because somebody dragged the exposure slider is a CPU
+                    // rasterise and a quarter-million-texel resample for a
+                    // picture that has not changed, and the cost of that is what
+                    // pushes a drag into haste in the first place.
                     let key = (
                         index,
-                        session.generation(),
+                        session.state().masks.get(index).cloned(),
                         session.viewport(),
                     );
                     if last_coverage.as_ref().map(|(k, _)| k) != Some(&key) {
@@ -4605,9 +4617,9 @@ fn draw_marquee(
     // Surface pixels to canvas pixels. In the loupe the canvas is sized in level
     // pixels, so the outline has to shrink by the same factor the presenter
     // magnifies by, or it would sit somewhere else entirely when zoomed.
-    let viewport = session.viewport();
-    let level = viewport.level(session.max_level());
-    let scale = viewport.scale * (1u32 << level) as f64;
+    // The level the canvas was *drawn* at, haste and all — see
+    // `surface_per_canvas` for why that distinction is the whole of it.
+    let scale = surface_per_canvas(session);
     if scale <= 0.0 {
         return;
     }
@@ -4652,8 +4664,7 @@ fn draw_marquee(
 /// in *straight* coordinates does not need the sensor's frame at all.
 fn visible_canvas_rect(session: &Session) -> [i32; 4] {
     let viewport = session.viewport();
-    let level = viewport.level(session.max_level());
-    let step = (1u32 << level) as f64;
+    let step = (1u32 << session.level()) as f64;
     let [x0, y0, x1, y1] = viewport.visible_rect(session.developed_size());
     let at = |v: f64, centre: f64, extent: u32| {
         ((v - centre) * viewport.scale + extent as f64 / 2.0) / (viewport.scale * step)
@@ -5032,8 +5043,7 @@ fn mask_outline(shape: &rawkit_editstate::MaskShape, image: [u32; 2]) -> Vec<[f3
 /// land. `None` when the map is degenerate, which a zero-sized viewport gives.
 fn canvas_mapper(session: &Session) -> Option<impl Fn([f32; 2]) -> [f64; 2] + '_> {
     let viewport = session.viewport();
-    let level = viewport.level(session.max_level());
-    let step = (1u32 << level) as f64;
+    let step = (1u32 << session.level()) as f64;
     if viewport.scale <= 0.0 {
         return None;
     }
@@ -5062,10 +5072,20 @@ fn canvas_mapper(session: &Session) -> Option<impl Fn([f32; 2]) -> [f64; 2] + '_
 /// Using one number for both is what put every handle in the wrong place once
 /// the view was zoomed past 1:1: there the ratio is above one, the clamp took
 /// hold, and the published positions came out un-scaled.
+///
+/// # The level has to be the one the canvas was drawn at
+///
+/// [`Session::level`] and `Viewport::level` are **not the same number**. The
+/// first applies haste — while a drag is outrunning the renderer the canvas is
+/// sized and filled a level coarser, which is what keeps the view moving — and
+/// the second does not. Every overlay here used the second, so the moment a
+/// drag turned haste on the canvas halved and the overlay went on being
+/// computed for the size it used to be: drawn at twice the scale, in the wrong
+/// place. Haste comes and goes from frame to frame as the cost is measured, so
+/// the overlay jumps back and forth with it, which is what "the mask keeps
+/// flickering while I drag it" is.
 fn surface_per_canvas(session: &Session) -> f64 {
-    let viewport = session.viewport();
-    let level = viewport.level(session.max_level());
-    viewport.scale * (1u32 << level) as f64
+    session.viewport().scale * (1u32 << session.level()) as f64
 }
 
 /// How many canvas pixels one screen pixel covers, for sizing a drawn mark.
@@ -5184,8 +5204,7 @@ fn draw_spots(
         return;
     }
     let viewport = session.viewport();
-    let level = viewport.level(session.max_level());
-    let step = (1u32 << level) as f64;
+    let step = (1u32 << session.level()) as f64;
     if viewport.scale <= 0.0 {
         return;
     }
@@ -5622,6 +5641,71 @@ mod radial_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_overlay_follows_the_canvas_when_haste_coarsens_it() {
+        // Reported as "the mask keeps flickering while I drag it", and it was
+        // neither the tint nor the redraw.
+        //
+        // `Session::level` applies **haste** — while a drag is outrunning the
+        // renderer the canvas is sized and filled a level coarser, which is what
+        // keeps the view moving — and `Viewport::level` does not. Every overlay
+        // used the second. So the moment a drag turned haste on, the canvas
+        // halved and the overlay went on being computed for the size it used to
+        // be: drawn at twice the scale, in the wrong place. Haste comes and goes
+        // from frame to frame as the cost is measured, so the overlay jumps back
+        // and forth with it.
+        //
+        // The round trip in the test above could not catch this: the drawing and
+        // the publishing shared the wrong number, so the two errors cancelled and
+        // the *hit test* stayed correct while the picture was wrong. What has to
+        // be asserted is that these follow the canvas at all.
+        let mut session = fitted();
+        // Zoomed in far enough that there is a coarser level to fall back to.
+        session.apply(Command::ZoomTo {
+            scale: 1.0,
+            anchor: [600.0, 400.0],
+        });
+        assert!(
+            session.level() < session.max_level(),
+            "this view has no coarser level, so haste cannot be observed"
+        );
+
+        let steady = (surface_per_canvas(&session), visible_canvas_rect(&session));
+        let point = [0.42f32, 0.61];
+        let steady_at = canvas_mapper(&session).expect("a map")(point);
+
+        session.set_haste(true);
+        assert_ne!(
+            session.level(),
+            session.viewport().level(session.max_level()),
+            "haste did not coarsen the level, so this test proves nothing"
+        );
+
+        let hasty = (surface_per_canvas(&session), visible_canvas_rect(&session));
+        let hasty_at = canvas_mapper(&session).expect("a map")(point);
+
+        // A coarser canvas is a smaller canvas, so a canvas pixel covers more of
+        // the surface and every canvas coordinate shrinks with it.
+        assert!(
+            hasty.0 > steady.0,
+            "a canvas pixel still covers {} of the surface under haste, against {}",
+            hasty.0,
+            steady.0
+        );
+        assert!(
+            hasty.1[2] < steady.1[2] && hasty.1[3] < steady.1[3],
+            "the visible rectangle is {:?} under haste and {:?} without, so the \
+             overlay is not following the canvas",
+            hasty.1,
+            steady.1
+        );
+        assert!(
+            (hasty_at[0] - steady_at[0]).abs() > 1.0,
+            "a point maps to {hasty_at:?} under haste and {steady_at:?} without — \
+             the overlay is being drawn for a canvas that is not there"
+        );
     }
 
     fn dragged(session: &Session, from: [f64; 2], to: [f64; 2]) -> ([f32; 2], [f32; 2], f32) {
