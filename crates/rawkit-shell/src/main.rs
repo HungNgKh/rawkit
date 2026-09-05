@@ -2341,6 +2341,7 @@ fn main() -> Result<()> {
                                     (origin[0] / step).floor() as f32,
                                     (origin[1] / step).floor() as f32,
                                 ],
+                                level: session.level(),
                                 layer: index as u32,
                                 strength: if tinting { MASK_TINT_STRENGTH } else { 0.0 },
                                 border: MASK_BORDER,
@@ -5682,6 +5683,63 @@ mod radial_tests {
     /// A point in sensor pixels, as the fractions a shape stores.
     fn sensor(px: [f32; 2]) -> [f32; 2] {
         [px[0] / SENSOR[0] as f32, px[1] / SENSOR[1] as f32]
+    }
+
+    #[test]
+    fn the_overlay_and_the_handles_agree_about_where_a_point_is() {
+        // The half never checked: the *drawing*. The handles are placed by
+        // `canvas_mapper`, and the tint and border are drawn by a shader given a
+        // `straight_origin` and a matrix. Those are two independent routes from
+        // the same shape to the same canvas, and nothing had ever compared them.
+        //
+        // The composition has to be the identity: take a sensor point, ask where
+        // the handles draw it, hand that canvas pixel to the overlay's own
+        // convention, and the sensor point must come back.
+        let mut session = fitted();
+        for scale in [0.15f64, 0.5, 1.0, 2.0] {
+            session.apply(Command::ZoomTo {
+                scale,
+                anchor: [600.0, 400.0],
+            });
+            let to_canvas = canvas_mapper(&session).expect("a map");
+            let step = (1u32 << session.level()) as f64;
+            let viewport = session.viewport();
+            let origin = viewport.image_at([0.0, 0.0]);
+            // Exactly what the render loop hands the shader.
+            let straight_origin = [(origin[0] / step).floor(), (origin[1] / step).floor()];
+            let map = session.geometry().sensor_map(SENSOR);
+
+            for point in [[0.5f32, 0.5], [0.42, 0.61], [0.58, 0.44]] {
+                let canvas = to_canvas(point);
+                // Exactly what the shader computes for that canvas pixel: out of
+                // canvas pixels and into the photograph's own, which is the unit
+                // the map is over. Leaving the step out was right at level zero
+                // and wrong by a factor of two per level everywhere else.
+                let corner = [
+                    straight_origin[0] + canvas[0],
+                    straight_origin[1] + canvas[1],
+                ];
+                let straight = [
+                    (corner[0] * step + step * 0.5 - 0.5) as f32,
+                    (corner[1] * step + step * 0.5 - 0.5) as f32,
+                ];
+                let back = map.at(straight);
+                let want = [point[0] * SENSOR[0] as f32, point[1] * SENSOR[1] as f32];
+                let off = ((back[0] - want[0]).powi(2) + (back[1] - want[1]).powi(2)).sqrt();
+                println!(
+                    "zoom {scale} level {}: the handles draw {want:?}, the overlay reads {back:?} — {off:.1} px apart",
+                    session.level()
+                );
+                // One canvas pixel, which is `step` of the photograph's own and
+                // as exact as a comparison between the two can be.
+                assert!(
+                    off <= step as f32,
+                    "at a zoom of {scale} the handles and the overlay disagree about \
+                     {want:?} by {off:.0} sensor pixels, more than the {step} one \
+                     canvas pixel covers"
+                );
+            }
+        }
     }
 
     #[test]

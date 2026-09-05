@@ -855,6 +855,7 @@ fn the_overlay_pass_runs_and_tints_where_the_mask_is() {
         [W, H],
         rawkit_engine::MaskOverlay {
             straight_origin: [0.0, 0.0],
+            level: 0,
             layer: 0,
             strength: 0.6,
             border: 2.0,
@@ -891,4 +892,113 @@ fn the_overlay_pass_runs_and_tints_where_the_mask_is() {
         at_rim > inside * 1.2,
         "no border at the mask's rim: {at_rim} against {inside} inside"
     );
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn the_overlay_draws_the_mask_where_the_mask_is() {
+    // Is the *drawing* in the right place? Everything measured so far has been
+    // the model — the shape's arithmetic, the drag's arithmetic. This asks the
+    // other half: render the overlay for an ellipse whose rim is known exactly,
+    // and find where the border actually lands on the canvas.
+    //
+    // Identity geometry and a canvas the size of the frame, so a canvas pixel is
+    // a sensor pixel and any disagreement is the pass's own.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    let renderer = Renderer::new(&gpu);
+    let cfa = flat();
+    let frame = Frame {
+        data: &cfa,
+        width: W,
+        height: H,
+        phase: BayerPhase::Rggb,
+        as_shot_wb: [1.0, 1.0, 1.0],
+        clip_level: f32::INFINITY,
+        profile: CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
+        recorded_orientation: rawkit_editstate::Orientation::AsShot,
+    };
+    let buffers = renderer.allocate(&gpu, &frame);
+    let (centre, radii) = ([0.5f32, 0.5], [0.3f32, 0.2]);
+    let state = EditState {
+        masks: vec![Mask {
+            shape: MaskShape::Radial {
+                centre,
+                radii,
+                feather: 0.0,
+                angle_deg: 0.0,
+            },
+            exposure_ev: -1.0,
+            ..Mask::default()
+        }],
+        ..EditState::default()
+    };
+    renderer
+        .set_edit(&gpu, &buffers, &frame, &state)
+        .expect("set edit");
+
+    let canvas = renderer.create_canvas(&gpu, W, H);
+    canvas.write(&gpu, &vec![0.0f32; (W * H) as usize * 4]);
+    renderer.overlay_mask(
+        &gpu,
+        &buffers,
+        &canvas,
+        &rawkit_editstate::Geometry::new(&state, rawkit_editstate::Orientation::AsShot),
+        [W, H],
+        rawkit_engine::MaskOverlay {
+            straight_origin: [0.0, 0.0],
+            level: 0,
+            layer: 0,
+            strength: 0.0,
+            border: 2.0,
+            brightness: 1.0,
+            tint: [1.0, 0.0, 0.0],
+        },
+    );
+    let drawn = canvas.read_back(&gpu).expect("read back");
+    let lit = |x: u32, y: u32| drawn[((y * W + x) * 4) as usize];
+
+    // The border's own bounding box, against the ellipse's. Measured this way
+    // rather than by walking out along each axis: at the extremes the contour is
+    // locally parallel to the scan, so whether a given row catches it depends on
+    // where the centre lands between two pixels. The box is the same claim
+    // without that fragility — the first version of this test reported "no
+    // border" for a border that was drawn exactly right.
+    let (mut x0, mut x1, mut y0, mut y1) = (W, 0u32, H, 0u32);
+    let mut count = 0u32;
+    for y in 0..H {
+        for x in 0..W {
+            if lit(x, y) > 0.1 {
+                x0 = x0.min(x);
+                x1 = x1.max(x);
+                y0 = y0.min(y);
+                y1 = y1.max(y);
+                count += 1;
+            }
+        }
+    }
+    assert!(count > 200, "almost nothing was drawn: {count} lit pixels");
+
+    let drawn_centre = [(x0 + x1) as f32 / 2.0, (y0 + y1) as f32 / 2.0];
+    let drawn_radii = [(x1 - x0) as f32 / 2.0, (y1 - y0) as f32 / 2.0];
+    let want_centre = [centre[0] * W as f32 - 0.5, centre[1] * H as f32 - 0.5];
+    let want_radii = [radii[0] * W as f32, radii[1] * H as f32];
+    println!(
+        "the border is centred at {drawn_centre:?} with radii {drawn_radii:?}; the \
+         ellipse is at {want_centre:?} with radii {want_radii:?}"
+    );
+    for axis in 0..2 {
+        assert!(
+            (drawn_centre[axis] - want_centre[axis]).abs() <= 1.0,
+            "the border is centred at {drawn_centre:?}, the ellipse at {want_centre:?}"
+        );
+        // Within the border's own half-width, which is what "drawn on the rim"
+        // can mean at best.
+        assert!(
+            (drawn_radii[axis] - want_radii[axis]).abs() <= 2.0,
+            "the border's radii are {drawn_radii:?}, the ellipse's {want_radii:?}"
+        );
+    }
 }

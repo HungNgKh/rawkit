@@ -41,6 +41,9 @@ struct Overlay {
     // How wide the border is, in canvas pixels, and how bright. Zero draws none.
     border: f32,
     brightness: f32,
+    // How many of the photograph's own pixels one canvas pixel covers: two to
+    // the power of the level the canvas was drawn at.
+    step: f32,
     // The tint, in the canvas's own linear light.
     tint: vec4<f32>,
     // The lens's curve, resolved: amount applied, peak subtracted, divisor
@@ -100,9 +103,18 @@ fn undistort(at: vec2<f32>) -> vec2<f32> {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    // `position.xy` is already at the pixel's centre, which is the convention the
-    // resampler and the straighten both sample on.
-    let straight = overlay.straight_origin + in.position.xy;
+    // Out of *canvas* pixels and into the photograph's own, which is what the map
+    // is over. At level two a canvas pixel is four image pixels wide, and handing
+    // the one to the other unconverted was a factor-of-four error at fit zoom —
+    // right at level zero, which is the only place it was ever tested.
+    //
+    // `position.xy` sits at the canvas pixel's centre, so subtracting a half puts
+    // it back on the corner; the block of image pixels it covers then starts at
+    // `(origin + corner) * step` and its own centre is half a step further on.
+    // The map adds another half image pixel of its own, which is why that half is
+    // taken off here rather than added.
+    let corner = overlay.straight_origin + in.position.xy - vec2<f32>(0.5);
+    let straight = corner * overlay.step + vec2<f32>(overlay.step * 0.5 - 0.5);
     let p = vec3<f32>(straight, 1.0);
     let homogeneous = vec3<f32>(
         dot(overlay.m0.xyz, p),

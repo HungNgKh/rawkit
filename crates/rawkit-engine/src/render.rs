@@ -492,6 +492,18 @@ pub struct MaskOverlay {
     /// draws none.
     pub border: f32,
     pub brightness: f32,
+    /// The resolution level the canvas was drawn at.
+    ///
+    /// **Not optional, and the reason is a bug it caused.** The canvas is
+    /// addressed in *level* pixels — at level two, one canvas pixel is four
+    /// image pixels — while [`Geometry::sensor_map`] is a map over the
+    /// photograph's own pixels, because that is what the export resampler walks.
+    /// Handing one to the other unconverted was right at level zero and wrong by
+    /// a factor of two per level everywhere else: at fit zoom on a 24 megapixel
+    /// frame the overlay read a quarter of the coordinate it was given, so the
+    /// tint and the border sat in the wrong place and at the wrong size — and
+    /// moved whenever haste changed the level.
+    pub level: u8,
     /// In the canvas's own linear light.
     pub tint: [f32; 3],
 }
@@ -510,12 +522,13 @@ struct OverlayParams {
     strength: f32,
     border: f32,
     brightness: f32,
+    step: f32,
     /// WGSL aligns a `vec4<f32>` to sixteen bytes and `#[repr(C)]` does not, so
-    /// without this the shader looks for `tint`, and the curve after it, eight
+    /// without this the shader looks for `tint`, and the curve after it, four
     /// bytes further on than they are. Checked by
     /// `the_overlay_uniform_is_laid_out_the_way_wgsl_reads_it` rather than by
     /// anyone re-deriving it.
-    _pad: [u32; 2],
+    _pad: u32,
     tint: [f32; 4],
     curve: [[f32; 4]; 4],
 }
@@ -1523,7 +1536,8 @@ impl Renderer {
             strength: view.strength,
             border: view.border,
             brightness: view.brightness,
-            _pad: [0; 2],
+            step: (1u32 << view.level) as f32,
+            _pad: 0,
             tint: [view.tint[0], view.tint[1], view.tint[2], 0.0],
             curve: {
                 let mut packed = [[0.0f32; 4]; 4];
@@ -3170,6 +3184,7 @@ mod tests {
         wgsl.field(4, 4); // strength
         wgsl.field(4, 4); // border
         wgsl.field(4, 4); // brightness
+        wgsl.field(4, 4); // step
         let tint = wgsl.field(16, 16);
         let curve = wgsl.field(16, 64);
 
