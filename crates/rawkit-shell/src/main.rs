@@ -3024,18 +3024,34 @@ fn shape_from_drag(
         rawkit_editstate::MaskShape::Linear { .. } => {
             rawkit_editstate::MaskShape::Linear { from: a, to: b }
         }
-        // Out from the centre, and the two radii follow the drag's own width and
-        // height — so one drag gives any aspect of ellipse, and a circle drawn
-        // on the photograph is stored as the two different fractions that make
-        // it come back a circle.
+        // Out from the centre, to a **circle through the point the hand let go
+        // of**. The radius is the drag's own length in pixels, stored as the two
+        // different fractions that make a circle come back a circle.
         //
-        // A floor on each radius rather than a refusal: a press that barely
-        // moves is a slip, and leaving an ellipse a few pixels across is kinder
-        // than leaving the previous one and looking broken.
+        // The radii used to be the drag's component-wise offsets — `|dx|` across
+        // and `|dy|` down. Two things were wrong with that, and both were
+        // reported as the size being weird. The endpoint then sat at an implicit
+        // radius of exactly root two, so the ellipse stopped **forty-one per cent
+        // short** of where it had been pulled and the shape visibly lagged the
+        // hand. And a drag that was mostly sideways gave a sliver, because the
+        // vertical radius was whatever small number the hand happened to wander
+        // — so most directions produced something nobody asked for.
+        //
+        // The aspect is not lost, it has moved to where it can be seen: the
+        // handles stretch either axis, with the shape drawn while you do it.
+        // Setting it from the drag was worth more before there were handles.
+        //
+        // A floor rather than a refusal: a press that barely moves is a slip,
+        // and leaving an ellipse a few pixels across is kinder than leaving the
+        // previous one and looking broken.
         rawkit_editstate::MaskShape::Radial { feather, .. } => {
+            let reach = (((b[0] - a[0]) * size[0] as f32).powi(2)
+                + ((b[1] - a[1]) * size[1] as f32).powi(2))
+            .sqrt()
+            .max(4.0);
             rawkit_editstate::MaskShape::Radial {
                 centre: a,
-                radii: [(b[0] - a[0]).abs().max(1e-3), (b[1] - a[1]).abs().max(1e-3)],
+                radii: [reach / size[0] as f32, reach / size[1] as f32],
                 feather,
                 angle_deg: 0.0,
             }
@@ -5538,6 +5554,60 @@ mod radial_tests {
         );
     }
 
+    #[test]
+    fn a_drag_puts_the_ellipse_where_it_was_drawn() {
+        // Reported as the position and the size of a radial being weird while
+        // dragging it out. Two claims a person would make without thinking about
+        // them, and neither was true.
+        //
+        // The radii were the drag's *component-wise* offsets — `|dx|` across and
+        // `|dy|` down. So the place you dragged to sat at an implicit radius of
+        // root two, forty-one per cent **outside** the shape: you pull to a point
+        // and the ellipse stops well short of it. And a drag that is mostly
+        // sideways gives a sliver, because the vertical radius is whatever small
+        // number the hand happened to wander.
+        let session = fitted();
+        let centre_at = [600.0f64, 400.0];
+        let scale = session.viewport().scale;
+        let sensor = SENSOR;
+        for (dx, dy) in [
+            (200.0f64, 200.0f64),
+            (240.0, 40.0),
+            (30.0, 260.0),
+            (-180.0, 120.0),
+        ] {
+            let to = [centre_at[0] + dx, centre_at[1] + dy];
+            let (centre, radii, _) = dragged(&session, centre_at, to);
+
+            // Where the drag ended, in the ellipse's own units. One is on the
+            // rim; anything else is the shape not reaching where it was pulled.
+            let end = [
+                (dx / scale) as f32 / sensor[0] as f32,
+                (dy / scale) as f32 / sensor[1] as f32,
+            ];
+            let reach = ((end[0] / radii[0]).powi(2) + (end[1] / radii[1]).powi(2)).sqrt();
+            println!(
+                "drag ({dx:+.0}, {dy:+.0}) -> radii {:.4} x {:.4}, the end sits at {reach:.3} of the rim",
+                radii[0], radii[1]
+            );
+            assert!(
+                (reach - 1.0).abs() < 0.02,
+                "a drag to ({dx:+.0}, {dy:+.0}) left the ellipse reaching {reach:.3} of \
+                 the way to where the hand let go"
+            );
+
+            // And it is centred where the press landed, not somewhere between.
+            let want = [
+                (centre_at[0] / scale) as f32 / sensor[0] as f32,
+                (centre_at[1] / scale) as f32 / sensor[1] as f32,
+            ];
+            assert!(
+                (centre[0] - want[0]).abs() < 1e-3 && (centre[1] - want[1]).abs() < 1e-3,
+                "the ellipse is centred at {centre:?} rather than at the press, {want:?}"
+            );
+        }
+    }
+
     fn dragged(session: &Session, from: [f64; 2], to: [f64; 2]) -> ([f32; 2], [f32; 2], f32) {
         match shape_from_drag(
             ELLIPSE,
@@ -5591,15 +5661,28 @@ mod radial_tests {
             (centre[0] - 0.5).abs() < 0.01 && (centre[1] - 0.5).abs() < 0.01,
             "the ellipse is not centred where the press was: {centre:?}"
         );
+        // **This test used to assert the opposite**, and deliberately: the radii
+        // were the drag's own width and height, a quarter and an eighth. That is
+        // a decision that has been changed rather than a bug that has been
+        // fixed, so it is worth saying which and why.
+        //
+        // Those radii put the point the hand let go of at an implicit radius of
+        // root two — the ellipse stopped forty-one per cent short of the cursor —
+        // and any drag that was not close to the frame's own diagonal produced a
+        // sliver. The rule now is a circle through the endpoint, so every
+        // direction behaves the same and the rim is under the cursor. The aspect
+        // moved to the handles, where it is set with the shape drawn.
+        //
+        // 1500 sensor pixels across and 500 down is a radius of 1581, which is
+        // 0.264 of a 6000-wide frame and 0.395 of a 4000-tall one.
         assert!(
-            (radii[0] - 0.25).abs() < 0.01,
-            "the horizontal radius is {}, not a quarter of the frame",
-            radii[0]
+            (radii[0] - 0.2635).abs() < 0.005 && (radii[1] - 0.3953).abs() < 0.005,
+            "the drag gave radii {radii:?}, not the circle through where it ended"
         );
+        // A circle on the photograph, which is what two different fractions mean.
         assert!(
-            (radii[1] - 0.125).abs() < 0.01,
-            "the vertical radius is {}, not an eighth of the frame",
-            radii[1]
+            (radii[0] * SENSOR[0] as f32 - radii[1] * SENSOR[1] as f32).abs() < 1.0,
+            "the radii are not the same distance on the sensor: {radii:?}"
         );
         assert_eq!(feather, 0.5, "the drag changed the feather");
     }
