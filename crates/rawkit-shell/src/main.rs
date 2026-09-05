@@ -1293,7 +1293,14 @@ fn main() -> Result<()> {
             // edit or the view moves and reused otherwise: it costs a resample of
             // a few hundred thousand texels, which is nothing once but something
             // every frame of a drag.
-            let mut showing_coverage = false;
+            // What the coverage tint last showed. `None` is not showing it.
+            type OverlayKey = (
+                usize,
+                Option<rawkit_editstate::Mask>,
+                rawkit_session::Viewport,
+                u8,
+            );
+            let mut last_overlay: Option<OverlayKey> = None;
             let mut last_outline: Option<(usize, usize, u64, rawkit_session::Viewport)> = None;
             // When the histogram was last recomputed. See `SURVEY_INTERVAL`.
             let mut last_survey: Option<std::time::Instant> = None;
@@ -2260,7 +2267,35 @@ fn main() -> Result<()> {
                     (dragging || SHOW_MASK.load(std::sync::atomic::Ordering::Relaxed))
                         .then_some(index)
                 });
-                if let Some(index) = showing_mask {
+                //
+                // **Painted only onto a canvas that was just filled.** The tint
+                // blends, so painting it twice over the same tiles darkens it —
+                // and taking it off again means redrawing the tiles underneath,
+                // because it lives in the canvas rather than over it. So the rule
+                // is: when what the tint shows changes, ask for the tiles back
+                // and paint on the frame they arrive; when nothing has changed,
+                // the canvas already holds the right answer and this does
+                // nothing at all.
+                //
+                // Invalidating unconditionally instead — which is what this did
+                // first — asks for every visible tile on every frame. A full pass
+                // is over a hundred milliseconds on a 24 MP frame, so the loop
+                // never finishes one before starting the next and the whole
+                // interface stops moving.
+                let overlay_key = showing_mask.map(|index| {
+                    let session = shared.lock().expect("session lock");
+                    (
+                        index,
+                        session.state().masks.get(index).cloned(),
+                        session.viewport(),
+                        session.level(),
+                    )
+                });
+                if overlay_key != last_overlay {
+                    last_overlay = overlay_key.clone();
+                    canvas_renderer.invalidate();
+                }
+                if let (Some(index), true) = (showing_mask, drawn > 0) {
                     let session = shared.lock().expect("session lock");
                     if index < session.state().masks.len().min(rawkit_editstate::MAX_MASKS) {
                         let viewport = session.viewport();
@@ -2284,17 +2319,6 @@ fn main() -> Result<()> {
                             },
                         );
                     }
-                    drop(session);
-                    if !showing_coverage {
-                        showing_coverage = true;
-                    }
-                    // The tint is painted into the canvas, so it has to be taken
-                    // off by redrawing the tiles under it — every frame, because
-                    // every frame paints it again.
-                    canvas_renderer.invalidate();
-                } else if showing_coverage {
-                    showing_coverage = false;
-                    canvas_renderer.invalidate();
                 }
 
                 // The outline and its handles, always while an adjustment is
