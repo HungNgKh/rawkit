@@ -4793,7 +4793,22 @@ fn reshape(
             },
             grab,
         ) => {
-            let offset = [(to[0] - centre[0]) * w, (to[1] - centre[1]) * h];
+            // Everything below is **relative to where the press landed**, never
+            // to where the pointer is. That distinction is the whole of a bug
+            // reported twice as the position and the size going wrong the moment
+            // a handle was touched.
+            //
+            // A handle can be grabbed from a little way off — deliberately, since
+            // missing one pans the photograph out from under the shape. Snapping
+            // the radius to the pointer's own distance therefore jumped the
+            // ellipse by however far the press had missed by, which at fit zoom
+            // on a 24 megapixel frame is a couple of hundred sensor pixels. The
+            // shape leapt, and then tracked correctly, which reads as the drag
+            // itself being wrong.
+            //
+            // `Move` was written this way from the start and its comment said
+            // why; the other two were not.
+            let bearing = |p: [f32; 2]| ((p[1] - centre[1]) * h).atan2((p[0] - centre[0]) * w);
             match grab {
                 MaskGrab::Move => rawkit_editstate::MaskShape::Radial {
                     centre: [centre[0] + shift[0], centre[1] + shift[1]],
@@ -4805,23 +4820,28 @@ fn reshape(
                     centre,
                     radii,
                     feather,
-                    angle_deg: offset[1].atan2(offset[0]).to_degrees(),
+                    angle_deg: angle_deg + (bearing(to) - bearing(from)).to_degrees(),
                 },
                 MaskGrab::Stretch(axis) => {
-                    // Projected onto the axis being dragged, in the shape's own
-                    // turned frame — so pulling a handle changes that radius and
-                    // leaves the other one and the angle alone.
+                    // How far out along the axis being dragged, in the shape's
+                    // own turned frame, so pulling a handle changes that radius
+                    // and leaves the other one and the angle alone. Signed by
+                    // which of the two handles on that axis was taken, so the
+                    // left one grows the ellipse by being pulled left.
                     let (sin, cos) = angle_deg.to_radians().sin_cos();
-                    let along = [
-                        offset[0] * cos + offset[1] * sin,
-                        -offset[0] * sin + offset[1] * cos,
-                    ];
+                    let along = |p: [f32; 2]| {
+                        let o = [(p[0] - centre[0]) * w, (p[1] - centre[1]) * h];
+                        [o[0] * cos + o[1] * sin, -o[0] * sin + o[1] * cos]
+                    };
+                    let sign = if axis < 2 { 1.0 } else { -1.0 };
+                    let k = (axis % 2) as usize;
+                    let moved = (along(to)[k] - along(from)[k]) * sign;
                     let smallest = 4.0;
                     let mut radii = radii;
-                    if axis % 2 == 0 {
-                        radii[0] = (along[0].abs().max(smallest)) / w;
+                    if k == 0 {
+                        radii[0] = (radii[0] * w + moved).max(smallest) / w;
                     } else {
-                        radii[1] = (along[1].abs().max(smallest)) / h;
+                        radii[1] = (radii[1] * h + moved).max(smallest) / h;
                     }
                     rawkit_editstate::MaskShape::Radial {
                         centre,
@@ -5604,6 +5624,201 @@ mod radial_tests {
             assert!(
                 (centre[0] - want[0]).abs() < 1e-3 && (centre[1] - want[1]).abs() < 1e-3,
                 "the ellipse is centred at {centre:?} rather than at the press, {want:?}"
+            );
+        }
+    }
+
+    /// The ellipse's parts, in sensor pixels, which is the frame it is a shape
+    /// in and the only one these numbers are comparable in.
+    fn parts(shape: &MaskShape) -> ([f32; 2], f32, f32, f32) {
+        match shape {
+            MaskShape::Radial {
+                centre,
+                radii,
+                angle_deg,
+                ..
+            } => (
+                [centre[0] * SENSOR[0] as f32, centre[1] * SENSOR[1] as f32],
+                radii[0] * SENSOR[0] as f32,
+                radii[1] * SENSOR[1] as f32,
+                *angle_deg,
+            ),
+            other => panic!("not an ellipse: {other:?}"),
+        }
+    }
+
+    /// A point in sensor pixels, as the fractions a shape stores.
+    fn sensor(px: [f32; 2]) -> [f32; 2] {
+        [px[0] / SENSOR[0] as f32, px[1] / SENSOR[1] as f32]
+    }
+
+    #[test]
+    fn grabbing_a_handle_does_not_move_the_shape() {
+        // The first thing a person notices, and the first thing nothing here
+        // tested: press on a handle without moving, and the ellipse must be
+        // exactly the ellipse it already was. A jump on grab is felt as the
+        // position and the size going wrong the instant you touch it.
+        for angle in [0.0f32, 30.0, -75.0] {
+            let was = MaskShape::Radial {
+                centre: [0.4, 0.55],
+                radii: [0.18, 0.22],
+                feather: 0.5,
+                angle_deg: angle,
+            };
+            for (grab, at) in mask_handles(&was, SENSOR) {
+                // **Near the handle, not on it.** A handle can be grabbed from a
+                // little way off — deliberately, because missing one pans the
+                // photograph out from under the shape being adjusted — so the
+                // press almost never lands exactly on it. Testing only the exact
+                // centre is what let the shape jump to the pointer on grab: the
+                // arithmetic was right about the place nobody presses.
+                //
+                // 120 sensor pixels is about what the hit radius is worth at fit
+                // zoom on a frame this size.
+                for miss in [[0.0f32, 0.0], [120.0, 0.0], [-70.0, 90.0]] {
+                    let pressed = [
+                        at[0] + miss[0] / SENSOR[0] as f32,
+                        at[1] + miss[1] / SENSOR[1] as f32,
+                    ];
+                    let after = reshape(&was, grab, pressed, pressed, SENSOR);
+                    let (c0, rx0, ry0, a0) = parts(&was);
+                    let (c1, rx1, ry1, a1) = parts(&after);
+                    assert!(
+                        (c0[0] - c1[0]).abs() < 1.0
+                            && (c0[1] - c1[1]).abs() < 1.0
+                            && (rx0 - rx1).abs() < 1.0
+                            && (ry0 - ry1).abs() < 1.0
+                            && (a0 - a1).abs() < 0.5,
+                        "a press {miss:?} px from {grab:?} at {angle}° moved the ellipse \
+                         from {c0:?} {rx0:.0}x{ry0:.0} at {a0}° to {c1:?} {rx1:.0}x{ry1:.0} \
+                         at {a1}°"
+                    );
+                }
+                let after = reshape(&was, grab, at, at, SENSOR);
+                let (c0, rx0, ry0, a0) = parts(&was);
+                let (c1, rx1, ry1, a1) = parts(&after);
+                assert!(
+                    (c0[0] - c1[0]).abs() < 1.0 && (c0[1] - c1[1]).abs() < 1.0,
+                    "grabbing {grab:?} at {angle}° moved the centre from {c0:?} to {c1:?}"
+                );
+                assert!(
+                    (rx0 - rx1).abs() < 1.0 && (ry0 - ry1).abs() < 1.0,
+                    "grabbing {grab:?} at {angle}° resized {rx0:.0}x{ry0:.0} to {rx1:.0}x{ry1:.0}"
+                );
+                assert!(
+                    (a0 - a1).abs() < 0.5,
+                    "grabbing {grab:?} at {angle}° turned it from {a0} to {a1}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_stretch_moves_the_axis_it_was_pulled_by_and_no_other() {
+        // Pull the right-hand handle out by a known number of sensor pixels: the
+        // radius along that axis must grow by exactly that many, and the other
+        // radius and the angle must not move at all.
+        for angle in [0.0f32, 30.0] {
+            let was = MaskShape::Radial {
+                centre: [0.4, 0.55],
+                radii: [0.18, 0.22],
+                feather: 0.5,
+                angle_deg: angle,
+            };
+            let (centre, rx, ry, _) = parts(&was);
+            let handles = mask_handles(&was, SENSOR);
+            let (grab, at) = handles
+                .iter()
+                .find(|(g, _)| matches!(g, MaskGrab::Stretch(0)))
+                .copied()
+                .expect("a stretch handle");
+
+            // Out along the shape's own major axis, which is where that handle
+            // lives, by 400 sensor pixels.
+            let (sin, cos) = angle.to_radians().sin_cos();
+            let pulled = [
+                at[0] * SENSOR[0] as f32 + 400.0 * cos,
+                at[1] * SENSOR[1] as f32 + 400.0 * sin,
+            ];
+            let after = reshape(&was, grab, at, sensor(pulled), SENSOR);
+            let (c1, rx1, ry1, a1) = parts(&after);
+            assert!(
+                (rx1 - (rx + 400.0)).abs() < 4.0,
+                "pulling the major axis out 400 px at {angle}° took it from {rx:.0} to {rx1:.0}"
+            );
+            assert!(
+                (ry1 - ry).abs() < 1.0,
+                "it also moved the other radius, {ry:.0} to {ry1:.0}"
+            );
+            assert!((a1 - angle).abs() < 0.5, "it also turned it to {a1}");
+            assert!(
+                (c1[0] - centre[0]).abs() < 1.0 && (c1[1] - centre[1]).abs() < 1.0,
+                "it also moved the centre to {c1:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_move_carries_the_shape_and_changes_nothing_else() {
+        let was = MaskShape::Radial {
+            centre: [0.4, 0.55],
+            radii: [0.18, 0.22],
+            feather: 0.5,
+            angle_deg: 20.0,
+        };
+        let (centre, rx, ry, angle) = parts(&was);
+        let (grab, at) = mask_handles(&was, SENSOR)
+            .into_iter()
+            .find(|(g, _)| matches!(g, MaskGrab::Move))
+            .expect("a move handle");
+        let moved = [
+            at[0] * SENSOR[0] as f32 + 300.0,
+            at[1] * SENSOR[1] as f32 - 500.0,
+        ];
+        let after = reshape(&was, grab, at, sensor(moved), SENSOR);
+        let (c1, rx1, ry1, a1) = parts(&after);
+        assert!(
+            (c1[0] - (centre[0] + 300.0)).abs() < 1.0 && (c1[1] - (centre[1] - 500.0)).abs() < 1.0,
+            "a move of (+300, -500) took the centre from {centre:?} to {c1:?}"
+        );
+        assert!(
+            (rx1 - rx).abs() < 1.0 && (ry1 - ry).abs() < 1.0,
+            "it resized it"
+        );
+        assert!((a1 - angle).abs() < 0.5, "it turned it");
+    }
+
+    #[test]
+    fn a_turn_follows_the_hand() {
+        let was = MaskShape::Radial {
+            centre: [0.4, 0.55],
+            radii: [0.18, 0.22],
+            feather: 0.5,
+            angle_deg: 0.0,
+        };
+        let (centre, rx, ry, _) = parts(&was);
+        let (grab, at) = mask_handles(&was, SENSOR)
+            .into_iter()
+            .find(|(g, _)| matches!(g, MaskGrab::Rotate))
+            .expect("a rotate handle");
+        for want in [35.0f32, -60.0, 150.0] {
+            let (sin, cos) = want.to_radians().sin_cos();
+            let reach = 900.0f32;
+            let to = sensor([centre[0] + reach * cos, centre[1] + reach * sin]);
+            let after = reshape(&was, grab, at, to, SENSOR);
+            let (c1, rx1, ry1, a1) = parts(&after);
+            let turned = (a1 - want + 540.0).rem_euclid(360.0) - 180.0;
+            assert!(
+                turned.abs() < 0.5,
+                "pulling the turn handle to {want}° left it at {a1}°"
+            );
+            assert!(
+                (rx1 - rx).abs() < 1.0 && (ry1 - ry).abs() < 1.0,
+                "turning it resized it from {rx:.0}x{ry:.0} to {rx1:.0}x{ry1:.0}"
+            );
+            assert!(
+                (c1[0] - centre[0]).abs() < 1.0 && (c1[1] - centre[1]).abs() < 1.0,
+                "turning it moved the centre"
             );
         }
     }
