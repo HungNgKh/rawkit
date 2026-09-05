@@ -1293,13 +1293,7 @@ fn main() -> Result<()> {
             // edit or the view moves and reused otherwise: it costs a resample of
             // a few hundred thousand texels, which is nothing once but something
             // every frame of a drag.
-            type CoverageKey = (
-                usize,
-                Option<rawkit_editstate::Mask>,
-                rawkit_session::Viewport,
-            );
-            let mut last_coverage: Option<(CoverageKey, rawkit_engine::PreviewImage)> = None;
-            let mut coverage_scratch: (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
+            let mut showing_coverage = false;
             let mut last_outline: Option<(usize, usize, u64, rawkit_session::Viewport)> = None;
             // When the histogram was last recomputed. See `SURVEY_INTERVAL`.
             let mut last_survey: Option<std::time::Instant> = None;
@@ -2250,6 +2244,13 @@ fn main() -> Result<()> {
                 // thing being decided — and on a key otherwise, because a tint
                 // laid over the photograph is exactly what stops you judging the
                 // edit underneath it.
+                //
+                // One compute-free call: the mask is already in the texture the
+                // develop kernel samples, and the map is the one the export
+                // resampler walks. What this replaced rasterised the mask a
+                // second time on the CPU and resampled it per texel — 28 ms on a
+                // plain frame, 76 with a straighten and a lens, on every frame of
+                // a drag.
                 let showing_mask = match SELECTED_MASK.load(std::sync::atomic::Ordering::Relaxed) {
                     usize::MAX => None,
                     index => Some(index),
@@ -2261,49 +2262,41 @@ fn main() -> Result<()> {
                 });
                 if let Some(index) = showing_mask {
                     let session = shared.lock().expect("session lock");
-                    // Keyed on what the overlay actually depends on — the mask
-                    // and where the view is — rather than on the generation,
-                    // which moves on *any* edit. Rebuilding a mask's coverage
-                    // because somebody dragged the exposure slider is a CPU
-                    // rasterise and a quarter-million-texel resample for a
-                    // picture that has not changed, and the cost of that is what
-                    // pushes a drag into haste in the first place.
-                    let key = (
-                        index,
-                        session.state().masks.get(index).cloned(),
-                        session.viewport(),
-                    );
-                    if last_coverage.as_ref().map(|(k, _)| k) != Some(&key) {
-                        last_coverage = draw_mask_coverage(
+                    if index < session.state().masks.len().min(rawkit_editstate::MAX_MASKS) {
+                        let viewport = session.viewport();
+                        let step = (1u32 << session.level()) as f64;
+                        let origin = viewport.image_at([0.0, 0.0]);
+                        canvas_renderer.overlay_mask(
                             &gpu,
-                            &blit,
-                            &canvas_renderer,
-                            &session,
-                            index,
-                            &mut coverage_scratch,
-                        )
-                        .map(|image| (key, image));
-                        canvas_renderer.invalidate();
-                    }
-                    if let Some((_, image)) = &last_coverage {
-                        let dest = visible_canvas_rect(&session);
-                        blit.draw_tinted(
-                            &gpu,
-                            canvas_renderer.canvas(),
-                            &[rawkit_engine::Cell {
-                                image,
-                                dest,
+                            &session.geometry(),
+                            session.image_size(),
+                            rawkit_engine::MaskOverlay {
+                                // The canvas is addressed in level pixels, and so
+                                // is the straighten's own origin — floored for the
+                                // same reason: a tile lands on whole pixels.
+                                straight_origin: [
+                                    (origin[0] / step).floor() as f32,
+                                    (origin[1] / step).floor() as f32,
+                                ],
+                                layer: index as u32,
+                                strength: MASK_TINT_STRENGTH,
                                 tint: MASK_TINT,
-                                edge: ([0.0; 3], 0.0),
-                                inner: ([0.0; 3], 0.0),
-                                round: false,
-                                tinted: true,
-                            }],
+                            },
                         );
                     }
-                } else if last_coverage.take().is_some() {
+                    drop(session);
+                    if !showing_coverage {
+                        showing_coverage = true;
+                    }
+                    // The tint is painted into the canvas, so it has to be taken
+                    // off by redrawing the tiles under it — every frame, because
+                    // every frame paints it again.
+                    canvas_renderer.invalidate();
+                } else if showing_coverage {
+                    showing_coverage = false;
                     canvas_renderer.invalidate();
                 }
+
                 // The outline and its handles, always while an adjustment is
                 // selected — unlike the tint, which hides the picture. This is
                 // what you grab; the tint is what you are grabbing it *for*.
@@ -4440,7 +4433,6 @@ fn draw_grid(
             edge,
             inner,
             round: false,
-            tinted: false,
         });
     }
 
@@ -4652,33 +4644,9 @@ fn draw_marquee(
             edge: (colour, t as f32),
             inner: ([0.0; 3], 0.0),
             round: false,
-            tinted: false,
         })
         .collect();
     blit.draw_over(gpu, canvas_renderer.canvas(), &cells);
-}
-
-/// Where the visible part of the photograph sits on the canvas, in canvas pixels.
-///
-/// The same arithmetic the spot markers use, one step shorter: an overlay built
-/// in *straight* coordinates does not need the sensor's frame at all.
-fn visible_canvas_rect(session: &Session) -> [i32; 4] {
-    let viewport = session.viewport();
-    let step = (1u32 << session.level()) as f64;
-    let [x0, y0, x1, y1] = viewport.visible_rect(session.developed_size());
-    let at = |v: f64, centre: f64, extent: u32| {
-        ((v - centre) * viewport.scale + extent as f64 / 2.0) / (viewport.scale * step)
-    };
-    let left = at(x0, viewport.center[0], viewport.size[0]);
-    let top = at(y0, viewport.center[1], viewport.size[1]);
-    let right = at(x1, viewport.center[0], viewport.size[0]);
-    let bottom = at(y1, viewport.center[1], viewport.size[1]);
-    [
-        left.round() as i32,
-        top.round() as i32,
-        (right - left).round().max(1.0) as i32,
-        (bottom - top).round().max(1.0) as i32,
-    ]
 }
 
 /// Whether the coverage tint is being asked for by hand.
@@ -4696,97 +4664,6 @@ pub(crate) static SHOW_MASK: std::sync::atomic::AtomicBool =
 /// would make the judgement impossible.
 const MASK_TINT: [f32; 3] = [1.0, 0.30, 0.34];
 const MASK_TINT_STRENGTH: f32 = 0.55;
-/// The longest edge the overlay is built at.
-///
-/// The tint is a soft, low-frequency thing and this is rebuilt on the interface's
-/// own thread while somebody is dragging, so it is capped well below the canvas.
-/// Sharper would cost milliseconds a frame to say the same thing.
-const MASK_OVERLAY_EDGE: u32 = 512;
-
-/// Paint where the selected adjustment reaches, over the photograph.
-///
-/// # Why this is resampled rather than blitted
-///
-/// The mask is rasterised in **sensor** coordinates, because that is the only
-/// frame that does not move when the photograph is turned or trimmed. The canvas
-/// shows the *developed* frame — rotated, cropped, straightened, keystoned, lens
-/// corrected. Laying the raster over it as a rectangle would be right only on an
-/// unedited photograph. So each overlay texel asks the geometry where it came
-/// from, which is the same question the renderer asks, and gets the same answer
-/// under every one of those.
-#[allow(clippy::too_many_arguments)]
-fn draw_mask_coverage(
-    gpu: &Gpu,
-    blit: &rawkit_engine::PreviewBlit,
-    canvas_renderer: &session_canvas::CanvasRenderer,
-    session: &Session,
-    index: usize,
-    scratch: &mut (Vec<f32>, Vec<f32>),
-) -> Option<rawkit_engine::PreviewImage> {
-    let mask = session.state().masks.get(index)?;
-    let image = session.image_size();
-    let (mw, mh) = rawkit_engine::mask::dimensions(image[0], image[1]);
-    let cells = (mw * mh) as usize;
-    scratch.0.resize(cells.max(1), 0.0);
-    scratch.1.resize(cells.max(1), 0.0);
-    rawkit_engine::mask::rasterise(
-        mask,
-        image[0],
-        image[1],
-        canvas_renderer.guide(),
-        &mut scratch.0,
-        &mut scratch.1,
-    );
-    let coverage = &scratch.0[..cells];
-
-    // Only the part of the photograph that is on screen, at about one texel per
-    // canvas pixel. Building it over the whole frame instead would be a blurred
-    // smear the moment anybody zoomed in.
-    let viewport = session.viewport();
-    let developed = session.developed_size();
-    let [vx0, vy0, vx1, vy1] = viewport.visible_rect(developed);
-    if vx1 <= vx0 || vy1 <= vy0 {
-        return None;
-    }
-    let (sw, sh) = ((vx1 - vx0) as f32, (vy1 - vy0) as f32);
-    let scale = MASK_OVERLAY_EDGE as f32 / sw.max(sh);
-    let (ow, oh) = (
-        ((sw * scale) as u32).clamp(1, MASK_OVERLAY_EDGE),
-        ((sh * scale) as u32).clamp(1, MASK_OVERLAY_EDGE),
-    );
-    let geometry = session.geometry();
-    let (gw, gh) = (mw as f32, mh as f32);
-    let mut rgba = vec![0u8; (ow * oh) as usize * 4];
-    for y in 0..oh {
-        for x in 0..ow {
-            let straight = [
-                vx0 as f32 + (x as f32 + 0.5) / ow as f32 * sw,
-                vy0 as f32 + (y as f32 + 0.5) / oh as f32 * sh,
-            ];
-            let at = geometry.source_at(straight, image);
-            // The raster is indexed in fractions of the sensor, so the sample is
-            // a plain scale — bilinear, because a mask is smooth and nearest
-            // would show its own texels as steps in the tint.
-            let (u, v) = (
-                (at[0] / image[0] as f32 * gw - 0.5).clamp(0.0, gw - 1.0),
-                (at[1] / image[1] as f32 * gh - 0.5).clamp(0.0, gh - 1.0),
-            );
-            let (x0, y0) = (u.floor() as u32, v.floor() as u32);
-            let (x1, y1) = ((x0 + 1).min(mw - 1), (y0 + 1).min(mh - 1));
-            let (fx, fy) = (u - x0 as f32, v - y0 as f32);
-            let get = |cx: u32, cy: u32| coverage[(cy * mw + cx) as usize];
-            let top = get(x0, y0) * (1.0 - fx) + get(x1, y0) * fx;
-            let bottom = get(x0, y1) * (1.0 - fx) + get(x1, y1) * fx;
-            let weight = (top * (1.0 - fy) + bottom * fy).clamp(0.0, 1.0);
-            let i = ((y * ow + x) * 4) as usize;
-            rgba[i] = 255;
-            rgba[i + 1] = 255;
-            rgba[i + 2] = 255;
-            rgba[i + 3] = (weight * MASK_TINT_STRENGTH * 255.0) as u8;
-        }
-    }
-    blit.upload(gpu, &rgba, ow, oh).ok()
-}
 
 /// How many marks an outline is drawn from.
 ///
@@ -5177,7 +5054,6 @@ fn draw_mask_outline(
             edge: ([*shade; 3], *side as f32),
             inner: ([0.0; 3], 0.0),
             round: false,
-            tinted: false,
         });
     }
     *MASK_HANDLES.lock().expect("mask handles lock") = published;
@@ -5268,7 +5144,6 @@ fn draw_spots(
             edge: ([*colour; 3], (thin * weight).ceil() as f32),
             inner: ([0.0; 3], 0.0),
             round: true,
-            tinted: false,
         });
     }
     blit.draw_over(gpu, canvas_renderer.canvas(), &cells);
@@ -5672,7 +5547,7 @@ mod radial_tests {
             "this view has no coarser level, so haste cannot be observed"
         );
 
-        let steady = (surface_per_canvas(&session), visible_canvas_rect(&session));
+        let steady = surface_per_canvas(&session);
         let point = [0.42f32, 0.61];
         let steady_at = canvas_mapper(&session).expect("a map")(point);
 
@@ -5683,23 +5558,14 @@ mod radial_tests {
             "haste did not coarsen the level, so this test proves nothing"
         );
 
-        let hasty = (surface_per_canvas(&session), visible_canvas_rect(&session));
+        let hasty = surface_per_canvas(&session);
         let hasty_at = canvas_mapper(&session).expect("a map")(point);
 
         // A coarser canvas is a smaller canvas, so a canvas pixel covers more of
         // the surface and every canvas coordinate shrinks with it.
         assert!(
-            hasty.0 > steady.0,
-            "a canvas pixel still covers {} of the surface under haste, against {}",
-            hasty.0,
-            steady.0
-        );
-        assert!(
-            hasty.1[2] < steady.1[2] && hasty.1[3] < steady.1[3],
-            "the visible rectangle is {:?} under haste and {:?} without, so the \
-             overlay is not following the canvas",
-            hasty.1,
-            steady.1
+            hasty > steady,
+            "a canvas pixel still covers {hasty} of the surface under haste, against {steady}"
         );
         assert!(
             (hasty_at[0] - steady_at[0]).abs() > 1.0,

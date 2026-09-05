@@ -164,7 +164,6 @@ fn a_grid_puts_each_cell_where_it_was_told_and_tints_it() {
                 edge: ([0.0; 3], 0.0),
                 inner: ([0.0; 3], 0.0),
                 round: false,
-                tinted: false,
             },
             // A third the brightness, the way a rejected frame is drawn.
             rawkit_engine::Cell {
@@ -174,7 +173,6 @@ fn a_grid_puts_each_cell_where_it_was_told_and_tints_it() {
                 edge: ([0.0; 3], 0.0),
                 inner: ([0.0; 3], 0.0),
                 round: false,
-                tinted: false,
             },
         ],
     );
@@ -226,7 +224,6 @@ fn a_cell_hanging_off_the_edge_is_cropped_rather_than_squashed() {
             edge: ([0.0; 3], 0.0),
             inner: ([0.0; 3], 0.0),
             round: false,
-            tinted: false,
         }],
     );
     let pixels = canvas.read_back(&gpu).expect("read back");
@@ -262,7 +259,6 @@ fn a_flag_and_a_colour_label_can_be_shown_at_once() {
             edge: ([0.0, 1.0, 0.0], 4.0),
             inner: ([1.0, 0.0, 0.0], 4.0),
             round: false,
-            tinted: false,
         }],
     );
 
@@ -306,7 +302,6 @@ fn a_round_cell_draws_a_ring_and_leaves_the_middle_alone() {
             edge: ([0.0; 3], 0.0),
             inner: ([0.0; 3], 0.0),
             round: false,
-            tinted: false,
         }],
     );
     let before = canvas.read_back(&gpu).expect("read back");
@@ -321,7 +316,6 @@ fn a_round_cell_draws_a_ring_and_leaves_the_middle_alone() {
             edge: ([1.0, 0.0, 0.0], 3.0),
             inner: ([0.0; 3], 0.0),
             round: true,
-            tinted: false,
         }],
     );
     let after = canvas.read_back(&gpu).expect("read back");
@@ -344,78 +338,4 @@ fn a_round_cell_draws_a_ring_and_leaves_the_middle_alone() {
             "({x}, {y}) was painted over"
         );
     }
-}
-
-#[test]
-#[ignore = "requires a GPU adapter"]
-fn a_tinted_cell_lets_the_photograph_through_in_proportion() {
-    // The coverage overlay. A cell that says something *about* the photograph has
-    // to leave it visible, and by an amount the cell itself carries — a mask
-    // covering a texel halfway must tint it halfway, or the overlay is a claim
-    // about where the mask is rather than a picture of how much of it there is.
-    let Some(gpu) = gpu() else { return };
-    let renderer = Renderer::new(&gpu);
-    let blit = PreviewBlit::new(&gpu);
-    let canvas = renderer.create_canvas(&gpu, 8, 8);
-
-    // A grey ground to lay the tint over.
-    let grey = blit.upload(&gpu, &flat(128, 4, 4), 4, 4).expect("upload");
-    blit.draw_grid(
-        &gpu,
-        &canvas,
-        &[rawkit_engine::Cell {
-            image: &grey,
-            dest: [0, 0, 8, 8],
-            tint: [1.0; 3],
-            edge: ([0.0; 3], 0.0),
-            inner: ([0.0; 3], 0.0),
-            round: false,
-            tinted: false,
-        }],
-    );
-    let ground = canvas.read_back(&gpu).expect("read back");
-
-    // Coverage: none on the left, half in the middle, all on the right.
-    let coverage: Vec<u8> = [0u8, 128, 255]
-        .iter()
-        .flat_map(|a| [255, 255, 255, *a])
-        .collect();
-    let mask = blit.upload(&gpu, &coverage, 3, 1).expect("upload");
-    blit.draw_tinted(
-        &gpu,
-        &canvas,
-        &[rawkit_engine::Cell {
-            image: &mask,
-            dest: [0, 0, 8, 8],
-            tint: [1.0, 0.0, 0.0],
-            edge: ([0.0; 3], 0.0),
-            inner: ([0.0; 3], 0.0),
-            round: false,
-            tinted: true,
-        }],
-    );
-    let after = canvas.read_back(&gpu).expect("read back");
-    let green = |px: &[f32], x: usize| px[(3 * 8 + x) * 4 + 1];
-
-    // Where nothing is covered the photograph is exactly as it was.
-    assert!(
-        (green(&after, 0) - green(&ground, 0)).abs() < 0.01,
-        "an uncovered pixel was tinted: {} against {}",
-        green(&ground, 0),
-        green(&after, 0)
-    );
-    // Where everything is covered the tint has no green in it, so the ground's
-    // green is gone.
-    assert!(
-        green(&after, 7) < green(&ground, 7) * 0.15,
-        "a fully covered pixel kept {} of {}",
-        green(&after, 7),
-        green(&ground, 7)
-    );
-    // And halfway is halfway, which is the claim a binary overlay would fail.
-    let middle = green(&after, 4) / green(&ground, 4);
-    assert!(
-        (0.35..0.65).contains(&middle),
-        "a half-covered pixel kept {middle} of its green"
-    );
 }

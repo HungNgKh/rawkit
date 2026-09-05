@@ -479,6 +479,35 @@ pub struct StraightenView {
     pub flat_origin: [f32; 2],
 }
 
+/// Which mask to paint, where, and how.
+#[derive(Debug, Clone, Copy)]
+pub struct MaskOverlay {
+    /// The straight-space point of the canvas's top-left pixel.
+    pub straight_origin: [f32; 2],
+    /// Which layer of the mask texture to read.
+    pub layer: u32,
+    /// How strongly to lay the tint on, 0 to 1.
+    pub strength: f32,
+    /// In the canvas's own linear light.
+    pub tint: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct OverlayParams {
+    straight_origin: [f32; 2],
+    extent: [u32; 2],
+    m: [[f32; 4]; 3],
+    centre: [f32; 2],
+    corner: f32,
+    knots: u32,
+    inverse_image: [f32; 2],
+    layer: u32,
+    strength: f32,
+    tint: [f32; 4],
+    curve: [[f32; 4]; 4],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct StraightenParams {
@@ -610,6 +639,8 @@ pub const DEFAULT_TILE: u32 = 512;
 pub struct Renderer {
     layout: wgpu::BindGroupLayout,
     mask_layout: wgpu::BindGroupLayout,
+    overlay_canvas_layout: wgpu::BindGroupLayout,
+    overlay_pipeline: wgpu::RenderPipeline,
     canvas_layout: wgpu::BindGroupLayout,
     pipelines: Vec<wgpu::ComputePipeline>,
     present: wgpu::ComputePipeline,
@@ -682,10 +713,14 @@ impl Renderer {
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("masks"),
+                // Fragment as well as compute: the develop kernel composites
+                // these, and the interface's coverage overlay paints one of them
+                // over the canvas in a blended render pass. One layout, because
+                // one bind group has to serve both.
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
+                        visibility: wgpu::ShaderStages::COMPUTE.union(wgpu::ShaderStages::FRAGMENT),
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
                             view_dimension: wgpu::TextureViewDimension::D2Array,
@@ -695,7 +730,7 @@ impl Renderer {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
+                        visibility: wgpu::ShaderStages::COMPUTE.union(wgpu::ShaderStages::FRAGMENT),
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
@@ -741,6 +776,70 @@ impl Renderer {
                     count: None,
                 }],
             });
+        // Read *and* write, unlike the present pass above, because an overlay
+        // blends with the photograph rather than replacing it. A separate layout
+        // rather than widening that one: the present pass writes every texel it
+        // touches, and asking for read access it does not need would be a claim
+        // about the pipeline that is not true.
+        let overlay_canvas_layout =
+            gpu.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("overlay canvas"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                });
+        let overlay_module = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("mask overlay"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/mask_overlay.wgsl").into(),
+                ),
+            });
+        let overlay_pipeline =
+            gpu.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("mask overlay"),
+                    layout: Some(&gpu.device.create_pipeline_layout(
+                        &wgpu::PipelineLayoutDescriptor {
+                            label: Some("mask overlay layout"),
+                            bind_group_layouts: &[Some(&overlay_canvas_layout), Some(&mask_layout)],
+                            immediate_size: 0,
+                        },
+                    )),
+                    vertex: wgpu::VertexState {
+                        module: &overlay_module,
+                        entry_point: Some("vs"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &overlay_module,
+                        entry_point: Some("fs"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: CANVAS_FORMAT,
+                            // Premultiplied, matching what the shader returns, so
+                            // the coverage is applied exactly once.
+                            blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                });
+
         let present_layout = gpu
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -825,6 +924,8 @@ impl Renderer {
         Self {
             layout,
             mask_layout,
+            overlay_canvas_layout,
+            overlay_pipeline,
             canvas_layout,
             pipelines,
             present,
@@ -1375,6 +1476,98 @@ impl Renderer {
     ///
     /// `straight_origin` and `flat_origin` are the straight- and flat-space
     /// points of each buffer's top-left pixel, in level pixels.
+    /// Paint where one local adjustment reaches, over the canvas.
+    ///
+    /// The mask is read from the texture the develop kernel already samples, and
+    /// the map is [`rawkit_editstate::Geometry::sensor_map`] — the same one the
+    /// export resampler walks. Nothing here is rasterised, resampled or
+    /// uploaded; see `mask_overlay.wgsl` for what this replaced and why.
+    ///
+    /// `layer` is an index into the masks as `set_edit` was given them.
+    pub fn overlay_mask(
+        &self,
+        gpu: &Gpu,
+        buffers: &TileBuffers,
+        canvas: &Canvas,
+        geometry: &Geometry,
+        image: [u32; 2],
+        view: MaskOverlay,
+    ) {
+        let map = geometry.sensor_map(image);
+        let extent = canvas.size();
+        let params = OverlayParams {
+            straight_origin: view.straight_origin,
+            extent,
+            m: [
+                [map.m[0][0], map.m[0][1], map.m[0][2], 0.0],
+                [map.m[1][0], map.m[1][1], map.m[1][2], 0.0],
+                [map.m[2][0], map.m[2][1], map.m[2][2], 0.0],
+            ],
+            centre: map.centre,
+            corner: map.corner,
+            knots: map.used,
+            inverse_image: [1.0 / image[0].max(1) as f32, 1.0 / image[1].max(1) as f32],
+            layer: view.layer,
+            strength: view.strength,
+            tint: [view.tint[0], view.tint[1], view.tint[2], 0.0],
+            curve: {
+                let mut packed = [[0.0f32; 4]; 4];
+                for (i, value) in map.curve.iter().enumerate() {
+                    packed[i / 4][i % 4] = *value;
+                }
+                packed
+            },
+        };
+        let uniform = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mask overlay params"),
+            size: std::mem::size_of::<OverlayParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        gpu.queue
+            .write_buffer(&uniform, 0, bytemuck::bytes_of(&params));
+        let target = canvas
+            .texture()
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mask overlay"),
+            layout: &self.overlay_canvas_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            }],
+        });
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("mask overlay"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("mask overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // Onto the photograph, never over it.
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.overlay_pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.set_bind_group(1, &buffers.mask_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        gpu.queue.submit([encoder.finish()]);
+    }
+
     pub fn straighten(
         &self,
         gpu: &Gpu,
@@ -1719,14 +1912,25 @@ impl Renderer {
         let colour = image.colour(state)?;
         let tone = crate::tone::ToneCurve::new(&state.tone);
 
-        // Only the adjustments that would change something. A mask sitting at
-        // its defaults still costs a texture layer and a sample per pixel, and
-        // skipping it here is also what makes placing a gradient before touching
-        // a slider cost nothing.
+        // Every mask, in the order the edit holds them — **not** only the ones
+        // that would change something.
+        //
+        // The filter that used to be here saved a texture layer and a sample per
+        // pixel on an adjustment sitting at its defaults. It also made the
+        // texture's layer index a position in a *filtered* list, so nothing
+        // outside this function could say which layer a given mask was in — and
+        // an adjustment that does nothing yet was not on the GPU at all. The
+        // interface's coverage overlay reads that texture, and a mask you have
+        // zeroed while you position it is exactly when you want to see where it
+        // reaches.
+        //
+        // The cost is one texture sample per pixel per idle mask, and no change
+        // to any render: an identity mask's gain is exactly 1, `pow(1, w)` is
+        // exactly 1, and the display-referred half already skips a mask whose
+        // three look values are zero. The golden references are what says so.
         let live: Vec<rawkit_editstate::Mask> = state
             .masks
             .iter()
-            .filter(|m| !m.is_identity())
             .take(rawkit_editstate::MAX_MASKS)
             .cloned()
             .collect();
@@ -2058,19 +2262,6 @@ impl Renderer {
     ) -> Result<(), EngineError> {
         state.validate()?;
         self.upload_params(gpu, buffers, image, state)
-    }
-}
-
-impl TileBuffers {
-    /// The whole frame at a few hundred pixels, in the camera's own RGB.
-    ///
-    /// Exposed because a *range* mask is a band on what the light is, so
-    /// anything that wants to draw where a mask reaches — the interface's
-    /// overlay, not the renderer — needs the same photograph the rasteriser
-    /// consulted. Rebuilding it on that side would be a second answer to the
-    /// same question, and the two would drift apart the moment either changed.
-    pub fn guide(&self) -> &crate::guide::Guide {
-        &self.guide
     }
 }
 

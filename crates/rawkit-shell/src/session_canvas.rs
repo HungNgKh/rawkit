@@ -160,10 +160,20 @@ impl CanvasRenderer {
         )?)
     }
 
-    /// The guide the renderer built for this photograph, so an overlay can ask
-    /// the same question the rasteriser did. See `TileBuffers::guide`.
-    pub fn guide(&self) -> &rawkit_engine::guide::Guide {
-        self.buffers.guide()
+    /// Paint where one adjustment reaches, over the canvas.
+    ///
+    /// `straight_origin` is where the canvas's top-left pixel sits in the
+    /// straightened photograph — the same number the straighten gather is given,
+    /// and the render loop is the only place that has it.
+    pub fn overlay_mask(
+        &self,
+        gpu: &Gpu,
+        geometry: &rawkit_editstate::Geometry,
+        image: [u32; 2],
+        view: rawkit_engine::MaskOverlay,
+    ) {
+        self.renderer
+            .overlay_mask(gpu, &self.buffers, &self.canvas, geometry, image, view);
     }
 
     pub fn canvas(&self) -> &Canvas {

@@ -31,12 +31,7 @@ struct Region {
     // `.x` above a half draws the cell as a ring inscribed in its rectangle and
     // discards everything else, so the photograph shows through the middle. For
     // the spot tool, where the marker has to show the radius it stands for and a
-    // square would claim the wrong area.
-    //
-    // `.y` above a half keeps the sampled *alpha* instead of forcing it to one,
-    // which is what lets a cell describe the photograph rather than cover it:
-    // paired with a blending pipeline, a mask's coverage arrives as the alpha and
-    // the tint shows through in proportion. `.zw` unused.
+    // square would claim the wrong area. `.yzw` unused.
     ring: vec4<f32>,
 }
 
@@ -91,9 +86,5 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     if (cell.x < 0.0 || cell.y < 0.0 || cell.x > 1.0 || cell.y > 1.0) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
-    let sampled = textureSample(image, image_sampler, cell);
-    let alpha = select(1.0, sampled.a, region.ring.y > 0.5);
-    // Premultiplied, because the blend state is: the colour a tinted cell wants
-    // to add is its own, scaled by how much of it there is.
-    return vec4<f32>(sampled.rgb * region.tint.rgb * alpha, alpha);
+    return vec4<f32>(textureSample(image, image_sampler, cell).rgb * region.tint.rgb, 1.0);
 }

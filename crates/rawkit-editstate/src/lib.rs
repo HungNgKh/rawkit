@@ -803,7 +803,7 @@ pub struct Distortion {
 ///
 /// Linear between the knots, and flat outside them — a point past the corner is
 /// a corner as far as a lens is concerned.
-fn sample_curve(curve: &[f32], t: f32) -> f32 {
+pub(crate) fn sample_curve(curve: &[f32], t: f32) -> f32 {
     if curve.len() < 2 {
         return 0.0;
     }
