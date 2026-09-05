@@ -124,12 +124,23 @@ fn draw(shape: &MaskShape, w: u32, h: u32, guide: &Guide, out: &mut [f32]) {
         }
 
         MaskShape::Linear { from, to } => {
-            // Distance along the gradient's axis, as a fraction of its length.
-            // Everything is done in the *frame's* proportions rather than in
-            // texel counts, so the gradient is not sheared by a non-square
-            // raster — the raster's aspect follows the image's, but only
-            // approximately once both edges are rounded to whole texels.
-            let axis = [to[0] - from[0], to[1] - from[1]];
+            // Distance along the gradient's axis, as a fraction of its length —
+            // measured in **pixel proportions**, not in the fractions the ends
+            // are stored as.
+            //
+            // The two are not the same thing, and the comment that used to sit
+            // here claimed the opposite. A dot product in normalised coordinates
+            // is not a dot product in pixels when the axes are fractions of
+            // different extents: on a 3:2 frame a diagonal gradient's bands came
+            // out skewed away from the direction they were dragged in, so the
+            // region it covered was not the region the drag described. The same
+            // mistake the ellipse's rotation had, and the same fix — put both
+            // axes in one unit first.
+            //
+            // The old test could not see it: it drew corner to corner on a
+            // *square* frame, where the two readings agree by construction.
+            let aspect = h as f32 / w as f32;
+            let axis = [to[0] - from[0], (to[1] - from[1]) * aspect];
             let length = axis[0] * axis[0] + axis[1] * axis[1];
             if length <= f32::MIN_POSITIVE {
                 out[..(w * h) as usize].fill(0.0);
@@ -137,7 +148,7 @@ fn draw(shape: &MaskShape, w: u32, h: u32, guide: &Guide, out: &mut [f32]) {
             }
             for y in 0..h {
                 // Texel centres, so the gradient does not sit half a texel out.
-                let v = (y as f32 + 0.5) / h as f32 - from[1];
+                let v = ((y as f32 + 0.5) / h as f32 - from[1]) * aspect;
                 for x in 0..w {
                     let u = (x as f32 + 0.5) / w as f32 - from[0];
                     let t = (u * axis[0] + v * axis[1]) / length;
@@ -525,6 +536,16 @@ mod tests {
         // Drawn corner to corner: the two *other* corners sit on the same line
         // through the middle, so they must read the same, and the ends must be
         // the extremes.
+        //
+        // The square is **load-bearing for this claim** and stays: the two
+        // off-axis corners are mirror images of each other about the diagonal
+        // only when the frame is square, so on a 3:2 frame they project to 0.69
+        // and 0.31 along the axis and reading the same would be wrong.
+        //
+        // Which is also why this could never have caught the shear that was
+        // here — a square is the one shape where measuring in fractions and
+        // measuring in pixels agree. `a_diagonal_gradient_runs_the_way_it_was_drawn`
+        // is the test for that, and it is on a 3:2 frame for the same reason.
         let mask = Mask {
             shape: MaskShape::Linear {
                 from: [0.0, 0.0],
@@ -566,6 +587,92 @@ mod tests {
             },
             ..Mask::default()
         }
+    }
+
+    fn gradient(from: [f32; 2], to: [f32; 2]) -> Mask {
+        Mask {
+            shape: MaskShape::Linear { from, to },
+            ..Mask::default()
+        }
+    }
+
+    #[test]
+    fn a_diagonal_gradient_runs_the_way_it_was_drawn() {
+        // The same mistake the ellipse's rotation had: the arithmetic was done in
+        // *normalised* coordinates, where the two axes are fractions of different
+        // extents. A dot product there is not a dot product in pixels, so on any
+        // frame that is not square a diagonal gradient's bands are skewed away
+        // from the direction they were dragged in — and the covered region is not
+        // the one the drag described.
+        //
+        // The claim: the line of constant weight through `from` is perpendicular
+        // to the drag **in pixels**. So stepping away from `from` at a right
+        // angle to it must not change the weight.
+        let (w, h) = (900u32, 600u32);
+        let from = [0.4f32, 0.4];
+        let to = [0.6f32, 0.7];
+        let (pixels, gw, gh) = draw(&gradient(from, to), w, h);
+        let at = |fx: f32, fy: f32| {
+            let x = ((fx * gw as f32) as u32).min(gw - 1);
+            let y = ((fy * gh as f32) as u32).min(gh - 1);
+            pixels[(y * gw + x) as usize]
+        };
+
+        // The drag, in pixels, and a unit step at a right angle to it.
+        let drag = [(to[0] - from[0]) * w as f32, (to[1] - from[1]) * h as f32];
+        let length = (drag[0] * drag[0] + drag[1] * drag[1]).sqrt();
+        let perp = [-drag[1] / length, drag[0] / length];
+
+        // Stepped out from the *middle* of the gradient rather than from its
+        // near end: the smoothstep is flat at both ends, so a skew barely moves
+        // the weight there and shows at its worst halfway across.
+        let centre = [(from[0] + to[0]) / 2.0, (from[1] + to[1]) / 2.0];
+        let middle = at(centre[0], centre[1]);
+        for step in [-120.0f32, -60.0, 60.0, 120.0] {
+            let fx = centre[0] + perp[0] * step / w as f32;
+            let fy = centre[1] + perp[1] * step / h as f32;
+            if !(0.02..0.98).contains(&fx) || !(0.02..0.98).contains(&fy) {
+                continue;
+            }
+            let along = at(fx, fy);
+            assert!(
+                (along - middle).abs() < 0.02,
+                "{step} px at a right angle to the drag changed the weight from \
+                 {middle:.3} to {along:.3} — the gradient is not running the way it \
+                 was drawn"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gradient_ends_where_it_was_dropped() {
+        // The other half of the same claim: the far end is where the hand let go,
+        // not somewhere a change of coordinates put it.
+        let (w, h) = (900u32, 600u32);
+        let (from, to) = ([0.3f32, 0.3], [0.6f32, 0.7]);
+        let (pixels, gw, gh) = draw(&gradient(from, to), w, h);
+        let at = |p: [f32; 2]| {
+            let x = ((p[0] * gw as f32) as u32).min(gw - 1);
+            let y = ((p[1] * gh as f32) as u32).min(gh - 1);
+            pixels[(y * gw + x) as usize]
+        };
+        assert!(
+            at(from) > 0.98,
+            "the near end is {} rather than whole",
+            at(from)
+        );
+        assert!(
+            at(to) < 0.02,
+            "the far end is {} rather than nothing",
+            at(to)
+        );
+        // And the middle is halfway, which a smoothstep puts at exactly a half.
+        let middle = [(from[0] + to[0]) / 2.0, (from[1] + to[1]) / 2.0];
+        assert!(
+            (at(middle) - 0.5).abs() < 0.02,
+            "the middle of the gradient is {}",
+            at(middle)
+        );
     }
 
     #[test]
