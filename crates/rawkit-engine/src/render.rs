@@ -510,6 +510,12 @@ struct OverlayParams {
     strength: f32,
     border: f32,
     brightness: f32,
+    /// WGSL aligns a `vec4<f32>` to sixteen bytes and `#[repr(C)]` does not, so
+    /// without this the shader looks for `tint`, and the curve after it, eight
+    /// bytes further on than they are. Checked by
+    /// `the_overlay_uniform_is_laid_out_the_way_wgsl_reads_it` rather than by
+    /// anyone re-deriving it.
+    _pad: [u32; 2],
     tint: [f32; 4],
     curve: [[f32; 4]; 4],
 }
@@ -1517,6 +1523,7 @@ impl Renderer {
             strength: view.strength,
             border: view.border,
             brightness: view.brightness,
+            _pad: [0; 2],
             tint: [view.tint[0], view.tint[1], view.tint[2], 0.0],
             curve: {
                 let mut packed = [[0.0f32; 4]; 4];
@@ -3077,6 +3084,35 @@ pub fn normalise(raw: &rawkit_decode::RawImage) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
+    /// Where WGSL puts each member of a struct, walked by its own rules.
+    ///
+    /// A member sits at the next multiple of its alignment, and the struct's own
+    /// size rounds up to the largest alignment in it. Written once because there
+    /// are two uniforms to check and there will be more — and because the second
+    /// one aborted the application while the first one's test sat here passing.
+    struct Wgsl {
+        at: usize,
+        align: usize,
+    }
+
+    impl Wgsl {
+        fn new() -> Self {
+            Self { at: 0, align: 1 }
+        }
+
+        fn field(&mut self, align: usize, size: usize) -> usize {
+            self.at = self.at.div_ceil(align) * align;
+            self.align = self.align.max(align);
+            let offset = self.at;
+            self.at += size;
+            offset
+        }
+
+        fn size(&self) -> usize {
+            self.at.div_ceil(self.align) * self.align
+        }
+    }
+
     /// Every field of a uniform has to sit where WGSL will look for it, and
     /// `#[repr(C)]` does not use WGSL's rules.
     ///
@@ -3092,37 +3128,62 @@ mod tests {
     #[test]
     fn the_straighten_uniform_is_laid_out_the_way_wgsl_reads_it() {
         use super::StraightenParams;
-        // Where WGSL puts each member, walked by its own rules: a member sits at
-        // the next multiple of its alignment.
-        let mut at = 0usize;
-        let mut place = |align: usize, size: usize| {
-            at = at.div_ceil(align) * align;
-            let offset = at;
-            at += size;
-            offset
-        };
-        place(8, 8); // straight_origin
-        place(8, 8); // flat_origin
-        place(16, 48); // m
-        place(8, 8); // extent
-        place(8, 8); // photograph
-        place(8, 8); // optical_centre
-        place(4, 4); // corner
-        place(4, 4); // knots
-        let curve = place(16, 64);
+        let mut wgsl = Wgsl::new();
+        wgsl.field(8, 8); // straight_origin
+        wgsl.field(8, 8); // flat_origin
+        wgsl.field(16, 48); // m
+        wgsl.field(8, 8); // extent
+        wgsl.field(8, 8); // photograph
+        wgsl.field(8, 8); // optical_centre
+        wgsl.field(4, 4); // corner
+        wgsl.field(4, 4); // knots
+        let curve = wgsl.field(16, 64);
 
         assert_eq!(
             curve,
             std::mem::offset_of!(StraightenParams, curve),
             "the curve is not where the shader will look for it"
         );
-        // And the struct as a whole is a multiple of its largest alignment, or
-        // an array of them would drift.
-        assert_eq!(std::mem::size_of::<StraightenParams>() % 16, 0);
+        assert_eq!(std::mem::size_of::<StraightenParams>(), wgsl.size());
+    }
+
+    /// The same, for the overlay — and this one is not hypothetical either.
+    ///
+    /// Two `f32` were added to it in the middle, which moved the `vec4` after
+    /// them off a sixteen-byte boundary. WGSL pads to it and `#[repr(C)]` does
+    /// not, so the struct was 184 bytes where the shader wanted 192, and the
+    /// application aborted on the first frame a mask was selected. The
+    /// straighten's test was sitting a few lines above, passing, for a uniform
+    /// I had not touched.
+    #[test]
+    fn the_overlay_uniform_is_laid_out_the_way_wgsl_reads_it() {
+        use super::OverlayParams;
+        let mut wgsl = Wgsl::new();
+        wgsl.field(8, 8); // straight_origin
+        wgsl.field(8, 8); // extent
+        wgsl.field(16, 48); // m
+        wgsl.field(8, 8); // centre
+        wgsl.field(4, 4); // corner
+        wgsl.field(4, 4); // knots
+        wgsl.field(8, 8); // inverse_image
+        wgsl.field(4, 4); // layer
+        wgsl.field(4, 4); // strength
+        wgsl.field(4, 4); // border
+        wgsl.field(4, 4); // brightness
+        let tint = wgsl.field(16, 16);
+        let curve = wgsl.field(16, 64);
+
         assert_eq!(
-            std::mem::size_of::<StraightenParams>(),
-            at.div_ceil(16) * 16
+            tint,
+            std::mem::offset_of!(OverlayParams, tint),
+            "the tint is not where the shader will look for it"
         );
+        assert_eq!(
+            curve,
+            std::mem::offset_of!(OverlayParams, curve),
+            "the curve is not where the shader will look for it"
+        );
+        assert_eq!(std::mem::size_of::<OverlayParams>(), wgsl.size());
     }
 
     use super::half_to_f32;

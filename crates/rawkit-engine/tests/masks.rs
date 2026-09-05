@@ -798,3 +798,97 @@ fn the_effect_is_half_on_where_the_border_is_drawn() {
         "the effect is half on at {half_at} px where the shape's rim is {rim}"
     );
 }
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn the_overlay_pass_runs_and_tints_where_the_mask_is() {
+    // The test whose absence let a uniform-layout mistake reach the application.
+    // Nothing in the suite executed `overlay_mask` at all: the layout guard beside
+    // it is cheap and exact, but it only checks the struct I remembered to
+    // describe. This one runs the shader, which checks everything at once — the
+    // bind group, the pipeline, the buffer's size, and whether the tint lands
+    // where the mask is.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    let renderer = Renderer::new(&gpu);
+    let cfa = flat();
+    let frame = Frame {
+        data: &cfa,
+        width: W,
+        height: H,
+        phase: BayerPhase::Rggb,
+        as_shot_wb: [1.0, 1.0, 1.0],
+        clip_level: f32::INFINITY,
+        profile: CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
+        recorded_orientation: rawkit_editstate::Orientation::AsShot,
+    };
+    let buffers = renderer.allocate(&gpu, &frame);
+    // A radial over the left half, so there is somewhere the tint must not go.
+    let state = EditState {
+        masks: vec![Mask {
+            shape: MaskShape::Radial {
+                centre: [0.25, 0.5],
+                radii: [0.2, 0.2],
+                feather: 0.0,
+                angle_deg: 0.0,
+            },
+            exposure_ev: -1.0,
+            ..Mask::default()
+        }],
+        ..EditState::default()
+    };
+    renderer
+        .set_edit(&gpu, &buffers, &frame, &state)
+        .expect("set edit");
+
+    let canvas = renderer.create_canvas(&gpu, W, H);
+    canvas.write(&gpu, &vec![0.5f32; (W * H) as usize * 4]);
+    let before = canvas.read_back(&gpu).expect("read back");
+
+    renderer.overlay_mask(
+        &gpu,
+        &buffers,
+        &canvas,
+        &rawkit_editstate::Geometry::new(&state, rawkit_editstate::Orientation::AsShot),
+        [W, H],
+        rawkit_engine::MaskOverlay {
+            straight_origin: [0.0, 0.0],
+            layer: 0,
+            strength: 0.6,
+            border: 2.0,
+            brightness: 0.9,
+            tint: [1.0, 0.0, 0.0],
+        },
+    );
+    let after = canvas.read_back(&gpu).expect("read back");
+
+    let green = |px: &[f32], x: u32, y: u32| px[((y * W + x) * 4 + 1) as usize];
+    // Inside the mask: the tint is red, so the ground's green is taken down.
+    let inside = green(&after, W / 4, H / 2);
+    assert!(
+        inside < green(&before, W / 4, H / 2) * 0.6,
+        "the tint did not reach the middle of the mask: {} from {}",
+        inside,
+        green(&before, W / 4, H / 2)
+    );
+    // Outside it: untouched, bit for bit. An overlay that dimmed the whole
+    // picture would be worse than one that did nothing.
+    let far = ((3 * W) / 4, H / 2);
+    assert_eq!(
+        green(&after, far.0, far.1),
+        green(&before, far.0, far.1),
+        "the tint reached outside the mask"
+    );
+    // And the border is drawn: at the rim there is a line brighter than the
+    // tinted interior, because it is white rather than red.
+    let rim = W / 4 + (0.2 * W as f32) as u32;
+    let at_rim = (rim.saturating_sub(3)..=rim + 3)
+        .map(|x| green(&after, x, H / 2))
+        .fold(0.0f32, f32::max);
+    assert!(
+        at_rim > inside * 1.2,
+        "no border at the mask's rim: {at_rim} against {inside} inside"
+    );
+}
