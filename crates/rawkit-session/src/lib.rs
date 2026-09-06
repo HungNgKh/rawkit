@@ -1441,6 +1441,25 @@ impl Session {
     fn clamp_center(&mut self) {
         for axis in 0..2 {
             let extent = self.developed[axis] as f64;
+            // While a crop is being drawn the rule is the other one: what has to
+            // stay on screen is the *rectangle*, not the photograph, and the
+            // photograph has to be free to slide underneath it. Holding it
+            // against the canvas here would absorb the pan that keeps the box
+            // still — and the box would slide instead, moving the opposite way
+            // to the hand. Which is what it did, on a real window, before this
+            // branch existed.
+            //
+            // The loose rule is the old one: the centre stays somewhere on the
+            // photograph. That is enough, because the pan is *derived* from how
+            // far the rectangle moved and the rectangle is itself held inside
+            // the frame — so the two travel together and the clamp only has
+            // anything to say at the extremes, where the rectangle has stopped
+            // as well. Empty canvas beside the frame is not a fault here: it is
+            // what every crop tool shows, and it is the room the picture needs.
+            if self.cropping {
+                self.viewport.center[axis] = self.viewport.center[axis].clamp(0.0, extent);
+                continue;
+            }
             // Guarded, because scale is finite and positive everywhere the
             // session lets it be set — but this runs on `Resize` too, and a
             // canvas of zero size has nothing to keep on screen.
@@ -2484,6 +2503,44 @@ mod tests {
             before,
             [IMAGE[0] as f64 / 2.0, IMAGE[1] as f64 / 2.0],
             "a fitted photograph is not in the middle of its canvas"
+        );
+    }
+
+    #[test]
+    fn a_crop_can_slide_the_photograph_where_the_loupe_cannot() {
+        // The two rules, side by side. In the loupe there is nowhere to pan at
+        // fit and a drag must do nothing; while a crop is being drawn the
+        // photograph has to be free to move under the rectangle, or the pan that
+        // keeps the box still gets absorbed and the box slides the opposite way
+        // to the hand instead. That is not a theory — it is what a real window
+        // did before this pair of rules existed.
+        let mut s = session();
+        s.apply(Command::FitToView);
+        let fitted = s.viewport().center;
+        s.apply(Command::Pan { dx: 300.0, dy: 0.0 });
+        assert_eq!(s.viewport().center, fitted, "the loupe let go of the frame");
+
+        s.set_cropping(true);
+        s.apply(Command::FitToView);
+        let before = s.viewport().center;
+        s.apply(Command::Pan { dx: 300.0, dy: 0.0 });
+        assert!(
+            s.viewport().center[0] < before[0],
+            "a crop could not slide the photograph: {before:?} to {:?}",
+            s.viewport().center
+        );
+
+        // And leaving the mode puts the strict rule back rather than leaving the
+        // photograph parked off to one side. Asserted as the centre returning to
+        // the middle of the frame, not as an absence of empty canvas: at fit a
+        // 3:2 photograph in an 8:5 window is letterboxed on one axis whatever
+        // anybody does, and a test that called that a fault would be measuring
+        // the aspect ratios.
+        s.set_cropping(false);
+        assert_eq!(
+            s.viewport().center,
+            fitted,
+            "leaving the crop left the photograph where the crop had slid it"
         );
     }
 

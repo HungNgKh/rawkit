@@ -6214,6 +6214,51 @@ mod radial_tests {
     }
 
     #[test]
+    fn at_fit_the_picture_moves_and_the_box_stays_still() {
+        // The case the test below it never reached, because that one zooms in
+        // first — and fit is *the* crop case, the one you are in the moment you
+        // press the key.
+        //
+        // Found on a real window: the box slid the opposite way to the hand.
+        // The pan that keeps it still was being absorbed by the viewport clamp,
+        // which is right for the loupe (there is nowhere to pan to at fit) and
+        // wrong while a crop is being drawn (the photograph has to be free to
+        // move under the rectangle). The session now keeps the two rules apart.
+        let (mut session, _) = cropping(rawkit_editstate::Crop {
+            left: 0.25,
+            top: 0.25,
+            right: 0.75,
+            bottom: 0.75,
+            ..rawkit_editstate::Crop::default()
+        });
+        session.apply(Command::FitToView);
+        let was = crop_rect_of(&session);
+        let before = crop_on_screen(&session, was).expect("on screen").rect;
+        let centre = session.viewport().center;
+
+        let now = advance_crop_rect(
+            &mut session,
+            CropGrab::Move,
+            was,
+            [600.0, 400.0],
+            [800.0, 400.0],
+            was,
+        );
+        let after = crop_on_screen(&session, now).expect("on screen").rect;
+        for axis in 0..4 {
+            assert!(
+                (after[axis] - before[axis]).abs() < 1.0,
+                "at fit the box moved on screen: {before:?} to {after:?}"
+            );
+        }
+        assert!(
+            session.viewport().center[0] < centre[0] - 1.0,
+            "at fit the photograph did not move: {:?} from {centre:?}",
+            session.viewport().center
+        );
+    }
+
+    #[test]
     fn the_picture_stops_when_the_box_would_leave_the_frame() {
         let (mut session, was) = cropping(rawkit_editstate::Crop {
             left: 0.0,
