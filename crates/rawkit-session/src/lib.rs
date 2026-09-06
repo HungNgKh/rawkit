@@ -1308,10 +1308,47 @@ impl Session {
             .then(|| (w as f64 / self.developed[0] as f64).min(h as f64 / self.developed[1] as f64))
     }
 
-    /// Keep the centre on the image, so the photo cannot be flung off screen.
+    /// Keep the photograph covering the canvas, so it cannot be dragged into
+    /// empty space.
+    ///
+    /// # What this used to guarantee, and why it was not enough
+    ///
+    /// It clamped the centre to `0..developed`, which keeps a *corner pixel* of
+    /// the image at the middle of the canvas and nothing more. Some of the
+    /// photograph was therefore always visible — which is all the test that
+    /// guarded it ever asserted — and three quarters of the window could be
+    /// empty. Worse, at fit scale, where the whole photograph is already on
+    /// screen and there is nothing to pan *towards*, a drag still slid it half a
+    /// frame off each edge and left it there. From the outside that reads as the
+    /// renderer having lost the picture rather than as a pan doing its job.
+    ///
+    /// [`Viewport::image_at`] puts the canvas's top-left at `center - half`,
+    /// where `half` is half the canvas measured in image pixels. So the picture
+    /// covers the canvas exactly while the centre stays in
+    /// `half ..= developed - half`.
+    ///
+    /// When the frame is *smaller* than the canvas on an axis that range is
+    /// empty — which is both axes at fit, and one axis whenever the two aspect
+    /// ratios differ — and the answer is to pin the centre to the middle of the
+    /// frame. A photograph with room around it is centred in that room rather
+    /// than being draggable within it, so at fit a drag does nothing at all.
     fn clamp_center(&mut self) {
-        self.viewport.center[0] = self.viewport.center[0].clamp(0.0, self.developed[0] as f64);
-        self.viewport.center[1] = self.viewport.center[1].clamp(0.0, self.developed[1] as f64);
+        for axis in 0..2 {
+            let extent = self.developed[axis] as f64;
+            // Guarded, because scale is finite and positive everywhere the
+            // session lets it be set — but this runs on `Resize` too, and a
+            // canvas of zero size has nothing to keep on screen.
+            let half = if self.viewport.scale > 0.0 {
+                self.viewport.size[axis] as f64 / (2.0 * self.viewport.scale)
+            } else {
+                0.0
+            };
+            self.viewport.center[axis] = if half * 2.0 >= extent {
+                extent / 2.0
+            } else {
+                self.viewport.center[axis].clamp(half, extent - half)
+            };
+        }
     }
 }
 
@@ -2176,22 +2213,108 @@ mod tests {
         assert!(s.state().tone.contrast.is_finite());
     }
 
+    /// How far the canvas's corners fall outside the photograph, if at all.
+    ///
+    /// The *unclamped* corners, deliberately: `visible_rect` clamps to the
+    /// image, so it cannot tell a canvas the picture covers from one with a
+    /// margin of nothing down two sides.
+    fn empty_margin(s: &Session) -> [f64; 4] {
+        let v = s.viewport();
+        let [w, h] = v.size;
+        let top_left = v.image_at([0.0, 0.0]);
+        let bottom_right = v.image_at([w as f64, h as f64]);
+        [
+            -top_left[0],
+            -top_left[1],
+            bottom_right[0] - IMAGE[0] as f64,
+            bottom_right[1] - IMAGE[1] as f64,
+        ]
+    }
+
     #[test]
-    fn the_image_cannot_be_flung_off_screen() {
+    fn a_pan_cannot_drag_the_photograph_into_empty_space() {
+        // The old version of this asserted only that *some* of the image was
+        // still visible, which passed with three quarters of the window empty.
+        // What a pan must actually preserve is that the picture still covers the
+        // canvas: an edge of nothing is indistinguishable, from the outside,
+        // from the renderer having lost the photograph.
         let mut s = session();
         s.apply(Command::ZoomTo {
             scale: 1.0,
             anchor: [800.0, 500.0],
         });
-        s.apply(Command::Pan { dx: 1e9, dy: -1e9 });
-        let rect = s.viewport().visible_rect(IMAGE);
-        assert!(
-            rect[2] > rect[0] && rect[3] > rect[1],
-            "some of the image must remain visible, got {rect:?}"
-        );
+        for (dx, dy) in [(1e9, -1e9), (-1e9, 1e9), (1e9, 1e9), (-1e9, -1e9)] {
+            s.apply(Command::Pan { dx, dy });
+            let margin = empty_margin(&s);
+            assert!(
+                margin.iter().all(|m| *m <= 1e-9),
+                "a pan of ({dx}, {dy}) left {margin:?} of empty canvas"
+            );
+        }
         assert!(
             !s.pending_work().is_empty(),
             "and therefore something to draw"
+        );
+    }
+
+    #[test]
+    fn at_fit_a_drag_does_nothing_at_all() {
+        // There is nothing to pan *towards*: the whole photograph is on screen,
+        // and every direction leads into the margin around it. Sliding it into
+        // that margin and leaving it there is the bug this pins.
+        let mut s = session();
+        s.apply(Command::FitToView);
+        let before = s.viewport().center;
+        s.apply(Command::Pan {
+            dx: 300.0,
+            dy: -200.0,
+        });
+        assert_eq!(
+            s.viewport().center,
+            before,
+            "the photograph moved at fit, where there is nowhere to move it to"
+        );
+        // And it is centred rather than merely stationary, so the margin is
+        // shared between the two sides.
+        assert_eq!(
+            before,
+            [IMAGE[0] as f64 / 2.0, IMAGE[1] as f64 / 2.0],
+            "a fitted photograph is not in the middle of its canvas"
+        );
+    }
+
+    #[test]
+    fn only_the_axis_with_room_to_move_moves() {
+        // The ordinary case between fit and 1:1, and the one a single clamp on
+        // the whole viewport would get wrong: a 3:2 frame in a 8:5 canvas runs
+        // out of height before it runs out of width.
+        let mut s = session();
+        // Wide enough to overflow the canvas horizontally (6000 * 0.3 = 1800 >
+        // 1600) and not vertically (4000 * 0.3 = 1200 > 1000 — both overflow),
+        // so pick a scale between the two fit ratios instead: at 0.26 the frame
+        // is 1560 x 1040, narrower than the canvas and taller than it.
+        s.apply(Command::ZoomTo {
+            scale: 0.26,
+            anchor: [800.0, 500.0],
+        });
+        let before = s.viewport().center;
+        s.apply(Command::Pan {
+            dx: 400.0,
+            dy: 400.0,
+        });
+        let after = s.viewport().center;
+        assert_eq!(
+            after[0], before[0],
+            "the frame is narrower than the canvas, so there is no room sideways"
+        );
+        assert!(
+            after[1] < before[1],
+            "and taller than it, so there is room up and down: {before:?} to {after:?}"
+        );
+        let margin = empty_margin(&s);
+        assert!(
+            margin[1] <= 1e-9 && margin[3] <= 1e-9,
+            "the axis that moved left empty canvas: {margin:?}"
         );
     }
 

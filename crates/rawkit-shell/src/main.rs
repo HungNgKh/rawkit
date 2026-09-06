@@ -5721,6 +5721,65 @@ mod radial_tests {
     }
 
     #[test]
+    fn dragging_across_the_grid_does_not_move_the_loupes_view() {
+        // The invisible half of "the photograph will not stay where I put it".
+        //
+        // A grid press falls through to arm a drag, because a click on a cell
+        // still has to be recorded — and nothing in the motion arm said that a
+        // drag across a contact sheet is not a pan. So it panned the *loupe's*
+        // viewport, on a view laid out in screen pixels where nothing moves.
+        // The only symptom was opening a photograph afterwards and finding it
+        // off-centre, which reads as a rendering fault rather than as something
+        // the hand did.
+        let session = std::sync::Arc::new(std::sync::Mutex::new(fitted()));
+        // Zoomed in, so there is somewhere for a pan to go: at fit the centre is
+        // pinned and this would pass without the guard.
+        session.lock().expect("session").apply(Command::ZoomTo {
+            scale: 1.0,
+            anchor: [600.0, 400.0],
+        });
+        let before = session.lock().expect("session").viewport().center;
+
+        MODE.store(MODE_GRID, std::sync::atomic::Ordering::Relaxed);
+        for event in [
+            crate::pointer::Pointer::Press {
+                at: [300.0, 200.0],
+                double: false,
+            },
+            crate::pointer::Pointer::Motion { at: [500.0, 400.0] },
+            crate::pointer::Pointer::Motion { at: [700.0, 600.0] },
+            crate::pointer::Pointer::Release,
+        ] {
+            crate::pointer::route(event, &session);
+        }
+        MODE.store(MODE_LOUPE, std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            session.lock().expect("session").viewport().center,
+            before,
+            "a drag across the grid moved the photograph the loupe will show"
+        );
+
+        // And the same drag in the loupe still pans, so the guard has not simply
+        // turned panning off.
+        for event in [
+            crate::pointer::Pointer::Press {
+                at: [300.0, 200.0],
+                double: false,
+            },
+            crate::pointer::Pointer::Motion { at: [500.0, 400.0] },
+            crate::pointer::Pointer::Release,
+        ] {
+            crate::pointer::route(event, &session);
+        }
+        assert_ne!(
+            session.lock().expect("session").viewport().center,
+            before,
+            "the loupe stopped panning"
+        );
+    }
+
+    #[test]
     fn a_placement_drag_is_spent_once_it_has_placed_something() {
         // The bug this exists for, and it was in the *arming* rather than in any
         // of the arithmetic the other tests here check.

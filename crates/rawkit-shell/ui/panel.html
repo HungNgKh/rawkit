@@ -528,7 +528,7 @@
   </details>
   <details id="s-keys">
     <summary>Keys</summary>
-    <div id="keys">G grid · E loupe · R crop · Q spots · O mask · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · 0–5 rate · 6–9 label · V copy · \ filter · Z undo cull · ⌃Z undo edit · ⌃E export · ⌃⇧E export what is shown · F11 fullscreen</div>
+    <div id="keys">G grid · E loupe · R crop · Q spots · O mask · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · 0–5 rate · 6–9 label · F fit · V copy · \ filter · Z undo cull · ⌃Z undo edit · ⌃E export · ⌃⇧E export what is shown · F11 fullscreen</div>
   </details>
 </main>
 </div>
@@ -2322,6 +2322,13 @@
       // keys need one.
       case "v":
         act(event.shiftKey ? "remove_copy" : "make_copy");
+        break;
+      // F fits the whole photograph in the window. The way back from a view
+      // that has got away from you — and the fit button beside the zoom
+      // controls has been the only way to reach it, which is a mouse trip for
+      // something you want mid-edit.
+      case "f":
+        send({ command: "fit_to_view" });
         break;
       case "p": act("pick"); break;
       case "x": act("reject"); break;

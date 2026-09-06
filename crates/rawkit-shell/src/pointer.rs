@@ -185,6 +185,16 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
             }
             let previous = *DRAG.lock().expect("drag lock");
             let Some(previous) = previous else { return };
+            // A grid press falls through to set `DRAG`, because a click there
+            // still has to be recorded — but a drag across a contact sheet is
+            // not a pan, and there was nothing here to say so. It panned the
+            // *loupe's* viewport, invisibly: the grid is laid out in screen
+            // pixels and nothing on it moves, so the only symptom was opening a
+            // photograph later and finding it off-centre for no reason anyone
+            // could see. Which reads as the renderer having lost the picture.
+            if in_grid() {
+                return;
+            }
             if in_crop() {
                 if let Some(marquee) = CANVAS_MARQUEE.lock().expect("marquee lock").as_mut() {
                     marquee.end = at;
