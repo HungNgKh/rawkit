@@ -263,7 +263,7 @@ pub fn delta_e_2000(one: [f32; 3], two: [f32; 3]) -> f32 {
 }
 
 /// A 3×3 inverse, or `None` when there is not one.
-fn invert(m: &Matrix3) -> Option<Matrix3> {
+pub fn invert(m: &Matrix3) -> Option<Matrix3> {
     let determinant = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
         - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);

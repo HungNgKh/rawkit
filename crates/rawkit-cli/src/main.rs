@@ -5,6 +5,7 @@
 //! here first: it makes the behaviour scriptable and, more usefully, testable on
 //! three operating systems without a display attached.
 
+mod chart;
 mod previews;
 mod render;
 
@@ -167,6 +168,41 @@ enum Command {
         /// How many to render at once.
         #[arg(long, default_value_t = previews::default_jobs())]
         jobs: usize,
+    },
+
+    /// Measure a photograph of a colour chart, patch by patch.
+    ///
+    /// How a calibration gets set by a number rather than by eye: shoot a
+    /// ColorChecker, say where its four corner patches are, and this prints the
+    /// ΔE2000 of every patch against the reference values you supply.
+    ///
+    /// **The reference is a file you provide, not a table this ships.** A
+    /// ColorChecker's published values changed when the chart was reformulated
+    /// in 2014, and different publishers disagree in the last digit — a built-in
+    /// table would be a number nobody here had checked, against which every
+    /// answer below would be quietly wrong.
+    ///
+    /// **Lightness is matched, not measured.** The render has been through the
+    /// tone map and the chart's reference has not, so comparing lightness would
+    /// mostly measure the tone curve — which no calibration slider can change.
+    /// What is reported is the hue and chroma error, which is what the seven
+    /// controls move.
+    Calibrate {
+        /// The RAW file: a photograph of the chart, evenly lit and square on.
+        input: PathBuf,
+        /// The four corner patches' centres, as fractions of the frame:
+        /// `x0,y0,x1,y1,x2,y2,x3,y3` — top left, top right, bottom right,
+        /// bottom left, as the chart appears in the photograph.
+        #[arg(long)]
+        corners: String,
+        /// Twenty-four reference colours, one `L a b` per line.
+        #[arg(long)]
+        reference: PathBuf,
+        /// A `.dcp` camera profile, as `render` takes one.
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[command(flatten)]
+        edit: EditFlags,
     },
 
     /// Report the GPU adapter this machine would render on.
@@ -491,6 +527,24 @@ fn main() -> Result<()> {
             for (name, why) in &report.failed {
                 println!("            {name}: {why}");
             }
+        }
+        Command::Calibrate {
+            input,
+            corners,
+            reference,
+            profile,
+            edit,
+        } => {
+            let corners = chart::Corners::parse(&corners)?;
+            let reference = chart::read_reference(&reference)?;
+            let measured = chart::measure(
+                &input,
+                profile.as_deref(),
+                &edit.state()?,
+                corners,
+                &reference,
+            )?;
+            chart::report(&measured);
         }
         Command::Gpu => {
             let gpu = rawkit_engine::Gpu::new()?;
