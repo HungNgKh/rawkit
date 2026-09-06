@@ -6,9 +6,9 @@
 //! the page forwards what it receives over IPC.
 //!
 //! What must *not* differ is what those events mean. A drag pans, a wheel zooms
-//! about the cursor, a click in the grid picks a cell, a drag in crop draws a
-//! rectangle — and if that lived in two places, one of them would quietly grow a
-//! different idea of which. So both front ends do the same small job — put the
+//! about the cursor, a click in the grid picks a cell, a drag in crop takes hold
+//! of the rectangle on the photograph — and if that lived in two places, one of
+//! them would quietly grow a different idea of which. So both front ends do the same small job — put the
 //! event in canvas pixels — and hand it here.
 //!
 //! Canvas pixels, not logical ones: the session works in the surface's own
@@ -16,8 +16,8 @@
 //! scale factor is known rather than passing a scale around.
 
 use crate::{
-    in_crop, in_grid, picking_range, picking_wb, placing_mask, targeting, Aim, Marquee, MaskDrag,
-    CANVAS_CLICK, CANVAS_MARQUEE, CANVAS_SCROLL, MASK_DRAG, TARGET_AIM, TARGET_RANGE_PX, WB_PICK,
+    in_crop, in_grid, picking_range, picking_wb, placing_mask, targeting, Aim, MaskDrag,
+    CANVAS_CLICK, CANVAS_SCROLL, MASK_DRAG, TARGET_AIM, TARGET_RANGE_PX, WB_PICK,
 };
 use rawkit_session::{Command, Session};
 use std::sync::{Arc, Mutex};
@@ -100,6 +100,26 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
                 *crate::RANGE_PICK.lock().expect("range pick lock") = Some(at);
                 return;
             }
+            // Crop is a mode, and while it is on the canvas belongs to it
+            // entirely. Taken before the handle test rather than after: a
+            // `MaskGrab` coming back from `handle_under` arms a mask drag, and a
+            // press meant for a crop corner would silently reshape whichever
+            // adjustment happened to be selected.
+            if in_crop() && !in_grid() {
+                let was = *crate::CROP_RECT.lock().expect("crop rect lock");
+                if let (Some(was), Some(grab)) = (was, crate::crop_grab_at(at)) {
+                    *crate::CROP_DRAG.lock().expect("crop drag lock") = Some(crate::CropDrag {
+                        grab,
+                        start: at,
+                        now: at,
+                        was,
+                    });
+                }
+                // Nothing else, and no `DRAG`: a press on the dimmed part is not
+                // a gesture, and panning underneath a crop would move the
+                // photograph out from under the rectangle being drawn on it.
+                return;
+            }
             // Placing a gradient takes the press for the same reason aiming
             // does: the drag draws the mask, so it must not also pan the
             // photograph the mask is being drawn on. A press with no motion
@@ -155,11 +175,6 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
                 // only place that knows the layout. Everything here does is say
                 // where the pointer was.
                 *CANVAS_CLICK.lock().expect("click lock") = Some((at, double));
-            } else if in_crop() {
-                // A new drag replaces whatever rectangle was there. Starting
-                // from the old one would mean a crop could only ever shrink.
-                *CANVAS_MARQUEE.lock().expect("marquee lock") =
-                    Some(Marquee { start: at, end: at });
             }
             *DRAG.lock().expect("drag lock") = Some(at);
         }
@@ -167,6 +182,10 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
         Pointer::Motion { at } => {
             // The far end follows the pointer. Where that lands on the sensor is
             // the render loop's question, not this one's.
+            if let Some(drag) = crate::CROP_DRAG.lock().expect("crop drag lock").as_mut() {
+                drag.now = at;
+                return;
+            }
             if let Some(drag) = MASK_DRAG.lock().expect("mask drag lock").as_mut() {
                 drag.now = at;
                 // Kept, not replaced: a brush paints along every point the hand
@@ -195,10 +214,9 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
             if in_grid() {
                 return;
             }
+            // Crop never pans. The press above returned without arming one, so
+            // this can only be a drag that began before the mode did.
             if in_crop() {
-                if let Some(marquee) = CANVAS_MARQUEE.lock().expect("marquee lock").as_mut() {
-                    marquee.end = at;
-                }
                 return;
             }
             // Dragging right moves the image right, which the session reads as
@@ -217,6 +235,7 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
         // until Enter takes it or Escape throws it away, so a drag that came out
         // wrong can be redrawn.
         Pointer::Release => {
+            *crate::CROP_DRAG.lock().expect("crop drag lock") = None;
             *DRAG.lock().expect("drag lock") = None;
             *TARGET_AIM.lock().expect("aim lock") = None;
             // A placement drag that actually travelled has placed the thing,

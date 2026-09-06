@@ -44,6 +44,13 @@ pub struct Cell<'a> {
     /// A second band just inside the first — a colour label, which a frame can
     /// carry at the same time as a flag.
     pub inner: ([f32; 3], f32),
+    /// How much of what is underneath this covers. 1.0 is opaque, which is
+    /// every mark that existed before there was a reason to dim anything.
+    ///
+    /// Written premultiplied, because that is what `present.wgsl` composites: a
+    /// black cell at 0.55 is a veil that takes 55% of the light, which is how
+    /// the area outside a crop is shown as excluded without hiding it.
+    pub alpha: f32,
     /// Draw only a ring inscribed in the rectangle, and discard the rest.
     ///
     /// For a marker that stands for a round thing — the spot tool's — where a
@@ -341,7 +348,7 @@ impl PreviewBlit {
                 cell.tint[0],
                 cell.tint[1],
                 cell.tint[2],
-                1.0,
+                cell.alpha,
             ]);
             // As a fraction of the *drawn* rectangle, so an edge stays the same
             // number of pixels wide on a cell that is half off-screen — except

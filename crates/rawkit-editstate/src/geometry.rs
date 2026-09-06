@@ -390,6 +390,70 @@ impl Geometry {
         ]
     }
 
+    /// The crop a rectangle drawn on *this* geometry's developed frame names.
+    ///
+    /// `view` is `[left, top, right, bottom]` in fractions of the developed
+    /// frame — what the window is showing — and the answer is a [`Crop`] in
+    /// fractions of the oriented frame, which is what a `Crop` is.
+    ///
+    /// # Why this is not the identity
+    ///
+    /// It looks as though a rectangle drawn on the whole frame is already in the
+    /// units a crop wants, and with nothing warping the frame it is. But a
+    /// straighten, a keystone or a stretch makes [`output_size`](Self::output_size)
+    /// the window pulled in by [`fit_scale`](Self::fit_scale) about its own
+    /// centre — so the developed frame is a *sub*-rectangle of the window, and
+    /// treating a fraction of one as a fraction of the other crops several
+    /// percent too much at 10°. That is a mistake nobody would see on a
+    /// photograph and everybody would see on a straight edge.
+    ///
+    /// The non-edge fields travel unchanged. That is deliberate and it is where
+    /// the fix belongs: the shell used to build its crop with `..Crop::default()`
+    /// and silently reset the straighten, the keystone and the stretch on every
+    /// commit. Here the fields are in scope, so there is nothing to remember.
+    pub fn crop_of_view(&self, view: [f32; 4], image: [u32; 2]) -> Crop {
+        let [ow, oh] = self.oriented_size(image);
+        let [x0, y0, x1, y1] = self.window(image);
+        let scale = self.fit_scale(image);
+        let along = |u: f32, low: u32, high: u32, extent: u32| {
+            let span = (high - low) as f32;
+            (low as f32 + span * (0.5 + (u - 0.5) * scale)) / extent.max(1) as f32
+        };
+        Crop {
+            left: along(view[0], x0, x1, ow),
+            top: along(view[1], y0, y1, oh),
+            right: along(view[2], x0, x1, ow),
+            bottom: along(view[3], y0, y1, oh),
+            ..self.crop
+        }
+    }
+
+    /// Where a stored crop sits on this geometry's developed frame — the
+    /// inverse of [`crop_of_view`](Self::crop_of_view).
+    ///
+    /// What a crop tool needs on the way in: open the view out to the whole
+    /// frame, then ask where the crop somebody already made is on it, so the
+    /// rectangle they see is the one they have rather than a fresh one. A tool
+    /// that started from nothing could only ever shrink a crop.
+    pub fn view_of_crop(&self, crop: &Crop, image: [u32; 2]) -> [f32; 4] {
+        let [ow, oh] = self.oriented_size(image);
+        let [x0, y0, x1, y1] = self.window(image);
+        let scale = self.fit_scale(image);
+        let back = |fraction: f32, low: u32, high: u32, extent: u32| {
+            let span = (high - low) as f32;
+            if span <= 0.0 || scale <= 0.0 {
+                return fraction;
+            }
+            0.5 + ((fraction * extent as f32 - low as f32) / span - 0.5) / scale
+        };
+        [
+            back(crop.left, x0, x1, ow),
+            back(crop.top, y0, y1, oh),
+            back(crop.right, x0, x1, ow),
+            back(crop.bottom, y0, y1, oh),
+        ]
+    }
+
     /// A point of the straightened photograph, in *flat* coordinates.
     ///
     /// Flat is the frame after the quarter turn and the crop's translation but
@@ -706,6 +770,176 @@ mod tests {
             orientation,
             crop: Crop::default(),
             distortion: None,
+        }
+    }
+
+    /// The geometry a crop tool draws on: the same edit with its rectangle
+    /// opened out to the whole frame, which is what the window shows while a
+    /// crop is being made.
+    fn opened_out(geometry: &Geometry) -> Geometry {
+        Geometry {
+            crop: Crop {
+                left: 0.0,
+                top: 0.0,
+                right: 1.0,
+                bottom: 1.0,
+                ..geometry.crop
+            },
+            ..*geometry
+        }
+    }
+
+    #[test]
+    fn a_view_rectangle_and_a_crop_are_inverses() {
+        // The round trip the whole crop tool rests on: what is drawn on the
+        // frame, and what gets stored. A rectangle drawn in one space and read
+        // back in another is the class of mistake that has cost this project
+        // more commits than any other.
+        let image = [6000u32, 4000];
+        let cases = [
+            ("plain", with(Orientation::AsShot, Crop::default())),
+            ("turned", with(Orientation::Rotate90Cw, Crop::default())),
+            (
+                "straightened",
+                with(
+                    Orientation::AsShot,
+                    Crop {
+                        angle_deg: 7.0,
+                        ..Crop::default()
+                    },
+                ),
+            ),
+            (
+                "keystoned",
+                with(
+                    Orientation::AsShot,
+                    Crop {
+                        vertical: 0.2,
+                        ..Crop::default()
+                    },
+                ),
+            ),
+            (
+                "stretched",
+                with(
+                    Orientation::AsShot,
+                    Crop {
+                        aspect: 1.3,
+                        ..Crop::default()
+                    },
+                ),
+            ),
+            (
+                "all of it",
+                with(
+                    Orientation::Rotate90Cw,
+                    Crop {
+                        angle_deg: -5.0,
+                        vertical: 0.15,
+                        horizontal: -0.1,
+                        aspect: 1.2,
+                        ..Crop::default()
+                    },
+                ),
+            ),
+        ];
+        for (name, geometry) in cases {
+            let view = opened_out(&geometry);
+            for rect in [
+                [0.0f32, 0.0, 1.0, 1.0],
+                [0.2, 0.3, 0.85, 0.9],
+                [0.45, 0.45, 0.55, 0.55],
+            ] {
+                let crop = view.crop_of_view(rect, image);
+                let back = view.view_of_crop(&crop, image);
+                for axis in 0..4 {
+                    // A whole oriented pixel of slack: `window` rounds to whole
+                    // pixels, so a fraction cannot survive better than that.
+                    let extent = if axis % 2 == 0 { 6000.0 } else { 4000.0 };
+                    assert!(
+                        (back[axis] - rect[axis]).abs() < 2.0 / extent,
+                        "{name}: {rect:?} came back as {back:?} through {crop:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_whole_view_is_the_whole_frame_when_nothing_is_warped() {
+        // With no straighten there is nothing to pull in, so the two spaces
+        // coincide and the identity has to come out exactly — a rectangle
+        // covering the view is a crop that removes nothing.
+        let image = [6000u32, 4000];
+        let geometry = with(Orientation::AsShot, Crop::default());
+        let crop = geometry.crop_of_view([0.0, 0.0, 1.0, 1.0], image);
+        assert_eq!(
+            [crop.left, crop.top, crop.right, crop.bottom],
+            [0.0, 0.0, 1.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn a_crop_proposed_from_the_whole_view_is_not_shrunk_a_second_time() {
+        // The trap: the developed frame is already `fit_scale` of the window, so
+        // a crop naming the whole of it could be pulled in *again* when it is
+        // stored and rendered — losing a few percent of the picture on every
+        // trip through the crop tool.
+        let image = [6000u32, 4000];
+        for angle in [3.0f32, 10.0, -14.0] {
+            let geometry = with(
+                Orientation::AsShot,
+                Crop {
+                    angle_deg: angle,
+                    ..Crop::default()
+                },
+            );
+            let view = opened_out(&geometry);
+            let proposed = view.crop_of_view([0.0, 0.0, 1.0, 1.0], image);
+            let stored = with(Orientation::AsShot, proposed);
+            let [vw, vh] = view.output_size(image);
+            let [sw, sh] = stored.output_size(image);
+            let shrink = (sw as f32 / vw as f32).min(sh as f32 / vh as f32);
+            assert!(
+                shrink > 0.98,
+                "at {angle}° the whole view became {sw}x{sh} from {vw}x{vh}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rectangle_drawn_anywhere_on_the_view_is_a_legal_crop() {
+        // `Crop::validate` refuses rather than clamps, so a proposal that lands
+        // outside 0..1 or inverts an edge is a commit that silently does
+        // nothing. Swept rather than spot-checked, because the failure would be
+        // at one corner of one combination.
+        let image = [6000u32, 4000];
+        for angle in [0.0f32, 12.0] {
+            for vertical in [0.0f32, 0.3] {
+                for aspect in [1.0f32, 1.4] {
+                    let view = opened_out(&with(
+                        Orientation::AsShot,
+                        Crop {
+                            angle_deg: angle,
+                            vertical,
+                            aspect,
+                            ..Crop::default()
+                        },
+                    ));
+                    for rect in [
+                        [0.0f32, 0.0, 1.0, 1.0],
+                        [0.0, 0.0, 0.02, 0.02],
+                        [0.98, 0.98, 1.0, 1.0],
+                        [0.3, 0.1, 0.7, 0.95],
+                    ] {
+                        let crop = view.crop_of_view(rect, image);
+                        assert!(
+                            crop.validate().is_ok(),
+                            "{rect:?} at {angle}°/{vertical}/{aspect} gave {crop:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 

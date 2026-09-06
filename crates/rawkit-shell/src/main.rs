@@ -907,7 +907,10 @@ fn cull(
             } else {
                 MODE_CROP
             };
-            *CANVAS_MARQUEE.lock().expect("marquee lock") = None;
+            // The rectangle itself is set up by the render loop, which is where
+            // the session is: it needs the whole frame on screen before it can
+            // say where the crop somebody already has sits on it.
+            *CROP_DRAG.lock().expect("crop drag lock") = None;
             MODE.store(next, std::sync::atomic::Ordering::Relaxed);
             CullAction::SelectBy(0)
         }
@@ -931,7 +934,7 @@ fn cull(
             CullAction::SelectBy(0)
         }
         CullAction::CropCancel => {
-            *CANVAS_MARQUEE.lock().expect("marquee lock") = None;
+            *CROP_DRAG.lock().expect("crop drag lock") = None;
             MODE.store(MODE_LOUPE, std::sync::atomic::Ordering::Relaxed);
             CullAction::SelectBy(0)
         }
@@ -1609,6 +1612,24 @@ fn main() -> Result<()> {
                         session.level() != session.viewport().level(session.max_level())
                     };
 
+                // Crop mode, stated to the session before anything reads the
+                // geometry — because in crop mode the geometry *is* the whole
+                // frame, and the fit, the tiles, the canvas and the overlay's
+                // mapper are all measured against it.
+                //
+                // Every frame rather than on the keypress, and idempotent:
+                // navigating to another photograph replaces the session while
+                // the tool is still open, and the new one has never heard of the
+                // mode the window is in.
+                {
+                    let mut session = shared.lock().expect("session lock");
+                    if in_crop() {
+                        enter_crop(&mut session);
+                    } else if session.cropping() {
+                        leave_crop(&mut session);
+                    }
+                }
+
                 // A white-balance pick. Resolved here because turning a canvas
                 // position into a rectangle of *sensor* needs the viewport, the
                 // geometry and the mosaic, and this is where all three meet.
@@ -2224,30 +2245,31 @@ fn main() -> Result<()> {
                     (None, None) => 0,
                 };
                 let drawing = rendering.elapsed();
-                // The outline goes on after the tiles, into the same canvas, and
-                // the canvas is only written where a tile landed — so a moving
-                // rectangle would leave its previous position behind. Redrawing
-                // every visible tile each frame is what stops that; at fit zoom
-                // it is about six of them.
                 if in_crop() {
-                    let marquee = *CANVAS_MARQUEE.lock().expect("marquee lock");
                     if CROP_COMMIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                        if let Some(marquee) = marquee {
-                            let mut session = shared.lock().expect("session lock");
-                            if let Some(crop) = crop_from(&session, &marquee) {
-                                // No explicit fit: the session refits whenever
-                                // the photograph changes shape, so asking again
-                                // here would be a second opinion on the same
-                                // question.
+                        let rect = *CROP_RECT.lock().expect("crop rect lock");
+                        let mut session = shared.lock().expect("session lock");
+                        if let Some(rect) = rect {
+                            // Read while the session is still showing the whole
+                            // frame, because that is the frame the rectangle is
+                            // in fractions of. After `leave_crop` it would be
+                            // fractions of the old crop.
+                            if let Some(crop) = crop_from(&session, rect) {
                                 session.apply(Command::SetCrop(Box::new(crop)));
                             }
                         }
-                        *CANVAS_MARQUEE.lock().expect("marquee lock") = None;
-                        MODE.store(MODE_LOUPE, std::sync::atomic::Ordering::Relaxed);
+                        leave_crop(&mut session);
+                        drop(session);
                         canvas_renderer.invalidate();
-                    } else if let Some(marquee) = marquee {
-                        let session = shared.lock().expect("session lock");
-                        draw_marquee(&gpu, &blit, &white, &canvas_renderer, &session, &marquee);
+                    } else {
+                        // The drag, then the drawing, in that order: a `Move`
+                        // pans the view, and drawing first would put the
+                        // rectangle where the view no longer is.
+                        let mut session = shared.lock().expect("session lock");
+                        advance_crop(&mut session);
+                        if let Some(rect) = *CROP_RECT.lock().expect("crop rect lock") {
+                            draw_crop(&gpu, &blit, &white, &canvas_renderer, &session, rect);
+                        }
                     }
                 }
                 // The spot markers, on the same terms as the crop outline: into
@@ -4195,29 +4217,8 @@ struct Survey {
     histogram: rawkit_export::histogram::Histogram,
 }
 
-pub(crate) static CANVAS_MARQUEE: Mutex<Option<Marquee>> = Mutex::new(None);
 /// Set when the page asks for the rectangle to be taken.
 static CROP_COMMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Marquee {
-    pub start: [f64; 2],
-    pub end: [f64; 2],
-}
-
-impl Marquee {
-    /// `[x, y, w, h]`, however the drag was made — up-left is a rectangle too.
-    pub(crate) fn rect(&self) -> [f64; 4] {
-        let x = self.start[0].min(self.end[0]);
-        let y = self.start[1].min(self.end[1]);
-        [
-            x,
-            y,
-            (self.start[0] - self.end[0]).abs(),
-            (self.start[1] - self.end[1]).abs(),
-        ]
-    }
-}
 
 pub(crate) fn mode_name() -> &'static str {
     match mode() {
@@ -4480,6 +4481,7 @@ fn draw_grid(
             tint,
             edge,
             inner,
+            alpha: 1.0,
             round: false,
         });
     }
@@ -4641,60 +4643,428 @@ pub(crate) fn test_mosaic(width: u32, height: u32) -> Vec<f32> {
     samples
 }
 
-/// The four sides of the rectangle being drawn, as thin filled cells.
+/// What a press on the crop overlay has taken hold of.
 ///
-/// Four cells rather than one outlined one: a cell is opaque everywhere, so a
-/// single rectangle with an edge would paint over the photograph it is meant to
-/// be drawn on. The image handed to each side is never sampled — the edge colour
-/// covers the whole of a cell this thin — but the type wants one.
-fn draw_marquee(
+/// Its own type rather than a reuse of [`MaskGrab`], and that is not tidiness.
+/// A `MaskGrab` coming back from `handle_under` makes the pointer arm a *mask*
+/// drag, which the render loop turns into a reshape of the selected adjustment —
+/// so a crop handle published into the mask list would silently move a gradient.
+/// The render loop also clears that list every frame when no mask is selected,
+/// which in crop mode is always.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CropGrab {
+    /// Inside the rectangle: the photograph moves under it.
+    Move,
+    /// A corner, clockwise from the top left.
+    Corner(u8),
+    /// One edge — left, top, right, bottom.
+    Edge(u8),
+}
+
+/// The rectangle being drawn, in fractions of the frame on screen.
+///
+/// **Fractions of the view, not surface pixels.** A rectangle kept in screen
+/// coordinates is the mistake this project has made in six consecutive commits:
+/// everything drawn — the outline, the dimming, the handles, the hit test — is
+/// derived from this each frame through one mapping, so a clamp anywhere can
+/// only move the box, never make the drawing and the hit test disagree about
+/// where it is.
+///
+/// `None` when no crop is being drawn.
+static CROP_RECT: Mutex<Option<[f32; 4]>> = Mutex::new(None);
+
+/// Where the rectangle and its handles are on screen, in **surface** pixels.
+///
+/// One struct rather than two statics, so the box and the handles cannot be
+/// published a frame apart and have a press land between them. Republished
+/// every frame by the one function that draws them.
+pub(crate) struct CropScreen {
+    rect: [f64; 4],
+    handles: Vec<(CropGrab, [f64; 2])>,
+}
+
+pub(crate) static CROP_SCREEN: Mutex<Option<CropScreen>> = Mutex::new(None);
+
+/// A drag on the crop overlay: what it has hold of, where it began, where it
+/// has reached, and the rectangle it began from.
+///
+/// Anchored to the press rather than accumulated between frames, for the reason
+/// [`MASK_ANCHOR`] is: a drag that adds up its deltas drifts, and at a limit it
+/// un-sticks early because the overshoot was thrown away instead of remembered.
+pub(crate) struct CropDrag {
+    pub(crate) grab: CropGrab,
+    pub(crate) start: [f64; 2],
+    pub(crate) now: [f64; 2],
+    pub(crate) was: [f32; 4],
+}
+
+pub(crate) static CROP_DRAG: Mutex<Option<CropDrag>> = Mutex::new(None);
+
+/// Where each handle sits, in fractions of the frame on screen.
+///
+/// One function, so the drawing and the hit test cannot disagree — which is the
+/// bug that makes a handle you can see and cannot grab. Corners first, because
+/// a corner is the more deliberate target where the two overlap.
+fn crop_handles(rect: [f32; 4]) -> Vec<(CropGrab, [f32; 2])> {
+    let [l, t, r, b] = rect;
+    let (mx, my) = ((l + r) / 2.0, (t + b) / 2.0);
+    vec![
+        (CropGrab::Corner(0), [l, t]),
+        (CropGrab::Corner(1), [r, t]),
+        (CropGrab::Corner(2), [r, b]),
+        (CropGrab::Corner(3), [l, b]),
+        (CropGrab::Edge(0), [l, my]),
+        (CropGrab::Edge(1), [mx, t]),
+        (CropGrab::Edge(2), [r, my]),
+        (CropGrab::Edge(3), [mx, b]),
+    ]
+}
+
+/// What a press at `at` takes hold of, in surface pixels.
+///
+/// A handle if one is within reach, otherwise `Move` if the press is inside the
+/// rectangle, otherwise nothing — a press on the dimmed part is not a gesture,
+/// because there is nothing there to grab and starting a fresh rectangle from it
+/// would throw away the crop somebody already has.
+pub(crate) fn crop_grab_at(at: [f64; 2]) -> Option<CropGrab> {
+    let screen = CROP_SCREEN.lock().expect("crop screen lock");
+    crop_grab_in(screen.as_ref()?, at)
+}
+
+/// The same question of a rectangle handed in rather than read from the static,
+/// so a test can ask it without the process-wide state a window has.
+fn crop_grab_in(screen: &CropScreen, at: [f64; 2]) -> Option<CropGrab> {
+    if let Some(grab) = nearest_handle(&screen.handles, at) {
+        return Some(grab);
+    }
+    let [l, t, r, b] = screen.rect;
+    (at[0] >= l && at[0] <= r && at[1] >= t && at[1] <= b).then_some(CropGrab::Move)
+}
+
+/// The nearest handle to a point, if one is close enough to have been meant.
+///
+/// Shared by the mask handles and the crop's, so the reach is written once.
+fn nearest_handle<T: Copy>(handles: &[(T, [f64; 2])], at: [f64; 2]) -> Option<T> {
+    // Generous, and in *physical* terms: a handle is drawn `HANDLE_SIZE` across
+    // and has to be grabbable by a hand rather than by a pixel.
+    let reach = HANDLE_SIZE * display_scale() * 2.2;
+    handles
+        .iter()
+        .map(|(grab, at_handle)| {
+            let (dx, dy) = (at_handle[0] - at[0], at_handle[1] - at[1]);
+            (*grab, dx.hypot(dy))
+        })
+        .filter(|(_, distance)| *distance <= reach)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(grab, _)| grab)
+}
+
+/// The rectangle a drag has made of the one it started from.
+///
+/// Pure, and anchored to the press: given the same start and end it always
+/// gives the same answer, whatever route the hand took. The caller derives the
+/// pan that keeps a `Move` looking like the photograph sliding — see the render
+/// loop — because the pan is relative and this is not.
+fn crop_from_drag(
+    grab: CropGrab,
+    was: [f32; 4],
+    from: [f64; 2],
+    to: [f64; 2],
+    viewport: rawkit_session::Viewport,
+    developed: [u32; 2],
+) -> [f32; 4] {
+    let (dw, dh) = (developed[0].max(1) as f64, developed[1].max(1) as f64);
+    if viewport.scale <= 0.0 {
+        return was;
+    }
+    let shift = [
+        ((to[0] - from[0]) / viewport.scale / dw) as f32,
+        ((to[1] - from[1]) / viewport.scale / dh) as f32,
+    ];
+    // Never nothing. A rectangle that rounds to zero pixels is a `Crop` the
+    // editstate refuses, so it is kept legal while it is being dragged rather
+    // than checked at the end — the end is a keypress that would silently do
+    // nothing.
+    let smallest = [(8.0 / dw).max(0.01) as f32, (8.0 / dh).max(0.01) as f32];
+    let mut rect = was;
+    match grab {
+        CropGrab::Move => {
+            // The photograph moves with the hand, so the box moves the other way
+            // through it — and it may not leave the frame, which is what stops
+            // the picture sliding rather than a second rule about the picture.
+            let dx = (-shift[0]).clamp(-was[0], 1.0 - was[2]);
+            let dy = (-shift[1]).clamp(-was[1], 1.0 - was[3]);
+            rect = [was[0] + dx, was[1] + dy, was[2] + dx, was[3] + dy];
+        }
+        CropGrab::Corner(corner) => {
+            let (x, y) = match corner {
+                0 => (0usize, 1usize),
+                1 => (2, 1),
+                2 => (2, 3),
+                _ => (0, 3),
+            };
+            move_crop_edge(&mut rect, was, x, shift[0], smallest[0]);
+            move_crop_edge(&mut rect, was, y, shift[1], smallest[1]);
+        }
+        CropGrab::Edge(edge) => {
+            let axis = if edge % 2 == 0 { 0 } else { 1 };
+            move_crop_edge(&mut rect, was, edge as usize, shift[axis], smallest[axis]);
+        }
+    }
+    rect
+}
+
+/// Move one edge of the rectangle, keeping it inside the frame and on its own
+/// side of the edge opposite.
+fn move_crop_edge(rect: &mut [f32; 4], was: [f32; 4], edge: usize, by: f32, smallest: f32) {
+    rect[edge] = match edge {
+        0 => (was[0] + by).clamp(0.0, was[2] - smallest),
+        1 => (was[1] + by).clamp(0.0, was[3] - smallest),
+        2 => (was[2] + by).clamp(was[0] + smallest, 1.0),
+        _ => (was[3] + by).clamp(was[1] + smallest, 1.0),
+    };
+}
+
+/// Put the session into crop mode, and set up the rectangle from the crop the
+/// photograph already has.
+///
+/// Stated every frame rather than once on the keypress, and idempotent, for the
+/// reason `set_haste` is: navigating to another photograph replaces the whole
+/// session while the tool is still open, and the new one knows nothing about
+/// what mode the window is in.
+fn enter_crop(session: &mut Session) {
+    if !session.set_cropping(true) {
+        return;
+    }
+    *CROP_RECT.lock().expect("crop rect lock") = Some(crop_rect_of(session));
+}
+
+/// Where the crop this photograph already has sits on the frame now on screen.
+///
+/// Asked *after* `set_cropping`, so `geometry()` is already the opened-out one
+/// and the answer is in fractions of what is being looked at.
+fn crop_rect_of(session: &Session) -> [f32; 4] {
+    let rect = session
+        .geometry()
+        .view_of_crop(&session.state().crop, session.image_size());
+    [
+        rect[0].clamp(0.0, 1.0),
+        rect[1].clamp(0.0, 1.0),
+        rect[2].clamp(0.0, 1.0),
+        rect[3].clamp(0.0, 1.0),
+    ]
+}
+
+/// Leave crop mode, whether the rectangle was taken or thrown away.
+fn leave_crop(session: &mut Session) {
+    session.set_cropping(false);
+    *CROP_RECT.lock().expect("crop rect lock") = None;
+    *CROP_DRAG.lock().expect("crop drag lock") = None;
+    *CROP_SCREEN.lock().expect("crop screen lock") = None;
+    MODE.store(MODE_LOUPE, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Carry a crop drag forward by one frame.
+///
+/// A `Move` is the one that pans. The rectangle moves against the hand and the
+/// view moves with it, by exactly the amount that leaves the box where it was on
+/// screen — so what the eye sees is the photograph sliding underneath a
+/// stationary frame. The two cancel by construction rather than by being tuned:
+/// the box's screen position is `(rect·developed − centre)·scale`, and both
+/// terms move by the same number of image pixels.
+///
+/// When the rectangle reaches the edge of the frame its clamp gives back no
+/// movement, so the derived pan is zero and the photograph stops. That is one
+/// subtraction rather than a second rule about the view — and where the view
+/// cannot follow (it is already showing all there is), the pan is absorbed by
+/// the session's own clamp and the box slides instead. Both are honest: the
+/// gesture always moves the crop relative to the picture, and which of the two
+/// appears to move is decided by whether there is any picture spare.
+fn advance_crop(session: &mut Session) {
+    let next = {
+        let drag = CROP_DRAG.lock().expect("crop drag lock");
+        let previous = *CROP_RECT.lock().expect("crop rect lock");
+        match (drag.as_ref(), previous) {
+            (Some(drag), Some(previous)) => Some(advance_crop_rect(
+                session, drag.grab, drag.was, drag.start, drag.now, previous,
+            )),
+            _ => None,
+        }
+    };
+    if let Some(rect) = next {
+        *CROP_RECT.lock().expect("crop rect lock") = Some(rect);
+    }
+}
+
+/// The rectangle a drag has reached, and the pan that keeps it looking still.
+///
+/// The whole of the arithmetic, with nothing read from a static — so a test can
+/// drive it with a session of its own and the window's globals stay out of it.
+fn advance_crop_rect(
+    session: &mut Session,
+    grab: CropGrab,
+    was: [f32; 4],
+    start: [f64; 2],
+    now: [f64; 2],
+    previous: [f32; 4],
+) -> [f32; 4] {
+    let developed = session.developed_size();
+    let rect = crop_from_drag(grab, was, start, now, session.viewport(), developed);
+    if grab == CropGrab::Move {
+        let scale = session.viewport().scale;
+        let dx = -((rect[0] - previous[0]) as f64) * developed[0] as f64 * scale;
+        let dy = -((rect[1] - previous[1]) as f64) * developed[1] as f64 * scale;
+        if dx != 0.0 || dy != 0.0 {
+            session.apply(Command::Pan { dx, dy });
+        }
+    }
+    rect
+}
+
+/// Where the rectangle and its handles are on screen, in surface pixels.
+///
+/// The single source both halves come from: [`draw_crop`] divides these by the
+/// zoom to get canvas pixels, and the pointer reads them as they are. A handle
+/// drawn from one arithmetic and grabbed by another is the bug this shape
+/// exists to make impossible — and `surface_of` here is exactly the inverse of
+/// [`rawkit_session::Viewport::image_at`], which is what the pointer uses on the
+/// way in.
+fn crop_on_screen(session: &Session, rect: [f32; 4]) -> Option<CropScreen> {
+    let viewport = session.viewport();
+    if viewport.scale <= 0.0 {
+        return None;
+    }
+    let [dw, dh] = session.developed_size();
+    let surface_of = |at: [f32; 2]| {
+        [
+            (at[0] as f64 * dw as f64 - viewport.center[0]) * viewport.scale
+                + viewport.size[0] as f64 / 2.0,
+            (at[1] as f64 * dh as f64 - viewport.center[1]) * viewport.scale
+                + viewport.size[1] as f64 / 2.0,
+        ]
+    };
+    let top_left = surface_of([rect[0], rect[1]]);
+    let bottom_right = surface_of([rect[2], rect[3]]);
+    Some(CropScreen {
+        rect: [top_left[0], top_left[1], bottom_right[0], bottom_right[1]],
+        handles: crop_handles(rect)
+            .into_iter()
+            .map(|(grab, at)| (grab, surface_of(at)))
+            .collect(),
+    })
+}
+
+/// How much light the area outside the crop keeps. Enough to see what is being
+/// cut away — the whole reason the frame is opened out — and little enough that
+/// the eye reads the bright part as the photograph.
+const CROP_DIM: f32 = 0.62;
+
+/// The crop rectangle over the whole frame: what is being kept, what is being
+/// cut away, and what to take hold of.
+///
+/// Everything here is derived from `rect`, which is in fractions of the frame on
+/// screen. Nothing is remembered between frames, because the overlay is cleared
+/// after every present — so this draws what is true now rather than patching
+/// what was true before.
+fn draw_crop(
     gpu: &Gpu,
     blit: &rawkit_engine::PreviewBlit,
     white: &rawkit_engine::PreviewImage,
     canvas_renderer: &session_canvas::CanvasRenderer,
     session: &Session,
-    marquee: &Marquee,
+    rect: [f32; 4],
 ) {
-    // Surface pixels to canvas pixels. In the loupe the canvas is sized in level
-    // pixels, so the outline has to shrink by the same factor the presenter
-    // magnifies by, or it would sit somewhere else entirely when zoomed.
-    // The level the canvas was *drawn* at, haste and all — see
-    // `surface_per_canvas` for why that distinction is the whole of it.
-    let scale = surface_per_canvas(session);
-    if scale <= 0.0 {
+    let per_canvas = surface_per_canvas(session);
+    let Some(screen) = crop_on_screen(session, rect) else {
+        return;
+    };
+    if per_canvas <= 0.0 {
         return;
     }
-    let [x, y, w, h] = marquee.rect();
-    let to_canvas = |v: f64| (v / scale).round() as i32;
-    let (x, y, w, h) = (to_canvas(x), to_canvas(y), to_canvas(w), to_canvas(h));
+    // Surface pixels to canvas ones: the canvas is sized in level pixels, so a
+    // mark has to shrink by the same factor the presenter magnifies by.
+    let to_canvas = |v: f64| (v / per_canvas).round() as i32;
+    let [x0, y0, x1, y1] = [
+        to_canvas(screen.rect[0]),
+        to_canvas(screen.rect[1]),
+        to_canvas(screen.rect[2]),
+        to_canvas(screen.rect[3]),
+    ];
+    let (w, h) = (x1 - x0, y1 - y0);
     if w <= 0 || h <= 0 {
         return;
     }
-    // Two *screen* pixels, whatever the zoom. In canvas pixels the same line
-    // would thin out as you zoom away — at fit on a 24 MP frame it came to a
-    // single pixel, which on white foam is invisible.
-    let t = (2.0 / scale).ceil().max(1.0) as i32;
-    let colour = [0.98, 0.98, 0.98];
-    let sides = [
-        [x, y, w, t],
-        [x, y + h - t, w, t],
-        [x, y, t, h],
-        [x + w - t, y, t, h],
+    let [cw, ch] = canvas_renderer.overlay().size();
+    let (cw, ch) = (cw as i32, ch as i32);
+
+    let veil = |dest: [i32; 4]| rawkit_engine::Cell {
+        image: white,
+        dest,
+        // Black at less than full coverage, so what is being cut away can still
+        // be judged. A cell was opaque everywhere until coverage existed, which
+        // is why this used to be a bare outline with nothing outside it.
+        tint: [0.0; 3],
+        edge: ([0.0; 3], 0.0),
+        inner: ([0.0; 3], 0.0),
+        alpha: CROP_DIM,
+        round: false,
+    };
+    // Four bands that do not overlap: a cell replaces rather than blends, so
+    // overlapping ones would darken twice where they met.
+    let mut cells = vec![
+        veil([0, 0, cw, y0.max(0)]),
+        veil([0, y1, cw, (ch - y1).max(0)]),
+        veil([0, y0.max(0), x0.max(0), h]),
+        veil([x1, y0.max(0), (cw - x1).max(0), h]),
     ];
-    let cells: Vec<rawkit_engine::Cell<'_>> = sides
-        .iter()
-        .map(|dest| rawkit_engine::Cell {
+
+    let line = |dest: [i32; 4], alpha: f32, thickness: f32| rawkit_engine::Cell {
+        image: white,
+        dest,
+        tint: [1.0; 3],
+        edge: ([0.98, 0.98, 0.98], thickness),
+        inner: ([0.0; 3], 0.0),
+        alpha,
+        round: false,
+    };
+    // Two *screen* pixels whatever the zoom: in canvas pixels the same line
+    // thins out as you zoom away, and at fit on a 24 MP frame it came to one.
+    let t = (2.0 / per_canvas).ceil().max(1.0) as i32;
+    for dest in [
+        [x0, y0, w, t],
+        [x0, y1 - t, w, t],
+        [x0, y0, t, h],
+        [x1 - t, y0, t, h],
+    ] {
+        cells.push(line(dest, 1.0, t as f32));
+    }
+    // Thirds, because a crop is a composition and this is what anyone making
+    // one is looking for. Faint: guides, not part of the picture.
+    let thin = (1.0 / per_canvas).ceil().max(1.0) as i32;
+    for third in 1..3 {
+        cells.push(line([x0 + w * third / 3, y0, thin, h], 0.35, thin as f32));
+        cells.push(line([x0, y0 + h * third / 3, w, thin], 0.35, thin as f32));
+    }
+
+    let side = (HANDLE_SIZE * display_scale() * canvas_per_screen(session)).max(3.0);
+    for (_, at) in &screen.handles {
+        let (px, py) = (at[0] / per_canvas, at[1] / per_canvas);
+        cells.push(rawkit_engine::Cell {
             image: white,
-            dest: *dest,
-            tint: [1.0, 1.0, 1.0],
-            // Thickness is a fraction of the cell's short side, so `t` on a cell
-            // `t` thick covers all of it — which is the point: the image below
-            // is never sampled.
-            edge: (colour, t as f32),
+            dest: [
+                (px - side / 2.0).round() as i32,
+                (py - side / 2.0).round() as i32,
+                side.round() as i32,
+                side.round() as i32,
+            ],
+            tint: [1.0; 3],
+            edge: ([0.98, 0.98, 0.98], side as f32),
             inner: ([0.0; 3], 0.0),
+            alpha: 1.0,
             round: false,
-        })
-        .collect();
+        });
+    }
+    *CROP_SCREEN.lock().expect("crop screen lock") = Some(screen);
     blit.draw_over(gpu, canvas_renderer.overlay(), &cells);
 }
 
@@ -4885,20 +5255,14 @@ pub(crate) static MASK_HANDLES: Mutex<Vec<(MaskGrab, [f64; 2])>> = Mutex::new(Ve
 
 /// Which handle a press at this point lands on, if any.
 pub(crate) fn handle_under(at: [f64; 2]) -> Option<MaskGrab> {
-    let handles = MASK_HANDLES.lock().expect("mask handles lock");
     // Generous, and in the display's own pixels: the cost of missing is panning
     // the photograph out from under the very shape being adjusted, and the cost
     // of an over-large target is nothing, because a press that is not on a
     // handle is a pan and a press near one almost always meant the handle.
     // Comfortably larger than the drawn square, which is the usual advice for a
-    // pointer target and the reason a handle can be *drawn* small.
-    let reach = HANDLE_SIZE * display_scale() * 2.2;
-    handles
-        .iter()
-        .map(|(grab, p)| (grab, (p[0] - at[0]).hypot(p[1] - at[1])))
-        .filter(|(_, d)| *d <= reach)
-        .min_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(grab, _)| *grab)
+    // pointer target and the reason a handle can be *drawn* small. The reach
+    // itself lives in `nearest_handle`, which the crop's handles share.
+    nearest_handle(&MASK_HANDLES.lock().expect("mask handles lock"), at)
 }
 
 /// Where each of the selected shape's handles sits, in sensor fractions.
@@ -5064,6 +5428,7 @@ fn draw_mask_handles(
             tint: [1.0; 3],
             edge: ([*shade; 3], *side as f32),
             inner: ([0.0; 3], 0.0),
+            alpha: 1.0,
             round: false,
         });
     }
@@ -5154,6 +5519,7 @@ fn draw_spots(
             tint: [1.0; 3],
             edge: ([*colour; 3], (thin * weight).ceil() as f32),
             inner: ([0.0; 3], 0.0),
+            alpha: 1.0,
             round: true,
         });
     }
@@ -5192,34 +5558,20 @@ fn straight_of_sensor(
 
 /// The rectangle on screen, as a crop of the photograph.
 ///
-/// Composed with the crop already in force rather than replacing it: the drag
-/// happened on what is *currently* visible, so a second crop names a region of
-/// the first. Replacing would make every crop after the first jump somewhere
-/// else, which reads as the rectangle being ignored.
-fn crop_from(session: &Session, marquee: &Marquee) -> Option<rawkit_editstate::Crop> {
-    let [x, y, w, h] = marquee.rect();
-    if w < 8.0 || h < 8.0 {
-        // A click, or a twitch. Cropping to a few pixels is never what was
-        // meant, and the photograph would vanish.
-        return None;
-    }
-    let viewport = session.viewport();
-    let [dw, dh] = session.developed_size();
-    let (dw, dh) = (dw as f64, dh as f64);
-
-    let top_left = viewport.image_at([x, y]);
-    let bottom_right = viewport.image_at([x + w, y + h]);
-    let fraction = |v: f64, extent: f64| (v / extent).clamp(0.0, 1.0) as f32;
-
-    let now = session.state().crop;
-    let (span_x, span_y) = (now.right - now.left, now.bottom - now.top);
-    let crop = rawkit_editstate::Crop {
-        left: now.left + span_x * fraction(top_left[0], dw),
-        top: now.top + span_y * fraction(top_left[1], dh),
-        right: now.left + span_x * fraction(bottom_right[0], dw),
-        bottom: now.top + span_y * fraction(bottom_right[1], dh),
-        ..rawkit_editstate::Crop::default()
-    };
+/// The conversion itself lives in `Geometry`, where the algebra it inverts
+/// lives: the developed frame is the crop's window pulled in by `fit_scale`, so
+/// a fraction of what is on screen is *not* a fraction of the oriented frame the
+/// moment anything is straightened.
+///
+/// Two long-standing defects go with the old version of this. It composed the
+/// new rectangle against the crop in force, because the canvas only ever showed
+/// the cropped photograph — so a crop could only ever shrink, and nothing could
+/// grow one back. And it built its `Crop` with `..Crop::default()`, silently
+/// resetting the straighten, both keystones and the stretch on every commit.
+/// Neither is expressible now: the view *is* the whole frame, and the non-edge
+/// fields are carried in `crop_of_view` where they are in scope.
+fn crop_from(session: &Session, rect: [f32; 4]) -> Option<rawkit_editstate::Crop> {
+    let crop = session.geometry().crop_of_view(rect, session.image_size());
     crop.validate().ok().map(|()| crop)
 }
 
@@ -5718,6 +6070,264 @@ mod radial_tests {
                 );
             }
         }
+    }
+
+    /// A session in crop mode, showing the whole frame with `crop` on it.
+    ///
+    /// Deliberately without the window's statics: these tests run in one process
+    /// beside every other, and a `CROP_RECT` set here would be read — or cleared
+    /// — by whichever test happened to be running at the same moment.
+    fn cropping(crop: rawkit_editstate::Crop) -> (Session, [f32; 4]) {
+        let mut session = fitted();
+        session.apply(Command::SetCrop(Box::new(crop)));
+        session.set_cropping(true);
+        let rect = crop_rect_of(&session);
+        (session, rect)
+    }
+
+    #[test]
+    fn a_crop_handle_is_published_where_a_click_on_it_will_land() {
+        // The class of bug that has cost this project more commits than any
+        // other: a mark drawn in one space and grabbed in another. Asserted at
+        // several zooms and on a turned frame, because at fit the two spaces
+        // very nearly coincide and the mistake hides there.
+        for (name, orientation) in [
+            ("upright", Orientation::AsShot),
+            ("turned", Orientation::Rotate90Cw),
+        ] {
+            for scale in [0.2f64, 0.5, 1.0, 2.0] {
+                let mut session = fitted();
+                session.apply(Command::SetOrientation(orientation));
+                session.apply(Command::SetCrop(Box::new(rawkit_editstate::Crop {
+                    left: 0.2,
+                    top: 0.15,
+                    right: 0.8,
+                    bottom: 0.85,
+                    ..rawkit_editstate::Crop::default()
+                })));
+                session.set_cropping(true);
+                let rect = crop_rect_of(&session);
+                session.apply(Command::ZoomTo {
+                    scale,
+                    anchor: [600.0, 400.0],
+                });
+                let screen = crop_on_screen(&session, rect).expect("somewhere on screen");
+
+                for (grab, at) in &screen.handles {
+                    assert_eq!(
+                        crop_grab_in(&screen, *at),
+                        Some(*grab),
+                        "{name} at {scale}x: the handle drawn at {at:?} is not the one a \
+                         click there finds"
+                    );
+                }
+                let middle = [
+                    (screen.rect[0] + screen.rect[2]) / 2.0,
+                    (screen.rect[1] + screen.rect[3]) / 2.0,
+                ];
+                assert_eq!(
+                    crop_grab_in(&screen, middle),
+                    Some(CropGrab::Move),
+                    "{name} at {scale}x: the middle of the box is not a move"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_box_is_where_the_pointer_says_it_is() {
+        // The other direction of the same arithmetic. `crop_on_screen` and
+        // `Viewport::image_at` have to be inverses, because a drag converts a
+        // pointer delta into a fraction of the frame and the drawing converts it
+        // back — if they disagreed the rectangle would drift under the hand.
+        let (session, _) = cropping(rawkit_editstate::Crop::default());
+        let rect = [0.25f32, 0.3, 0.75, 0.8];
+        let screen = crop_on_screen(&session, rect).expect("on screen");
+        let [dw, dh] = session.developed_size();
+        let back = session
+            .viewport()
+            .image_at([screen.rect[0], screen.rect[1]]);
+        assert!(
+            (back[0] / dw as f64 - rect[0] as f64).abs() < 1e-9
+                && (back[1] / dh as f64 - rect[1] as f64).abs() < 1e-9,
+            "{rect:?} was drawn at {:?} and read back as {back:?}",
+            screen.rect
+        );
+    }
+
+    #[test]
+    fn a_drag_inside_the_box_moves_the_picture_and_not_the_box() {
+        // The gesture the whole overlay is for: the box stays where it is on
+        // screen and the photograph slides beneath it. Two movements that have
+        // to cancel exactly rather than approximately.
+        let (mut session, was) = cropping(rawkit_editstate::Crop {
+            left: 0.3,
+            top: 0.3,
+            right: 0.7,
+            bottom: 0.7,
+            ..rawkit_editstate::Crop::default()
+        });
+        // Zoomed in, so the view has somewhere to go. At fit the session pins the
+        // centre and the box moves instead — which is the honest degradation and
+        // has its own test below.
+        session.apply(Command::ZoomTo {
+            scale: 1.0,
+            anchor: [600.0, 400.0],
+        });
+        let before = crop_on_screen(&session, was).expect("on screen").rect;
+        let centre = session.viewport().center;
+
+        let now = advance_crop_rect(
+            &mut session,
+            CropGrab::Move,
+            was,
+            [600.0, 400.0],
+            [700.0, 400.0],
+            was,
+        );
+        let after = crop_on_screen(&session, now).expect("on screen").rect;
+        for axis in 0..4 {
+            assert!(
+                (after[axis] - before[axis]).abs() < 1.0,
+                "the box moved on screen: {before:?} to {after:?}"
+            );
+        }
+        assert!(
+            // Not exact: the rectangle is `f32` fractions of the frame, so a
+            // hundred surface pixels come back through it a ten-thousandth of a
+            // pixel out.
+            (session.viewport().center[0] - (centre[0] - 100.0)).abs() < 1e-2,
+            "the photograph did not slide with the hand: {:?} from {centre:?}",
+            session.viewport().center
+        );
+        // Dragging right brings the part of the picture to the left into the
+        // box, so the crop moves left through the frame.
+        assert!(
+            now[0] < was[0],
+            "the crop went the wrong way: {was:?} to {now:?}"
+        );
+    }
+
+    #[test]
+    fn the_picture_stops_when_the_box_would_leave_the_frame() {
+        let (mut session, was) = cropping(rawkit_editstate::Crop {
+            left: 0.0,
+            top: 0.0,
+            right: 0.4,
+            bottom: 0.4,
+            ..rawkit_editstate::Crop::default()
+        });
+        session.apply(Command::ZoomTo {
+            scale: 1.0,
+            anchor: [600.0, 400.0],
+        });
+        let centre = session.viewport().center;
+        // The crop is already against the left edge of the frame. Dragging the
+        // photograph *right* would carry the crop further left, where there is
+        // no photograph to crop — so it must not go, and the picture must stop
+        // with it rather than sliding out from under a box that has halted.
+        let now = advance_crop_rect(
+            &mut session,
+            CropGrab::Move,
+            was,
+            [600.0, 400.0],
+            [4600.0, 400.0],
+            was,
+        );
+        assert!(now[0] >= 0.0, "the crop left the frame: {now:?}");
+        assert_eq!(
+            session.viewport().center[0],
+            centre[0],
+            "the photograph went on sliding after the crop had stopped"
+        );
+    }
+
+    #[test]
+    fn a_corner_drag_moves_one_corner_and_leaves_the_view_alone() {
+        let (mut session, _) = cropping(rawkit_editstate::Crop::default());
+        session.apply(Command::ZoomTo {
+            scale: 1.0,
+            anchor: [600.0, 400.0],
+        });
+        let was = [0.2f32, 0.2, 0.8, 0.8];
+        let centre = session.viewport().center;
+        let now = advance_crop_rect(
+            &mut session,
+            CropGrab::Corner(0),
+            was,
+            [600.0, 400.0],
+            [700.0, 500.0],
+            was,
+        );
+        assert!(
+            now[0] > was[0] && now[1] > was[1],
+            "the corner did not move"
+        );
+        assert_eq!(
+            [now[2], now[3]],
+            [was[2], was[3]],
+            "the opposite corner moved with it"
+        );
+        assert_eq!(
+            session.viewport().center,
+            centre,
+            "resizing the box moved the photograph"
+        );
+    }
+
+    #[test]
+    fn a_crop_can_grow_one_that_already_exists_and_keeps_the_straighten() {
+        // Both standing defects, in one pass. The old tool composed its
+        // rectangle against the crop in force — so a crop could only ever shrink
+        // — and built its `Crop` with `..Crop::default()`, silently resetting the
+        // straighten, both keystones and the stretch on every commit.
+        let stored = rawkit_editstate::Crop {
+            left: 0.4,
+            top: 0.4,
+            right: 0.6,
+            bottom: 0.6,
+            angle_deg: 5.0,
+            vertical: 0.1,
+            horizontal: -0.05,
+            aspect: 1.2,
+        };
+        let (session, rect) = cropping(stored);
+
+        // The rectangle opens on the crop that is already there rather than on
+        // nothing, which is what makes growing one possible at all.
+        let round_trip = crop_from(&session, rect).expect("a legal crop");
+        for (was, now) in [
+            (stored.left, round_trip.left),
+            (stored.top, round_trip.top),
+            (stored.right, round_trip.right),
+            (stored.bottom, round_trip.bottom),
+        ] {
+            assert!(
+                (was - now).abs() < 2e-3,
+                "the crop moved just by being looked at: {stored:?} to {round_trip:?}"
+            );
+        }
+
+        // Now grow it, by taking the left edge out to the edge of the frame.
+        let grown = crop_from(&session, [0.0, rect[1], rect[2], rect[3]]).expect("a legal crop");
+        assert!(
+            grown.left < round_trip.left - 0.1,
+            "the crop could not be grown past what it already was: {grown:?}"
+        );
+        assert!(
+            (grown.right - round_trip.right).abs() < 2e-3,
+            "growing one edge moved the other: {grown:?}"
+        );
+        assert_eq!(
+            (
+                grown.angle_deg,
+                grown.vertical,
+                grown.horizontal,
+                grown.aspect
+            ),
+            (5.0, 0.1, -0.05, 1.2),
+            "committing a crop reset the straighten, the keystone or the stretch"
+        );
     }
 
     #[test]

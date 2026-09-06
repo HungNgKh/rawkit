@@ -10,12 +10,15 @@
 //!
 //! GPU-gated like the rest: `cargo test -- --ignored`.
 
-use rawkit_engine::{Gpu, PreviewBlit, Renderer};
+use rawkit_engine::{Cell, Gpu, PreviewBlit, Renderer};
 
 /// Half floats carry an 11-bit significand; a value near 1.0 is exact to about
 /// 5e-4. Eight-bit sRGB input quantises more coarsely than that, so the budget
 /// here is one 8-bit step in linear terms near mid-grey.
 const TOLERANCE: f32 = 4e-3;
+
+/// The overlay the coverage tests draw into, small enough to read back whole.
+const SPAN: u32 = 16;
 
 fn gpu() -> Option<Gpu> {
     Gpu::new().ok()
@@ -163,6 +166,7 @@ fn a_grid_puts_each_cell_where_it_was_told_and_tints_it() {
                 tint: [1.0, 1.0, 1.0],
                 edge: ([0.0; 3], 0.0),
                 inner: ([0.0; 3], 0.0),
+                alpha: 1.0,
                 round: false,
             },
             // A third the brightness, the way a rejected frame is drawn.
@@ -172,6 +176,7 @@ fn a_grid_puts_each_cell_where_it_was_told_and_tints_it() {
                 tint: [0.33, 0.33, 0.33],
                 edge: ([0.0; 3], 0.0),
                 inner: ([0.0; 3], 0.0),
+                alpha: 1.0,
                 round: false,
             },
         ],
@@ -223,6 +228,7 @@ fn a_cell_hanging_off_the_edge_is_cropped_rather_than_squashed() {
             tint: [1.0; 3],
             edge: ([0.0; 3], 0.0),
             inner: ([0.0; 3], 0.0),
+            alpha: 1.0,
             round: false,
         }],
     );
@@ -258,6 +264,7 @@ fn a_flag_and_a_colour_label_can_be_shown_at_once() {
             // Pure green outside, pure red just inside it.
             edge: ([0.0, 1.0, 0.0], 4.0),
             inner: ([1.0, 0.0, 0.0], 4.0),
+            alpha: 1.0,
             round: false,
         }],
     );
@@ -301,6 +308,7 @@ fn a_round_cell_draws_a_ring_and_leaves_the_middle_alone() {
             tint: [1.0; 3],
             edge: ([0.0; 3], 0.0),
             inner: ([0.0; 3], 0.0),
+            alpha: 1.0,
             round: false,
         }],
     );
@@ -315,6 +323,7 @@ fn a_round_cell_draws_a_ring_and_leaves_the_middle_alone() {
             tint: [1.0; 3],
             edge: ([1.0, 0.0, 0.0], 3.0),
             inner: ([0.0; 3], 0.0),
+            alpha: 1.0,
             round: true,
         }],
     );
@@ -338,4 +347,103 @@ fn a_round_cell_draws_a_ring_and_leaves_the_middle_alone() {
             "({x}, {y}) was painted over"
         );
     }
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_partly_covering_cell_lands_premultiplied_on_the_overlay() {
+    // What dimming the area outside a crop is made of. Before this every cell
+    // was opaque, so there was no way to say "show this, but show that it is
+    // excluded" — the choice was hiding the picture or marking nothing.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    let renderer = Renderer::new(&gpu);
+    let blit = PreviewBlit::new(&gpu);
+    let white = blit
+        .upload(&gpu, &[255, 255, 255, 255], 1, 1)
+        .expect("a white texel");
+    let overlay = renderer.create_overlay(&gpu, SPAN, SPAN);
+    overlay.clear(&gpu);
+
+    blit.draw_over(
+        &gpu,
+        &overlay,
+        &[Cell {
+            image: &white,
+            dest: [0, 0, (SPAN / 2) as i32, SPAN as i32],
+            // Black at just over half coverage: a veil that takes most of the
+            // light and leaves the photograph readable underneath it.
+            tint: [0.0; 3],
+            edge: ([0.0; 3], 0.0),
+            inner: ([0.0; 3], 0.0),
+            alpha: 0.55,
+            round: false,
+        }],
+    );
+    let drawn = overlay.read_back(&gpu).expect("overlay read back");
+    let at = |x: u32, y: u32| {
+        let i = ((y * SPAN + x) * 4) as usize;
+        [drawn[i], drawn[i + 1], drawn[i + 2], drawn[i + 3]]
+    };
+
+    let veiled = at(1, SPAN / 2);
+    assert_eq!(
+        &veiled[..3],
+        &[0, 0, 0],
+        "a black veil is premultiplied to nothing, not to grey: {veiled:?}"
+    );
+    assert!(
+        (veiled[3] as i32 - 140).abs() <= 2,
+        "0.55 coverage came back as {} of 255",
+        veiled[3]
+    );
+    assert_eq!(
+        at(SPAN - 1, SPAN / 2),
+        [0, 0, 0, 0],
+        "the veil reached the half it does not cover"
+    );
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn an_opaque_cell_is_what_it_always_was() {
+    // The regression guard for every mark that existed before coverage did:
+    // grid thumbnails, mask handles, spot rings, the crop outline. At full
+    // coverage the premultiply is a multiply by one and must change nothing.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    let renderer = Renderer::new(&gpu);
+    let blit = PreviewBlit::new(&gpu);
+    let white = blit
+        .upload(&gpu, &[255, 255, 255, 255], 1, 1)
+        .expect("a white texel");
+    let overlay = renderer.create_overlay(&gpu, SPAN, SPAN);
+    overlay.clear(&gpu);
+    blit.draw_over(
+        &gpu,
+        &overlay,
+        &[Cell {
+            image: &white,
+            dest: [0, 0, SPAN as i32, SPAN as i32],
+            tint: [1.0; 3],
+            edge: ([0.5, 0.25, 0.75], 2.0),
+            inner: ([0.0; 3], 0.0),
+            alpha: 1.0,
+            round: false,
+        }],
+    );
+    let drawn = overlay.read_back(&gpu).expect("overlay read back");
+    let middle = ((SPAN / 2 * SPAN + SPAN / 2) * 4) as usize;
+    assert_eq!(
+        &drawn[middle..middle + 4],
+        &[255, 255, 255, 255],
+        "an opaque cell stopped being opaque"
+    );
+    // And the edge keeps its own colour rather than being scaled by anything.
+    let edge = ((SPAN / 2 * SPAN) * 4) as usize;
+    assert_eq!(drawn[edge + 3], 255, "an opaque edge stopped being opaque");
 }

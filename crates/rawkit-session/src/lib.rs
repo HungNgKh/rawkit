@@ -584,6 +584,18 @@ pub struct Session {
     /// cost is that the photograph is visibly softer until the edit settles,
     /// which is the trade every editor makes and the reason this is a *decision*
     /// the shell makes from a measurement rather than something on by default.
+    /// Showing the whole frame because a crop is being drawn on it.
+    ///
+    /// A fact about the *view*, like `fitted` and `haste`, and emphatically not
+    /// about the picture: [`state`](Self::state) is untouched, so nothing is
+    /// saved, nothing enters the undo history, and leaving the mode puts the
+    /// framing back. What it buys is the thing a crop tool cannot do without —
+    /// the area outside the crop, which the renderer otherwise never asks for,
+    /// because [`visible_tiles`](Self::visible_tiles) clips to the developed
+    /// frame and the developed frame *is* the crop.
+    ///
+    /// Without it a crop could only ever shrink.
+    cropping: bool,
     haste: bool,
     /// The control that opened the step now on top of `past`, so a run of the
     /// same one collapses into it. `None` means the next edit starts a new step
@@ -623,6 +635,7 @@ impl Session {
             // literal has to name every field.
             fitted: false,
             haste: false,
+            cropping: false,
             recorded,
             developed,
             tile,
@@ -717,8 +730,68 @@ impl Session {
     }
 
     /// The map between the sensor's frame and the photograph's.
+    ///
+    /// **Mode-dependent.** While [`set_cropping`](Self::set_cropping) is on this
+    /// is the same edit with its rectangle opened out to the whole frame, so
+    /// that everything measured against it — the fit, the tiles, the canvas, the
+    /// overlay's mapper — is measured against what is on screen. Every caller
+    /// wants that; the one thing that must not is the *render job*, which
+    /// carries `state` and develops the picture with the crop the user actually
+    /// stored.
     pub fn geometry(&self) -> Geometry {
-        Geometry::new(&self.state, self.recorded)
+        if self.cropping {
+            Geometry::from_parts(
+                self.recorded,
+                self.state.orientation,
+                Crop {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 1.0,
+                    bottom: 1.0,
+                    // Kept, all four: the frame a crop is drawn on is the
+                    // straightened, keystoned, stretched one it will come out
+                    // of. Drawing on the raw frame and storing against the
+                    // warped one is a rectangle that moves when you commit it.
+                    ..self.state.crop
+                },
+                self.state.lens.distortion,
+            )
+        } else {
+            Geometry::new(&self.state, self.recorded)
+        }
+    }
+
+    /// Show the whole frame rather than the crop, or stop.
+    ///
+    /// Returns whether anything changed, so a render loop can state it every
+    /// frame the way it states [`set_haste`](Self::set_haste) — idempotent, and
+    /// therefore correct when the session is replaced under it by navigating to
+    /// another photograph while the crop tool is still open.
+    ///
+    /// **The generation is deliberately not bumped.** It is what the autosave
+    /// watches: bumping it would write a new catalog version of an unchanged
+    /// edit for every photograph merely *looked at* through the crop tool. The
+    /// rendered tiles survive too, and correctly — a tile's pixels do not depend
+    /// on the crop, which only decides which tiles are wanted and where they
+    /// land.
+    pub fn set_cropping(&mut self, cropping: bool) -> bool {
+        if self.cropping == cropping {
+            return false;
+        }
+        self.cropping = cropping;
+        let was = self.developed;
+        self.developed = self.geometry().output_size(self.image);
+        if self.developed != was {
+            self.fit_to_view();
+        } else {
+            self.clamp_center();
+        }
+        true
+    }
+
+    /// Whether the whole frame is being shown for a crop.
+    pub fn cropping(&self) -> bool {
+        self.cropping
     }
 
     /// Apply one command. Never blocks and never renders.
@@ -1151,7 +1224,10 @@ impl Session {
         // rotated and never will be, because rotating it would move the CFA
         // phase. So the visible rectangle is carried back across the geometry
         // before it becomes tile indices.
-        let rect = Geometry::new(&self.state, self.recorded).sensor_rect(seen, self.image);
+        // `self.geometry()`, not a fresh `Geometry::new`: while a crop is being
+        // drawn the view is the whole frame, and this is the line that decides
+        // whether the tiles outside the stored crop are ever asked for.
+        let rect = self.geometry().sensor_rect(seen, self.image);
         let span = (self.tile << level) as f64;
         let tiles_x = (self.image[0] as f64 / span).ceil() as u32;
         let tiles_y = (self.image[1] as f64 / span).ceil() as u32;
@@ -1258,7 +1334,7 @@ impl Session {
         // two multiplications, and remembering which commands are geometric is a
         // rule somebody eventually forgets.
         let was = self.developed;
-        self.developed = Geometry::new(&self.state, self.recorded).output_size(self.image);
+        self.developed = self.geometry().output_size(self.image);
         if self.developed != was {
             // The photograph is a different shape, so the old scale and centre
             // describe a frame that no longer exists — a rotate would leave it
@@ -2229,6 +2305,104 @@ mod tests {
             bottom_right[0] - IMAGE[0] as f64,
             bottom_right[1] - IMAGE[1] as f64,
         ]
+    }
+
+    #[test]
+    fn crop_mode_shows_the_whole_frame_without_touching_the_edit() {
+        let mut s = session();
+        let crop = Crop {
+            left: 0.25,
+            top: 0.25,
+            right: 0.75,
+            bottom: 0.75,
+            ..Crop::default()
+        };
+        s.apply(Command::SetCrop(Box::new(crop)));
+        assert_eq!(s.developed_size(), [3000, 2000]);
+        let edit = s.state().clone();
+        let generation = s.generation();
+
+        assert!(s.set_cropping(true), "turning it on is a change");
+        assert!(!s.set_cropping(true), "and turning it on again is not");
+        assert_eq!(
+            s.developed_size(),
+            IMAGE,
+            "the whole frame is not on screen"
+        );
+        assert_eq!(s.state(), &edit, "showing the frame changed the edit");
+        assert_eq!(
+            s.generation(),
+            generation,
+            "a view change bumped the generation, which is what the autosave watches"
+        );
+
+        s.set_cropping(false);
+        assert_eq!(
+            s.developed_size(),
+            [3000, 2000],
+            "the crop did not come back"
+        );
+    }
+
+    #[test]
+    fn crop_mode_asks_for_the_tiles_outside_the_crop() {
+        // The point of the whole exercise. `visible_tiles` clips to the
+        // developed frame, so without this the renderer never draws the part of
+        // the photograph a crop would have to grow back into — and a crop tool
+        // that cannot show it can only ever shrink.
+        let mut s = session();
+        s.apply(Command::SetCrop(Box::new(Crop {
+            left: 0.4,
+            top: 0.4,
+            right: 0.6,
+            bottom: 0.6,
+            ..Crop::default()
+        })));
+        s.apply(Command::FitToView);
+        // Level 0 for both, deliberately: fitting a small crop lands at a finer
+        // level than fitting the whole frame, and comparing tile *counts* across
+        // two levels compares the pyramid rather than the coverage.
+        let inside = s.visible_tiles(0);
+
+        s.set_cropping(true);
+        s.apply(Command::FitToView);
+        let whole = s.visible_tiles(0);
+        assert!(
+            whole.len() > inside.len(),
+            "crop mode asked for {} tiles, the crop for {}",
+            whole.len(),
+            inside.len()
+        );
+        assert!(
+            whole.iter().any(|tile| !inside.contains(tile)),
+            "every tile was already being drawn, so nothing outside the crop is reachable"
+        );
+    }
+
+    #[test]
+    fn crop_mode_keeps_the_straighten() {
+        // The frame a crop is drawn on has to be the one it will come out of.
+        // Opening the rectangle out while dropping the angle would show an
+        // unrotated frame and store a rectangle against a rotated one.
+        let mut s = session();
+        s.apply(Command::SetStraighten(10.0));
+        s.set_cropping(true);
+        assert!((s.geometry().angle().to_degrees() - 10.0).abs() < 1e-4);
+        assert!(
+            s.developed_size()[0] < IMAGE[0],
+            "a straightened whole frame still pulls in to keep its corners full"
+        );
+    }
+
+    #[test]
+    fn entering_crop_mode_leaves_nothing_to_undo() {
+        let mut s = session();
+        s.set_cropping(true);
+        s.set_cropping(false);
+        assert!(
+            matches!(s.apply(Command::Undo), Event::Refused { .. }),
+            "looking at the whole frame became an undo step"
+        );
     }
 
     #[test]

@@ -61,30 +61,38 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     // rectangle that survived being clipped to the canvas, which is what the
     // edge is measured against; a *ring* has to be measured against the whole
     // cell instead, or a marker half off-screen would draw an ellipse.
+    // How much of what is underneath this cell covers. Everything below returns
+    // premultiplied — colour already scaled by it — because that is what the
+    // present pass composites, and because it makes a black veil at low coverage
+    // exactly "take this much of the light away".
+    let a = region.tint.w;
     let cell = region.origin + in.uv * region.span;
     if (region.ring.x > 0.5) {
         let d = length(cell - vec2<f32>(0.5, 0.5)) * 2.0;
         if (d > 1.0 || d < 1.0 - region.edge.w * 2.0) {
             discard;
         }
-        return vec4<f32>(region.edge.rgb, 1.0);
+        return vec4<f32>(region.edge.rgb * a, a);
     }
     // The edge is drawn in the cell's own rectangle rather than as extra
     // geometry, so selection and flags cost no draw calls and no second
     // pipeline.
     let inset = min(min(in.uv.x, in.uv.y), min(1.0 - in.uv.x, 1.0 - in.uv.y));
     if (region.edge.w > 0.0 && inset < region.edge.w) {
-        return vec4<f32>(region.edge.rgb, 1.0);
+        return vec4<f32>(region.edge.rgb * a, a);
     }
     if (region.inner.w > 0.0 && inset < region.edge.w + region.inner.w) {
-        return vec4<f32>(region.inner.rgb, 1.0);
+        return vec4<f32>(region.inner.rgb * a, a);
     }
 
     // Outside the photograph is black, not the edge pixel smeared outwards.
     // Clamping would paint a border of stretched sky wherever the image does not
     // fill the view, which reads as part of the picture.
     if (cell.x < 0.0 || cell.y < 0.0 || cell.x > 1.0 || cell.y > 1.0) {
-        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        return vec4<f32>(0.0, 0.0, 0.0, a);
     }
-    return vec4<f32>(textureSample(image, image_sampler, cell).rgb * region.tint.rgb, 1.0);
+    return vec4<f32>(
+        textureSample(image, image_sampler, cell).rgb * region.tint.rgb * a,
+        a,
+    );
 }
