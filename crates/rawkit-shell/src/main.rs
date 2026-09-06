@@ -4954,9 +4954,14 @@ fn crop_on_screen(session: &Session, rect: [f32; 4]) -> Option<CropScreen> {
     })
 }
 
-/// How much light the area outside the crop keeps. Enough to see what is being
-/// cut away — the whole reason the frame is opened out — and little enough that
-/// the eye reads the bright part as the photograph.
+/// How much light the veil outside the crop *takes*, not what it leaves.
+///
+/// The name and this note were the other way round until the overlay was
+/// measured on screen: the area outside keeps 0.38 of its light, which reads as
+/// a ratio of 0.63 once encoded, and that is what a screenshot of it comes back
+/// as. Enough light left to see what is being cut away — the whole reason the
+/// frame is opened out — and little enough that the eye reads the bright part as
+/// the photograph.
 const CROP_DIM: f32 = 0.62;
 
 /// The crop rectangle over the whole frame: what is being kept, what is being
