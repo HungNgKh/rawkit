@@ -410,7 +410,9 @@ impl CameraProfile {
         // first version asked `has_forward_matrix()` and the two answers could
         // differ, which a real profile — one forward matrix, two illuminants —
         // turned into a panic.
-        self.camera_to_working(cct)?;
+        // The calibration is irrelevant here: this asks only *whether* the
+        // working space is reachable, and no slider can take it away.
+        self.camera_to_working(cct, &rawkit_editstate::Calibration::default())?;
         match (self.calibrations.as_slice(), self.hue_sat.as_slice()) {
             ([_], [only]) => only.clone(),
             ([low, high], [a, b]) => match (a, b) {
@@ -473,8 +475,17 @@ impl CameraProfile {
     /// rotate its hue corrections by an unknown angle, making colour worse in a
     /// way that looks like the profile being wrong. Skipping it is the honest
     /// option and is what [`Self::hue_sat_map`] enforces.
-    pub fn camera_to_working(&self, temperature_k: f32) -> Option<(Matrix3, Matrix3)> {
+    pub fn camera_to_working(
+        &self,
+        temperature_k: f32,
+        calibration: &rawkit_editstate::Calibration,
+    ) -> Option<(Matrix3, Matrix3)> {
         let forward = self.forward_matrix(temperature_k)?;
+        // The calibration is applied here, to camera-to-XYZ, and not to the
+        // composed matrix below: it turns the primaries in CIELAB, and LAB is
+        // reached from XYZ. Composing first and turning afterwards would rotate
+        // them by an angle measured in ProPhoto, which is a different angle.
+        let forward = crate::calibrate::calibrated(&forward, calibration);
         Some((
             multiply(&PROPHOTO_FROM_XYZ_D50, &forward),
             multiply(&SRGB_FROM_XYZ_D50, &XYZ_D50_FROM_PROPHOTO),
@@ -585,12 +596,17 @@ impl CameraProfile {
     /// before it. The rows are normalised so that the balanced camera neutral
     /// maps to display neutral; skip that and every image carries a cast which
     /// looks exactly like a white-balance error and is not one.
-    pub fn camera_to_display(&self, temperature_k: f32) -> Matrix3 {
+    pub fn camera_to_display(
+        &self,
+        temperature_k: f32,
+        calibration: &rawkit_editstate::Calibration,
+    ) -> Matrix3 {
         if let Some(forward) = self.forward_matrix(temperature_k) {
             // The forward matrix already maps *balanced* camera values to XYZ
             // D50, and its rows sum to the D50 white point by construction, so
             // a balanced neutral arrives neutral with no normalisation of our
             // own. All that remains is the connection space.
+            let forward = crate::calibrate::calibrated(&forward, calibration);
             return multiply(&SRGB_FROM_XYZ_D50, &forward);
         }
         let xyz_to_camera = self.xyz_to_camera(temperature_k);
@@ -610,7 +626,26 @@ impl CameraProfile {
                 }
             }
         }
-        invert(&camera_from_srgb).unwrap_or(IDENTITY)
+        let camera_to_srgb = invert(&camera_from_srgb).unwrap_or(IDENTITY);
+        if calibration.is_identity() {
+            return camera_to_srgb;
+        }
+        // Out to XYZ, calibrated, and back. The long way round on purpose: the
+        // rotation is defined in LAB, LAB is reached from XYZ, and doing it in
+        // sRGB's primaries instead would turn each one by a different angle from
+        // the profile path above — so the same slider would mean two things
+        // depending on whether a `.dcp` happened to be loaded.
+        //
+        // Inverted rather than reached for as a constant. `XYZ_FROM_SRGB` is
+        // referred to **D65** and this matrix to D50, so the pair are not
+        // inverses — going out through one and back through the other quietly
+        // adapts the white point, which came out as a 9.5% cast on a grey the
+        // moment any slider was touched. The exact inverse cannot do that: with
+        // no calibration to apply it is the identity by construction.
+        let xyz_from_srgb = invert(&SRGB_FROM_XYZ_D50).unwrap_or(IDENTITY);
+        let calibrated =
+            crate::calibrate::calibrated(&multiply(&xyz_from_srgb, &camera_to_srgb), calibration);
+        multiply(&SRGB_FROM_XYZ_D50, &calibrated)
     }
 }
 
@@ -890,7 +925,10 @@ mod tests {
                 camera[1] * multipliers[1],
                 camera[2] * multipliers[2],
             ];
-            let display = apply(&profile.camera_to_display(temperature), balanced);
+            let display = apply(
+                &profile.camera_to_display(temperature, &rawkit_editstate::Calibration::default()),
+                balanced,
+            );
 
             let mean = (display[0] + display[1] + display[2]) / 3.0;
             for (c, v) in display.iter().enumerate() {
@@ -962,7 +1000,10 @@ mod tests {
         profile.set_forward_matrix(6504.0, FORWARD_D50);
         assert!(profile.has_forward_matrix());
 
-        let display = apply(&profile.camera_to_display(5000.0), [1.0, 1.0, 1.0]);
+        let display = apply(
+            &profile.camera_to_display(5000.0, &rawkit_editstate::Calibration::default()),
+            [1.0, 1.0, 1.0],
+        );
         for (c, v) in display.iter().enumerate() {
             assert!(
                 (v - 1.0).abs() < 0.01,
@@ -989,10 +1030,12 @@ mod tests {
         profile.set_forward_matrix(2856.0, tungsten);
 
         // At the daylight end the daylight matrix must dominate.
-        let at_daylight = profile.camera_to_display(6504.0);
+        let at_daylight =
+            profile.camera_to_display(6504.0, &rawkit_editstate::Calibration::default());
         let mut expected = CameraProfile::from_color_matrix(sony_matrix());
         expected.set_forward_matrix(6504.0, daylight);
-        let reference = expected.camera_to_display(6504.0);
+        let reference =
+            expected.camera_to_display(6504.0, &rawkit_editstate::Calibration::default());
         for r in 0..3 {
             for c in 0..3 {
                 assert!(

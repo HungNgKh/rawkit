@@ -900,6 +900,28 @@ fn develop_rgb(camera: vec3<f32>, ixy: vec2<f32>, hazy: bool) -> vec3<f32> {
         recovered = recovered * lens_falloff(ixy);
     }
 
+    // The shadow tint, before the profile and after the balance. Green at
+    // negative, magenta at positive, and weighted to the shadows -- which is the
+    // whole of why it is not white balance. A sensor's channels agree least
+    // where there is least light, so a cast that is invisible in the midtones
+    // can be plain in the darks, and correcting it with the temperature would
+    // take the midtones with it.
+    //
+    // The weight falls off with the balanced luminance rather than with a single
+    // channel, so it does not itself depend on the cast it is correcting. Half
+    // strength at 5% of full scale, and nothing left by about 30%: the shadows
+    // are a small part of the range and this is a correction, not a grade.
+    let tint = params.cam_to_display[0].w;
+    if (tint != 0.0) {
+        let luma = dot(recovered, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let weight = 1.0 / (1.0 + max(luma, 0.0) / 0.05);
+        // Green one way, magenta the other, as one multiply on the green
+        // channel: magenta is the absence of green, so a single scale expresses
+        // both directions and cannot pull the picture off neutral in some third
+        // way.
+        recovered.g = recovered.g * (1.0 - tint * 0.25 * weight);
+    }
+
     let display = vec3<f32>(
         dot(params.cam_to_display[0].rgb, recovered),
         dot(params.cam_to_display[1].rgb, recovered),

@@ -125,6 +125,14 @@ pub enum Command {
         control: u8,
         value: f32,
     },
+    /// One of the calibration controls, by index: 0 shadow tint, then hue and
+    /// saturation for the red, green and blue primaries — 1 to 6.
+    ///
+    /// Indexed like the effects and the perspective, for the same reason.
+    SetCalibration {
+        control: u8,
+        value: f32,
+    },
     /// How much of the lens's own corner falloff to undo.
     ///
     /// Beside the effects rather than in them, because it corrects the glass and
@@ -294,6 +302,7 @@ impl Command {
             Command::SetBlacks(_) => "set_blacks",
             Command::SetPerspective { .. } => "set_perspective",
             Command::SetEffect { .. } => "set_effect",
+            Command::SetCalibration { .. } => "set_calibration",
             Command::SetLensVignette(_) => "set_lens_vignette",
             Command::SetClarity(_) => "set_clarity",
             Command::SetTexture(_) => "set_texture",
@@ -356,6 +365,7 @@ impl Command {
             Command::SetSpots { control, .. } => *control,
             Command::SetPerspective { control, .. } => *control,
             Command::SetEffect { control, .. } => *control,
+            Command::SetCalibration { control, .. } => *control,
             Command::SetHsl { band, control, .. } => {
                 let control = match control {
                     rawkit_editstate::BandControl::Hue => 0,
@@ -378,6 +388,7 @@ impl Command {
             | Command::SetBlacks(_)
             | Command::SetPerspective { .. }
             | Command::SetEffect { .. }
+            | Command::SetCalibration { .. }
             | Command::SetLensVignette(_)
             | Command::SetClarity(_)
             | Command::SetTexture(_)
@@ -898,6 +909,25 @@ impl Session {
                     return refused(name, e.to_string());
                 }
                 self.edit(name, value, move |s, _| s.effects = effects)
+            }
+            // Through `Calibration::validate`, so the range is stated once
+            // rather than once per slider.
+            Command::SetCalibration { control, value } => {
+                let mut calibration = self.state.calibration;
+                match control {
+                    0 => calibration.shadow_tint = value,
+                    1 => calibration.red_hue = value,
+                    2 => calibration.red_saturation = value,
+                    3 => calibration.green_hue = value,
+                    4 => calibration.green_saturation = value,
+                    5 => calibration.blue_hue = value,
+                    6 => calibration.blue_saturation = value,
+                    other => return refused(name, format!("{other} is not a calibration control")),
+                }
+                if let Err(e) = calibration.validate() {
+                    return refused(name, e.to_string());
+                }
+                self.edit(name, value, move |s, _| s.calibration = calibration)
             }
             Command::SetLensVignette(v) => {
                 let lens = rawkit_editstate::Lens {

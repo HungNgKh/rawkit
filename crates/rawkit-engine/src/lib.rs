@@ -24,6 +24,7 @@
 use rawkit_editstate::EditState;
 
 pub mod aberration;
+pub mod calibrate;
 pub mod geometry;
 pub mod guide;
 pub mod mask;

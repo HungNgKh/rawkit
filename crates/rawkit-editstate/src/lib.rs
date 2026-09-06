@@ -59,6 +59,8 @@ pub enum EditStateError {
     TooManyMasks(usize),
     #[error("an effect is out of range: {0}")]
     InvalidEffects(String),
+    #[error("invalid calibration: {0}")]
+    InvalidCalibration(String),
     #[error("spot is not usable: {0}")]
     InvalidSpot(String),
     #[error("more spots than a photograph may carry: {0}")]
@@ -103,6 +105,10 @@ pub struct EditState {
     /// The vignette and the grain, which go on after everything else.
     #[serde(default)]
     pub effects: Effects,
+    /// The camera's primaries, adjusted. Applied to the profile rather than to
+    /// the pixels — see [`Calibration`].
+    #[serde(default)]
+    pub calibration: Calibration,
     /// Local adjustments: what changes, and where.
     #[serde(default)]
     pub masks: Vec<Mask>,
@@ -137,6 +143,7 @@ impl Default for EditState {
             curve: Curve::default(),
             grade: Grade::default(),
             effects: Effects::default(),
+            calibration: Calibration::default(),
         }
     }
 }
@@ -188,6 +195,7 @@ impl EditState {
         self.curve.validate()?;
         self.grade.validate()?;
         self.effects.validate()?;
+        self.calibration.validate()?;
         Ok(())
     }
 
@@ -996,6 +1004,122 @@ impl Effects {
             }
         }
         Ok(())
+    }
+}
+
+/// The camera's own primaries, adjusted.
+///
+/// Lightroom Classic's Calibration panel: a tint for the shadows, and a hue and
+/// a saturation for each of the three primaries. The names, ranges and sense are
+/// theirs so that a photographer's hands already know what these are; **the
+/// arithmetic is ours and is written down below**, and a setting of +20 here is
+/// not a promise about a setting of +20 anywhere else. Adobe has never said what
+/// its sliders compute, and a number that claims to match one nobody has
+/// published is a claim that cannot be kept.
+///
+/// # Why this is not a look
+///
+/// It is applied to the *profile*, not to the pixels. The camera-to-XYZ matrix
+/// has one column per primary — the colour a unit of that channel produces — so
+/// turning the red primary's hue is literally moving where the sensor's red
+/// sits, which is what calibrating a primary means. It also costs nothing per
+/// pixel: the matrix is built once and uploaded, and a whole calibration is
+/// three columns of arithmetic on the CPU.
+///
+/// The shadow tint is the exception and has to be per-pixel, because "the
+/// shadows" is a property of the pixel rather than of the sensor.
+///
+/// # Where it sits
+///
+/// The camera-profile stage, on white-balanced camera values. Before the profile because it *is* the profile; after white balance
+/// because a primary's hue means nothing until the neutral is neutral.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Calibration {
+    /// Green at negative, magenta at positive, weighted towards the shadows.
+    ///
+    /// The one control here that is not about a primary. A sensor's darkest
+    /// values are where its channels agree least, so a cast that is invisible in
+    /// the midtones can be plain in the shadows — and correcting it with the
+    /// white balance would take the midtones with it.
+    pub shadow_tint: f32,
+    /// The red primary, rotated. Negative takes it towards magenta, positive
+    /// towards orange.
+    pub red_hue: f32,
+    /// The red primary's distance from neutral, as a multiplier around 1.
+    pub red_saturation: f32,
+    pub green_hue: f32,
+    pub green_saturation: f32,
+    pub blue_hue: f32,
+    pub blue_saturation: f32,
+}
+
+impl Calibration {
+    /// How far a hue slider turns a primary, in degrees of CIELAB hue at full
+    /// deflection.
+    ///
+    /// Twelve, and the number was measured rather than chosen. Moving a primary
+    /// means the three of them no longer add up to the neutral they did, and the
+    /// channel gains that put it back are a solve that stops having a positive
+    /// answer once a primary has gone far enough — on sRGB's own primaries the
+    /// blue one needs a *negative* red gain somewhere past 25°. Twelve leaves
+    /// room for a camera matrix less well behaved than that one, and at full
+    /// deflection it already changes a channel's gain by a quarter, which is a
+    /// long way for something called a calibration.
+    ///
+    /// Past that the engine backs the move off rather than refusing it — see
+    /// `rawkit_engine::calibrate` — so this is where the slider is honest, not
+    /// where it breaks.
+    pub const HUE_RANGE_DEG: f32 = 12.0;
+
+    /// How far a saturation slider scales one, at full deflection.
+    pub const SATURATION_RANGE: f32 = 0.5;
+
+    /// Whether this leaves the profile exactly as it found it.
+    pub fn is_identity(&self) -> bool {
+        *self == Calibration::default()
+    }
+
+    pub fn validate(&self) -> Result<(), EditStateError> {
+        for (name, value) in [
+            ("shadow tint", self.shadow_tint),
+            ("red hue", self.red_hue),
+            ("red saturation", self.red_saturation),
+            ("green hue", self.green_hue),
+            ("green saturation", self.green_saturation),
+            ("blue hue", self.blue_hue),
+            ("blue saturation", self.blue_saturation),
+        ] {
+            if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
+                return Err(EditStateError::InvalidCalibration(format!(
+                    "{name} is {value}, and runs from -1 to 1"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The hue and saturation for one primary, by index — red, green, blue.
+    pub fn primary(&self, index: usize) -> (f32, f32) {
+        match index {
+            0 => (self.red_hue, self.red_saturation),
+            1 => (self.green_hue, self.green_saturation),
+            _ => (self.blue_hue, self.blue_saturation),
+        }
+    }
+}
+
+impl Default for Calibration {
+    fn default() -> Self {
+        Self {
+            shadow_tint: 0.0,
+            red_hue: 0.0,
+            red_saturation: 0.0,
+            green_hue: 0.0,
+            green_saturation: 0.0,
+            blue_hue: 0.0,
+            blue_saturation: 0.0,
+        }
     }
 }
 

@@ -39,6 +39,7 @@ pub enum Group {
     Curve,
     Grade,
     Effects,
+    Calibration,
     Masks,
 }
 
@@ -46,7 +47,7 @@ impl Group {
     /// Every group, in the order an interface should offer them — which is the
     /// order the renderer applies them, so a list of ticked boxes reads down the
     /// pipeline rather than in an order chosen by the alphabet.
-    pub const ALL: [Group; 9] = [
+    pub const ALL: [Group; 10] = [
         Group::WhiteBalance,
         Group::Tone,
         Group::Detail,
@@ -55,6 +56,7 @@ impl Group {
         Group::Curve,
         Group::Grade,
         Group::Effects,
+        Group::Calibration,
         Group::Masks,
     ];
 
@@ -69,6 +71,7 @@ impl Group {
             Group::Curve => "curve",
             Group::Grade => "grade",
             Group::Effects => "effects",
+            Group::Calibration => "calibration",
             Group::Masks => "masks",
         }
     }
@@ -91,6 +94,7 @@ impl Group {
             Group::Curve => "Tone curve",
             Group::Grade => "Colour grading",
             Group::Effects => "Vignette and grain",
+            Group::Calibration => "Calibration",
             Group::Masks => "Local adjustments",
         }
     }
@@ -114,6 +118,7 @@ impl EditState {
                 Group::Curve => self.curve = source.curve.clone(),
                 Group::Grade => self.grade = source.grade,
                 Group::Effects => self.effects = source.effects,
+                Group::Calibration => self.calibration = source.calibration,
                 // Cloned rather than copied, and *replacing* rather than
                 // appending: a preset that added its masks to whatever the
                 // target already had would build up a stack nobody asked for,

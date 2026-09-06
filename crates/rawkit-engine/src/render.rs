@@ -216,7 +216,9 @@ impl Frame<'_> {
         // it — otherwise whether a photograph's curve ran in ProPhoto would
         // depend on whether its profile happened to carry a look table, which
         // `an_identity_look_changes_nothing` is exactly the test to notice.
-        let working = self.profile.camera_to_working(temperature);
+        let working = self
+            .profile
+            .camera_to_working(temperature, &state.calibration);
         let hue_sat = self.profile.hue_sat_map(temperature);
         let look = self.profile.look_table().cloned();
 
@@ -240,7 +242,9 @@ impl Frame<'_> {
                 multipliers,
                 temperature,
                 tint,
-                cam_to_display: self.profile.camera_to_display(temperature),
+                cam_to_display: self
+                    .profile
+                    .camera_to_display(temperature, &state.calibration),
                 working_to_display: crate::profile::IDENTITY,
                 hue_sat: None,
                 look: None,
@@ -2035,7 +2039,12 @@ impl Renderer {
             _pad: [0; 3],
             wb: [wb[0], wb[1], wb[2], 1.0],
             cam_to_display: [
-                [m[0][0], m[0][1], m[0][2], 0.0],
+                // The fourth lane of each row is the padding a `vec4` array
+                // stride forces anyway. The first carries the shadow tint,
+                // which belongs beside the matrix because it is the other half
+                // of the same control — the primaries move the profile, and this
+                // is the one part of a calibration that has to be per pixel.
+                [m[0][0], m[0][1], m[0][2], state.calibration.shadow_tint],
                 [m[1][0], m[1][1], m[1][2], 0.0],
                 [m[2][0], m[2][1], m[2][2], 0.0],
             ],

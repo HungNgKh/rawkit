@@ -552,7 +552,9 @@ fn one_forward_matrix_across_two_illuminants_is_usable() {
 
     for temperature in [2856.0, 4500.0, 6504.0] {
         assert!(
-            profile.camera_to_working(temperature).is_some(),
+            profile
+                .camera_to_working(temperature, &rawkit_editstate::Calibration::default())
+                .is_some(),
             "no working transform at {temperature}K"
         );
         assert!(

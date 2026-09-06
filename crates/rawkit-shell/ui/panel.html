@@ -324,6 +324,31 @@
     <div class="row"><button id="curve-reset">Reset</button></div>
   </details>
 
+  <details id="s-calibration"><summary>Calibration</summary>
+    <label><span>Shadows tint</span>
+      <input id="shadow_tint" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="shadow_tint-value">0.00</output></label>
+    <label><span>Red hue</span>
+      <input id="red_hue" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="red_hue-value">0.00</output></label>
+    <label><span>Red saturation</span>
+      <input id="red_saturation" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="red_saturation-value">0.00</output></label>
+    <label><span>Green hue</span>
+      <input id="green_hue" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="green_hue-value">0.00</output></label>
+    <label><span>Green saturation</span>
+      <input id="green_saturation" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="green_saturation-value">0.00</output></label>
+    <label><span>Blue hue</span>
+      <input id="blue_hue" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="blue_hue-value">0.00</output></label>
+    <label><span>Blue saturation</span>
+      <input id="blue_saturation" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="blue_saturation-value">0.00</output></label>
+    <div class="row"><button id="calibration-reset">Reset calibration</button></div>
+  </details>
+
   <details id="s-geometry"><summary>Geometry</summary>
     <div id="orientation">upright</div>
     <label><span>Straighten</span>
@@ -658,6 +683,21 @@
     slider(id, v => ({ command: "set_effect", params: { control, value: v } }),
       v => id === "grain_size" ? v.toFixed(1) : v.toFixed(2));
   }
+  // The calibration, indexed on the wire the way the effects are. The three
+  // primaries move the profile itself; the shadow tint is the one that is per
+  // pixel — see `rawkit_engine::calibrate`.
+  const CALIBRATION = [["shadow_tint", 0], ["red_hue", 1], ["red_saturation", 2],
+                       ["green_hue", 3], ["green_saturation", 4],
+                       ["blue_hue", 5], ["blue_saturation", 6]];
+  for (const [id, control] of CALIBRATION) {
+    slider(id, v => ({ command: "set_calibration", params: { control, value: v } }),
+      v => v.toFixed(2));
+  }
+  document.getElementById("calibration-reset").addEventListener("click", async () => {
+    for (const [, control] of CALIBRATION) {
+      await send({ command: "set_calibration", params: { control, value: 0 } });
+    }
+  });
   slider("lens_vignette", v => ({ command: "set_lens_vignette", params: v }), v => v.toFixed(2));
   slider("clarity", v => ({ command: "set_clarity", params: v }), v => v.toFixed(2));
   slider("texture", v => ({ command: "set_texture", params: v }), v => v.toFixed(2));
@@ -772,6 +812,9 @@
       const value = (state.effects || {})[id];
       setSlider(id, value ?? (id === "grain_size" ? 2 : id === "vignette" || id === "roundness" || id === "grain" ? 0 : 0.5),
         v => id === "grain_size" ? Number(v).toFixed(1) : Number(v).toFixed(2));
+    }
+    for (const [id] of CALIBRATION) {
+      setSlider(id, (state.calibration || {})[id] ?? 0, v => Number(v).toFixed(2));
     }
     setSlider("lens_vignette", state.lens.vignette ?? 0, v => Number(v).toFixed(2));
     for (const [id] of PERSPECTIVE) {
