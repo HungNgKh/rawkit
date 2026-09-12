@@ -337,6 +337,16 @@ struct Params {
     /// `[highlight reference, shadow reference, unused, unused]` — how far the
     /// local tone operator will trust its own neighbourhood.
     tone_local: [f32; 4],
+    /// The tone *map*'s own parameters, as opposed to the tone *controls*
+    /// above: `.x` is how much of the compression keeps a colour's ratios.
+    /// The rest unused.
+    ///
+    /// A lane of its own rather than a spare slot in `tone` or `levels`,
+    /// because it belongs to a different stage. The five controls run after the
+    /// sigmoid and this one *is* the sigmoid, and a reader who has to work out
+    /// which half of a shared lane applies where is a reader who will
+    /// eventually get it wrong.
+    tone_map: [f32; 4],
     /// `[sharpen amount, sharpen radius, chroma noise, luminance noise]`.
     detail: [f32; 4],
     /// `[clarity, texture, dehaze, the airlight's level]`.
@@ -2101,6 +2111,20 @@ impl Renderer {
             tone: tone.shape(),
             levels: tone.levels(),
             tone_local: tone.local(),
+            tone_map: [
+                // Clamped here rather than trusted, for the same reason the
+                // five controls are: this is the boundary a stored edit crosses
+                // and the shader's `mix` has no opinion about weights outside
+                // `0..1`.
+                if state.tone.hue_preservation.is_finite() {
+                    state.tone.hue_preservation.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                },
+                0.0,
+                0.0,
+                0.0,
+            ],
             detail: [
                 state.detail.sharpen_amount,
                 state.detail.sharpen_radius,

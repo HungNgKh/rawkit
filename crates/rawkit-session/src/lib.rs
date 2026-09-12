@@ -143,6 +143,9 @@ pub enum Command {
     SetTexture(f32),
     /// Airlight, undone in scene-linear light. See [`rawkit_editstate::Tone::dehaze`].
     SetDehaze(f32),
+    /// How much of the tone map's compression keeps a colour's ratios, `0..1`.
+    /// See [`rawkit_editstate::Tone::hue_preservation`].
+    SetHuePreservation(f32),
     /// `None` restores the camera's own white balance. Distinct from any
     /// numeric value, because as-shot differs per file.
     SetTemperature(Option<f32>),
@@ -307,6 +310,7 @@ impl Command {
             Command::SetClarity(_) => "set_clarity",
             Command::SetTexture(_) => "set_texture",
             Command::SetDehaze(_) => "set_dehaze",
+            Command::SetHuePreservation(_) => "set_hue_preservation",
             Command::SetTemperature(_) => "set_temperature",
             Command::SetTint(_) => "set_tint",
             Command::SetOrientation(_) => "set_orientation",
@@ -393,6 +397,7 @@ impl Command {
             | Command::SetClarity(_)
             | Command::SetTexture(_)
             | Command::SetDehaze(_)
+            | Command::SetHuePreservation(_)
             | Command::SetTemperature(_)
             | Command::SetTint(_)
             | Command::SetSharpen(_)
@@ -942,6 +947,9 @@ impl Session {
             Command::SetClarity(v) => self.edit(name, v, |s, v| s.tone.clarity = v),
             Command::SetTexture(v) => self.edit(name, v, |s, v| s.tone.texture = v),
             Command::SetDehaze(v) => self.edit(name, v, |s, v| s.tone.dehaze = v),
+            Command::SetHuePreservation(v) => {
+                self.edit(name, v, |s, v| s.tone.hue_preservation = v)
+            }
             Command::SetTint(v) => self.edit(name, v, |s, v| s.white_balance.tint = v),
 
             Command::SetTemperature(None) => {
@@ -1514,6 +1522,7 @@ fn edit_is_finite(state: &EditState) -> bool {
         t.clarity,
         t.texture,
         t.dehaze,
+        t.hue_preservation,
         wb.tint,
     ]
     .iter()

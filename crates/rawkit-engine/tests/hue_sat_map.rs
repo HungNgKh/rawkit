@@ -174,12 +174,28 @@ fn a_profile_tone_curve_replaces_the_tone_map() {
     // picture completely. If ours ran as well as the profile's, the output would
     // still vary with the scene — two tone maps in series map the scene twice,
     // and the symptom is a flat muddy picture rather than an error.
+    //
+    // **On the per-channel path, because the probe only works there.** A
+    // degenerate curve is what makes this test sharp, and hue preservation
+    // turns it from degenerate into something perfectly sensible: a flat curve
+    // takes every colour's largest channel to 0.5 and keeps the ratios, so two
+    // different colours come out equally *bright* and still differently
+    // coloured. That is the operator behaving, not our tone map leaking
+    // through, and it would make this assertion fail for a reason that has
+    // nothing to do with what it is asking.
     let gpu = Gpu::new().expect("no usable GPU adapter");
     let mut profile = profile_with(None);
     profile.set_tone_curve(&[(0.0, 0.5), (1.0, 0.5)]);
 
-    let dark = render_colour(&gpu, &profile, [0.05, 0.04, 0.03]);
-    let bright = render_colour(&gpu, &profile, [0.80, 0.70, 0.60]);
+    let per_channel = EditState {
+        tone: rawkit_editstate::Tone {
+            hue_preservation: 0.0,
+            ..Default::default()
+        },
+        ..EditState::default()
+    };
+    let dark = render_with(&gpu, &profile, [0.05, 0.04, 0.03], &per_channel);
+    let bright = render_with(&gpu, &profile, [0.80, 0.70, 0.60], &per_channel);
     for c in 0..3 {
         assert!(
             (dark[c] - bright[c]).abs() < 2e-3,
@@ -354,8 +370,15 @@ fn a_profile_curve_changes_brightness_without_turning_the_colour() {
         "curve lifted luma {straight_luma:.4} to {lift_luma:.4} and turned the hue \
          {turn:.2} degrees ({straight_hue:.2} to {lift_hue:.2})"
     );
+    // 1.4 and not 1.5, and the reason is the operator rather than a loosened
+    // bar. The gain a ratio-preserving curve applies comes from the colour's
+    // *largest* channel, and a lifting curve is concave — so the smaller
+    // channels are lifted by less than a per-channel curve would lift them,
+    // and a saturated colour's luma therefore rises by less. Measured here:
+    // 1.45x against the per-channel path's 1.6x. What the test is asking is
+    // whether the curve moved the brightness at all, and it plainly did.
     assert!(
-        lift_luma > straight_luma * 1.5,
+        lift_luma > straight_luma * 1.4,
         "the curve did not lift anything: {lift_luma:.4} against {straight_luma:.4}"
     );
     assert!(

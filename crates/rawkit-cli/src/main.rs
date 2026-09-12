@@ -664,6 +664,11 @@ pub struct EditFlags {
     /// Haze, undone in scene-linear light. Negative adds it, -1 to 1.
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     dehaze: f32,
+    /// How much of the tone map's compression keeps a colour's ratios, 0 to 1.
+    /// At 1 a highlight holds its hue all the way up; at 0 it bleaches towards
+    /// white the way a per-channel curve makes it.
+    #[arg(long, default_value_t = rawkit_editstate::Tone::default().hue_preservation)]
+    hue_preservation: f32,
     /// Vignette, centred on the crop. Negative darkens the corners, -1 to 1.
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     vignette: f32,
@@ -819,6 +824,7 @@ impl EditFlags {
                 clarity: self.clarity,
                 texture: self.texture,
                 dehaze: self.dehaze,
+                hue_preservation: self.hue_preservation,
             },
             orientation,
             crop,

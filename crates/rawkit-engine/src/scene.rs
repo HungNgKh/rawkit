@@ -407,10 +407,9 @@ mod tests {
         let wgsl = include_str!("../shaders/demosaic_rcd.wgsl");
         let k: f32 = wgsl
             .lines()
-            .skip_while(|l| !l.contains("fn tone_map("))
-            .find_map(|l| l.trim().strip_prefix("let k = "))
+            .find_map(|l| l.trim().strip_prefix("const TONE_MAP_K: f32 = "))
             .and_then(|tail| tail.trim_end_matches(';').parse().ok())
-            .expect("the shader's tone map has no `let k =`");
+            .expect("the shader has no TONE_MAP_K");
 
         let rendered = MID_GREY / (MID_GREY + k);
         assert!(

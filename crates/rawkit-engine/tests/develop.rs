@@ -163,8 +163,25 @@ fn white_balance_multiplies_channels_independently() {
     // Scene-linear is what makes white balance three multiplies rather than a
     // colour-appearance model. Stated exactly rather than as an ordering:
     // channel c of a neutral frame with multiplier m must equal a neutral frame
-    // of `value * m` rendered with no white balance at all. That holds whatever
-    // the tone curve does, because the multiply happens before it.
+    // of `value * m` rendered with no white balance at all.
+    //
+    // **With hue preservation off, and that is not a workaround.** The equality
+    // above needs everything after the multiply to be per-channel, and the tone
+    // map is deliberately no longer per-channel by default — it asks the curve
+    // once at the colour's largest channel and applies that gain to all three,
+    // so a saturated colour keeps its hue as it is compressed. Comparing a
+    // channel of a balanced render against a *neutral* render of the same value
+    // is comparing two colours the curve now treats differently, on purpose.
+    //
+    // So this pins the per-channel path, where the property is exactly true,
+    // and `hue_preservation_keeps_a_colours_ratios` below pins the default one.
+    let per_channel = EditState {
+        tone: rawkit_editstate::Tone {
+            hue_preservation: 0.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let gpu = Gpu::new().expect("no usable GPU adapter");
     let renderer = Renderer::new(&gpu);
     let wb = [2.0f32, 1.0, 1.5];
@@ -184,7 +201,7 @@ fn white_balance_multiplies_channels_independently() {
                 profile: neutral_profile(),
                 recorded_orientation: rawkit_editstate::Orientation::AsShot,
             },
-            &EditState::default(),
+            &per_channel,
             Output::Display,
         )
         .expect("render failed")
@@ -192,7 +209,7 @@ fn white_balance_multiplies_channels_independently() {
     let i = ((N / 2 * N + N / 2) * 4) as usize;
 
     for (c, m) in wb.iter().enumerate() {
-        let expected = develop(&gpu, &renderer, value * m, &EditState::default())[c];
+        let expected = develop(&gpu, &renderer, value * m, &per_channel)[c];
         assert!(
             (out[i + c] - expected).abs() < 1e-4,
             "channel {c} with multiplier {m} gave {}, but {} unbalanced gives {expected}",
@@ -284,4 +301,88 @@ fn as_shot_reports_a_plausible_temperature() {
         "as-shot temperature {temperature} K is not a temperature a camera would report"
     );
     assert!(tint.abs() < 60.0, "implausible as-shot tint {tint}");
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn hue_preservation_keeps_a_colours_ratios() {
+    // The property the control exists to deliver, stated as a ratio because
+    // that is what a hue *is*. At full preservation the curve is asked once, at
+    // the colour's largest channel, and the answer is applied to all three as a
+    // single gain — so whatever proportion the channels arrived in, they leave
+    // in.
+    //
+    // Compressing them separately cannot do this and the difference is not
+    // subtle: the largest channel compresses proportionally hardest, so every
+    // colour walks towards white along a path that is not constant hue. Three
+    // stops of exposure on a real frame rotates an amber window light by 13.9
+    // degrees, with nothing clipped anywhere.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let renderer = Renderer::new(&gpu);
+
+    // A strongly coloured light, made with the white balance because a flat
+    // mosaic is the only way to isolate the develop stage from the demosaic —
+    // the multipliers are what put three different values in front of the tone
+    // map. Far enough up that the sigmoid is doing real work: at this value the
+    // largest channel is compressed to about two thirds of the way to white,
+    // which is where a per-channel curve does its damage.
+    let wb = [4.0f32, 1.0, 0.5];
+    let value = 0.25f32;
+    let cfa = vec![value; (N * N) as usize];
+
+    for (keep, tolerance) in [(1.0f32, 0.002f32), (0.0, 0.5)] {
+        let state = EditState {
+            tone: rawkit_editstate::Tone {
+                hue_preservation: keep,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let out = renderer
+            .run(
+                &gpu,
+                &Frame {
+                    data: &cfa,
+                    width: N,
+                    height: N,
+                    phase: BayerPhase::Rggb,
+                    as_shot_wb: wb,
+                    clip_level: f32::INFINITY,
+                    profile: neutral_profile(),
+                    recorded_orientation: rawkit_editstate::Orientation::AsShot,
+                },
+                &state,
+                Output::Display,
+            )
+            .expect("render failed")
+            .pixels;
+        let i = ((N / 2 * N + N / 2) * 4) as usize;
+        let (r, g, b) = (out[i], out[i + 1], out[i + 2]);
+
+        // Against the ratios the light arrived in, which the multipliers set.
+        let red = (r / g - wb[0] / wb[1]).abs();
+        let blue = (b / g - wb[2] / wb[1]).abs();
+        if keep > 0.0 {
+            assert!(
+                red < tolerance && blue < tolerance,
+                "at full preservation the colour left as {r}/{g}/{b}, ratios {}/{} \
+                 against the {}/{} it arrived in",
+                r / g,
+                b / g,
+                wb[0] / wb[1],
+                wb[2] / wb[1]
+            );
+        } else {
+            // And the other end, so the test proves the control is doing
+            // something rather than that the curve never turned a colour.
+            assert!(
+                red > tolerance,
+                "with preservation off the red ratio was {} against {}, which is \
+                 within {tolerance} — the per-channel curve is not turning the \
+                 colour and this test proves nothing",
+                r / g,
+                wb[0] / wb[1]
+            );
+        }
+    }
 }

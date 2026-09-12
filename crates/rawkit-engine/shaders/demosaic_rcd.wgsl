@@ -94,6 +94,11 @@ struct Params {
     // `.x` the brightest reference it will read a gain at, `.y` the darkest.
     // `.zw` unused. See `tone_curve`, and `ToneCurve::local` in Rust.
     tone_local: vec4<f32>,
+    // The tone *map*'s parameters, as opposed to the tone *controls* above.
+    // `.x` is how much of the compression keeps a colour's ratios; see
+    // `hue_preserved`. The rest unused. Ordered exactly as `Params` in
+    // render.rs.
+    tone_map: vec4<f32>,
     // `.x` is the sharpening amount, `.y` its radius in pixels, `.z` the chroma
     // noise reduction. `.w` unused.
     detail: vec4<f32>,
@@ -995,10 +1000,23 @@ fn develop_rgb(camera: vec3<f32>, ixy: vec2<f32>, hazy: bool) -> vec3<f32> {
     // The profile's curve *instead of* ours, not as well as. Both map the scene
     // to a display, and running two tone maps in series maps the scene twice —
     // which reads as a flat, muddy picture rather than as a bug.
-    var mapped = tone_map(looked);
+    //
+    // Whichever curve runs, the colour's largest channel goes through it a
+    // second time on its own: that single value is what the ratio-preserving
+    // path needs, and taking it from the curve in use rather than from a fixed
+    // one is what stops the control meaning two different things depending on
+    // whether a `.dcp` happened to be loaded.
+    let norm = max(looked.r, max(looked.g, looked.b));
+    var mapped: vec3<f32>;
+    var peak: f32;
     if (params.curve.z > 0u) {
         mapped = profile_tone_rgb(looked);
+        peak = profile_tone(max(norm, 0.0));
+    } else {
+        mapped = tone_map(looked);
+        peak = tone_sigmoid(norm);
     }
+    mapped = hue_preserved(looked, mapped, norm, peak);
 
     // And out to the display's primaries, once, with everything that wanted the
     // working space behind it.
@@ -1243,6 +1261,14 @@ fn grade_colour(rgb: vec3<f32>) -> vec3<f32> {
     out = grade_tint(out, params.grade[2], highlights);
     return out;
 }
+
+/// The tone map's shoulder.
+///
+/// Not a free number: it is fixed by where a photographed mid-grey has to land.
+/// `MID_GREY / (MID_GREY + TONE_MAP_K) = 0.18` with `MID_GREY` at 0.072, and
+/// `the_tone_map_puts_mid_grey_where_this_module_says` in `scene.rs` is what
+/// holds the two halves of that one decision together.
+const TONE_MAP_K: f32 = 0.33;
 
 /// Mid-grey in the perceptual coordinate: `0.18^(1/2.2)`.
 const TONE_PIVOT: f32 = 0.45865646;
@@ -2202,9 +2228,66 @@ fn sample_curve(base: u32, entries: u32, v: f32) -> f32 {
 }
 
 fn tone_map(x: vec3<f32>) -> vec3<f32> {
-    let k = 0.33;
     let clamped = max(x, vec3<f32>(0.0));
-    return clamped / (clamped + vec3<f32>(k));
+    return clamped / (clamped + vec3<f32>(TONE_MAP_K));
+}
+
+/// The same sigmoid on one value, for the channel that decides a colour's
+/// compression when the ratios are being kept.
+fn tone_sigmoid(x: f32) -> f32 {
+    let clamped = max(x, 0.0);
+    return clamped / (clamped + TONE_MAP_K);
+}
+
+/// Compress a colour without turning it.
+///
+/// # The defect this exists for
+///
+/// Compressing each channel on its own compresses the largest one
+/// proportionally hardest, so every colour walks towards white along a path
+/// that is **not** constant hue. Measured on a real frame, three stops of
+/// exposure rotates an amber window light 13.9 degrees towards yellow across
+/// nine thousand pixels, with nothing clipped anywhere. That rotation is what
+/// "blown out" looks like before anything is actually blown out, and no later
+/// colour control can undo it — by then the hue that was photographed is gone.
+///
+/// # The fix, and why it is max RGB
+///
+/// Ask the curve how much it compresses at this colour's **largest** channel,
+/// and apply that one number to all three. A single gain leaves the ratios
+/// between the channels exactly as they were, and the ratios are what hue and
+/// saturation are.
+///
+/// It has to be the largest channel and not a cleverer norm. The output's
+/// largest channel is `curve(norm) * peak / norm`, which stays inside the
+/// display exactly when `norm >= peak`, and every norm worth having — the power
+/// norm `(R^3+G^3+B^3)/(R^2+G^2+B^2)`, luminance, the Euclidean norm — is a
+/// weighted mean of the channels and therefore **below** the largest one. Each
+/// would push saturated colours out of the display and leave the per-channel
+/// clamp at the end of the pipeline to bring them back, which turns the hue at
+/// the clamp instead of at the curve. Max RGB is the boundary of the safe
+/// family, which is the whole of its theoretical justification and enough.
+///
+/// The cost, stated: max RGB darkens saturated blues relative to a luminance
+/// norm, because a blue's largest channel is a long way above its brightness.
+/// That is a known and accepted trade in every engine that ships this.
+///
+/// # Why it is a blend and not a switch
+///
+/// Because bleaching towards white is sometimes the photograph. A sunset, a
+/// fire, a filament: film does this and the eye expects it, and a perfectly
+/// hue-stable sun is a flat orange disc. See `Tone::hue_preservation`.
+///
+/// At a weight of exactly zero this returns `mapped` untouched rather than an
+/// algebraically equal rearrangement of it, so an edit that turns this off is
+/// **bit**-identical to a build that never had it.
+fn hue_preserved(source: vec3<f32>, mapped: vec3<f32>, norm: f32, peak: f32) -> vec3<f32> {
+    let keep = params.tone_map.x;
+    if (keep <= 0.0 || norm <= EPS) {
+        return mapped;
+    }
+    let preserved = max(source, vec3<f32>(0.0)) * (peak / norm);
+    return mix(mapped, preserved, keep);
 }
 
 // ---------------------------------------------------------------------------
