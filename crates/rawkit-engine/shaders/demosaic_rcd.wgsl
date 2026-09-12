@@ -836,11 +836,7 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
     // all three channels, so shadows and highlights move a colour without
     // turning it -- see `tone_curve`.
     let local = local_tone(ixy);
-    var shaped = vec3<f32>(
-        tone_curve(looked.r, local),
-        tone_curve(looked.g, local),
-        tone_curve(looked.b, local),
-    );
+    var shaped = tone_curve_rgb(looked, local);
     // And the hand-drawn curve last of the tone controls, so it shapes what the
     // sliders left rather than competing with them.
     if (params.user_curve.z > 0u) {
@@ -1363,13 +1359,29 @@ fn tone_shadow_highlight(p1: f32) -> f32 {
 /// Without a guide the arithmetic is the original expression untouched, not an
 /// algebraically equal rearrangement of it -- so an edit that does not use this
 /// is bit-identical to a build that never had it.
-fn tone_curve(y: f32, local: f32) -> f32 {
+fn tone_curve_rgb(rgb: vec3<f32>, local: f32) -> vec3<f32> {
     // Bit-identical passthrough when nothing is set, so an identity edit is
     // untouched by all of this rather than merely close to untouched.
     if (params.tone.w < 0.5) {
-        return y;
+        return rgb;
     }
 
+    let p2 = vec3<f32>(
+        tone_shaped(rgb.r, local),
+        tone_shaped(rgb.g, local),
+        tone_shaped(rgb.b, local),
+    );
+    return tone_levels(p2);
+}
+
+/// Contrast and the two local controls, on one channel.
+///
+/// Per channel, deliberately, and the reasoning differs for the two halves.
+/// Contrast is an RGB curve and an RGB curve is *meant* to add saturation —
+/// that is what a photographer means by contrast and what the eye expects. The
+/// shadow and highlight gain is per channel only in form: the number it
+/// multiplies by is one scalar for all three, so it cannot turn a colour.
+fn tone_shaped(y: f32, local: f32) -> f32 {
     // The tone map is asymptotic, so `y` is already inside [0, 1) -- but a
     // non-finite exposure would put it outside, and `1.0 - p` going negative
     // would make every `pow` below a NaN. Clamping is one instruction.
@@ -1417,16 +1429,95 @@ fn tone_curve(y: f32, local: f32) -> f32 {
         p2 = p1 * tone_shadow_highlight(reference) / max(reference, EPS);
     }
 
-    // The black and white points, and the only place in the whole pipeline that
-    // clips. Deliberate: the endpoints are where a photographer asks for
-    // clipping, and an editor whose black slider only compresses reads as
-    // broken. The points can never cross -- see LEVELS_REACH in Rust.
-    let levelled = clamp(
-        (p2 - params.levels.x) / (params.levels.y - params.levels.x),
-        0.0,
-        1.0,
-    );
-    return pow(levelled, TONE_GAMMA);
+    return p2;
+}
+
+/// The black and white points: the only place in the whole pipeline that clips.
+///
+/// Deliberate, that: the endpoints are where a photographer *asks* for
+/// clipping, and an editor whose black slider only compresses reads as broken.
+/// The points can never cross -- see LEVELS_REACH in Rust.
+///
+/// # Why this takes all three channels at once
+///
+/// Because clipping them separately is the last place in the pipeline where
+/// making a colour brighter **turns** it. Measured on a real frame, pushing
+/// Whites to +1 moved a lit facade's hue by **2.2 degrees**, with two thirds of
+/// those pixels pinned at 255 in one channel; it is now 0.0.
+///
+/// Both halves of the step contributed. The affine stretch is shared across the
+/// channels but is not a scaling — subtracting a black point moves the ratios —
+/// and that alone was worth 1.5 degrees; the clamp added another degree on top.
+///
+/// # What this does *not* fix, stated because it was first claimed as a fault
+///
+/// The colourfulness. It was measured as rising from 0.683 to 0.979 and read as
+/// the control saturating a colour rather than bleaching it — which would have
+/// been the larger fault of the two. **That was the measure, not the renderer.**
+/// HLS saturation is not invariant under scaling: its denominator carries the
+/// lightness, so it climbs whenever a colour is made brighter at constant
+/// ratios. Against `(max - min) / max`, which is invariant, the same push moves
+/// colourfulness 0.759 to 0.724 — a slight bleach — and moves it *identically*
+/// with this function and without it.
+///
+/// So the endpoint was never over-saturating. It was turning the hue, and only
+/// that.
+///
+/// So a colour that would clip is brought inside the ceiling by *scaling*,
+/// which leaves its ratios alone, and then bleached towards white by however
+/// much clipping there would have been. Same control as `hue_preserved`, same
+/// two-mix arrangement, same reason.
+///
+/// **Only the top end.** A colour crushed against the black point still clamps
+/// per channel and still turns as it goes. That half was measured too and is
+/// the smaller one — 1.5 degrees against the top's 2.2 — and crushing ends at
+/// black, which is where every hue meets anyway.
+///
+/// At a weight of exactly zero this is the per-channel clamp it replaced,
+/// arithmetic for arithmetic.
+fn tone_levels(p2: vec3<f32>) -> vec3<f32> {
+    let span = params.levels.y - params.levels.x;
+    // What each channel would be with no ceiling at all. Per channel this is
+    // then clamped, which is the behaviour being replaced.
+    let u = (p2 - vec3<f32>(params.levels.x)) / span;
+    let per_channel = clamp(u, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    let keep = params.tone_map.x;
+    let hi = max(u.r, max(u.g, u.b));
+    let lo = min(u.r, min(u.g, u.b));
+    // Nothing over the ceiling is nothing to do: below it the clamp is the
+    // identity and there is no clipping to preserve the hue through.
+    if (keep <= 0.0 || hi <= 1.0) {
+        return pow(per_channel, vec3<f32>(TONE_GAMMA));
+    }
+
+    // Brought inside the ceiling by scaling, which is the one operation that
+    // leaves the ratios — and therefore the hue — exactly alone.
+    let fitted = u / hi;
+
+    // **How far to bleach, and this is the number the first attempt got wrong.**
+    //
+    // Written as "white once the largest channel passes the ceiling", a colour
+    // lost all of its chroma the instant it began to clip. Per-channel does not
+    // do that: it whitens one channel at a time and only arrives at white when
+    // the *smallest* channel reaches the ceiling too. The difference is the
+    // ratio between the largest and smallest, which on a saturated colour is
+    // several stops — and the golden reference built from a saturated chirp at
+    // full contrast came out 98% white, which is not an exaggerated result, it
+    // is a blank one.
+    //
+    // So the bleach is tied to how much clipping there would have been.
+    // `hi` at 1 is the first channel touching the ceiling and nothing is
+    // bleached; `hi / lo` is where the last one reaches it, and there the
+    // colour is white. The two paths therefore arrive at white together, and
+    // differ only in the route: this one goes straight there, and the
+    // per-channel one walks round the hue circle on its way.
+    let full = max(hi / max(lo, EPS), 1.0);
+    let t = clamp((hi - 1.0) / max(full - 1.0, EPS), 0.0, 1.0);
+    let bleached = mix(fitted, vec3<f32>(1.0), t);
+
+    let levelled = clamp(mix(per_channel, bleached, keep), vec3<f32>(0.0), vec3<f32>(1.0));
+    return pow(levelled, vec3<f32>(TONE_GAMMA));
 }
 
 /// One texel of one of the guide's two fields, in the camera's own RGB.
