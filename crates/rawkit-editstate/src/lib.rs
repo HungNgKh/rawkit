@@ -1191,21 +1191,28 @@ pub struct Tone {
     /// them — which is what hue and saturation are — come through exactly. At
     /// 0.0 it is the per-channel behaviour above, unchanged.
     ///
-    /// # It means the midtones, and the default is 1.0
+    /// # It is not a control, and there is no slider for it
     ///
-    /// A colour that bleaches towards white as it gets brighter is sometimes
-    /// the point — a sunset, a fire, a tungsten filament. Film does this and
-    /// the eye expects it, and a perfectly hue-stable sun is a flat orange
-    /// disc.
+    /// It was one, briefly, and it should not have been. A colour that bleaches
+    /// towards white as it gets brighter is sometimes the point — a sunset, a
+    /// fire, a tungsten filament — and while that bleach was a global weight,
+    /// trading it against the midtones was a real decision somebody might want
+    /// to make.
     ///
-    /// That is handled **where it belongs**, at the top of the curve, rather
-    /// than by holding this below 1.0 and smearing a little bleach across every
-    /// tone in the frame. The renderer tapers the weight away as a colour
-    /// approaches display white, so a specular bleaches on its own and the
-    /// midtones can be exactly what the sensor and the profile saw.
+    /// It stopped being one. The bleach now lives **where it belongs**, at the
+    /// top of the curve: the renderer tapers the weight away as a colour
+    /// approaches display white, so a specular goes white on its own and the
+    /// midtones stay exactly what the sensor and the profile saw. Once that
+    /// landed, every value below 1.0 bought nothing that the top of the curve
+    /// was not already giving, and paid for it by smearing bleach across tones
+    /// that had asked for none.
     ///
-    /// Which leaves this as a taste control rather than a compromise: lower it
-    /// to let the bleach reach further down the frame.
+    /// So the value is 1.0, the panel does not offer it, and what remains here
+    /// is the seam the measurements are taken across — `develop.rs`'s
+    /// `hue_preservation_keeps_a_colours_ratios` renders the same frame at 0.0
+    /// and 1.0 to show that the hue-preserving path is doing the work it claims
+    /// to. A number nobody can reach from the window is still worth being able
+    /// to check from a test.
     #[serde(default = "default_hue_preservation")]
     pub hue_preservation: f32,
 }

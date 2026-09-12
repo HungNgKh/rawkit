@@ -2187,10 +2187,18 @@ impl Renderer {
                 // five controls are: this is the boundary a stored edit crosses
                 // and the shader's `mix` has no opinion about weights outside
                 // `0..1`.
+                //
+                // A non-finite value falls back to the *default*, not to zero.
+                // Zero was the old answer and it is the one value that means
+                // "render this the way it was rendered before hue preservation
+                // existed" — so a corrupt sidecar would not degrade, it would
+                // quietly pick a different look. No slider can produce that
+                // number any more, which makes the fallback the only way it
+                // could ever be reached.
                 if state.tone.hue_preservation.is_finite() {
                     state.tone.hue_preservation.clamp(0.0, 1.0)
                 } else {
-                    0.0
+                    rawkit_editstate::Tone::default().hue_preservation
                 },
                 0.0,
                 0.0,
