@@ -1359,6 +1359,16 @@ const TONE_GAMMA: f32 = 2.2;
 /// and the test there that checks these three numbers against this file.
 const TONE_TAPER: f32 = 0.75;
 
+/// How far up towards the pivot the shadow control keeps its authority.
+///
+/// See `rawkit_engine::tone::SHADOW_REACH`, which is the specification and
+/// which `the_shader_uses_the_constants_documented_here` checks this against.
+/// In short: a plain `1 - v` taper is spent by about level 100 of 255, which on
+/// a frame whose darkest tone is level 86 means the slider does nothing at all.
+/// The `v * v` keeps the deep shadows where they were while the upper ones gain
+/// five to ten levels.
+const TONE_SHADOW_REACH: f32 = 1.5;
+
 /// Contrast: a power about the pivot, each side of it separately.
 ///
 /// Both segments carry slope k at the pivot, so this is smooth there and not
@@ -1379,7 +1389,8 @@ fn tone_contrast(p0: f32) -> f32 {
 fn tone_shadow_highlight(p1: f32) -> f32 {
     if (p1 <= TONE_PIVOT) {
         let v = p1 / TONE_PIVOT;
-        return TONE_PIVOT * pow(v, 1.0 - params.tone.z * TONE_TAPER * (1.0 - v));
+        let taper = (1.0 - v) * (1.0 + TONE_SHADOW_REACH * v * v);
+        return TONE_PIVOT * pow(v, 1.0 - params.tone.z * TONE_TAPER * taper);
     }
     let u = (1.0 - p1) / (1.0 - TONE_PIVOT);
     return 1.0 - (1.0 - TONE_PIVOT) * pow(u, 1.0 + params.tone.y * TONE_TAPER * (1.0 - u));

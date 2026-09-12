@@ -57,6 +57,10 @@
 //! `1.1354` at `u = e^-2`. So `|c| < 1/1.1354 = 0.8807`, and [`TAPER`] is 0.75
 //! to leave margin. Past that bound the curve folds back on itself and local
 //! contrast inverts — which looks like a contour, not like a bug.
+//!
+//! The general form, for a taper `f` that is not `1 - u`, is `1 + c·G(u) > 0`
+//! with `G(u) = f(u) + u·f'(u)·ln u`. [`SHADOW_REACH`] changes the shadow
+//! side's `f` and so has its own scan; it comes out *looser* than this one.
 
 use rawkit_editstate::Tone;
 
@@ -88,6 +92,53 @@ const GAMMA: f32 = 2.2;
 /// Bounded by monotonicity at 0.8807; see the module docs for the derivation.
 /// Not test-only, for the reason given on [`PIVOT`].
 const TAPER: f32 = 0.75;
+
+/// How far up towards the pivot the **shadow** control keeps its authority.
+///
+/// # What it fixes
+///
+/// The taper is what makes the exponent reach exactly 1 at mid-grey, so the
+/// shadow control cannot secretly move the midtones. Written as a plain
+/// `1 - v` it also gives the control away long before it gets there: measured
+/// on the curve, Shadows at +1 lifts level 13 to 56 and level 51 to 72, but
+/// level 86 only to 91 and level 102 to 103. It is spent by about level 100.
+///
+/// That is narrower than it reads on the slider, and there is a whole class of
+/// photograph where it means nothing happens at all. `DSC01588.ARW` is one: a
+/// tree against a blown sky, which looks like a silhouette and is not — its
+/// darkest pixel is 72 of 255 and its darkest 24x24 region is 86, barely a stop
+/// below mid-grey. Every tone in the frame sits in the part of the range the
+/// control had already let go of, so the slider moved 0.25% of its channels by
+/// at most six levels. Nothing was broken; the control was simply empty.
+///
+/// # The shape, and why this one
+///
+/// `(1 - v)(1 + REACH·v²)`. The `v²` is what keeps the deep shadows where they
+/// were — at level 13 it is worth 1.02 and the lift moves by two levels — while
+/// the upper shadows gain five to ten. A linear `(1 + REACH·v)` fattens the
+/// whole range instead and takes level 26 from 62 to 76, which is not widening
+/// a control, it is re-pitching one that already worked.
+///
+/// What it cannot do is worth stating too. Level 86 is 0.4 stops under the
+/// pivot, and asking for it to reach 110 means asking the exponent to be
+/// *strongest* at the pivot rather than weakest — which is the definition of
+/// moving mid-grey. A control pinned at mid-grey can only do so much this close
+/// to it, and this is most of what is available.
+///
+/// # Monotonicity
+///
+/// The bound in the module docs is derived for `1 - v` and has to be redone for
+/// any other taper: the requirement is `1 + c·G(v) > 0` with
+/// `G(v) = f(v) + v·f'(v)·ln v`. Scanned over twenty thousand steps, `max G`
+/// *falls* from 1.1353 to 1.0883 as this goes from 0 to 1.5 — so the bound on
+/// `|c|` rises from 0.8808 to 0.9189 and [`TAPER`] at 0.75 keeps more margin
+/// than it had, not less. The shape is gentler than the one it replaces, not
+/// more extreme; it simply holds on longer.
+///
+/// Shadows only. The highlight side was measured separately and reaches where
+/// it should, and widening it because its opposite number needed it would be
+/// symmetry for its own sake.
+const SHADOW_REACH: f32 = 1.5;
 
 /// How far the black and white points may travel from their defaults.
 ///
@@ -212,10 +263,19 @@ fn highlight_gain(r: f32, highlights: f32) -> f32 {
     (1.0 - (1.0 - PIVOT) * u.powf(1.0 + highlights * TAPER * (1.0 - u))) / r
 }
 
+/// How much of the shadow exponent's travel survives at `v = r / PIVOT`.
+///
+/// One function because the same factor appears in the gain, in the mirror of
+/// the curve below and in the shader, and three copies of a shape is how a
+/// curve comes to be rendered that nobody specified. See [`SHADOW_REACH`].
+fn shadow_taper(v: f32) -> f32 {
+    (1.0 - v) * (1.0 + SHADOW_REACH * v * v)
+}
+
 /// The same, below the pivot.
 fn shadow_gain(r: f32, shadows: f32) -> f32 {
     let v = r / PIVOT;
-    PIVOT * v.powf(1.0 - shadows * TAPER * (1.0 - v)) / r
+    PIVOT * v.powf(1.0 - shadows * TAPER * shadow_taper(v)) / r
 }
 
 /// The brightest a neighbourhood is worth reading a gain at.
@@ -412,7 +472,7 @@ fn curve(y: f32, c: &ToneCurve) -> f32 {
     // Shadows and highlights: exponents that taper to 1 at the pivot.
     let p = if p <= PIVOT {
         let v = p / PIVOT;
-        PIVOT * v.powf(1.0 - c.shadows * TAPER * (1.0 - v))
+        PIVOT * v.powf(1.0 - c.shadows * TAPER * shadow_taper(v))
     } else {
         let u = (1.0 - p) / (1.0 - PIVOT);
         1.0 - (1.0 - PIVOT) * u.powf(1.0 + c.highlights * TAPER * (1.0 - u))
@@ -535,6 +595,7 @@ mod tests {
             ("TONE_PIVOT", PIVOT),
             ("TONE_GAMMA", GAMMA),
             ("TONE_TAPER", TAPER),
+            ("TONE_SHADOW_REACH", SHADOW_REACH),
         ] {
             let line = wgsl
                 .lines()
@@ -602,6 +663,44 @@ mod tests {
                 worst
             );
         }
+    }
+
+    #[test]
+    fn the_shadow_control_still_has_authority_near_the_pivot() {
+        // The defect this exists for: the shadow taper was `1 - v`, which is
+        // spent long before it reaches mid-grey. Measured on the old curve,
+        // Shadows at +1 lifted level 13 of 255 to 56 and level 51 to 72, but
+        // level 86 only to 91 — and on a photograph whose *darkest* tone is 86
+        // that is a control with nothing to do. It happens: a subject against a
+        // blown sky reads as a silhouette and is barely a stop under mid-grey.
+        //
+        // Stated as a floor on the lift three quarters of the way to the pivot,
+        // because that is the region that was given away. Not as an exact
+        // number: the point is that something is left there, and pinning the
+        // value would make this a change detector for `SHADOW_REACH` rather
+        // than a statement about the curve.
+        let strong = ToneCurve::new(&Tone {
+            shadows: 1.0,
+            ..Tone::default()
+        });
+        let r = 0.75 * PIVOT;
+        let lift = effective_gain(&strong, r);
+        assert!(
+            lift > 1.08,
+            "at three quarters of the way to the pivot the shadow lift is only              {lift:.3}x, which is under five levels of 255 and reads as a slider              that does nothing"
+        );
+
+        // And the other end has to stay where it was, or this is not a wider
+        // control but a differently pitched one. The deep shadows were already
+        // doing the right thing and the `v * v` in the taper is what leaves
+        // them alone.
+        let deep = effective_gain(&strong, 0.1 * PIVOT);
+        assert!(
+            (4.5..5.2).contains(&deep),
+            "the deep shadow lift moved to {deep:.2}x; it was 4.73x before the \
+             reach widened and 4.84x after, and the whole point of the `v * v` \
+             is that this end barely moves"
+        );
     }
 
     #[test]
