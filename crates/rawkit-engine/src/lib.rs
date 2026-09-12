@@ -27,6 +27,7 @@ pub mod aberration;
 pub mod calibrate;
 pub mod geometry;
 pub mod guide;
+pub mod laplacian;
 pub mod mask;
 pub mod pipeline;
 pub mod present;
