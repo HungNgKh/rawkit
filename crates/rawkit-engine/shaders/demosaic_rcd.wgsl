@@ -2805,6 +2805,74 @@ fn sharpen(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// How far the chroma blur reaches. Folded into `HALO` in `render.rs`.
 const CHROMA_REACH: i32 = 2;
 
+/// The frame noise a chroma-noise slider position means what it says at.
+///
+/// The reduction used to be a fixed amount that knew nothing about the
+/// photograph it was cleaning, so one number had to serve both a base-ISO frame
+/// with fine colour detail in it and a pushed one full of blotches. Measured on
+/// the two ends of that: at full strength the ISO 1000 frame loses 58% of its
+/// high-frequency chroma, which is the noise, and the ISO 200 one loses 37%,
+/// which is its windows. A single compromise gives away something at both ends,
+/// and the frame itself says which end it is on — see `Guide::noise`.
+///
+/// This is the middle of the measured range, so the slider still means roughly
+/// what it did on a typical photograph and the scaling is a correction rather
+/// than a re-pitch: ISO 100-200 reads 0.0024 to 0.0031 and ISO 500-1000 reads
+/// 0.0046 to 0.0054.
+const NOISE_TYPICAL: f32 = 0.0035;
+
+/// How far the frame's own noise may pull the slider, either way.
+///
+/// Bounded because the estimate is a statistic and a statistic can be wrong:
+/// a frame that is one flat wall has little for the percentile to sit on. Two
+/// stops of authority is enough to separate a clean exposure from a pushed one
+/// and not enough for a bad estimate to turn the control off or run it to full
+/// on its own.
+const NOISE_STRENGTH_MIN: f32 = 0.5;
+const NOISE_STRENGTH_MAX: f32 = 2.0;
+
+/// Above this the reading is not noise, and the scaling gives up on it.
+///
+/// `Guide::noise` cannot tell noise from detail at the sensor's own limit —
+/// nothing that looks at one Bayer quad can. It gets away with that on a
+/// photograph because a photograph has flat light somewhere and the
+/// quarter-point finds it. A frame that is modulated at pixel scale *all over*
+/// has no flat light to find, and the statistic reads the detail instead: the
+/// golden chirp, a radial frequency sweep running to Nyquist in every corner,
+/// reads **0.033** against 0.0024 to 0.0054 for the ten reference photographs.
+///
+/// Left alone that saturated the boost and took 13-21% of the texture out of
+/// the golden fixtures — a denoiser eating detail, which is the one thing it
+/// must not do.
+///
+/// So a reading outside the range photographs occupy is treated as a *failed
+/// measurement*, and the answer to a failed measurement is the behaviour you
+/// had before you took it: the strength tapers back to exactly 1, which is the
+/// fixed amount this replaced. Tapered rather than switched because the
+/// alternative is a frame flipping its rendering on a hair's difference in a
+/// statistic — it is per frame so it cannot draw a contour, but it can still
+/// make two frames of the same scene disagree.
+///
+/// The band sits well clear of every real reading: the noisiest reference frame
+/// is 0.0054 and this starts at 0.008.
+const NOISE_IMPLAUSIBLE_FROM: f32 = 0.008;
+const NOISE_IMPLAUSIBLE_BY: f32 = 0.016;
+
+/// And how much more the shadows get than mid-grey.
+///
+/// Relative photon noise goes as one over the square root of the signal, so the
+/// same sensor is noisier in the dark *as a fraction of what is there* — which
+/// is what chroma noise is, and why blotches live in the shadows. Keyed on the
+/// pixel rather than the edit on purpose: a shadow is noisy whether or not
+/// anybody has lifted it yet, and a denoiser that waits for the slider cleans
+/// the picture only after it has already been seen dirty.
+const NOISE_DARK_MAX: f32 = 2.0;
+
+/// The value a photographed mid-grey arrives at, where the darkness scaling
+/// above is neither raising nor lowering anything. `rawkit_engine::scene`'s
+/// `MID_GREY`, and the same 0.18 the tone map is pinned to.
+const NOISE_MID_GREY: f32 = 0.072;
+
 @compute @workgroup_size(8, 8)
 fn chroma_blur(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = i32(gid.x);
@@ -2859,7 +2927,28 @@ fn chroma_mix(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     // The neighbourhood's colour at this pixel's own brightness.
     let recoloured = blurred * (was / now);
-    rgba_out[p] = vec4<f32>(mix(original, recoloured, amount), 1.0);
+
+    // How much this *photograph* needs, and how much this part of it needs.
+    //
+    // A guide with no noise measured in it -- a frame flat enough that the
+    // percentile found nothing, or a caller that built none -- falls back to
+    // the slider on its own, which is what this did before it could ask.
+    var strength = 1.0;
+    let measured = params.guide_scale.w;
+    if (measured > 0.0) {
+        let scaled = clamp(
+            measured / NOISE_TYPICAL,
+            NOISE_STRENGTH_MIN,
+            NOISE_STRENGTH_MAX,
+        );
+        // And back to 1 where the reading is too high to be noise. See
+        // `NOISE_IMPLAUSIBLE_FROM`.
+        let gave_up = smoothstep(NOISE_IMPLAUSIBLE_FROM, NOISE_IMPLAUSIBLE_BY, measured);
+        strength = mix(scaled, 1.0, gave_up);
+    }
+    let dark = clamp(sqrt(NOISE_MID_GREY / max(was, EPS)), 1.0, NOISE_DARK_MAX);
+    let effective = clamp(amount * strength * dark, 0.0, 1.0);
+    rgba_out[p] = vec4<f32>(mix(original, recoloured, effective), 1.0);
 }
 
 // ---------------------------------------------------------------------------

@@ -238,6 +238,7 @@ mod tests {
             data: texels.iter().flatten().copied().collect(),
             chroma: [1.0; 3],
             chroma_known: true,
+            noise: 0.0,
             clipped: 0.0,
             blown: 0.0,
             width: texels.len() as u32,

@@ -2368,7 +2368,10 @@ impl Renderer {
                 // reconstruction runs on every frame with a blown pixel in it,
                 // whatever the tone controls say.
                 if buffers.guide.chroma_known { 1.0 } else { 0.0 },
-                0.0,
+                // The frame's own noise, which chroma noise reduction scales
+                // itself by. Zero is "not measured", and the shader falls back
+                // to the slider alone.
+                buffers.guide.noise,
             ],
             // Per-tile, and rewritten by both render paths before the develop
             // stage reads it. Level zero at the origin, with the halo, is what

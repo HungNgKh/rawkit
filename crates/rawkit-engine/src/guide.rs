@@ -126,6 +126,29 @@ const RANGE_STOPS: f32 = 0.5;
 /// colour spreading across a whole sky, which nothing covers.
 const FLAT_ENOUGH: f32 = 0.1;
 
+/// Resolution of the histogram [`Guide::noise`] takes its median from.
+///
+/// A median needs a distribution and a distribution of six million floats is
+/// not worth holding. Two hundred bins put the quantisation an order of
+/// magnitude below the difference between one ISO stop and the next, which is
+/// the only distinction anything downstream makes.
+const NOISE_BINS: usize = 200;
+
+/// The widest green-to-green gap the histogram resolves.
+///
+/// Everything above lands in the last bin, which is correct rather than lossy:
+/// those are edges, they are in the tail, and a median does not care how far
+/// into the tail its tail goes.
+const NOISE_TOP: f32 = 0.05;
+
+/// Below this, a quad is too dark to say anything about the sensor.
+///
+/// Down there the black level's own subtraction is a larger error than the
+/// noise being measured, so including those quads measures the calibration
+/// rather than the photograph. In the same units as the mosaic, and it is the
+/// *pair* of greens summed, matching what the edge test compares against.
+const NOISE_FLOOR: f32 = 0.01;
+
 /// A sample this close to the clip level is not to be trusted.
 ///
 /// The mosaic arrives with the decoder's white level at 1.0, and sensors do not
@@ -180,6 +203,40 @@ pub struct Guide {
     /// end to end, where [`Guide::chroma`] is neutral and reconstruction falls
     /// back to the grey it used to produce unconditionally.
     pub chroma_known: bool,
+    /// How noisy the sensor was, in mosaic units — the typical gap between a
+    /// quad's two greens.
+    ///
+    /// # What it measures, and why it is nearly free
+    ///
+    /// The two greens sit on opposite corners of a Bayer quad and see the same
+    /// light wherever the light is flat, which is the reason [`FLAT_ENOUGH`]
+    /// can use their difference to detect an edge. Turn that around and the
+    /// same number is a noise measurement: where there is no edge, what
+    /// separates them is the sensor. The quantity is already computed for the
+    /// edge test, so this costs a histogram bin per quad and nothing else.
+    ///
+    /// A **median** rather than a mean, and that is what makes it robust
+    /// without having to decide where the flat parts of a photograph are. Over
+    /// half of any frame is flat at the scale of one quad — a mean would be
+    /// dragged by every edge in the picture, and the middle of the distribution
+    /// is not.
+    ///
+    /// # What it is for
+    ///
+    /// Chroma noise reduction was a fixed amount that knew nothing about the
+    /// frame it was cleaning. Measured across the ten reference frames, this
+    /// tracks ISO closely enough to key on: it is what lets a clean exposure
+    /// keep its fine colour detail while a pushed one gets the reduction it
+    /// needs, instead of both getting the same compromise.
+    ///
+    /// # Divided by the square root of the level, and that is what made it work
+    ///
+    /// Photon noise rises with the square root of the signal, so the raw gap
+    /// between two greens says as much about how bright the quad was as about
+    /// the sensor. Undo that and what is left is the sensor: measured across
+    /// the ten reference frames the raw statistic ranked four ISO 100 frames
+    /// above an ISO 1000 one, and the normalised one does not.
+    pub noise: f32,
     /// The fraction of the sensor's 2x2 quads with at least one channel at or
     /// above the trusted level — the frame's clipping, as a number.
     ///
@@ -251,6 +308,10 @@ impl Guide {
         let mut count = vec![0.0f32; cells];
         let mut chroma = [0.0f32; 3];
         let mut chroma_weight = 0.0f32;
+        // How far apart a quad's two greens land, histogrammed so a median can
+        // be taken without holding six million numbers. See `Guide::noise`.
+        let mut spread = [0u32; NOISE_BINS];
+        let mut spread_count = 0u32;
         // How many quads there were and how many of them clipped. Counted in
         // the pass that already asks the question, so the frame's clipping
         // costs two increments rather than a second walk over the mosaic.
@@ -344,7 +405,24 @@ impl Guide {
                 // like, since red and blue have one sample each and no way to
                 // disagree with themselves.
                 let level = greens[0] + greens[1];
-                let flat = (greens[0] - greens[1]).abs() <= FLAT_ENOUGH * level;
+                let apart = (greens[0] - greens[1]).abs();
+                let flat = apart <= FLAT_ENOUGH * level;
+
+                // The same two numbers, read as a measurement of the sensor
+                // rather than of the picture. See `Guide::noise`: in flat light
+                // the two greens saw the same thing, so what separates them is
+                // noise — and a median over the whole frame finds the flat
+                // light without having to decide in advance where it is.
+                //
+                // Clipped quads are out because a pinned channel has no noise
+                // left, and very dark ones because the black level's own
+                // subtraction is the larger error down there.
+                if !clipped && level > NOISE_FLOOR {
+                    let scaled = apart / level.sqrt();
+                    let bin = ((scaled / NOISE_TOP) * NOISE_BINS as f32) as usize;
+                    spread[bin.min(NOISE_BINS - 1)] += 1;
+                    spread_count += 1;
+                }
                 if !clipped && flat {
                     // Weighted by the quad's own brightness, so the reference
                     // is the colour of the *bright* light near a highlight
@@ -392,10 +470,40 @@ impl Guide {
             [0.0; 3]
         };
 
+        // The median of that histogram, which is the noise: over half of any
+        // photograph is flat at the scale of one Bayer quad, so the middle of
+        // the distribution is flat light and the edges are in the tail.
+        let percentile = |q: f32| -> f32 {
+            if spread_count == 0 {
+                return 0.0;
+            }
+            let want = (spread_count as f32 * q) as u32;
+            let mut seen = 0u32;
+            let mut bin = NOISE_BINS - 1;
+            for (i, n) in spread.iter().enumerate() {
+                seen += n;
+                if seen >= want {
+                    bin = i;
+                    break;
+                }
+            }
+            (bin as f32 + 0.5) / NOISE_BINS as f32 * NOISE_TOP
+        };
+        // **A quarter of the way up, not the middle.** The median is a texture
+        // measurement: over half of a frame full of grass or twigs has an edge
+        // inside the quad, and the unnormalised median duly ranked four ISO 100
+        // frames above an ISO 1000 one. A quarter of the way up is below the
+        // textured quads and above the handful that are flat *and* dark enough
+        // for the black level's own error to dominate — and across the ten
+        // reference frames it separates ISO 100-200 (0.0024-0.0031) from ISO
+        // 500-1000 (0.0046-0.0054) with no overlap at all.
+        let noise = percentile(0.25);
+
         Guide {
             data,
             chroma,
             chroma_known,
+            noise,
             clipped: if quads == 0 {
                 0.0
             } else {
@@ -598,6 +706,63 @@ mod tests {
                 "{w}x{h} needs more than the allocation reserves"
             );
         }
+    }
+
+    /// A deterministic pseudo-random in `-1..1`. A test that samples a real
+    /// generator is a test whose failure nobody can reproduce.
+    fn jitter(x: u32, y: u32) -> f32 {
+        let h =
+            (x.wrapping_mul(374_761_393) ^ y.wrapping_mul(668_265_263)).wrapping_mul(1_274_126_177);
+        ((h >> 8) & 0xffff) as f32 / 32768.0 - 1.0
+    }
+
+    #[test]
+    fn the_frame_tells_the_guide_how_noisy_it_is() {
+        // Three frames at the same brightness. The third is the one that
+        // matters: **a clean frame full of fine texture must not read as a
+        // noisy one**, and the first estimator written here did exactly that.
+        // It took the median of the green-to-green gap over the whole frame,
+        // which is a texture measurement — on the reference photographs it
+        // ranked four ISO 100 frames above an ISO 1000 one.
+        const W: u32 = 256;
+        const H: u32 = 256;
+        const LEVEL: f32 = 0.25;
+        let build = |data: Vec<f32>| Guide::build(&data, W, H, BayerPhase::Rggb, 1.0);
+
+        let flat = build(mosaic(W, H, |_, _| [LEVEL; 3]));
+        // Four-pixel blocks against two-pixel quads, so about half the quads
+        // straddle an edge and half do not — which is what puts the median in
+        // the texture and leaves the quarter-point in the flat light.
+        let textured = build(mosaic(W, H, |x, y| {
+            let v = if (x / 4 + y / 4) % 2 == 0 {
+                LEVEL
+            } else {
+                LEVEL * 0.4
+            };
+            [v; 3]
+        }));
+        let noisy = build(mosaic(W, H, |x, y| {
+            [(LEVEL + jitter(x, y) * 0.02).max(0.0); 3]
+        }));
+        println!(
+            "flat {:.5}  textured {:.5}  noisy {:.5}",
+            flat.noise, textured.noise, noisy.noise
+        );
+
+        assert!(
+            noisy.noise > flat.noise * 5.0,
+            "noise on a flat frame did not register: {:.5} against {:.5}",
+            noisy.noise,
+            flat.noise
+        );
+        assert!(
+            textured.noise < noisy.noise / 2.0,
+            "a clean frame full of texture read as a noisy one: {:.5} against \
+             {:.5}. That is the failure the median had, and the quarter-point \
+             is what fixes it.",
+            textured.noise,
+            noisy.noise
+        );
     }
 
     #[test]

@@ -87,6 +87,98 @@ fn sharpening_a_flat_field_changes_nothing() {
     assert!(worst < 1e-5, "sharpening invented {worst:e} of detail");
 }
 
+/// A flat field with sensor noise of a chosen depth scattered over every site.
+///
+/// **Every site, not only red and blue**, and that is not incidental. A sensor
+/// puts noise on all of its photosites, and `Guide::noise` measures it where it
+/// can be seen without an assumption — between a quad's two greens, which saw
+/// the same light. A fixture that scattered only red and blue left the greens
+/// identical, the frame measured as clean however deep the colour noise went,
+/// and the test below could not tell its two cases apart.
+fn sensor_noise(depth: f32) -> Vec<f32> {
+    (0..H)
+        .flat_map(|y| (0..W).map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let hash = (x * 1973 + y * 9277 + (x * y) % 7919) % 101;
+            0.25 + (hash as f32 / 100.0 - 0.5) * depth
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_noisy_frame_gets_more_reduction_than_a_clean_one_at_the_same_setting() {
+    // The defect this is the fix for: the amount was a fixed number that knew
+    // nothing about the photograph it was cleaning, so one slider position had
+    // to serve a base-ISO frame with fine colour detail in it and a pushed one
+    // full of blotches. Measured on the two ends of that, at full strength the
+    // ISO 1000 reference frame loses 58% of its high-frequency chroma — the
+    // noise — and the ISO 200 one loses 37%, which is its windows.
+    //
+    // The frame itself says which end it is on. `Guide::noise` measures it, and
+    // this is the claim that the measurement reaches the renderer: two frames,
+    // identical but for how much colour noise is on them, at the *same* slider
+    // position, must not be cleaned by the same amount.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    let mut state = EditState::default();
+    state.detail.sharpen_amount = 0.0;
+    state.detail.chroma_noise = 0.5;
+
+    let luma = |p: &[f32]| (p[0] + p[1] + p[2]) / 3.0;
+    // How much colour is left, as a mean distance from neutral. Cleaning colour
+    // noise off a field that has no real colour in it can only reduce this.
+    let left = |p: &[f32]| {
+        let mut total = 0.0f64;
+        let mut n = 0u32;
+        for i in (0..p.len()).step_by(4) {
+            let px = &p[i..i + 3];
+            let m = luma(px);
+            total += px.iter().map(|c| (c - m).abs() as f64).sum::<f64>();
+            n += 1;
+        }
+        total / n as f64
+    };
+
+    let mut kept = Vec::new();
+    // Chosen to span the range the reference photographs actually occupy
+    // rather than to be far apart: `Guide::noise` reads 0.0024 to 0.0031 at ISO
+    // 100-200 and 0.0046 to 0.0054 at ISO 500-1000, and the scaling is clamped
+    // either side of that. Two depths outside the clamp would pass this test
+    // while proving the renderer responds only to values no photograph has.
+    for depth in [0.004f32, 0.03] {
+        let cfa = sensor_noise(depth);
+        let plain = render(
+            &gpu,
+            &cfa,
+            &{
+                let mut s = state.clone();
+                s.detail.chroma_noise = 0.0;
+                s
+            },
+            Output::SceneLinear,
+        );
+        let cleaned = render(&gpu, &cfa, &state, Output::SceneLinear);
+        let fraction = left(&cleaned) / left(&plain);
+        println!(
+            "depth {depth}: {:.1}% of the colour noise survives",
+            fraction * 100.0
+        );
+        kept.push(fraction);
+    }
+
+    assert!(
+        kept[1] < kept[0] * 0.85,
+        "the same setting cleaned both frames the same: {:.3} of the noise left \
+         on the quiet one against {:.3} on the noisy one. The frame's own noise \
+         is not reaching the renderer.",
+        kept[0],
+        kept[1]
+    );
+}
+
 #[test]
 #[ignore = "requires a GPU adapter"]
 fn chroma_noise_reduction_keeps_every_pixel_its_own_brightness() {
