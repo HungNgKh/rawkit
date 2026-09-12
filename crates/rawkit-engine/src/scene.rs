@@ -27,6 +27,19 @@
 //!   excluded.** A statistic that moved when the exposure slider moved would
 //!   make every control derived from it chase its own tail.
 //!
+//! # The guide is read the *other* way a few lines from here, and both are right
+//!
+//! `local_tone` in the shader reads the same guide through the full develop
+//! chain — exposure, look, tone map and all — so the highlight and shadow
+//! controls act on a region that moves when the exposure does. Measured: two
+//! stops of exposure moves the band those controls affect by about two stops.
+//!
+//! That is not an inconsistency with this module, it is the difference between
+//! the two questions. This one describes **the photograph**, which must not
+//! move or whatever it anchors moves with it. That one describes **the
+//! rendering**, which must move or the control acts on something invisible.
+//! They look like one quantity from outside and are two.
+//!
 //! # What "mid-grey" means here, and why it is 0.072
 //!
 //! [`MID_GREY`] is the value a photographed mid-grey arrives at in the space the

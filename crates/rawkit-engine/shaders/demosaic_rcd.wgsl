@@ -1892,6 +1892,44 @@ fn unclipped_colour() -> vec3<f32> {
 /// Negative when neither local control is off zero, which is what `tone_curve`
 /// reads as "use the pixel's own value" -- so the whole arrangement costs
 /// nothing on a photograph that is not using it.
+/// How bright this pixel's *neighbourhood* is, in the perceptual coordinate.
+///
+/// # It is measured on the current rendering, exposure and all
+///
+/// The guide goes through `develop_rgb`, so what comes back carries the white
+/// balance, the profile, **the exposure**, the local adjustments, the look and
+/// the tone map — and `tone_curve` then puts the contrast on top of it before
+/// using it. Every one of those moves which part of the picture the highlight
+/// and shadow controls act on.
+///
+/// Measured, on a sunset frame at Highlights -1: at 0 EV the scene's 64-128
+/// band is untouched, 0.0%, and the 192-224 band is pulled down 13.9%. At +2 EV
+/// the same 64-128 band is pulled down 5.4% and the top band 20.9%. **The
+/// affected region moves by about the exposure change, and the control also
+/// gets stronger.**
+///
+/// That is deliberate and it is what the industry does. These are display-
+/// referred controls: they shape what the eye will see, and after two stops of
+/// exposure the things that *look* like highlights are a different set of
+/// pixels. Adobe's own guidance for the same controls — set Exposure and
+/// Contrast first, then Highlights and Shadows — is only necessary advice
+/// because the later controls depend on the earlier ones.
+///
+/// # And why this is the opposite of `SceneStats`, which is not a contradiction
+///
+/// [`crate::scene::SceneStats`] excludes exposure on purpose, with the
+/// reasoning that a statistic which moved when the exposure slider moved would
+/// make everything derived from it chase its own tail. Both are right, because
+/// they answer different questions:
+///
+/// - `SceneStats` describes **the photograph** — a property of the file, which
+///   must not move, or the thing it anchors moves with it.
+/// - this describes **the rendering** — what the picture looks like now, which
+///   must move, or the control acts on something nobody can see.
+///
+/// From the outside they look like one quantity, "how bright is this region",
+/// which is how somebody eventually changes one to match the other. They are
+/// two quantities.
 fn local_tone(ixy: vec2<f32>) -> f32 {
     if (params.guide.w == 0u) {
         return -1.0;
