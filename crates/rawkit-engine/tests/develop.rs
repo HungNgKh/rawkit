@@ -387,6 +387,86 @@ fn hue_preservation_keeps_a_colours_ratios() {
     }
 }
 
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_near_white_cast_bleaches_before_a_colour_does() {
+    // Two colours at the same brightness, one a faint tint on a near-white and
+    // one unmistakably coloured, and the bleach has to treat them differently.
+    //
+    // It is the property `HUE_BLEACH_NEUTRAL` exists for. A cast on a near-white
+    // highlight is as likely to be flare, a clipping residue or the profile's
+    // error as it is to be the subject, and the eye is least forgiving of one
+    // there because it knows what colour a cloud is. A saturated highlight is
+    // not ambiguous, and taking its colour away is the artefact rather than the
+    // fix — which is what a single brightness threshold had to choose between,
+    // because a grey cloud and an orange one sit at the same height.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let renderer = Renderer::new(&gpu);
+
+    // High enough that the near-neutral is past its onset and low enough that
+    // the coloured one is short of its own. Between the two thresholds is
+    // exactly where the two answers have to differ; outside it they agree by
+    // construction and the test would prove nothing.
+    // The two share a largest multiplier on purpose. The onset is a function of
+    // brightness *and* saturation, so two colours compared at different
+    // brightnesses would not isolate which of the two moved the answer — and
+    // the largest channel is what sets the brightness the bleach reads.
+    // Green is 1.0 in both because the renderer normalises the multipliers by
+    // it, and a largest channel that only matched *before* that division would
+    // put the two colours at different brightnesses again.
+    let value = 0.90f32;
+    let pale = develop_colour(&gpu, &renderer, value, [1.10, 1.00, 0.95]);
+    let vivid = develop_colour(&gpu, &renderer, value, [1.10, 0.50, 0.30]);
+
+    fn saturation(rgb: [f32; 3]) -> f32 {
+        let hi = rgb[0].max(rgb[1]).max(rgb[2]);
+        let lo = rgb[0].min(rgb[1]).min(rgb[2]);
+        if hi <= 0.0 {
+            0.0
+        } else {
+            (hi - lo) / hi
+        }
+    }
+    // What each arrived as, in the same measure: the multipliers are the colour
+    // going in, and the render is the colour coming out.
+    let asked_pale = saturation([1.10, 1.00, 0.95]);
+    let asked_vivid = saturation([1.10, 0.50, 0.30]);
+    println!(
+        "pale  asked {asked_pale:.3} got {:.3}  {pale:?}\n\
+         vivid asked {asked_vivid:.3} got {:.3}  {vivid:?}",
+        saturation(pale),
+        saturation(vivid)
+    );
+
+    // The tone map compresses, so neither comes out at the saturation it went
+    // in with and the absolute numbers are not the point. The *ratio* is: the
+    // pale one has to give up a larger share of its colour than the vivid one,
+    // and by a margin too wide to be the curve's own doing.
+    let pale_kept = saturation(pale) / asked_pale;
+    let vivid_kept = saturation(vivid) / asked_vivid;
+    assert!(
+        vivid_kept > pale_kept * 1.5,
+        "the bleach did not tell them apart: the pale cast kept {pale_kept:.3} of \
+         its saturation and the vivid colour {vivid_kept:.3}. A single brightness \
+         threshold gives these two the same answer, which is the thing \
+         HUE_BLEACH_NEUTRAL is there to stop."
+    );
+    // And the other end, so the margin above cannot be met by an operator that
+    // does nothing to either: the pale cast has to actually come off.
+    //
+    // The vivid colour is not asserted to be untouched, and that is not a
+    // loosened bound. The profile matrix mixes the channels, so a saturated
+    // colour's largest channel lands higher than a pale one's from the same
+    // multiplier — 0.857 against 0.750 here — and at 0.857 the vivid colour is
+    // past `HUE_BLEACH_FROM` on its own account. Both are bleaching; the claim
+    // is that the pale one bleaches *sooner*, which is the ratio above.
+    assert!(
+        pale_kept < 0.6,
+        "the pale cast kept {pale_kept:.3} of its saturation, so nothing came \
+         off it and the ratio above is met by both colours being left alone"
+    );
+}
+
 /// Render a flat frame through the given multipliers, so the develop stage sees
 /// a colour rather than a neutral. A flat mosaic demosaics to a flat image, so
 /// the multipliers are the only way to put three different values in front of

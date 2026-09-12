@@ -1281,6 +1281,67 @@ fn grade_colour(rgb: vec3<f32>) -> vec3<f32> {
 /// 0.80 sits in it.
 const HUE_BLEACH_FROM: f32 = 0.80;
 
+/// Where the bleach starts for a colour that has almost none left.
+///
+/// # The frame that needed it
+///
+/// `DSC01588.ARW` — a sky shot into the sun, with a channel clipped across 41%
+/// of the sensor. Its clouds render around 0.68 on the curve, well under
+/// [`HUE_BLEACH_FROM`], so they keep every scrap of their chroma. Against a
+/// near-white ground a few per cent of chroma is not a subtle tint: it reads as
+/// magenta and olive-green blotches the size of a cloud, and the eye is least
+/// forgiving of a cast exactly there, because it knows what colour a cloud is.
+///
+/// # Why one threshold could not do it
+///
+/// The sweep that chose 0.80 is pinned from below by ordinary lit midtones,
+/// which begin bleaching at 0.70 and are nowhere near white. Brightness alone
+/// therefore cannot separate the two cases: a sunset's orange cloud and this
+/// sky's grey one sit at similar heights on the curve and want opposite
+/// answers.
+///
+/// **Saturation is what separates them.** A strongly coloured highlight is
+/// unambiguous — an orange cloud is orange, and taking its colour away is the
+/// artefact. A highlight already within a few per cent of neutral has no colour
+/// worth defending, and what it has is as likely to be flare, a clipping
+/// residue or the profile's error as it is to be the subject. So the onset
+/// slides: near-neutral colours begin bleaching here, saturated ones not until
+/// [`HUE_BLEACH_FROM`], and everything between interpolates.
+///
+/// Measured across the ten reference frames: the two sunsets are bit-identical
+/// in 99.99% of channels and their bright saturation does not move at all
+/// (0.5592 and 0.4903, unchanged to four figures), while the two clipped skies
+/// move 38% and 26% of their channels by at most 25 levels. That is the
+/// targeting this is for.
+///
+/// # And why it cannot draw a ring
+///
+/// Because it is a smooth function of the pixel's own colour and nothing else.
+/// The obvious alternative — check per pixel whether the borrowed highlight
+/// colour explains the channels that survived, and go neutral where it does not
+/// — was built and measured first. It draws rings: that residual is only
+/// *defined* where two channels survive, a thin band around every highlight,
+/// and acting on a quantity that exists only in a ring paints a ring. It put
+/// white contour lines through the sunset in `DSC00775.ARW`, which is the
+/// artefact class [`CLIP_RUNUP`] exists to prevent.
+const HUE_BLEACH_NEUTRAL: f32 = 0.45;
+
+/// The saturation at which a colour is defended in full.
+///
+/// In the display's coordinate rather than the light's — see the measure in
+/// `hue_preserved`, which is what makes these numbers comparable with the sweep
+/// that chose [`HUE_BLEACH_FROM`]. There the sunset's clouds read 0.538 and its
+/// lit midtones 0.849, both past this and so untouched; the sky that needed the
+/// fix reads about 0.21.
+///
+/// Swept at 0.35, 0.40 and 0.45 against the pair of frames that pull in
+/// opposite directions. At 0.35 a lilac wash survives in the sky's upper band;
+/// 0.45 buys nothing further and moves the sunset's worst pixel by one more
+/// level. The gap between 0.21 and 0.538 is wide, which is what makes the exact
+/// value uncritical — and is the same kind of gap the brightness sweep found
+/// between a bright cloud and a specular.
+const HUE_BLEACH_COLOURED: f32 = 0.40;
+
 /// The tone map's shoulder.
 ///
 /// Not a free number: it is fixed by where a photographed mid-grey has to land.
@@ -2487,7 +2548,26 @@ fn hue_preserved(source: vec3<f32>, mapped: vec3<f32>, norm: f32, peak: f32) -> 
     // the taper's slope is visible in a gradient that crosses it — a sky
     // running up to a sun — and a corner in the weight reads as a ring around
     // the highlight.
-    let bleach = smoothstep(HUE_BLEACH_FROM, 1.0, peak);
+    //
+    // **Where it starts depends on how much colour there is to lose**, and
+    // that is the half this was missing. See `HUE_BLEACH_NEUTRAL`.
+    let floor = min(preserved.r, min(preserved.g, preserved.b));
+    // Measured in the *perceptual* coordinate, not in the light. A bright
+    // near-white pixel at (0.49, 0.39, 0.65) of full scale is 40% saturated as
+    // a ratio of linear values and looks like a faintly tinted white, because
+    // the eye reads the ratio of the cube-rootish quantities and not of the
+    // photons. Judging "is there colour here worth defending" on the linear
+    // ratio defends casts nobody would call a colour -- which is how this
+    // measured 0.40 for a grey cloud and 0.538 for an orange one, two numbers
+    // that had to be far apart and were not. In the display's coordinate the
+    // same pair reads 0.21 and 0.538.
+    let saturation = 1.0 - pow(floor / max(peak, EPS), 1.0 / TONE_GAMMA);
+    let onset = mix(
+        HUE_BLEACH_NEUTRAL,
+        HUE_BLEACH_FROM,
+        smoothstep(0.0, HUE_BLEACH_COLOURED, saturation),
+    );
+    let bleach = smoothstep(onset, 1.0, peak);
     let bleached = mix(preserved, vec3<f32>(peak), bleach);
     return mix(mapped, bleached, keep);
 }
