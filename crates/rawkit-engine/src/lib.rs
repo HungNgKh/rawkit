@@ -34,6 +34,7 @@ pub mod preview;
 pub mod profile;
 pub mod render;
 pub mod resize;
+pub mod scene;
 pub mod sharpen;
 pub mod spot;
 mod tone;

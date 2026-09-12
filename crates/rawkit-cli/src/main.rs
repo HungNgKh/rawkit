@@ -6,6 +6,7 @@
 //! three operating systems without a display attached.
 
 mod chart;
+mod measure;
 mod previews;
 mod render;
 
@@ -46,6 +47,28 @@ enum Command {
     /// Python lab in v2, any external tooling — derives from this output rather
     /// than from a second hand-written copy that can drift.
     Schema,
+
+    /// Report what the light in a photograph actually is, in stops from
+    /// mid-grey.
+    ///
+    /// Decodes, builds the same edge-aware guide the renderer uses, and reports
+    /// the frame's two tails, its median and how much of the sensor clipped.
+    /// Renders nothing and writes nothing — it exists so the numbers the tone
+    /// controls are about to be derived from can be checked against the
+    /// photographs they came from.
+    ///
+    /// Needs no GPU.
+    Measure {
+        /// RAW files to measure.
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+        /// A `.dcp` profile, if the camera has one. Without it the decoder's
+        /// single-illuminant matrix is used, which moves the answer by a few
+        /// hundredths of a stop and not more — a luminance is not where a
+        /// profile does its work.
+        #[arg(long)]
+        profile: Option<PathBuf>,
+    },
 
     /// Print the render pipeline, stage by stage, with each stage's light
     /// domain. The order is a compile-time fact in `rawkit-engine`; this prints
@@ -266,6 +289,9 @@ fn main() -> Result<()> {
         Command::Schema => {
             let schema = rawkit_editstate::EditState::json_schema();
             println!("{}", serde_json::to_string_pretty(&schema)?);
+        }
+        Command::Measure { inputs, profile } => {
+            measure::measure(&inputs, profile.as_deref())?;
         }
         Command::Stages => {
             for (i, stage) in rawkit_engine::Stage::ALL.iter().enumerate() {

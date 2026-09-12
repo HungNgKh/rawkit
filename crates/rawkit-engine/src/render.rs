@@ -168,6 +168,31 @@ impl Frame<'_> {
     /// to be the one for *this* illuminant, and the multipliers have to be the
     /// ones that neutralise it; computing them apart is how an image ends up
     /// with a cast that looks like a white-balance error and is not one.
+    /// Measure this photograph's light, given a guide already built from it.
+    ///
+    /// Here rather than on [`crate::scene::SceneStats`] because this is the one
+    /// place that knows how to get from a frame to the two transforms the
+    /// measurement has to be taken through — and getting *that* wrong is
+    /// invisible, since a measurement in the wrong space is still a plausible
+    /// set of numbers. The guide is a parameter rather than built here because
+    /// the renderer has already built one and it costs 133 ms.
+    ///
+    /// `None` when the frame has no measurable range; see
+    /// [`crate::scene::SceneStats::measure`].
+    pub fn scene(
+        &self,
+        state: &EditState,
+        guide: &crate::guide::Guide,
+    ) -> Option<crate::scene::SceneStats> {
+        let colour = self.colour(state).ok()?;
+        // The full chain to display primaries, which is where a Rec. 709 luma
+        // means what it says. Composed rather than passed as two matrices: the
+        // profile splits camera -> working -> display only so a table can be
+        // read in the middle, and a luminance does not care.
+        let chain = crate::profile::multiply(&colour.working_to_display, &colour.cam_to_display);
+        crate::scene::SceneStats::measure(guide, colour.multipliers, &chain)
+    }
+
     fn colour(&self, state: &EditState) -> Result<Colour, EngineError> {
         let (multipliers, temperature, tint) = match state.white_balance.temperature_k {
             Some(temperature) => (

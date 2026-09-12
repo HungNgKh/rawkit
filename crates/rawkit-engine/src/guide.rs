@@ -143,6 +143,17 @@ pub struct Guide {
     /// end to end, where [`Guide::chroma`] is neutral and reconstruction falls
     /// back to the grey it used to produce unconditionally.
     pub chroma_known: bool,
+    /// The fraction of the sensor's 2x2 quads with at least one channel at or
+    /// above the trusted level — the frame's clipping, as a number.
+    ///
+    /// **Counted on the mosaic, not on the texels below it**, and that is the
+    /// whole reason it lives here rather than being recovered later. The
+    /// reduction and the edge-aware blur both average clipped samples against
+    /// unclipped neighbours, so by the time anything reads [`Guide::data`] a
+    /// small blown specular has been smoothed away to nothing and a large blown
+    /// region has soft edges. Asking the mosaic is asking the only thing that
+    /// still knows.
+    pub clipped: f32,
     pub width: u32,
     pub height: u32,
 }
@@ -190,6 +201,11 @@ impl Guide {
         let mut count = vec![0.0f32; cells];
         let mut chroma = [0.0f32; 3];
         let mut chroma_weight = 0.0f32;
+        // How many quads there were and how many of them clipped. Counted in
+        // the pass that already asks the question, so the frame's clipping
+        // costs two increments rather than a second walk over the mosaic.
+        let mut quads = 0u32;
+        let mut blown = 0u32;
 
         // Which guide column each image column falls in, worked out once rather
         // than as a 64-bit divide per pixel — it is the same answer every row.
@@ -244,6 +260,9 @@ impl Guide {
                         }
                     }
                 }
+
+                quads += 1;
+                blown += u32::from(clipped);
 
                 let cell = gy as usize * gw as usize + column[bx as usize] as usize;
                 for (c, v) in rgb.iter().enumerate() {
@@ -324,6 +343,11 @@ impl Guide {
             data,
             chroma,
             chroma_known,
+            clipped: if quads == 0 {
+                0.0
+            } else {
+                blown as f32 / quads as f32
+            },
             width: gw,
             height: gh,
         }
