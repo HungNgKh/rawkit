@@ -1103,6 +1103,7 @@ fn main() -> Result<()> {
             toggle_fullscreen,
             arm_target,
             pick_white_balance,
+            upright,
             pick_range,
             add_refinement,
             remove_refinement,
@@ -1627,6 +1628,49 @@ fn main() -> Result<()> {
                         enter_crop(&mut session);
                     } else if session.cropping() {
                         leave_crop(&mut session);
+                    }
+                }
+
+                // An upright. Here for the same reason the pick below is: it
+                // needs the sensor data, and the session holds none.
+                if UPRIGHT_REQUEST.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    match showing.raw.as_ref() {
+                        None => notice("no photograph to straighten"),
+                        Some(loaded) => {
+                            let frame = loaded.frame();
+                            // Built here rather than borrowed from the renderer,
+                            // which keeps its own inside the GPU buffers. A
+                            // fifth of a second, once, on a button press —
+                            // against a second thread's worth of plumbing to
+                            // share one.
+                            let guide = rawkit_engine::guide::Guide::build(
+                                frame.data,
+                                frame.width,
+                                frame.height,
+                                frame.phase,
+                                frame.clip_level,
+                            );
+                            let mut session = shared.lock().expect("session lock");
+                            match frame.upright(session.state(), &guide) {
+                                None => notice("nothing here is straight enough to level by"),
+                                Some(found) => {
+                                    // Everything else about the crop is kept.
+                                    // An upright decides the angle and the
+                                    // lean; where the picture is cut is still
+                                    // the photographer's.
+                                    let crop = rawkit_editstate::Crop {
+                                        angle_deg: found.angle_deg,
+                                        vertical: found.vertical,
+                                        ..session.state().crop
+                                    };
+                                    session.apply(Command::SetCrop(Box::new(crop)));
+                                    notice(format!(
+                                        "upright: {:+.1}°, lean {:+.2}",
+                                        found.angle_deg, found.vertical
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -3900,6 +3944,26 @@ fn pick_range(armed: bool) -> bool {
         *RANGE_PICK.lock().expect("range pick lock") = None;
     }
     armed
+}
+
+/// A request for an upright, awaiting the render loop.
+///
+/// A flag rather than a `Command`, because the session cannot answer it: this
+/// needs the sensor data and `rawkit-session` holds no pixels by design. The
+/// render loop is where the frame and the edit meet, which is the same reason
+/// the white-balance picker below works this way.
+pub(crate) static UPRIGHT_REQUEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Straighten the photograph, and take the lean out of its verticals.
+///
+/// One-shot: it works out two numbers, writes them into the crop, and is then
+/// finished with. They are ordinary values afterwards — draggable, undoable,
+/// and carried by a preset like any others — which is why nothing here is
+/// stored as a mode.
+#[tauri::command]
+fn upright() {
+    UPRIGHT_REQUEST.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Set the white balance from a patch that ought to be neutral.

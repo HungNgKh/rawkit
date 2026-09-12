@@ -193,6 +193,50 @@ impl Frame<'_> {
         crate::scene::SceneStats::measure(guide, colour.multipliers, &chain)
     }
 
+    /// Propose a straighten and a keystone for this photograph, or decline to.
+    ///
+    /// Here for the same reason [`Frame::scene`] is: this is the one place that
+    /// knows how to get from a frame to a developed brightness, and a detector
+    /// handed the wrong thing still returns a plausible pair of numbers.
+    ///
+    /// The guide is turned into the orientation the photographer is looking at
+    /// before anything is measured. A portrait frame stored as landscape pixels
+    /// would otherwise have its verticals detected as horizontals, and the
+    /// correction would come back as a keystone on the wrong axis — which is
+    /// not a subtle error but does look like one until it is drawn.
+    ///
+    /// `None` when there is nothing it is willing to act on; see
+    /// [`crate::upright::detect`].
+    pub fn upright(
+        &self,
+        state: &EditState,
+        guide: &crate::guide::Guide,
+    ) -> Option<crate::upright::Upright> {
+        let colour = self.colour(state).ok()?;
+        let chain = crate::profile::multiply(&colour.working_to_display, &colour.cam_to_display);
+        let wb = colour.multipliers;
+        let luma: Vec<f32> = guide
+            .data
+            .chunks_exact(3)
+            .map(|t| {
+                let balanced = [t[0] * wb[0], t[1] * wb[1], t[2] * wb[2]];
+                let rgb = crate::profile::apply(&chain, balanced);
+                // Rec. 709, and in the *perceptual* coordinate rather than in
+                // light: an edge detector works on differences, and in linear
+                // light a step in the shadows is a hundredth the size of the
+                // same step in the highlights, so every line in a dark part of
+                // the picture would be invisible to it.
+                let luma = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+                luma.max(0.0).powf(1.0 / 2.2)
+            })
+            .collect();
+
+        let geometry = rawkit_editstate::Geometry::new(state, self.recorded_orientation);
+        let (w, h) = (guide.width as usize, guide.height as usize);
+        let (turned, tw, th) = turn(&luma, w, h, geometry.turns());
+        crate::upright::detect(&turned, tw, th)
+    }
+
     fn colour(&self, state: &EditState) -> Result<Colour, EngineError> {
         let (multipliers, temperature, tint) = match state.white_balance.temperature_k {
             Some(temperature) => (
@@ -433,6 +477,33 @@ struct Params {
     /// read the same guide as the same region at level 0. Written per tile, and
     /// by both render paths — unlike `present`, which only the canvas needs.
     source: [i32; 4],
+}
+
+/// A grid, turned by quarter-turns clockwise.
+///
+/// Index arithmetic rather than a resample: a quarter turn moves samples and
+/// does not interpolate them, so anything fancier would soften every edge the
+/// caller is about to go looking for.
+fn turn(values: &[f32], w: usize, h: usize, turns: u32) -> (Vec<f32>, usize, usize) {
+    match turns % 4 {
+        0 => (values.to_vec(), w, h),
+        2 => (values.iter().rev().copied().collect(), w, h),
+        quarter => {
+            let (nw, nh) = (h, w);
+            let mut out = vec![0.0f32; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let (nx, ny) = if quarter == 1 {
+                        (h - 1 - y, x)
+                    } else {
+                        (y, w - 1 - x)
+                    };
+                    out[ny * nw + nx] = values[y * w + x];
+                }
+            }
+            (out, nw, nh)
+        }
+    }
 }
 
 /// One control across all eight bands, in `Band::ALL` order, laid out the way a

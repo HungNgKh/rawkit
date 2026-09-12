@@ -1,4 +1,4 @@
-//! `rawkit measure` — what the light in a photograph actually is.
+//! `rawkit measure` — what the light and the geometry in a photograph are.
 //!
 //! A diagnostic, and a deliberately dull one: it renders nothing, writes
 //! nothing and decides nothing. It exists because the tone controls are about
@@ -37,8 +37,8 @@ pub fn measure(inputs: &[std::path::PathBuf], profile_path: Option<&Path>) -> Re
     };
 
     println!(
-        "{:<16} {:>8} {:>8} {:>8} {:>9} {:>9}",
-        "file", "black", "median", "white", "range", "clipped"
+        "{:<16} {:>8} {:>8} {:>8} {:>9} {:>9} {:>9} {:>9}",
+        "file", "black", "median", "white", "range", "clipped", "straighten", "keystone"
     );
 
     for input in inputs {
@@ -86,9 +86,16 @@ pub fn measure(inputs: &[std::path::PathBuf], profile_path: Option<&Path>) -> Re
         // default is the only state that adds nothing to it. A calibration or a
         // white balance the user typed would move the answer, which is correct
         // — but then the number would describe an edit, not a photograph.
-        match frame.scene(&EditState::default(), &guide) {
+        // Reported beside the light because both are measurements of the same
+        // photograph and both are checked the same way: against the picture.
+        let state = EditState::default();
+        let upright = match frame.upright(&state, &guide) {
+            Some(u) => format!("{:>+8.1}° {:>+9.3}", u.angle_deg, u.vertical),
+            None => format!("{:>9} {:>9}", "—", "—"),
+        };
+        match frame.scene(&state, &guide) {
             Some(s) => println!(
-                "{:<16} {:>+8.2} {:>+8.2} {:>+8.2} {:>7.2} EV {:>8.2}%",
+                "{:<16} {:>+8.2} {:>+8.2} {:>+8.2} {:>7.2} EV {:>8.2}% {upright}",
                 name,
                 s.black_ev,
                 s.median_ev,
@@ -96,7 +103,7 @@ pub fn measure(inputs: &[std::path::PathBuf], profile_path: Option<&Path>) -> Re
                 s.dynamic_range(),
                 s.clipped * 100.0
             ),
-            None => println!("{name:<16} {:>8}", "flat"),
+            None => println!("{name:<16} {:>8} {:>44} {upright}", "flat", ""),
         }
     }
 

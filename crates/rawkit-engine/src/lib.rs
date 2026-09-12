@@ -39,6 +39,7 @@ pub mod scene;
 pub mod sharpen;
 pub mod spot;
 mod tone;
+pub mod upright;
 
 /// A digest of every source file in this crate, computed at build time.
 ///

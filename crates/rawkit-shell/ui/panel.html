@@ -361,6 +361,10 @@
     <label><span>Straighten</span>
       <input id="straighten" type="range" min="-15" max="15" step="0.1" value="0">
       <output id="straighten-value">0.0°</output></label>
+    <!-- One-shot, not a mode: it works out the angle and the lean, writes them
+         into the two controls above and below, and is then done. They stay
+         draggable afterwards, which is the whole reason it is a button. -->
+    <button id="upright" class="target">Upright</button>
     <label><span>Vertical</span>
       <input id="vertical" type="range" min="-0.35" max="0.35" step="0.005" value="0">
       <output id="vertical-value">0.000</output></label>
@@ -1638,6 +1642,12 @@
     document.body.classList.toggle("aiming", on || armed !== null);
     invoke("pick_white_balance", { armed: on }).catch(say);
   };
+
+  // Fire and forget, and nothing to keep in step: the answer arrives as a
+  // notice and as the two sliders moving, both of which already sync
+  // themselves from the edit.
+  const uprightButton = document.getElementById("upright");
+  if (uprightButton) uprightButton.onclick = () => invoke("upright").catch(say);
   dropper.addEventListener("click", () => {
     if (!picking && armed !== null) arm(null);
     if (!picking) place(false);
