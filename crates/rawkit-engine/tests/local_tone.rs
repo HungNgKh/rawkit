@@ -308,3 +308,134 @@ fn zooming_out_does_not_change_the_picture() {
          being read at the wrong place when the view is zoomed out"
     );
 }
+
+/// How wide the probe's frames are.
+///
+/// Chosen so the guide is at its full [`rawkit_engine::guide::MAX_EDGE`] and one
+/// guide texel covers exactly four image pixels — which puts the blur's sigma at
+/// 48 image pixels and its reach at about 96. A 24 MP frame has the same *ratio*
+/// with sigma near 188 pixels, so a square measured here at 1/16th of the frame
+/// stands for a square at 1/16th of a photograph.
+const PROBE: u32 = 1536;
+
+/// A background with a centred square of another value.
+fn square_on(background: f32, square: f32, size: u32) -> Vec<f32> {
+    let lo = (PROBE - size) / 2;
+    let hi = lo + size;
+    mosaic(PROBE, PROBE, |x, y| {
+        if x >= lo && x < hi && y >= lo && y < hi {
+            square
+        } else {
+            background
+        }
+    })
+}
+
+/// The mean rendered luminance over the middle half of the centred square.
+fn centre_of(pixels: &[f32], size: u32) -> f32 {
+    let half = (size / 4).max(1);
+    let c = PROBE / 2;
+    let mut total = 0.0f64;
+    let mut n = 0u32;
+    for y in (c - half)..(c + half) {
+        for x in (c - half)..(c + half) {
+            total += f64::from(luma(pixels, PROBE, x, y));
+            n += 1;
+        }
+    }
+    (total / f64::from(n.max(1))) as f32
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn how_small_an_object_may_be_and_still_be_its_own_region() {
+    // **A measurement, and only weakly an assertion.** The local operator keys a
+    // pixel on its neighbourhood, and the shader says plainly what that costs:
+    // "a dark pixel inside a *brighter* region is keyed by that region, so it
+    // takes the highlight branch and a shadow lift barely moves it."
+    //
+    // That is stated as a property of *pixels*. The question nobody has asked is
+    // how it behaves for *objects*: a dark thing that genuinely is its own
+    // region, but small. The guide's blur is edge-aware — it stops at about a
+    // stop of difference — so an object well clear of its surroundings ought to
+    // keep its own value however small it is, right up until the guide can no
+    // longer resolve it at all.
+    //
+    // Which of those two limits bites first decides what a multi-scale operator
+    // could even do here. If authority falls away at sizes the guide resolves,
+    // a pyramid at guide resolution fixes it. If it only falls away below a
+    // texel or two, the guide's *resolution* is the wall and a pyramid built at
+    // that same resolution cannot help — a different and much more expensive
+    // conclusion, and far better to find now than after building one.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+
+    let lifted = EditState {
+        tone: rawkit_editstate::Tone {
+            shadows: 1.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let flat = EditState::default();
+
+    // **The object is held fixed and only its surroundings move.** The first
+    // version of this probe varied the square with the background, which
+    // confounded the two things it is trying to separate: a square three stops
+    // under a bright background is not very dark in absolute terms, so the
+    // shadow curve has little to give it there whatever the guide says, and a
+    // share of "nothing available" is not a measurement.
+    //
+    // Fixed at 0.01 the square is properly dark — about 0.20 in the perceptual
+    // coordinate, well below the pivot — so the control has real authority to
+    // deliver and the only variable left is how far the surroundings are from
+    // it.
+    let square = 0.01f32;
+
+    let texel = PROBE / rawkit_engine::guide::MAX_EDGE;
+    println!("guide texel = {texel} image px, sigma ~= {} px", texel * 12);
+    println!("  a fixed dark object at {square}, surroundings varying");
+    println!("       size  px |  texels | share of the lift delivered, by how far");
+    println!("                |         | the surroundings are above it");
+    println!("                |         |   +2 EV   +3 EV   +4 EV   +5 EV");
+
+    let mut widest_shortfall = 0.0f32;
+    // What the control delivers when the object *is* the whole region: a
+    // uniform frame of its own value, where the guide can only say one thing.
+    let uniform = mosaic(PROBE, PROBE, |_, _| square);
+    let alone_flat = centre_of(&render(&gpu, 512, &uniform, PROBE, PROBE, &flat), PROBE);
+    let alone_lift = centre_of(&render(&gpu, 512, &uniform, PROBE, PROBE, &lifted), PROBE);
+    let available = alone_lift / alone_flat.max(1e-6) - 1.0;
+    println!(
+        "  (a frame of nothing but the object lifts by {:.1}%)",
+        available * 100.0
+    );
+
+    for size in [8u32, 16, 32, 64, 128, 256, 512] {
+        let mut row = String::new();
+        for stops in [2.0f32, 3.0, 4.0, 5.0] {
+            let background = square * stops.exp2();
+            let cfa = square_on(background, square, size);
+            let here_flat = centre_of(&render(&gpu, 512, &cfa, PROBE, PROBE, &flat), size);
+            let here_lift = centre_of(&render(&gpu, 512, &cfa, PROBE, PROBE, &lifted), size);
+            let delivered = here_lift / here_flat.max(1e-6) - 1.0;
+            let share = delivered / available;
+            row.push_str(&format!("  {share:>6.2}"));
+            if size >= 256 && stops >= 4.0 {
+                widest_shortfall = widest_shortfall.max(1.0 - share);
+            }
+        }
+        println!("       {size:>4}     |  {:>4}   | {row}", size / texel);
+    }
+
+    // The only thing certain enough to assert today: an object far larger than
+    // the blur's reach must get essentially all of the control's authority. If
+    // even *that* fails, the operator is not keying on regions at all and the
+    // table above is measuring something else.
+    assert!(
+        widest_shortfall < 0.25,
+        "an object four times the blur's reach, four stops clear of its \
+         surroundings, still lost {:.0}% of the shadow lift — the guide is not \
+         resolving regions at any size",
+        widest_shortfall * 100.0
+    );
+}
