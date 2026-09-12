@@ -74,8 +74,8 @@
 //!
 //! | level filter | 2-texel object, +2 EV | thin-line separation |
 //! |---|---|---|
-//! | blur, range 1.0 (shipped) | 0.08 | **1.315** |
-//! | blur, range 0.5 | **1.01** | 1.232 |
+//! | blur, range 1.0 (what shipped then) | 0.08 | **1.315** |
+//! | blur, range 0.5 (**shipped now**) | **1.01** | 1.232 |
 //! | this, sigma 1.6 | 0.88 | 1.168 |
 //! | this, sigma 1.0 | 0.98 | 1.120 |
 //! | this, sigma 0.8 | **1.00** | 1.122 |
@@ -102,10 +102,12 @@
 //! composes is a piece of research rather than a slice. The module is left here,
 //! tested and correct in itself, as the floor such a thing would be built on.
 //!
-//! It also has a cheaper implication worth not losing: the whole defect may be
-//! one constant. `RANGE_STOPS` at 0.5 takes every cell of the object table to
-//! 1.00 and costs 0.08 of line separation, which is a trade somebody should
-//! look at in the window rather than in a table.
+//! Its cheaper implication was taken: `RANGE_STOPS` moved to 0.5, which takes
+//! every cell of the object table to 0.98 or better for 0.08 of line
+//! separation. Driven on four photographs first — it lifts dark bands by 2 to 5
+//! levels, leaves everything above mid-grey bit-identical, and does nothing at
+//! all to a frame that is dark all over. So the bar this module has to clear is
+//! now the *second* column of that table and not the first.
 
 /// Burt and Adelson's 5-tap kernel, the one the method is defined against.
 const KERNEL: [f32; 5] = [0.0625, 0.25, 0.375, 0.25, 0.0625];

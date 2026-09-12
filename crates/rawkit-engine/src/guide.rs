@@ -74,9 +74,46 @@ const SIGMA_DIVISOR: f32 = 32.0;
 
 /// How much brightness difference stops the blur, in stops.
 ///
-/// One stop: enough that texture and shading flow together, little enough that
-/// a skyline does not.
-const RANGE_STOPS: f32 = 1.0;
+/// **Half a stop, and it was one stop until it was measured.** The old value
+/// came with the reasoning "enough that texture and shading flow together,
+/// little enough that a skyline does not", which is the right question and was
+/// answered by eye.
+///
+/// Answered by measurement instead — `how_small_an_object_may_be_and_still_be_
+/// its_own_region` — one stop turned out to be far too permissive. A Gaussian
+/// range term leaks: a neighbour two stops away still carries `exp(-2) = 0.135`
+/// of the weight of one at the same brightness, and a small object has twenty
+/// texels of surround against its own few, so the surround wins on count alone.
+/// The cost was not subtle. A dark object two stops under its surroundings and
+/// smaller than a quarter of the frame received **8%** of the shadow lift it
+/// should have, a miss of over a stop, and two to three stops is the ordinary
+/// case — a face in open shade, foliage against sky — rather than the dramatic
+/// one.
+///
+/// At half a stop that object receives all of it, at every size down to two
+/// texels and at every separation from two stops up.
+///
+/// # What it costs, stated
+///
+/// The opposite property, which is real and which this number also has to hold:
+/// a four-pixel line must be *carried by the field it crosses* rather than
+/// treated as its own region. That separation falls from 1.315 to 1.232 —
+/// measured in `the_same_value_is_treated_by_where_it_is`, whose bar is 1.15.
+///
+/// The two are the same configuration with opposite right answers and they
+/// differ in scale, so no single radius holds both perfectly. A multi-scale
+/// operator was built to see whether it could and could not: see
+/// [`crate::laplacian`], which is in the tree, tested, and calls nothing.
+///
+/// # And what it does not cost
+///
+/// Driven on four photographs with shadows pushed to 0.90, the change lifts
+/// dark bands by 2 to 5 levels, pulls midtones back by about 0.6, and leaves
+/// everything above mid-grey bit-identical. On a frame that is dark *all over*
+/// it does nothing at all — 0.02 levels — because a frame with no bright
+/// surround has nothing to contaminate the guide with. It is a targeted repair,
+/// not a change of look.
+const RANGE_STOPS: f32 = 0.5;
 
 /// How far a quad's two greens may differ before it is taken to span an edge,
 /// as a fraction of their sum.

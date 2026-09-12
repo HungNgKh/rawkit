@@ -101,6 +101,17 @@ fn the_same_value_is_treated_by_where_it_is() {
         "the stripe in the bright half was not recovered at all: \
          {bright_before:.4} -> {bright_after:.4}"
     );
+    // 1.232 as measured, against a bar of 1.15 — and it used to be 1.315.
+    //
+    // The margin narrowed on purpose and the trade is recorded on `RANGE_STOPS`:
+    // this test wants a four-pixel line *carried by the field it crosses*, and
+    // `how_small_an_object_may_be_and_still_be_its_own_region` wants an object
+    // to be *its own region*. Same configuration, opposite right answers,
+    // differing only in scale — so one radius cannot hold both perfectly, and
+    // the radius now favours the case that was failing by a mile rather than
+    // the one that was passing comfortably.
+    //
+    // If this ever drops below the bar, the answer is not to move the bar.
     assert!(
         dark_after > bright_after * 1.15,
         "the same value was treated the same in both halves, so the control is \
@@ -420,22 +431,27 @@ fn how_small_an_object_may_be_and_still_be_its_own_region() {
             let delivered = here_lift / here_flat.max(1e-6) - 1.0;
             let share = delivered / available;
             row.push_str(&format!("  {share:>6.2}"));
-            if size >= 256 && stops >= 4.0 {
-                widest_shortfall = widest_shortfall.max(1.0 - share);
-            }
+            widest_shortfall = widest_shortfall.max(1.0 - share);
         }
         println!("       {size:>4}     |  {:>4}   | {row}", size / texel);
     }
 
-    // The only thing certain enough to assert today: an object far larger than
-    // the blur's reach must get essentially all of the control's authority. If
-    // even *that* fails, the operator is not keying on regions at all and the
-    // table above is measuring something else.
+    // **The whole table, not a corner of it.** When this was written the bar
+    // could only be set on the one cell that was certain — an object far larger
+    // than the blur's reach — because everything else was failing: a two-stop
+    // object at two texels was getting 8% of its lift. Narrowing `RANGE_STOPS`
+    // to half a stop took every cell to 0.98 or better, so the measurement can
+    // become a guard.
+    //
+    // 0.20 of margin against a worst observed 0.02. Loose enough that a
+    // rounding change or a different GPU cannot trip it, tight enough that
+    // anything which brings back region-blindness fails here rather than in a
+    // photograph six months later.
     assert!(
-        widest_shortfall < 0.25,
-        "an object four times the blur's reach, four stops clear of its \
-         surroundings, still lost {:.0}% of the shadow lift — the guide is not \
-         resolving regions at any size",
+        widest_shortfall < 0.20,
+        "an object lost {:.0}% of the shadow lift to its surroundings — the \
+         guide has stopped resolving it as its own region. The table above says \
+         at which size and separation.",
         widest_shortfall * 100.0
     );
 }
