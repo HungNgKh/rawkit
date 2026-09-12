@@ -1262,6 +1262,29 @@ fn grade_colour(rgb: vec3<f32>) -> vec3<f32> {
     return out;
 }
 
+/// Where a colour starts being allowed to bleach towards white, as a fraction
+/// of the way up the curve.
+///
+/// **Swept, not chosen.** Four values against two real frames, measuring the
+/// same pixels in each render rather than whatever qualified:
+///
+/// | from | sun's core, DSC00775 | its clouds | lit midtones at 0 EV |
+/// |---|---|---|---|
+/// | 0.60 | 0.051 | 0.538 | already bleaching |
+/// | 0.70 | 0.088 | 0.538 | already bleaching |
+/// | **0.80** | **0.188** | **0.538** | **0.802 against 0.849** |
+/// | 0.90 | 0.619 | 0.538 | untouched |
+///
+/// (Saturation, `(max - min) / max`.) Three things decide it. The sun's core
+/// has to reach white, which rules out 0.90 — 0.619 is still an orange disc.
+/// Ordinary lit midtones must not bleach, which rules out 0.70 and below: at
+/// 0.60 the amber windows in DSC00794 read 11.1 degrees against the untouched
+/// 17.2, so the taper has already reached tones that are nowhere near blown.
+/// And the clouds are flat at 0.538 throughout, which says the threshold is not
+/// delicate — there is a wide gap between a bright cloud and a specular, and
+/// 0.80 sits in it.
+const HUE_BLEACH_FROM: f32 = 0.80;
+
 /// The tone map's shoulder.
 ///
 /// Not a free number: it is fixed by where a photographed mid-grey has to land.
@@ -2278,6 +2301,48 @@ fn tone_sigmoid(x: f32) -> f32 {
 /// fire, a filament: film does this and the eye expects it, and a perfectly
 /// hue-stable sun is a flat orange disc. See `Tone::hue_preservation`.
 ///
+/// # The bleach at the top, and the mistake it is easy to make here
+///
+/// One weight across the whole range was a compromise that did neither end
+/// well. Film holds hue in the midtones and bleaches at the *top*: a specular,
+/// a filament, the sun's core all go white, and a rendering that keeps them
+/// perfectly saturated turns the sun into a flat orange disc — which is what a
+/// flat weight below 1 was buying, and what it was costing.
+///
+/// The obvious way to add that back is to let the weight fall towards zero near
+/// white, since zero is the per-channel curve and the per-channel curve's
+/// asymptote *is* white. **That is wrong, and it was built and measured before
+/// it was understood.** Per-channel compression does two things at once: it
+/// desaturates, and it rotates the hue. Tapering towards it hands back the
+/// artefact along with the look. Measured on DSC00794 at +3 EV, where a flat
+/// weight of 0.75 left 1.6 degrees of hue drift, tapering towards per-channel
+/// left **18.9** — worse than the 13.9 of no preservation at all, because the
+/// exposure had pushed the midtones into the bleach zone.
+///
+/// A bleach is desaturation **along constant hue**: towards the neutral of the
+/// same brightness, not towards whatever the per-channel curve happens to
+/// produce. That is the same conclusion filmic reached with its extreme-
+/// luminance saturation curves, and the two are kept as two separate mixes
+/// here precisely so that they cannot be confused again.
+///
+/// The midtones can then be fully faithful, which is what they should have been
+/// all along.
+///
+/// Nothing is needed at the dark end, and that is provable rather than assumed:
+/// for small `x` the sigmoid is `x / TONE_MAP_K`, which is linear, so the
+/// per-channel and ratio-preserving answers already agree there. A taper into
+/// the shadows would be a no-op with a cost.
+///
+/// # The invariant that makes this safe
+///
+/// **Nothing here can change a colour's largest channel.** All three candidates
+/// agree on it exactly: per-channel gives `curve(norm)`, the preserved path
+/// gives `norm * curve(norm) / norm`, and the neutral the bleach heads for is
+/// `peak` in every channel — one number, three times. So this whole control
+/// moves chroma and never brightness, and a weight that varies with brightness
+/// therefore cannot fold the curve back on itself.
+/// `the_blend_never_moves_the_brightest_channel` is what holds it.
+///
 /// At a weight of exactly zero this returns `mapped` untouched rather than an
 /// algebraically equal rearrangement of it, so an edit that turns this off is
 /// **bit**-identical to a build that never had it.
@@ -2286,8 +2351,16 @@ fn hue_preserved(source: vec3<f32>, mapped: vec3<f32>, norm: f32, peak: f32) -> 
     if (keep <= 0.0 || norm <= EPS) {
         return mapped;
     }
+    // The ratios, exactly as they arrived.
     let preserved = max(source, vec3<f32>(0.0)) * (peak / norm);
-    return mix(mapped, preserved, keep);
+    // And the bleach: towards the neutral *of the same peak*, so saturation
+    // falls and hue does not move. Smoothstep rather than a linear ramp because
+    // the taper's slope is visible in a gradient that crosses it — a sky
+    // running up to a sun — and a corner in the weight reads as a ring around
+    // the highlight.
+    let bleach = smoothstep(HUE_BLEACH_FROM, 1.0, peak);
+    let bleached = mix(preserved, vec3<f32>(peak), bleach);
+    return mix(mapped, bleached, keep);
 }
 
 // ---------------------------------------------------------------------------

@@ -81,6 +81,19 @@ fn frame(cfa: &[f32]) -> Frame<'_> {
 
 /// Sharpening and noise reduction off, so what is measured is this stage and not
 /// what the two neighbours of it did to its output.
+/// Everything else off, so what is measured is this one repair.
+///
+/// **Hue preservation included, and it is the interesting one.** The tone map
+/// desaturates colours towards white as they approach the top of the curve, and
+/// a clipping rim is exactly that: a near-white pixel with a strong cast. So the
+/// bleach removes a good part of this artefact on its own — measured at four
+/// times the clip level, the worst cast with defringe *off* fell from 1.92 to
+/// 0.73 the day the taper landed, and the pixel it was worst at moved out of the
+/// blown core and onto the rim's outer edge, where defringe has least to say.
+///
+/// That is two repairs overlapping, which is welcome and is not what this file
+/// is for. Pinned off here so the test measures defringe rather than measuring
+/// how much of defringe's job the tone map has quietly taken over.
 fn bare(defringe: f32) -> EditState {
     EditState {
         detail: rawkit_editstate::Detail {
@@ -88,6 +101,10 @@ fn bare(defringe: f32) -> EditState {
             luminance_noise: 0.0,
             sharpen_amount: 0.0,
             defringe,
+            ..Default::default()
+        },
+        tone: rawkit_editstate::Tone {
+            hue_preservation: 0.0,
             ..Default::default()
         },
         ..Default::default()

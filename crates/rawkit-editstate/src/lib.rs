@@ -1191,15 +1191,21 @@ pub struct Tone {
     /// them — which is what hue and saturation are — come through exactly. At
     /// 0.0 it is the per-channel behaviour above, unchanged.
     ///
-    /// # Why the default is not 1.0
+    /// # It means the midtones, and the default is 1.0
     ///
-    /// Because a colour that bleaches towards white as it gets brighter is
-    /// sometimes the point. A sunset, a fire, a tungsten filament: film does
-    /// this, the eye expects it, and a perfectly hue-stable rendering of a sun
-    /// reads as a flat orange disc. darktable's sigmoid exposes the same
-    /// control for the same reason rather than choosing for the photographer.
+    /// A colour that bleaches towards white as it gets brighter is sometimes
+    /// the point — a sunset, a fire, a tungsten filament. Film does this and
+    /// the eye expects it, and a perfectly hue-stable sun is a flat orange
+    /// disc.
     ///
-    /// The default keeps most of the ratio and leaves some of the bleach.
+    /// That is handled **where it belongs**, at the top of the curve, rather
+    /// than by holding this below 1.0 and smearing a little bleach across every
+    /// tone in the frame. The renderer tapers the weight away as a colour
+    /// approaches display white, so a specular bleaches on its own and the
+    /// midtones can be exactly what the sensor and the profile saw.
+    ///
+    /// Which leaves this as a taste control rather than a compromise: lower it
+    /// to let the bleach reach further down the frame.
     #[serde(default = "default_hue_preservation")]
     pub hue_preservation: f32,
 }
@@ -1208,7 +1214,7 @@ pub struct Tone {
 /// give the *type's* default — zero — to every edit written before the field
 /// existed, which is the one value that means "do the old thing".
 fn default_hue_preservation() -> f32 {
-    0.75
+    1.0
 }
 
 impl Default for Tone {

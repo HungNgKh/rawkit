@@ -322,7 +322,19 @@ fn a_profile_curve_changes_brightness_without_turning_the_colour() {
     // degrees putting the middle channel back where it started.
     let gpu = Gpu::new().expect("no usable GPU adapter");
     // Red dim, blue bright, green between: a sky, in camera RGB.
-    let colour = [0.05, 0.30, 0.90];
+    //
+    // A *normally exposed* sky, and the exposure matters. This used to read
+    // 0.90 in blue, which after a lifting curve sits at 0.96 — inside the range
+    // where the tone map bleaches a colour towards white on purpose. Chroma
+    // collapses there, and the LAB hue angle of a near-neutral is arctangent
+    // noise: the test reported the curve "turning the colour 20.5 degrees" when
+    // what had actually happened was that there was almost no colour left to
+    // have an angle. Three stops down the same sky keeps its chroma and the
+    // question the test is asking becomes answerable again.
+    //
+    // The bleach is tested where it belongs, on its own, by
+    // `a_colour_keeps_its_hue_until_it_is_bright_enough_to_bleach`.
+    let colour = [0.012, 0.075, 0.225];
 
     // A real profile curve is strongly concave -- it lifts the darks far more
     // than the brights, which is exactly the shape that pulls a dim channel up

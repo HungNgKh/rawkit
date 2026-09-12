@@ -386,3 +386,164 @@ fn hue_preservation_keeps_a_colours_ratios() {
         }
     }
 }
+
+/// Render a flat frame through the given multipliers, so the develop stage sees
+/// a colour rather than a neutral. A flat mosaic demosaics to a flat image, so
+/// the multipliers are the only way to put three different values in front of
+/// the tone map without the interpolation having an opinion.
+fn develop_colour(gpu: &Gpu, renderer: &Renderer, value: f32, wb: [f32; 3]) -> [f32; 3] {
+    let cfa = vec![value; (N * N) as usize];
+    let out = renderer
+        .run(
+            gpu,
+            &Frame {
+                data: &cfa,
+                width: N,
+                height: N,
+                phase: BayerPhase::Rggb,
+                as_shot_wb: wb,
+                clip_level: f32::INFINITY,
+                profile: neutral_profile(),
+                recorded_orientation: rawkit_editstate::Orientation::AsShot,
+            },
+            &EditState::default(),
+            Output::Display,
+        )
+        .expect("render failed")
+        .pixels;
+    let i = ((N / 2 * N + N / 2) * 4) as usize;
+    [out[i], out[i + 1], out[i + 2]]
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn the_blend_never_moves_the_brightest_channel() {
+    // The invariant that makes a brightness-dependent weight safe to have at
+    // all. All three candidates the tone map mixes between agree exactly on a
+    // colour's largest channel: the per-channel curve gives `curve(norm)`, the
+    // ratio-preserving path gives `norm * curve(norm) / norm`, and the neutral
+    // the bleach heads for is `curve(norm)` in every channel. One number, three
+    // times.
+    //
+    // So the control moves chroma and never brightness — and a weight that
+    // varies with brightness therefore cannot fold the curve back on itself,
+    // which would read as a contour in a sky rather than as a bug here.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let renderer = Renderer::new(&gpu);
+    let wb = [3.0f32, 1.0, 0.4];
+
+    // Across the whole curve, including well past the bleach threshold, so the
+    // taper is active for the upper values and not for the lower ones.
+    for value in [0.02f32, 0.07, 0.2, 0.5, 1.5, 6.0] {
+        let mut peak = f32::NEG_INFINITY;
+        for keep in [0.0f32, 0.5, 1.0] {
+            let state = EditState {
+                tone: rawkit_editstate::Tone {
+                    hue_preservation: keep,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let cfa = vec![value; (N * N) as usize];
+            let out = renderer
+                .run(
+                    &gpu,
+                    &Frame {
+                        data: &cfa,
+                        width: N,
+                        height: N,
+                        phase: BayerPhase::Rggb,
+                        as_shot_wb: wb,
+                        clip_level: f32::INFINITY,
+                        profile: neutral_profile(),
+                        recorded_orientation: rawkit_editstate::Orientation::AsShot,
+                    },
+                    &state,
+                    Output::Display,
+                )
+                .expect("render failed")
+                .pixels;
+            let i = ((N / 2 * N + N / 2) * 4) as usize;
+            let here = out[i].max(out[i + 1]).max(out[i + 2]);
+            if peak.is_finite() {
+                assert!(
+                    (here - peak).abs() < 2e-3,
+                    "at {value} the brightest channel moved to {here} at keep {keep}, \
+                     against {peak} — the control is changing brightness, which it \
+                     must not"
+                );
+            }
+            peak = here;
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_colour_keeps_its_hue_until_it_is_bright_enough_to_bleach() {
+    // The two halves of the operator, and they have to be measured separately
+    // because one was built by confusing them. Tapering towards the *per-channel*
+    // curve looked like a bleach and was not: per-channel desaturates and
+    // rotates at the same time, so it handed the artefact back along with the
+    // look — 18.9 degrees of drift on a real frame where the untapered operator
+    // left 0.2.
+    //
+    // A bleach desaturates along **constant hue**. So: below the threshold a
+    // colour holds both, and above it saturation falls while hue stays put.
+    let gpu = Gpu::new().expect("no usable GPU adapter");
+    let renderer = Renderer::new(&gpu);
+    let wb = [3.0f32, 1.0, 0.4];
+
+    let hue_of = |c: [f32; 3]| {
+        let (max, min) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
+        let span = max - min;
+        if span <= 0.0 {
+            return 0.0;
+        }
+        // The red sector, which is where these multipliers put it. Degrees, so
+        // the tolerances below read as angles.
+        60.0 * (c[1] - c[2]) / span
+    };
+    let saturation = |c: [f32; 3]| {
+        let (max, min) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
+        if max <= 0.0 {
+            0.0
+        } else {
+            (max - min) / max
+        }
+    };
+
+    // Two values a stop apart, both comfortably below the bleach threshold.
+    let dim = develop_colour(&gpu, &renderer, 0.08, wb);
+    let mid = develop_colour(&gpu, &renderer, 0.16, wb);
+    assert!(
+        (hue_of(dim) - hue_of(mid)).abs() < 1.0,
+        "a stop of light below the threshold turned the hue from {} to {}",
+        hue_of(dim),
+        hue_of(mid)
+    );
+    assert!(
+        (saturation(dim) - saturation(mid)).abs() < 0.03,
+        "a stop of light below the threshold moved saturation from {} to {}",
+        saturation(dim),
+        saturation(mid)
+    );
+
+    // And far above it, where a specular lives. Saturation must collapse and
+    // the hue must not follow it.
+    let blown = develop_colour(&gpu, &renderer, 8.0, wb);
+    assert!(
+        saturation(blown) < saturation(mid) * 0.4,
+        "a colour eight times over full scale kept saturation {} against the \
+         midtone's {} — nothing is bleaching",
+        saturation(blown),
+        saturation(mid)
+    );
+    assert!(
+        (hue_of(blown) - hue_of(mid)).abs() < 6.0,
+        "the bleach turned the hue from {} to {}, which is a per-channel curve's \
+         answer rather than a desaturation",
+        hue_of(mid),
+        hue_of(blown)
+    );
+}
