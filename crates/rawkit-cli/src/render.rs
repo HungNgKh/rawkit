@@ -67,49 +67,62 @@ pub fn render(
         );
     }
 
-    let profile = match profile_path {
-        Some(path) => {
-            let bytes = std::fs::read(path)
-                .with_context(|| format!("reading profile {}", path.display()))?;
-            let profile = rawkit_engine::profile::dcp::parse(&bytes)
-                .with_context(|| format!("parsing profile {}", path.display()))?;
-            eprintln!(
-                "colour     : {} ({}, {})",
-                profile.name.as_deref().unwrap_or("unnamed profile"),
-                if profile.is_dual_illuminant() {
-                    "two illuminants"
-                } else {
-                    "one illuminant"
-                },
-                if profile.has_forward_matrix() {
-                    "forward matrix"
-                } else {
-                    "colour matrix only"
-                },
-            );
-            match profile.hue_sat_map(5000.0) {
-                Some(map) => eprintln!(
-                    "hue/sat    : {}x{}x{} correction table",
-                    map.hue_divisions, map.sat_divisions, map.value_divisions
-                ),
-                None => eprintln!("hue/sat    : none (matrix correction only)"),
-            }
-            profile
-        }
-        None => match rawkit_engine::render::single_illuminant_profile(&raw.xyz_to_camera) {
-            Some(p) => {
-                eprintln!("colour     : decoder camera matrix, single illuminant (no DCP)");
-                p
-            }
-            None => {
+    let profile =
+        match profile_path {
+            Some(path) => {
+                let bytes = std::fs::read(path)
+                    .with_context(|| format!("reading profile {}", path.display()))?;
+                let profile = rawkit_engine::profile::dcp::parse(&bytes)
+                    .with_context(|| format!("parsing profile {}", path.display()))?;
                 eprintln!(
-                    "colour     : NONE — no camera matrix for this body; \
-                     the image will be strongly cast"
+                    "colour     : {} ({}, {})",
+                    profile.name.as_deref().unwrap_or("unnamed profile"),
+                    if profile.is_dual_illuminant() {
+                        "two illuminants"
+                    } else {
+                        "one illuminant"
+                    },
+                    if profile.has_forward_matrix() {
+                        "forward matrix"
+                    } else {
+                        "colour matrix only"
+                    },
                 );
-                CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY)
+                match profile.hue_sat_map(5000.0) {
+                    Some(map) => eprintln!(
+                        "hue/sat    : {}x{}x{} correction table",
+                        map.hue_divisions, map.sat_divisions, map.value_divisions
+                    ),
+                    None => eprintln!("hue/sat    : none (matrix correction only)"),
+                }
+                match profile.tone_curve() {
+                    Some(lut) => {
+                        let at = |x: f32| {
+                            lut[((x * (lut.len() - 1) as f32) as usize).min(lut.len() - 1)]
+                        };
+                        eprintln!(
+                        "tone curve : {} points; 0.10->{:.3} 0.18->{:.3} 0.50->{:.3} 0.90->{:.3}",
+                        lut.len(), at(0.10), at(0.18), at(0.50), at(0.90)
+                    );
+                    }
+                    None => eprintln!("tone curve : none"),
+                }
+                profile
             }
-        },
-    };
+            None => match rawkit_engine::render::single_illuminant_profile(&raw.xyz_to_camera) {
+                Some(p) => {
+                    eprintln!("colour     : decoder camera matrix, single illuminant (no DCP)");
+                    p
+                }
+                None => {
+                    eprintln!(
+                        "colour     : NONE — no camera matrix for this body; \
+                     the image will be strongly cast"
+                    );
+                    CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY)
+                }
+            },
+        };
 
     let gpu = Gpu::new()?;
     eprintln!(

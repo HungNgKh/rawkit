@@ -855,8 +855,12 @@ fn develop(@builtin(global_invocation_id) gid: vec3<u32>) {
     // grey, at the guide's own scale. Before the local half, so a mask refines
     // what the global slider did rather than arguing with it -- the same order
     // every other pair of global and local controls is in.
-    shaped = against_neighbourhood(shaped, local, params.local_contrast.x);
-    shaped = local_look(shaped, ixy, local);
+    //
+    // Through the same curve the pixel just went through, or the two are being
+    // compared in different coordinates. See `neighbourhood_after_curve`.
+    let around = neighbourhood_after_curve(local);
+    shaped = against_neighbourhood(shaped, around, params.local_contrast.x);
+    shaped = local_look(shaped, ixy, around);
 
     // Stage J -- colour adjustments, after the tone curve for the same reason
     // the tone curve is after the tone map: this is about the picture, not the
@@ -1751,6 +1755,49 @@ fn against_grey(rgb: vec3<f32>, amount: f32) -> vec3<f32> {
 
 /// Contrast about a moving pivot, in the perceptual coordinate.
 ///
+/// The neighbourhood, put through the curve the pixel has already been through.
+///
+/// # The bug this is the fix for
+///
+/// `against_neighbourhood` finds the neutral point of clarity by asking whether
+/// a pixel equals what surrounds it. That comparison is only meaningful if the
+/// two are in the same coordinate, and by the time clarity runs the pixel has
+/// been through the tone curve while the guide's neighbourhood has not.
+///
+/// It went unnoticed because until `BASE_CONTRAST` existed the curve was
+/// *skipped entirely* at defaults, so on a photograph nobody had touched the
+/// two were trivially in the same coordinate and clarity's neutral point was
+/// exactly right. Turn the curve on for every frame and the neutral point moves
+/// by however much the curve moves that brightness: measured on a flat frame,
+/// clarity at +1 took it from 0.525 to 0.579 — a control whose whole definition
+/// is "does nothing where there is nothing around you to differ from", changing
+/// a frame with nothing in it.
+///
+/// Note that it was *already* wrong for anybody with a contrast, highlights or
+/// shadows slider off zero. The baseline did not introduce it; it made it
+/// unconditional, which is the only reason a test caught it.
+///
+/// # Why the global branch
+///
+/// `tone_shaped` is asked for the neighbourhood's own value with `-1.0`, which
+/// selects the branch that keys on the pixel rather than on a neighbourhood.
+/// For the neighbourhood *itself* the two agree by construction — the local
+/// branch's gain is `curve(reference)/reference` with the reference being this
+/// same value — so the global branch is the same answer without the detour.
+///
+/// Returned in the perceptual coordinate, because that is what
+/// `against_neighbourhood` compares against and what `local` already was.
+fn neighbourhood_after_curve(local: f32) -> f32 {
+    // The sentinel for "no local control is on", which has to survive: it is
+    // what tells `against_neighbourhood` there is nothing to do.
+    if (local < 0.0 || params.tone.w < 0.5) {
+        return local;
+    }
+    let p2 = tone_shaped(pow(max(local, 0.0), TONE_GAMMA), -1.0);
+    let span = params.levels.y - params.levels.x;
+    return clamp((p2 - params.levels.x) / span, 0.0, 1.0);
+}
+
 /// The shared definition of clarity, global and local. Two things it settles.
 ///
 /// **The coordinate.** The neighbourhood arrives gamma-encoded, because that is

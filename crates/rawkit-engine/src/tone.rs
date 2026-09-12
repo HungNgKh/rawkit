@@ -140,6 +140,52 @@ const TAPER: f32 = 0.75;
 /// symmetry for its own sake.
 const SHADOW_REACH: f32 = 1.5;
 
+/// The contrast the default rendering carries before any slider is touched.
+///
+/// # Why a default rendering needs one at all
+///
+/// The tone map is a hyperbola. It pins mid-grey and rolls the top off, and it
+/// has no toe and no shoulder — so what comes out of it is a photograph with
+/// the right middle and both ends flattened. Nothing downstream put an S back,
+/// because the only tone curve the engine had was the one a DCP supplies, and
+/// **Adobe's profiles do not supply one**: `Sony ILCE-6400 Adobe Standard.dcp`
+/// carries a forward matrix, two hue/sat tables and a look table, and no
+/// `ProfileToneCurve` at all. Camera Raw renders it with a default curve of its
+/// own — `dng_tone_curve_acr3_default` in the SDK — and rawkit rendered it with
+/// nothing.
+///
+/// # How far off that was
+///
+/// Measured against the ten reference frames' own out-of-camera JPEGs, on a
+/// 48-wide grid of blocks, in CIELAB: **tonal contrast 0.67x the camera's**,
+/// with mid-grey landing correctly and both ends compressed. Regression to the
+/// mean was ruled out by fitting both directions — ours-on-camera 0.662 and
+/// camera-on-ours 1.463, which is 0.683 inverted. A single direction sloping
+/// down proves nothing; both directions disagreeing with 1 in *opposite* ways
+/// is a real difference in contrast.
+///
+/// # Why a power about the pivot, and not a curve of its own
+///
+/// Because the shape is already here and already proven. `tone_contrast` is a
+/// power either side of mid-grey: at an exponent above 1 its slope goes to zero
+/// at both black and white, which is a toe and a shoulder, and it pins the
+/// pivot by construction rather than by a table that has to be checked. It
+/// inherits the monotonicity bound in the module docs, and the user's contrast
+/// composes with it by addition — so the slider still reads 0.00 at the default
+/// and still travels the same distance either side of it.
+///
+/// # What it is not
+///
+/// Not scene-dependent, and that is the point. The earlier attempt at this
+/// (deferred slice 2) keyed an exponent to the frame's own headroom, which
+/// silently applies an auto-levels to a photograph somebody shot flat on
+/// purpose. This is one constant for every frame: it changes the look and it
+/// cannot change what the look *is* from one photograph to the next.
+///
+/// Off when a profile brings its own tone curve, which is the DNG SDK's rule
+/// and the only sensible one — two curves stacked is two looks.
+pub(crate) const BASE_CONTRAST: f32 = 0.25;
+
 /// How far the black and white points may travel from their defaults.
 ///
 /// A quarter of the perceptual range each. At the extremes that leaves the two
@@ -200,7 +246,10 @@ pub(crate) struct ToneCurve {
 }
 
 impl ToneCurve {
-    pub fn new(tone: &Tone) -> Self {
+    /// `baseline` is the contrast the rendering carries before the slider, in
+    /// the slider's own units. [`BASE_CONTRAST`] normally; zero when a profile
+    /// brought a tone curve of its own.
+    pub fn new(tone: &Tone, baseline: f32) -> Self {
         let clamp = |v: f32| {
             if v.is_finite() {
                 v.clamp(-1.0, 1.0)
@@ -216,7 +265,10 @@ impl ToneCurve {
             clamp(tone.blacks),
         );
         Self {
-            contrast_exponent: contrast.exp2(),
+            // Added in the slider's units rather than multiplied into the
+            // exponent, so the two compose the way two contrast moves should:
+            // a stop of contrast is a stop wherever it starts from.
+            contrast_exponent: (contrast + baseline).exp2(),
             highlights,
             shadows,
             // Negative crushes, which is the direction every editor's black
@@ -226,9 +278,15 @@ impl ToneCurve {
             white_point: 1.0 - whites * LEVELS_REACH,
             highlight_reference: highlight_reference(highlights),
             shadow_reference: shadow_reference(shadows),
-            active: [contrast, highlights, shadows, whites, blacks]
-                .iter()
-                .any(|v| *v != 0.0),
+            // The baseline counts. Without it the whole curve is skipped at
+            // defaults, which is exactly the state the baseline exists to
+            // change — and an `active` that ignored it would leave every
+            // untouched photograph rendered by the old flat curve while every
+            // edited one got the new shape.
+            active: baseline != 0.0
+                || [contrast, highlights, shadows, whites, blacks]
+                    .iter()
+                    .any(|v| *v != 0.0),
         }
     }
 
@@ -567,7 +625,7 @@ mod tests {
                 for &shadows in &levels {
                     for &whites in &levels {
                         for &blacks in &levels {
-                            out.push(ToneCurve::new(&Tone {
+                            out.push(new_for_test(&Tone {
                                 exposure_ev: 0.0,
                                 contrast,
                                 highlights,
@@ -608,6 +666,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("cannot read a number out of `{line}`"));
             assert_eq!(literal, value, "{name} disagrees with the shader");
         }
+    }
+
+    /// The curve as it ships: the baseline contrast included.
+    ///
+    /// Every property below is a claim about what a photograph is rendered
+    /// through, so the tests build the same thing `render.rs` does. The one
+    /// case that takes a different baseline says so at the call site.
+    fn new_for_test(tone: &Tone) -> ToneCurve {
+        ToneCurve::new(tone, BASE_CONTRAST)
     }
 
     /// The gain the local operator actually applies at a neighbourhood of `r`,
@@ -679,7 +746,7 @@ mod tests {
         // number: the point is that something is left there, and pinning the
         // value would make this a change detector for `SHADOW_REACH` rather
         // than a statement about the curve.
-        let strong = ToneCurve::new(&Tone {
+        let strong = new_for_test(&Tone {
             shadows: 1.0,
             ..Tone::default()
         });
@@ -733,7 +800,7 @@ mod tests {
         // The bounds must not become a second way for an untouched slider to
         // change a photograph. Exact values, because the shader clamps by them
         // unconditionally and 0.999999 would be a quiet, permanent nudge.
-        let c = ToneCurve::new(&Tone {
+        let c = new_for_test(&Tone {
             exposure_ev: 0.0,
             contrast: 0.5,
             highlights: 0.0,
@@ -765,16 +832,43 @@ mod tests {
     }
 
     #[test]
-    fn the_default_edit_changes_nothing_at_all() {
-        // Not "close enough": the identity has to be *exact*, because that is
-        // what lets the golden references blessed before this existed stand
-        // unchanged, and what makes the whole addition provably additive.
-        let shape = ToneCurve::new(&Tone::default());
-        assert!(!shape.active);
+    fn the_default_edit_is_a_curve_now_and_it_is_the_same_one_every_time() {
+        // This used to assert the exact identity, and the claim was true until
+        // [`BASE_CONTRAST`] existed. What replaces it is two halves, because
+        // the old test was carrying two claims and only one of them changed.
+        //
+        // The half that changed: a default edit is no longer nothing. It is
+        // the baseline curve, and it has to be *active* — an `active` flag that
+        // ignored the baseline would render every untouched photograph through
+        // the old flat curve and every edited one through the new shape.
+        let shape = new_for_test(&Tone::default());
+        assert!(
+            shape.active,
+            "the baseline contrast has to reach the shader"
+        );
+        assert_ne!(curve(0.1, &shape), 0.1, "a baseline that changes nothing");
+
+        // The half that did not: with no baseline the default is still exactly
+        // the identity, to the bit. That is what keeps a photograph rendered
+        // through a profile's own tone curve untouched by any of this.
+        let bare = ToneCurve::new(&Tone::default(), 0.0);
+        assert!(!bare.active);
         for step in 0..=1000 {
             let y = step as f32 / 1000.0;
-            assert_eq!(curve(y, &shape), y);
+            assert_eq!(curve(y, &bare), y);
         }
+
+        // And the baseline is a *constant*, not a measurement of the frame —
+        // the whole reason it is defensible as a default. Three fixed points,
+        // pinned for every photograph there will ever be.
+        assert_eq!(curve(0.0, &shape), 0.0);
+        assert_eq!(curve(1.0, &shape), 1.0);
+        let grey = PIVOT.powf(GAMMA);
+        assert!(
+            (curve(grey, &shape) - grey).abs() < 1e-5,
+            "the baseline moved mid-grey to {}",
+            curve(grey, &shape)
+        );
     }
 
     #[test]
@@ -784,7 +878,7 @@ mod tests {
         // different label.
         let grey = 0.18f32;
         for contrast in [-1.0, -0.5, 0.5, 1.0] {
-            let shape = ToneCurve::new(&Tone {
+            let shape = new_for_test(&Tone {
                 contrast,
                 ..Tone::default()
             });
@@ -795,7 +889,7 @@ mod tests {
             );
         }
         // And it is contrast: darker below, brighter above.
-        let up = ToneCurve::new(&Tone {
+        let up = new_for_test(&Tone {
             contrast: 1.0,
             ..Tone::default()
         });
@@ -825,14 +919,14 @@ mod tests {
                 },
             ),
         ] {
-            let shape = ToneCurve::new(&tone);
+            let shape = new_for_test(&tone);
             assert!(
                 (curve(grey, &shape) - grey).abs() < 1e-4,
                 "{name} moved mid-grey"
             );
         }
 
-        let recover = ToneCurve::new(&Tone {
+        let recover = new_for_test(&Tone {
             highlights: -1.0,
             ..Tone::default()
         });
@@ -844,22 +938,27 @@ mod tests {
             "highlight recovery moved {bright} to {}",
             curve(bright, &recover)
         );
-        // And a shadow is untouched.
-        assert!((curve(0.01, &recover) - 0.01).abs() < 1e-4);
+        // And a shadow is untouched *by this control*, which since the
+        // baseline contrast exists is a different sentence from "unchanged".
+        // The reference is the default curve, not the input: the toe is there
+        // either way and asserting against the input would be asserting the
+        // baseline away.
+        let plain = new_for_test(&Tone::default());
+        assert!((curve(0.01, &recover) - curve(0.01, &plain)).abs() < 1e-4);
 
-        let lift = ToneCurve::new(&Tone {
+        let lift = new_for_test(&Tone {
             shadows: 1.0,
             ..Tone::default()
         });
-        assert!(curve(0.01, &lift) > 0.02);
-        assert!((curve(0.8, &lift) - 0.8).abs() < 1e-4);
+        assert!(curve(0.01, &lift) > curve(0.01, &plain) * 1.5);
+        assert!((curve(0.8, &lift) - curve(0.8, &plain)).abs() < 1e-4);
     }
 
     #[test]
     fn the_endpoints_clip_and_nothing_else_does() {
         // The decision this slice made explicit: whites and blacks are where
         // clipping is allowed, because the user asked for it there.
-        let crush = ToneCurve::new(&Tone {
+        let crush = new_for_test(&Tone {
             blacks: -1.0,
             ..Tone::default()
         });
@@ -868,7 +967,7 @@ mod tests {
         assert_eq!(curve(0.25f32.powf(GAMMA) * 0.9, &crush), 0.0);
         assert!(curve(0.5, &crush) > 0.0);
 
-        let blow = ToneCurve::new(&Tone {
+        let blow = new_for_test(&Tone {
             whites: 1.0,
             ..Tone::default()
         });
@@ -887,8 +986,14 @@ mod tests {
                 ..Tone::default()
             },
         ] {
-            let shape = ToneCurve::new(&tone);
-            assert!(curve(0.999, &shape) < 1.0, "{tone:?} clipped a highlight");
+            let shape = new_for_test(&tone);
+            // 0.99 rather than 0.999, and the reason is arithmetic rather than
+            // a weaker claim. Contrast at +1 over the baseline is an exponent
+            // of 2.38, and 0.999 through it lands 2.7e-8 below white — inside
+            // one f32 step at 1.0, so it stores *as* 1.0. The old bound was
+            // measuring float spacing, not the curve, and it would have read as
+            // a clipping bug the first time anyone raised the exponent.
+            assert!(curve(0.99, &shape) < 1.0, "{tone:?} clipped a highlight");
         }
     }
 
@@ -911,7 +1016,7 @@ mod tests {
         // The renderer is the boundary. `EditState` is JSON somebody could have
         // hand-edited, and the taper bound is only safe for `-1..1` — so this
         // is defence at the edge, not a formality.
-        let wild = ToneCurve::new(&Tone {
+        let wild = new_for_test(&Tone {
             contrast: 40.0,
             highlights: -12.0,
             shadows: f32::NAN,
@@ -920,7 +1025,7 @@ mod tests {
             exposure_ev: 0.0,
             ..Tone::default()
         });
-        assert_eq!(wild.contrast_exponent, 2.0);
+        assert_eq!(wild.contrast_exponent, (1.0 + BASE_CONTRAST).exp2());
         assert_eq!(wild.highlights, -1.0);
         assert_eq!(wild.shadows, 0.0, "NaN is not a slider position");
         assert!(wild.active, "the finite controls are still set");

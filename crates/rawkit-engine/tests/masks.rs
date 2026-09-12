@@ -458,8 +458,14 @@ fn a_range_mask_reaches_the_renderer_at_all() {
         dark.0,
         dark.1
     );
+    // 1.15 rather than the 1.2 this was written with, and the reason is the
+    // curve rather than a weaker mask. `BASE_CONTRAST` gave the default
+    // rendering a shoulder, so the bright half starts higher *and* a stop of
+    // exposure buys less display change near white — the same lift now reads
+    // 0.7053 to 0.8392 instead of clearing 1.2x. That is a shoulder working.
+    // The absolute move is +0.134 on a 0-to-1 scale, which nobody would miss.
     assert!(
-        bright.1 > bright.0 * 1.2,
+        bright.1 > bright.0 * 1.15,
         "a band on the bright half did not lift it: {:.4} to {:.4}",
         bright.0,
         bright.1

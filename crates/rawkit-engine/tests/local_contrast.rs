@@ -128,6 +128,36 @@ fn clarity_works_at_the_neighbourhoods_scale_and_not_at_the_pixels() {
          wrong coordinate"
     );
 
+    // And the same with the tone curve doing real work, which is the case that
+    // was broken for as long as this file has existed and could not be seen.
+    //
+    // Clarity's neutral point is "the pixel equals what surrounds it", and the
+    // pixel arrives here having been through the tone curve while the guide's
+    // neighbourhood has not. While the curve was skipped at defaults the two
+    // were trivially in the same coordinate and the assertion above passed for
+    // the wrong reason; with a contrast set they were not, and a flat frame
+    // moved. `BASE_CONTRAST` made the curve unconditional, which is the only
+    // reason the assertion above started failing and the bug got found.
+    let curved_off = render(&gpu, &flat(), &tone(|t| t.contrast = 1.0));
+    let curved_on = render(
+        &gpu,
+        &flat(),
+        &tone(|t| {
+            t.contrast = 1.0;
+            t.clarity = 1.0;
+        }),
+    );
+    let (was, now) = (
+        luma(&curved_off, W / 2, H / 2),
+        luma(&curved_on, W / 2, H / 2),
+    );
+    assert!(
+        (now - was).abs() < 1e-3,
+        "with contrast set, clarity moved a flat frame from {was} to {now} — \
+         the neighbourhood it compares against has not been through the curve \
+         the pixel has"
+    );
+
     let off = render(&gpu, &two_scales(), &EditState::default());
     let on = render(&gpu, &two_scales(), &tone(|t| t.clarity = 1.0));
     // The blob's flank, where the picture differs most from its own

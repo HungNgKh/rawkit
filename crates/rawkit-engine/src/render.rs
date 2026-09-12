@@ -2085,7 +2085,15 @@ impl Renderer {
         // and blue sites from unscaled CFA values, so any other normalisation
         // would mix scaled and unscaled greens in the same subtraction.
         let colour = image.colour(state)?;
-        let tone = crate::tone::ToneCurve::new(&state.tone);
+        // The baseline contrast steps aside for a profile that brought its own
+        // tone curve: that curve *is* the look, and stacking a second one under
+        // it is two looks. The same rule the DNG SDK follows.
+        let baseline = if image.profile.tone_curve().is_some() {
+            0.0
+        } else {
+            crate::tone::BASE_CONTRAST
+        };
+        let tone = crate::tone::ToneCurve::new(&state.tone, baseline);
 
         // Every mask, in the order the edit holds them — **not** only the ones
         // that would change something.
