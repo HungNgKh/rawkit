@@ -121,6 +121,13 @@ pub struct SceneStats {
     /// the *scene*, it is the sensor's ceiling, and an operator that anchored
     /// to it would anchor to the exposure the photographer happened to make.
     pub clipped: f32,
+    /// The share where *every* channel clipped, from [`Guide::blown`].
+    ///
+    /// Beside the one above because the two together say what a highlight
+    /// recovery can do here: the gap between them is the part that still has a
+    /// colour to restore, and this is the part that has only a lower bound and
+    /// will come back grey however hard the slider is pulled.
+    pub blown: f32,
     /// How many guide texels the measurement is over. Carried so a caller can
     /// tell a thin measurement from a thick one rather than having to trust
     /// every one equally.
@@ -201,6 +208,7 @@ impl SceneStats {
             white_ev,
             median_ev: at(0.5),
             clipped: guide.clipped,
+            blown: guide.blown,
             texels: total,
         })
     }
@@ -231,6 +239,7 @@ mod tests {
             chroma: [1.0; 3],
             chroma_known: true,
             clipped: 0.0,
+            blown: 0.0,
             width: texels.len() as u32,
             height: 1,
         }

@@ -439,6 +439,7 @@ mod tests {
             chroma: [value; 3],
             chroma_known: true,
             clipped: 0.0,
+            blown: 0.0,
             width: 1,
             height: 1,
         }
@@ -462,6 +463,7 @@ mod tests {
             chroma: [1.0; 3],
             chroma_known: true,
             clipped: 0.0,
+            blown: 0.0,
             width: w,
             height: h,
         }
@@ -1073,6 +1075,7 @@ mod tests {
             chroma: [1.0; 3],
             chroma_known: true,
             clipped: 0.0,
+            blown: 0.0,
             width: 1,
             height: 1,
         };

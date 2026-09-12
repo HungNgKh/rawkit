@@ -37,8 +37,8 @@ pub fn measure(inputs: &[std::path::PathBuf], profile_path: Option<&Path>) -> Re
     };
 
     println!(
-        "{:<16} {:>8} {:>8} {:>8} {:>9} {:>9} {:>9} {:>9}",
-        "file", "black", "median", "white", "range", "clipped", "straighten", "keystone"
+        "{:<16} {:>8} {:>8} {:>8} {:>9} {:>9} {:>8} {:>10}",
+        "file", "black", "median", "white", "range", "clipped", "blown", "straighten"
     );
 
     for input in inputs {
@@ -95,13 +95,14 @@ pub fn measure(inputs: &[std::path::PathBuf], profile_path: Option<&Path>) -> Re
         };
         match frame.scene(&state, &guide) {
             Some(s) => println!(
-                "{:<16} {:>+8.2} {:>+8.2} {:>+8.2} {:>7.2} EV {:>8.2}% {upright}",
+                "{:<16} {:>+8.2} {:>+8.2} {:>+8.2} {:>7.2} EV {:>8.2}% {:>7.2}% {upright}",
                 name,
                 s.black_ev,
                 s.median_ev,
                 s.white_ev,
                 s.dynamic_range(),
-                s.clipped * 100.0
+                s.clipped * 100.0,
+                s.blown * 100.0
             ),
             None => println!("{name:<16} {:>8} {:>44} {upright}", "flat", ""),
         }

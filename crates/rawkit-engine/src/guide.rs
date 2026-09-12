@@ -191,6 +191,19 @@ pub struct Guide {
     /// region has soft edges. Asking the mosaic is asking the only thing that
     /// still knows.
     pub clipped: f32,
+    /// The fraction of quads where **every** channel clipped.
+    ///
+    /// The difference between this and [`Guide::clipped`] is the difference
+    /// between a highlight that can be reconstructed and one that cannot. With
+    /// a channel still inside the sensor's range there is a measurement to
+    /// anchor a borrowed colour to, and `reconstruct_highlights` uses it; with
+    /// all three gone there is no colour information left at that pixel at all,
+    /// only a lower bound, and what comes back is neutral.
+    ///
+    /// So this is the share of the frame where a highlight recovery can restore
+    /// *gradation* but not *hue* — which is worth knowing before anybody tries
+    /// to make it restore hue.
+    pub blown: f32,
     pub width: u32,
     pub height: u32,
 }
@@ -243,6 +256,8 @@ impl Guide {
         // costs two increments rather than a second walk over the mosaic.
         let mut quads = 0u32;
         let mut blown = 0u32;
+        // Every channel gone, as opposed to any of them.
+        let mut gone = 0u32;
 
         // Which guide column each image column falls in, worked out once rather
         // than as a 64-bit divide per pixel — it is the same answer every row.
@@ -300,6 +315,7 @@ impl Guide {
 
                 quads += 1;
                 blown += u32::from(clipped);
+                gone += u32::from(rgb[0] >= trusted && rgb[1] >= trusted && rgb[2] >= trusted);
 
                 let cell = gy as usize * gw as usize + column[bx as usize] as usize;
                 for (c, v) in rgb.iter().enumerate() {
@@ -384,6 +400,11 @@ impl Guide {
                 0.0
             } else {
                 blown as f32 / quads as f32
+            },
+            blown: if quads == 0 {
+                0.0
+            } else {
+                gone as f32 / quads as f32
             },
             width: gw,
             height: gh,
