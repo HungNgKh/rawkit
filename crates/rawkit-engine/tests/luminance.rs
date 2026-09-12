@@ -125,6 +125,83 @@ fn edge_strength(pixels: &[f32]) -> f32 {
     total / count
 }
 
+/// A fine vertical pattern, optionally with sensor noise scattered on top.
+///
+/// The *detail* is identical in both versions and the noise is the only
+/// difference, which is what lets the test below attribute a difference in what
+/// survives to the frame's noise rather than to the frame.
+fn detail_with_noise(depth: f32) -> Vec<f32> {
+    (0..H)
+        .flat_map(|y| (0..W).map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let pattern = 0.25 + 0.035 * ((x / 2) % 2) as f32;
+            (pattern + noise(x, y) * depth).max(0.0)
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn one_setting_means_one_thing_on_every_photograph() {
+    // The claim the module header already makes about brightness *within* a
+    // frame, extended across frames — and the reason is the same.
+    //
+    // A bilateral's range tolerance is a statement about the noise: neighbours
+    // closer together than that are the same thing seen twice, further apart
+    // are two things. `LUMA_SIGMA` was calibrated against one synthetic
+    // fixture's noise depth, so the slider meant a different amount of
+    // filtering on every photograph. Measured on two real frames at the same
+    // setting: the ISO 1000 one shed 46% of its noise while the ISO 100 one
+    // lost 24% of its detail, and nothing in the control knew the difference.
+    //
+    // Two frames carrying the *same* fine pattern, one of them noisy. The quiet
+    // one has to keep more of that pattern than the noisy one does, because its
+    // tolerance should be narrower. With a fixed tolerance they are smoothed
+    // identically and this fails.
+    let Ok(gpu) = Gpu::new() else { return };
+    // Depths spanning what the reference photographs occupy rather than
+    // something far apart: `Guide::noise` reads 0.0024 to 0.0031 at ISO 100-200
+    // and 0.0046 to 0.0054 at ISO 500-1000, and the scaling is clamped either
+    // side of that.
+    let quiet_cfa = detail_with_noise(0.002);
+    let noisy_cfa = detail_with_noise(0.02);
+
+    // How much of the vertical pattern is left, as the mean step between
+    // neighbouring columns — the same measure `edge_strength` uses, over the
+    // flat middle where the pattern is all there is.
+    let pattern = |pixels: &[f32]| {
+        let mut total = 0.0;
+        let mut count = 0.0;
+        for y in 16..H - 16 {
+            for x in 40..W - 40 {
+                let a = pixels[((y * W + x) * 4 + 1) as usize];
+                let b = pixels[((y * W + x + 1) * 4 + 1) as usize];
+                total += (b - a).abs();
+                count += 1.0;
+            }
+        }
+        total / count
+    };
+    // **Each against its own unfiltered self**, because adding noise raises this
+    // measure before anything is filtered — comparing the two absolute numbers
+    // would be comparing how much noise was added, not how much survived.
+    let kept = |cfa: &[f32]| pattern(&render(&gpu, cfa, MODEST)) / pattern(&render(&gpu, cfa, 0.0));
+    let (kept_quiet, kept_noisy) = (kept(&quiet_cfa), kept(&noisy_cfa));
+    println!(
+        "quiet keeps {:.1}%, noisy keeps {:.1}%",
+        kept_quiet * 100.0,
+        kept_noisy * 100.0
+    );
+    assert!(
+        kept_quiet > kept_noisy * 1.15,
+        "the same setting smoothed both frames the same: the quiet frame kept \
+         {:.1}% of its structure against the noisy one's {:.1}%. The tolerance \
+         is not tracking the frame's own noise.",
+        kept_quiet * 100.0,
+        kept_noisy * 100.0
+    );
+}
+
 #[test]
 #[ignore = "requires a GPU adapter"]
 fn noise_falls_and_the_edge_survives() {

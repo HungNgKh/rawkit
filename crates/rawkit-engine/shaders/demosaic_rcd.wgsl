@@ -2858,6 +2858,27 @@ const NOISE_STRENGTH_MAX: f32 = 2.0;
 const NOISE_IMPLAUSIBLE_FROM: f32 = 0.008;
 const NOISE_IMPLAUSIBLE_BY: f32 = 0.016;
 
+/// How far this photograph's own noise moves a noise control from its nominal
+/// setting. One number, used by both stages, so there is one rule for what a
+/// measurement means and one place it can be wrong.
+///
+/// Exactly 1 when there is no measurement and when the measurement is not
+/// believable, which in both cases is the behaviour these controls had before
+/// they could ask — see `NOISE_IMPLAUSIBLE_FROM`.
+fn noise_scale() -> f32 {
+    let measured = params.guide_scale.w;
+    if (measured <= 0.0) {
+        return 1.0;
+    }
+    let scaled = clamp(
+        measured / NOISE_TYPICAL,
+        NOISE_STRENGTH_MIN,
+        NOISE_STRENGTH_MAX,
+    );
+    let gave_up = smoothstep(NOISE_IMPLAUSIBLE_FROM, NOISE_IMPLAUSIBLE_BY, measured);
+    return mix(scaled, 1.0, gave_up);
+}
+
 /// And how much more the shadows get than mid-grey.
 ///
 /// Relative photon noise goes as one over the square root of the signal, so the
@@ -2933,21 +2954,8 @@ fn chroma_mix(@builtin(global_invocation_id) gid: vec3<u32>) {
     // A guide with no noise measured in it -- a frame flat enough that the
     // percentile found nothing, or a caller that built none -- falls back to
     // the slider on its own, which is what this did before it could ask.
-    var strength = 1.0;
-    let measured = params.guide_scale.w;
-    if (measured > 0.0) {
-        let scaled = clamp(
-            measured / NOISE_TYPICAL,
-            NOISE_STRENGTH_MIN,
-            NOISE_STRENGTH_MAX,
-        );
-        // And back to 1 where the reading is too high to be noise. See
-        // `NOISE_IMPLAUSIBLE_FROM`.
-        let gave_up = smoothstep(NOISE_IMPLAUSIBLE_FROM, NOISE_IMPLAUSIBLE_BY, measured);
-        strength = mix(scaled, 1.0, gave_up);
-    }
     let dark = clamp(sqrt(NOISE_MID_GREY / max(was, EPS)), 1.0, NOISE_DARK_MAX);
-    let effective = clamp(amount * strength * dark, 0.0, 1.0);
+    let effective = clamp(amount * noise_scale() * dark, 0.0, 1.0);
     rgba_out[p] = vec4<f32>(mix(original, recoloured, effective), 1.0);
 }
 
@@ -2990,11 +2998,17 @@ fn chroma_mix(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// How far the bilateral reaches. Folded into `HALO` in `render.rs`, where 3
 /// and 2 happen to cost the same because the halo rounds to an even number.
 const LUMA_REACH: i32 = 3;
-/// Range tolerance at full strength, in square-root-signal units.
+/// Range tolerance at full strength, in square-root-signal units, **on a frame
+/// whose noise is [`NOISE_TYPICAL`]**.
 ///
 /// Calibrated against `noise_falls_and_the_edge_survives` rather than reasoned
 /// from a sensor model: the number that has to be right is "how much does a
 /// flat area smooth before an edge starts to move", and that is measurable.
+///
+/// Scaled by `noise_scale` at the point of use, so this is where the slider
+/// sits on a typical photograph and other frames move either side of it. Left
+/// where the calibration put it deliberately: the change is to make the control
+/// consistent across frames, not to re-pitch what its numbers mean.
 const LUMA_SIGMA: f32 = 0.075;
 /// Spatial falloff across the kernel, in pixels. Wide enough that the corners
 /// of a 7x7 still contribute, narrow enough that the nearest ring dominates.
@@ -3025,7 +3039,20 @@ fn luminance_blur(@builtin(global_invocation_id) gid: vec3<u32>) {
     // `max` rather than a branch on negatives: a pixel below black is a real
     // thing after white balance, and its square root is not.
     let centre_root = sqrt(max(centre, 0.0));
-    let sigma = LUMA_SIGMA * strength;
+    // **Relative to what this photograph's noise actually is.**
+    //
+    // A bilateral's range tolerance is a statement about the noise: neighbours
+    // closer together than that are the same thing seen twice, and further
+    // apart are two things. `LUMA_SIGMA` was calibrated against a synthetic
+    // fixture's noise depth, so the slider meant a different amount of
+    // filtering on every photograph — measured on two real ones at the same
+    // setting, the noisy frame shed 46% of its noise while the clean one lost
+    // 24% of its detail, and nothing in the control knew the difference.
+    //
+    // This module already makes exactly this argument once, for the square root
+    // the comparison happens on: one setting has to mean one thing at every
+    // brightness *within* a frame. It means one thing across frames now too.
+    let sigma = LUMA_SIGMA * noise_scale() * strength;
 
     var sum = 0.0;
     var total = 0.0;
