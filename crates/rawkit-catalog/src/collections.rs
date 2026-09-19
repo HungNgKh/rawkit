@@ -160,15 +160,14 @@ pub fn add(catalog: &Catalog, id: i64, images: &[i64]) -> Result<usize, CatalogE
         rusqlite::params![id],
         |r| r.get(0),
     )?;
-    let at = now();
     let mut added = 0;
     for image in images {
         next += 1;
         added += transaction.execute(
-            "INSERT INTO collection_images (collection_id, image_id, position, added_at)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO collection_images (collection_id, image_id, position)
+             VALUES (?1, ?2, ?3)
              ON CONFLICT (collection_id, image_id) DO NOTHING",
-            rusqlite::params![id, image, next, at],
+            rusqlite::params![id, image, next],
         )?;
     }
     transaction.commit()?;
@@ -204,7 +203,44 @@ pub fn holds(catalog: &Catalog, id: i64, image: i64) -> Result<bool, CatalogErro
     )? == 1)
 }
 
+/// Exchange two photographs' places, and nothing else.
+///
+/// **What moving one frame one place has to cost**, and the reason this exists
+/// beside [`reorder`]. The shell first did a move by handing `reorder` the whole
+/// sequence with two entries swapped, which is a write per member: measured on a
+/// collection of twenty thousand, 70 ms for one press of an arrow key — most of
+/// what an interaction is allowed, spent rewriting 19 998 rows to the values
+/// they already had. Two rows changed, so two rows are written.
+///
+/// Works the same under a filter, where the neighbour on screen may be a long
+/// way off in the stored order: exchanging the two *values* still puts the frame
+/// on the other side of the one it was moved past.
+pub fn swap(catalog: &Catalog, id: i64, a: i64, b: i64) -> Result<(), CatalogError> {
+    let connection = catalog.connection();
+    let place = |image: i64| -> Result<i64, CatalogError> {
+        Ok(connection.query_row(
+            "SELECT position FROM collection_images WHERE collection_id = ?1 AND image_id = ?2",
+            rusqlite::params![id, image],
+            |r| r.get(0),
+        )?)
+    };
+    let (at_a, at_b) = (place(a)?, place(b)?);
+    let transaction = connection.unchecked_transaction()?;
+    for (image, position) in [(a, at_b), (b, at_a)] {
+        transaction.execute(
+            "UPDATE collection_images SET position = ?3
+              WHERE collection_id = ?1 AND image_id = ?2",
+            rusqlite::params![id, image, position],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 /// Write an order. The list is the collection's sequence from first to last.
+///
+/// **A write per member, so not for a keypress** — see [`swap`] for moving one
+/// frame. This is for an order that really has changed wholesale.
 ///
 /// Whole rather than a move-this-one-here, for the reason a judgement is written
 /// whole: the caller holds the sequence the person is looking at, and a shuffle
@@ -369,6 +405,23 @@ mod tests {
         // order they already had.
         reorder(&catalog, id, &[ids[3], ids[1]]).unwrap();
         assert_eq!(ids_in(&catalog, id), [ids[3], ids[1], ids[0], ids[2]]);
+    }
+
+    #[test]
+    fn swapping_two_frames_moves_only_those_two() {
+        // What one press of an arrow key is. The first version rewrote every
+        // row in the collection to say so.
+        let (_dir, catalog, ids) = library_of(4);
+        let id = create(&catalog, "Edit", None).unwrap();
+        add(&catalog, id, &ids).unwrap();
+        swap(&catalog, id, ids[1], ids[2]).unwrap();
+        assert_eq!(ids_in(&catalog, id), [ids[0], ids[2], ids[1], ids[3]]);
+        // Not neighbours, which is what a move under a filter looks like.
+        swap(&catalog, id, ids[0], ids[3]).unwrap();
+        assert_eq!(ids_in(&catalog, id), [ids[3], ids[2], ids[1], ids[0]]);
+        // A frame that is not in the collection is an error, not a silent no-op
+        // that leaves the screen and the catalog disagreeing.
+        assert!(swap(&catalog, id, ids[0], 999_999).is_err());
     }
 
     #[test]

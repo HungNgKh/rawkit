@@ -39,26 +39,49 @@ CREATE UNIQUE INDEX collections_root_name
 CREATE UNIQUE INDEX collections_one_quick ON collections (is_quick) WHERE is_quick = 1;
 
 -- Membership, and the order it was put in.
+--
+-- **An index into the library, and built like one.** A collection copies
+-- nothing: not the photograph, not its edit, not a preview. A membership is
+-- three integers saying "this image, in this collection, at this place", and the
+-- table is shaped so that is all it costs on disk as well.
+--
+-- `WITHOUT ROWID` makes the primary key *be* the table rather than an index
+-- beside one. The first shape of this had four b-trees per membership — the
+-- rowid table, the key's index, the order index and a by-image index — and it
+-- mattered somewhere nobody was looking: opening a catalog runs a full integrity
+-- check, which reads every page, so a library with six memberships per
+-- photograph went from 27 ms to open to 130 ms. Two b-trees now, and each one is
+-- a question something actually asks.
 CREATE TABLE collection_images (
     collection_id INTEGER NOT NULL REFERENCES collections (id) ON DELETE CASCADE,
+    -- An *image*, not a file, and the difference is virtual copies: two
+    -- interpretations of one frame are two rows in `images`, and either can be
+    -- in a collection without the other. Pointing at the file would make a
+    -- collection unable to hold the black-and-white version and not the colour.
     image_id      INTEGER NOT NULL REFERENCES images (id) ON DELETE CASCADE,
     -- Where this frame sits in the hand-made sequence. Sparse and not
     -- necessarily contiguous: appending takes the current maximum and adds one,
-    -- and a reorder rewrites only the rows that moved. Nothing reads the
-    -- absolute value, so gaps left by a removal cost nothing and closing them
-    -- would be a write per remaining row for no visible difference.
+    -- and moving a frame exchanges two values. Nothing reads the absolute
+    -- number, so gaps left by a removal cost nothing and closing them would be a
+    -- write per remaining row for no visible difference.
     position      INTEGER NOT NULL,
-    added_at      INTEGER NOT NULL,
     -- Adding a photograph twice is not an error and does not make two rows; it
     -- is somebody pressing the key again on a frame already in the collection.
+    -- Also what answers "is this frame in this collection", asked on every
+    -- keypress of a cull.
     PRIMARY KEY (collection_id, image_id)
-);
+) WITHOUT ROWID;
 
--- The order a collection is read in, which is every read of one.
+-- The order a collection is read in, which is every read of one, and the
+-- maximum an append needs.
+--
+-- There is deliberately **no index on `image_id` alone**. The first shape had
+-- one for "which collections is this frame in", which nothing asks — and an
+-- index nobody queries is a b-tree every write maintains and every open checks.
+-- What it would also have served is the cascade when an image is deleted, which
+-- without it scans this table; that is measured in the scale gate rather than
+-- assumed, and it is a virtual copy being thrown away, not a keypress.
 CREATE INDEX collection_images_order ON collection_images (collection_id, position);
--- And the reverse: "which collections is this frame in", asked once per frame
--- while culling to light the indicator.
-CREATE INDEX collection_images_by_image ON collection_images (image_id);
 
 -- And it exists from the moment the table does.
 --

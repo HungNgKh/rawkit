@@ -2222,8 +2222,17 @@
   // that has just been emptied cannot be honoured — and a page drawing its own
   // intentions would keep a chip lit for a view nobody has.
   const collectionRow = document.getElementById("filter-collections");
+  // What was last drawn, so an arrow key does not rebuild the row. The view
+  // carries the list after every keypress and almost none of them change it;
+  // tearing down and recreating a button per collection each time is work that
+  // grows with how many collections somebody has made, spent on a row that
+  // reads the same as it did.
+  let collectionsDrawn = "";
   const drawCollections = view => {
     const shown = view.collections ?? [];
+    const signature = `${view.viewing}|` + shown.map(c => `${c.id}:${c.name}:${c.count}`).join(",");
+    if (signature === collectionsDrawn) return;
+    collectionsDrawn = signature;
     collectionRow.replaceChildren();
     for (const collection of shown) {
       // An empty collection nobody is in is noise in a row that is read at a

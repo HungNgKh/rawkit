@@ -171,6 +171,22 @@ fn library_of(root: &Path, n: usize) -> Catalog {
     // And the quick collection, which every keystroke asks about.
     let quick = collections::quick(&catalog).expect("quick");
     collections::add(&catalog, quick, &in_collection[..in_collection.len() / 4]).expect("add");
+
+    // **A heavy user, because two collections measured nothing.** The first
+    // version of this fixture had the quick collection and one more, and every
+    // number it produced was flattering: the listing counts membership across
+    // the *whole catalog*, so its cost is set by how many collections somebody
+    // has made over the years, not by the one on screen. A hundred of them at a
+    // twentieth of the library each, and one that holds everything — six
+    // memberships per photograph, which is a library that has been used.
+    let ids: Vec<i64> = everything.iter().map(|image| image.id).collect();
+    for c in 0..HEAVY_COLLECTIONS {
+        let id = collections::create(&catalog, &format!("Set {c:03}"), None).expect("create");
+        let chosen: Vec<i64> = ids.iter().skip(c % 20).step_by(20).copied().collect();
+        collections::add(&catalog, id, &chosen).expect("add");
+    }
+    let whole = collections::create(&catalog, "Everything", None).expect("create");
+    collections::add(&catalog, whole, &ids).expect("add");
     catalog
 }
 
@@ -186,6 +202,8 @@ fn fixture_hash() -> String {
     rawkit_editstate::EditState::default().content_hash()
 }
 const RENDERER: &str = "scale-test/0";
+/// How many collections the heavy-user fixture makes, beside the three named ones.
+const HEAVY_COLLECTIONS: usize = 100;
 
 fn timed<T>(mut f: impl FnMut() -> T) -> (Duration, T) {
     let start = Instant::now();
@@ -202,8 +220,8 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
         "images", "scan", "open", "seq all", "seq pick", "match", "tally", "prev 1", "outstandng"
     );
     println!(
-        "{:>8} {:>9} {:>9} {:>9}",
-        "", "coll all", "members", "holds 1"
+        "{:>8} {:>9} {:>9} {:>9} {:>10} {:>9} {:>10} {:>9}",
+        "", "coll all", "members", "holds 1", "mem whole", "move 1", "reorder *", "drop 1"
     );
 
     let mut worst = Duration::ZERO;
@@ -269,13 +287,20 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
         // is actually waiting on.
         let (coll_all, listed) = timed(|| collections::all(&catalog).expect("collections"));
         assert!(
-            listed.iter().any(|c| c.is_quick) && listed.len() == 2,
-            "the fixture should have the quick collection and one more: {listed:?}"
+            listed.iter().any(|c| c.is_quick) && listed.len() == HEAVY_COLLECTIONS + 3,
+            "the fixture should have the quick collection, Portfolio, Everything \
+             and the heavy set: {} listed",
+            listed.len()
         );
         let shelf = listed
             .iter()
-            .find(|c| !c.is_quick)
-            .expect("a collection")
+            .find(|c| c.name == "Portfolio")
+            .expect("Portfolio")
+            .id;
+        let whole = listed
+            .iter()
+            .find(|c| c.name == "Everything")
+            .expect("Everything")
             .id;
         let (members, held) =
             timed(|| collections::members(&catalog, shelf, &Filter::default()).expect("members"));
@@ -287,13 +312,49 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
         });
         let per_holds = asked / ids.len() as u32;
 
+        // The largest collection there can be, read whole — what switching the
+        // grid to it costs.
+        let (members_whole, everything_in) =
+            timed(|| collections::members(&catalog, whole, &Filter::default()).expect("members"));
+        assert_eq!(everything_in.len(), n);
+
+        // **Moving one photograph one place**, which is a keypress and has a
+        // keypress's budget. Two rows change, so two rows are written.
+        let order: Vec<i64> = everything_in.iter().map(|image| image.id).collect();
+        let (moved, _) = timed(|| {
+            collections::swap(&catalog, whole, order[n / 2], order[n / 2 + 1]).expect("swap")
+        });
+
+        // And the same move done the way the shell *first* did it: the whole
+        // sequence handed to `reorder`, a write per member. Reported and kept
+        // off the interaction budget for the reason `outstanding` is — nothing
+        // a finger waits on calls it — and printed so that stays a decision
+        // somebody can see rather than one they would have to rediscover.
+        let mut wholesale = order.clone();
+        wholesale.swap(n / 2, n / 2 + 1);
+        let (rewritten, _) =
+            timed(|| collections::reorder(&catalog, whole, &wholesale).expect("reorder"));
+
+        // **What the missing index costs.** There is no index on `image_id`
+        // alone, so the cascade when an image is deleted scans every membership
+        // there is. That is a virtual copy being thrown away, not a keypress,
+        // but it is measured rather than assumed — and it goes last, because
+        // it changes the library the rest of this measured.
+        let doomed = order[n / 3];
+        let (dropped, _) = timed(|| {
+            catalog
+                .connection()
+                .execute("DELETE FROM images WHERE id = ?1", [doomed])
+                .expect("delete")
+        });
+
         println!(
             "{n:>8} {:>8.0?} {:>8.1?} {:>8.1?} {:>8.1?} {:>8.1?} {:>8.1?} {:>8.1?} {:>9.1?}",
             build, open, all, pick, per_match, tally, per_lookup, left
         );
         println!(
-            "{:>8} {:>8.1?} {:>8.1?} {:>8.1?}",
-            "", coll_all, members, per_holds
+            "{:>8} {:>8.1?} {:>8.1?} {:>8.1?} {:>9.1?} {:>9.1?} {:>9.1?} {:>9.1?}",
+            "", coll_all, members, per_holds, members_whole, moved, rewritten, dropped
         );
         assert!(
             !wanted.is_empty() && wanted.len() < n,
@@ -314,6 +375,9 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
             ("collection list", coll_all),
             ("collection members", members),
             ("collection holds", per_holds),
+            ("whole-library collection", members_whole),
+            ("moving one photograph", moved),
+            ("deleting one image", dropped),
             // `outstanding` is excluded from the interaction budget and
             // reported anyway: it runs once, off the interactive path, to
             // decide what to build. What would matter is it growing faster than

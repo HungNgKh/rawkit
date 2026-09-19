@@ -137,9 +137,21 @@ impl Catalog {
     /// Ask SQLite whether the file is sound, and refuse it if not.
     ///
     /// The full check rather than `quick_check`: it reads every page and
-    /// verifies every index, and on a catalog sized for a real library — tens of
-    /// megabytes, not the photos themselves — it costs single-digit
-    /// milliseconds. The weaker check would save time that nobody is spending.
+    /// verifies every index.
+    ///
+    /// **Its cost is the size of the file, and that is worth knowing before
+    /// adding a table.** This comment used to say "single-digit milliseconds",
+    /// which was a guess: measured by the scale gate it is 27 ms at twenty
+    /// thousand photographs and linear from there. It is why the collections
+    /// table is `WITHOUT ROWID` with two b-trees rather than the four it first
+    /// had — six memberships a photograph took opening a catalog from 27 ms to
+    /// 130 ms, past what an interaction is allowed, and nobody had touched this
+    /// function. Every row any table adds is read here, once per launch.
+    ///
+    /// Still the full check, because refusing a damaged catalog is worth more
+    /// than the time. But it is a budget now rather than a free action, and a
+    /// library five times this size will need it moved off the path the window
+    /// waits on rather than weakened.
     fn check_integrity(&self) -> Result<(), CatalogError> {
         let report: String = self
             .connection

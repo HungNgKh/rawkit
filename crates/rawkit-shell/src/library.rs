@@ -418,6 +418,18 @@ pub struct Library {
     /// order*, a filter says *which of those to show*. Folding one into the
     /// other would mean choosing which of them a pick is allowed to change.
     viewing: Option<i64>,
+    /// Every collection and its count, as of the last time one changed.
+    ///
+    /// **Held, because the page is sent it after every keypress.** Asking the
+    /// catalog each time is a count over every membership there is — its cost
+    /// is set by how many collections somebody has made over the years, not by
+    /// anything on screen, and on a used library that measured 4.9 ms a key for
+    /// an answer that had not changed since the last one. Collections only
+    /// change through [`Library::act`], so that is where this is refreshed.
+    collections: Vec<Collection>,
+    /// The quick collection's id. It is created with the schema and never
+    /// changes, so it is read once.
+    quick: i64,
     /// What each judgement replaced, most recent last.
     ///
     /// Bounded because it is a convenience, not a history: the versioned record
@@ -469,12 +481,16 @@ impl Library {
             path.display(),
             images.len()
         );
+        let listed = collections::all(&catalog)?;
+        let quick = collections::quick(&catalog)?;
         Ok(Self {
             catalog,
             images,
             index: 0,
             filter: Filter::default(),
             viewing: None,
+            collections: listed,
+            quick,
             undo: Vec::new(),
             copied: None,
             paste_requested: false,
@@ -911,12 +927,19 @@ impl Library {
             CullAction::SetFilter(filter) => self.narrow(filter)?,
             CullAction::ShowCollection(id) => self.show_collection(id)?,
             CullAction::QuickToggle => {
-                let quick = collections::quick(&self.catalog)?;
+                let quick = self.quick;
                 let id = self.current().id;
-                if collections::holds(&self.catalog, quick, id)? {
-                    collections::take_out(&self.catalog, quick, &[id])?;
+                // The held count moves by what the catalog says it did, rather
+                // than by asking for the whole list again: K is the key this
+                // feature is pressed with, and a recount is every membership in
+                // the catalog to learn that one number went up by one.
+                let change = if collections::holds(&self.catalog, quick, id)? {
+                    -(collections::take_out(&self.catalog, quick, &[id])? as i64)
                 } else {
-                    collections::add(&self.catalog, quick, &[id])?;
+                    collections::add(&self.catalog, quick, &[id])? as i64
+                };
+                if let Some(held) = self.collections.iter_mut().find(|c| c.id == quick) {
+                    held.count = (held.count as i64 + change).max(0) as usize;
                 }
                 // Only the view being *of* the quick collection can have
                 // changed shape; anywhere else this is a fact about the frame
@@ -926,11 +949,14 @@ impl Library {
                 }
             }
             CullAction::ClearQuick => {
-                let quick = collections::quick(&self.catalog)?;
+                let quick = self.quick;
                 collections::clear(&self.catalog, quick)?;
                 if self.viewing == Some(quick) {
                     let standing = self.current().id;
                     self.resequence(Some(standing))?;
+                }
+                if let Some(held) = self.collections.iter_mut().find(|c| c.id == quick) {
+                    held.count = 0;
                 }
             }
             CullAction::NewCollection(name) => {
@@ -944,6 +970,7 @@ impl Library {
                 };
                 let id = collections::create(&self.catalog, &name, None)?;
                 collections::add(&self.catalog, id, &chosen)?;
+                self.collections = collections::all(&self.catalog)?;
             }
             CullAction::MoveInCollection(step) => {
                 let Some(id) = self.viewing else {
@@ -954,11 +981,20 @@ impl Library {
                 };
                 let target = self.index as i64 + step as i64;
                 if target >= 0 && (target as usize) < self.images.len() {
-                    let mut order: Vec<i64> = self.images.iter().map(|i| i.id).collect();
-                    order.swap(self.index, target as usize);
-                    collections::reorder(&self.catalog, id, &order)?;
-                    self.images = self.read(&self.filter)?;
-                    self.index = target as usize;
+                    let target = target as usize;
+                    // Two rows in the catalog and two entries here. This first
+                    // handed the whole sequence to `reorder` and then read the
+                    // collection back — a write per member followed by a read
+                    // of all of them, 90 ms at twenty thousand, to exchange two
+                    // neighbours. The sequence in hand is already the answer.
+                    collections::swap(
+                        &self.catalog,
+                        id,
+                        self.images[self.index].id,
+                        self.images[target].id,
+                    )?;
+                    self.images.swap(self.index, target);
+                    self.index = target;
                 }
             }
             // Both are resolved before they arrive: making one needs the
@@ -1235,13 +1271,12 @@ impl Library {
             is_marked: self.marked.contains(&image.id),
             mode: crate::mode_name(),
             filter: self.filter.clone(),
-            collections: collections::all(&self.catalog)?,
+            collections: self.collections.clone(),
             viewing: self.viewing,
-            in_quick: collections::holds(
-                &self.catalog,
-                collections::quick(&self.catalog)?,
-                image.id,
-            )?,
+            // An indexed point lookup, 4 µs and flat at twenty thousand — the
+            // one collection question that really is about this frame, and so
+            // the one still asked per keypress.
+            in_quick: collections::holds(&self.catalog, self.quick, image.id)?,
             in_library,
         })
     }
@@ -1617,8 +1652,33 @@ mod tests {
         assert!(!library.view().unwrap().in_quick);
         library.act(CullAction::QuickToggle).unwrap();
         assert!(library.view().unwrap().in_quick, "K did not add it");
+        // The list the page draws is *held* rather than asked for on every key,
+        // so it has to be refreshed by whatever changes it. A count that stayed
+        // at zero here would be a chip reading "quick 0" with a photograph in
+        // it — the cache going stale, which is the one way holding it can fail.
+        let quick_count = |library: &Library| {
+            let view = library.view().unwrap();
+            view.collections.iter().find(|c| c.is_quick).unwrap().count
+        };
+        assert_eq!(
+            quick_count(&library),
+            1,
+            "the held list did not follow the key"
+        );
         library.act(CullAction::QuickToggle).unwrap();
         assert!(!library.view().unwrap().in_quick, "K did not take it out");
+        assert_eq!(quick_count(&library), 0);
+        // And a new collection shows up in it without being asked for again.
+        library
+            .act(CullAction::NewCollection("Portfolio".into()))
+            .unwrap();
+        let view = library.view().unwrap();
+        let made = view.collections.iter().find(|c| c.name == "Portfolio");
+        assert_eq!(
+            made.map(|c| c.count),
+            Some(1),
+            "made from the frame on screen"
+        );
 
         // And the list the page draws its chips from always has it, so the key
         // has somewhere to put a photograph from the first keystroke.
