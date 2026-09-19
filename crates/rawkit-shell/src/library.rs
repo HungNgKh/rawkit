@@ -671,7 +671,25 @@ impl Library {
             Undone::Pasted { frames } => !frames.iter().any(|(id, _)| *id == image.id),
         });
         self.resequence(None)?;
+        // Deleting an image takes it out of every collection it was in, and the
+        // held list is a *copy* of those counts. This was the mutation that did
+        // not know the copy existed: three arms of `act` kept it fresh and this
+        // one, which is not in `act` at all, left a chip reading one more than
+        // the collection held.
+        self.refresh_collections()?;
         Ok(image.label())
+    }
+
+    /// Ask the catalog for the collection list again.
+    ///
+    /// **One way in**, because the list is held rather than asked for per
+    /// keypress and a held copy is only as good as the discipline that refreshes
+    /// it. Anything that can change which photographs a collection holds calls
+    /// this; the one exception is K, which knows the count moved by exactly one
+    /// and says so rather than recounting the catalog.
+    fn refresh_collections(&mut self) -> Result<()> {
+        self.collections = collections::all(&self.catalog)?;
+        Ok(())
     }
 
     /// The sequence as it now stands: the collection being viewed if there is
@@ -968,9 +986,11 @@ impl Library {
                 } else {
                     self.marked.clone()
                 };
-                let id = collections::create(&self.catalog, &name, None)?;
-                collections::add(&self.catalog, id, &chosen)?;
-                self.collections = collections::all(&self.catalog)?;
+                // With its photographs or not at all: as a create followed by
+                // an add, a failure between them left an empty collection
+                // carrying a name nobody chose to make empty.
+                collections::create_holding(&self.catalog, &name, None, &chosen)?;
+                self.refresh_collections()?;
             }
             CullAction::MoveInCollection(step) => {
                 let Some(id) = self.viewing else {
@@ -1684,6 +1704,34 @@ mod tests {
         // has somewhere to put a photograph from the first keystroke.
         let view = library.view().unwrap();
         assert!(view.collections.iter().any(|c| c.is_quick));
+    }
+
+    #[test]
+    fn throwing_a_copy_away_takes_it_off_the_chip_too() {
+        // The held list is a copy of the catalog's counts, and deleting an image
+        // cascades it out of every collection it was in. `remove_copy` is not an
+        // arm of `act`, so it was the one mutation that never heard the copy
+        // existed — and the chip went on claiming a photograph that was gone.
+        let dir = Scratch::new("collection-copy");
+        let mut library = library_at(&dir.0, 2);
+        let quick_count = |library: &Library| {
+            let view = library.view().unwrap();
+            view.collections.iter().find(|c| c.is_quick).unwrap().count
+        };
+        library.add_copy(&EditState::default()).unwrap();
+        assert!(
+            library.current().copy_name.is_some(),
+            "standing on the copy"
+        );
+        library.act(CullAction::QuickToggle).unwrap();
+        assert_eq!(quick_count(&library), 1);
+
+        library.remove_copy().unwrap();
+        assert_eq!(
+            quick_count(&library),
+            0,
+            "the copy is gone from the catalog and still counted on the chip"
+        );
     }
 
     #[test]

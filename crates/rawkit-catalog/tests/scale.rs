@@ -220,8 +220,17 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
         "images", "scan", "open", "seq all", "seq pick", "match", "tally", "prev 1", "outstandng"
     );
     println!(
-        "{:>8} {:>9} {:>9} {:>9} {:>10} {:>9} {:>10} {:>9}",
-        "", "coll all", "members", "holds 1", "mem whole", "move 1", "reorder *", "drop 1"
+        "{:>8} {:>9} {:>9} {:>9} {:>10} {:>9} {:>10} {:>10} {:>9} {:>9}",
+        "",
+        "coll all",
+        "members",
+        "holds 1",
+        "mem whole",
+        "move 1",
+        "move again",
+        "reorder *",
+        "drop 1",
+        "drop 200"
     );
 
     let mut worst = Duration::ZERO;
@@ -325,6 +334,13 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
             collections::swap(&catalog, whole, order[n / 2], order[n / 2 + 1]).expect("swap")
         });
 
+        // **And again**, because the first write after a catalog opens also pays
+        // for creating the write-ahead log, which is not the move's cost. The
+        // second is what holding Shift and pressing an arrow twice feels like.
+        let (moved_again, _) = timed(|| {
+            collections::swap(&catalog, whole, order[n / 2], order[n / 2 + 1]).expect("swap")
+        });
+
         // And the same move done the way the shell *first* did it: the whole
         // sequence handed to `reorder`, a write per member. Reported and kept
         // off the interaction budget for the reason `outstanding` is — nothing
@@ -348,13 +364,35 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
                 .expect("delete")
         });
 
+        // **Two hundred at once, which is what "delete the rejects" is.** The
+        // cascade looks up each deleted image's memberships, so whatever one
+        // costs, this costs two hundred times — and a scan per image is a
+        // quadratic nobody sees while the only caller deletes one virtual copy.
+        let many: Vec<i64> = order
+            .iter()
+            .skip(7)
+            .step_by(n / 250)
+            .take(200)
+            .copied()
+            .collect();
+        let (dropped_many, _) = timed(|| {
+            let connection = catalog.connection();
+            let transaction = connection.unchecked_transaction().expect("begin");
+            for id in &many {
+                transaction
+                    .execute("DELETE FROM images WHERE id = ?1", [id])
+                    .expect("delete");
+            }
+            transaction.commit().expect("commit");
+        });
+
         println!(
             "{n:>8} {:>8.0?} {:>8.1?} {:>8.1?} {:>8.1?} {:>8.1?} {:>8.1?} {:>8.1?} {:>9.1?}",
             build, open, all, pick, per_match, tally, per_lookup, left
         );
         println!(
-            "{:>8} {:>8.1?} {:>8.1?} {:>8.1?} {:>9.1?} {:>9.1?} {:>9.1?} {:>9.1?}",
-            "", coll_all, members, per_holds, members_whole, moved, rewritten, dropped
+            "{:>8} {:>8.1?} {:>8.1?} {:>8.1?} {:>9.1?} {:>9.1?} {:>9.1?} {:>9.1?} {:>9.1?} {:>9.1?}",
+            "", coll_all, members, per_holds, members_whole, moved, moved_again, rewritten, dropped, dropped_many
         );
         assert!(
             !wanted.is_empty() && wanted.len() < n,
@@ -377,7 +415,9 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
             ("collection holds", per_holds),
             ("whole-library collection", members_whole),
             ("moving one photograph", moved),
+            ("moving another", moved_again),
             ("deleting one image", dropped),
+            ("deleting two hundred images", dropped_many),
             // `outstanding` is excluded from the interaction budget and
             // reported anyway: it runs once, off the interactive path, to
             // decide what to build. What would matter is it growing faster than

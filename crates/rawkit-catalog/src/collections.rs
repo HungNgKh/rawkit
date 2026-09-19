@@ -30,6 +30,20 @@
 
 use crate::cull::{narrowing, Filter, LibraryImage};
 use crate::{db::Catalog, CatalogError};
+use rusqlite::{Connection, OptionalExtension};
+use unicode_normalization::UnicodeNormalization;
+
+/// A name as it is compared, which is not as it is shown.
+///
+/// Composed and lower-cased, so "Portfolio", "portfolio" and the same word typed
+/// with a decomposed accent are one name. Full Unicode lower-casing rather than
+/// the ASCII folding paths get: a path is compared the way a *filesystem*
+/// compares it, and claiming more would merge names the disk keeps apart — but
+/// a collection's name is compared by a person reading a list, and nobody reads
+/// "Été" and "été" as two places to put a photograph.
+pub fn name_key(name: &str) -> String {
+    name.trim().nfc().collect::<String>().to_lowercase()
+}
 
 /// A collection, and how many photographs are in it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -54,12 +68,40 @@ pub struct Collection {
 /// only one that knows whether it is drawing an indented list, a menu or a
 /// breadcrumb. Building the tree here would decide that for it.
 pub fn all(catalog: &Catalog) -> Result<Vec<Collection>, CatalogError> {
+    // **The count is of what the collection will show**, which is not every
+    // membership: a photograph whose file has gone missing stays a member and is
+    // left out of the view, because nothing can open it. Counting it anyway put
+    // "40" on a chip that opened on "1 of 38".
+    //
+    // Subtracted rather than joined. Counting memberships is one covering-index
+    // range per collection; joining each of them to its file to ask whether it
+    // is missing is two lookups per membership, to find what is nearly always
+    // nothing. So the missing ones are found from *their* side — few files,
+    // then their images, then the memberships the image-first key makes a
+    // search rather than a scan.
     let mut statement = catalog.connection().prepare(
-        "SELECT c.id, c.parent_id, c.name, c.is_quick, COUNT(m.image_id)
+        // **`CROSS JOIN` is doing work here: in SQLite it pins the join order.**
+        // Written as plain joins, the planner started from the memberships —
+        // nothing tells it that missing files are the small side, there being no
+        // index on `missing` — and looked up the image and the file behind every
+        // one of them. That is exactly the join the paragraph above says this
+        // avoids, and the scale gate caught it: 43 ms of a 45 ms query, to
+        // subtract zero. I blamed the CTE first and was wrong; the plan said so.
+        // Pinned, it reads the files once, finds the few that are gone, and
+        // reaches their memberships through the image-first key.
+        "WITH gone AS MATERIALIZED (
+             SELECT m.collection_id AS id, COUNT(*) AS n
+               FROM files f
+              CROSS JOIN images i ON i.file_id = f.id
+              CROSS JOIN collection_images m ON m.image_id = i.id
+              WHERE f.missing = 1
+              GROUP BY m.collection_id)
+         SELECT c.id, c.parent_id, c.name, c.is_quick,
+                (SELECT COUNT(*) FROM collection_images m WHERE m.collection_id = c.id)
+                    - COALESCE(gone.n, 0)
            FROM collections c
-           LEFT JOIN collection_images m ON m.collection_id = c.id
-          GROUP BY c.id
-          ORDER BY c.is_quick DESC, c.name",
+           LEFT JOIN gone ON gone.id = c.id
+          ORDER BY c.is_quick DESC, c.name_key",
     )?;
     let rows = statement
         .query_map([], |r| {
@@ -68,7 +110,7 @@ pub fn all(catalog: &Catalog) -> Result<Vec<Collection>, CatalogError> {
                 parent_id: r.get(1)?,
                 name: r.get(2)?,
                 is_quick: r.get::<_, i64>(3)? == 1,
-                count: r.get::<_, i64>(4)? as usize,
+                count: r.get::<_, i64>(4)?.max(0) as usize,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -86,16 +128,67 @@ pub fn quick(catalog: &Catalog) -> Result<i64, CatalogError> {
 
 /// Make one, and answer with its id.
 pub fn create(catalog: &Catalog, name: &str, parent_id: Option<i64>) -> Result<i64, CatalogError> {
+    insert(catalog.connection(), name, parent_id)
+}
+
+/// Make one that already holds these photographs, or make nothing.
+///
+/// One transaction, because the two halves are one act to the person doing it.
+/// As two — which is how the shell first did this — a failure between them
+/// leaves an empty collection with a name on it that nobody chose to make empty.
+pub fn create_holding(
+    catalog: &Catalog,
+    name: &str,
+    parent_id: Option<i64>,
+    images: &[i64],
+) -> Result<i64, CatalogError> {
+    let transaction = catalog.connection().unchecked_transaction()?;
+    let id = insert(&transaction, name, parent_id)?;
+    append(&transaction, id, images)?;
+    transaction.commit()?;
+    Ok(id)
+}
+
+// The two writes, against a connection rather than a catalog.
+//
+// A `Transaction` dereferences to a `Connection`, so taking one is what lets a
+// caller decide where the transaction's edges are. When every function opened
+// its own, nothing could be built out of two of them that either happened or
+// did not — which is the shape an import of somebody's whole library will need.
+fn insert(
+    connection: &Connection,
+    name: &str,
+    parent_id: Option<i64>,
+) -> Result<i64, CatalogError> {
     let name = name.trim();
     if name.is_empty() {
         return Err(CatalogError::Unsupported("a collection needs a name"));
     }
-    catalog.connection().execute(
-        "INSERT INTO collections (parent_id, name, is_quick, created_at)
-         VALUES (?1, ?2, 0, ?3)",
-        rusqlite::params![parent_id, name, now()],
+    connection.execute(
+        "INSERT INTO collections (parent_id, name, name_key, is_quick, created_at)
+         VALUES (?1, ?2, ?3, 0, ?4)",
+        rusqlite::params![parent_id, name, name_key(name), now()],
     )?;
-    Ok(catalog.connection().last_insert_rowid())
+    Ok(connection.last_insert_rowid())
+}
+
+fn append(connection: &Connection, id: i64, images: &[i64]) -> Result<usize, CatalogError> {
+    let mut next: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(position), 0) FROM collection_images WHERE collection_id = ?1",
+        rusqlite::params![id],
+        |r| r.get(0),
+    )?;
+    let mut added = 0;
+    for image in images {
+        next += 1;
+        added += connection.execute(
+            "INSERT INTO collection_images (collection_id, image_id, position)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (image_id, collection_id) DO NOTHING",
+            rusqlite::params![id, image, next],
+        )?;
+    }
+    Ok(added)
 }
 
 /// Rename one. The quick collection may be renamed like any other — `is_quick`
@@ -106,8 +199,8 @@ pub fn rename(catalog: &Catalog, id: i64, name: &str) -> Result<(), CatalogError
         return Err(CatalogError::Unsupported("a collection needs a name"));
     }
     catalog.connection().execute(
-        "UPDATE collections SET name = ?2 WHERE id = ?1",
-        rusqlite::params![id, name],
+        "UPDATE collections SET name = ?2, name_key = ?3 WHERE id = ?1",
+        rusqlite::params![id, name, name_key(name)],
     )?;
     Ok(())
 }
@@ -118,6 +211,9 @@ pub fn rename(catalog: &Catalog, id: i64, name: &str) -> Result<(), CatalogError
 /// frame, and "there is exactly one" stops being true the moment this can make
 /// it zero. Emptying it is [`clear`].
 pub fn remove(catalog: &Catalog, id: i64) -> Result<(), CatalogError> {
+    // `optional`, not `ok`. The first version turned *every* failure here into
+    // "not the quick collection" — a locked database included — and went on to
+    // run the delete. No row is an answer; an error is not one.
     let is_quick: Option<i64> = catalog
         .connection()
         .query_row(
@@ -125,8 +221,11 @@ pub fn remove(catalog: &Catalog, id: i64) -> Result<(), CatalogError> {
             rusqlite::params![id],
             |r| r.get(0),
         )
-        .ok();
-    if is_quick == Some(1) {
+        .optional()?;
+    let Some(is_quick) = is_quick else {
+        return Err(CatalogError::Unsupported("there is no such collection"));
+    };
+    if is_quick == 1 {
         return Err(CatalogError::Unsupported(
             "the quick collection cannot be deleted; empty it instead",
         ));
@@ -153,23 +252,8 @@ pub fn clear(catalog: &Catalog, id: i64) -> Result<usize, CatalogError> {
 /// frame that is already in. The position of a frame already present does not
 /// move, because re-adding is not a request to reorder.
 pub fn add(catalog: &Catalog, id: i64, images: &[i64]) -> Result<usize, CatalogError> {
-    let connection = catalog.connection();
-    let transaction = connection.unchecked_transaction()?;
-    let mut next: i64 = transaction.query_row(
-        "SELECT COALESCE(MAX(position), 0) FROM collection_images WHERE collection_id = ?1",
-        rusqlite::params![id],
-        |r| r.get(0),
-    )?;
-    let mut added = 0;
-    for image in images {
-        next += 1;
-        added += transaction.execute(
-            "INSERT INTO collection_images (collection_id, image_id, position)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT (collection_id, image_id) DO NOTHING",
-            rusqlite::params![id, image, next],
-        )?;
-    }
+    let transaction = catalog.connection().unchecked_transaction()?;
+    let added = append(&transaction, id, images)?;
     transaction.commit()?;
     Ok(added)
 }
@@ -216,16 +300,17 @@ pub fn holds(catalog: &Catalog, id: i64, image: i64) -> Result<bool, CatalogErro
 /// way off in the stored order: exchanging the two *values* still puts the frame
 /// on the other side of the one it was moved past.
 pub fn swap(catalog: &Catalog, id: i64, a: i64, b: i64) -> Result<(), CatalogError> {
-    let connection = catalog.connection();
+    // Read inside the transaction that writes. Outside it, the two positions
+    // are a fact about a moment that has passed by the time they are used.
+    let transaction = catalog.connection().unchecked_transaction()?;
     let place = |image: i64| -> Result<i64, CatalogError> {
-        Ok(connection.query_row(
+        Ok(transaction.query_row(
             "SELECT position FROM collection_images WHERE collection_id = ?1 AND image_id = ?2",
             rusqlite::params![id, image],
             |r| r.get(0),
         )?)
     };
     let (at_a, at_b) = (place(a)?, place(b)?);
-    let transaction = connection.unchecked_transaction()?;
     for (image, position) in [(a, at_b), (b, at_a)] {
         transaction.execute(
             "UPDATE collection_images SET position = ?3
@@ -292,7 +377,7 @@ pub fn members(
            JOIN folders d ON d.id = f.folder_id
            JOIN volumes v ON v.id = d.volume_id
           WHERE m.collection_id = ? AND f.missing = 0{narrowed}
-          ORDER BY m.position, i.id"
+          ORDER BY m.position, m.image_id"
     ))?;
     // The collection binds first, which is the rule `narrowing` states: its own
     // placeholders are positional and come after anything the caller adds.
@@ -518,6 +603,117 @@ mod tests {
         create(&catalog, "Portfolio", Some(parent)).unwrap();
         assert!(create(&catalog, "Portfolio", Some(parent)).is_err());
         assert!(create(&catalog, "   ", None).is_err(), "a name is required");
+    }
+
+    #[test]
+    fn a_name_is_compared_the_way_a_person_reads_it() {
+        // Two rows that differ by a capital are a coin toss every time one is
+        // picked from a list. Decided before any catalog exists that breaks the
+        // rule, because a uniqueness rule can be loosened later and cannot be
+        // tightened.
+        let (_dir, catalog, _ids) = library_of(1);
+        create(&catalog, "Portfolio", None).unwrap();
+        assert!(create(&catalog, "portfolio", None).is_err());
+        assert!(create(&catalog, "  PORTFOLIO ", None).is_err());
+        // The same word, typed with the accent as a separate combining mark.
+        create(&catalog, "\u{00c9}t\u{00e9}", None).unwrap();
+        assert!(create(&catalog, "E\u{0301}te\u{0301}", None).is_err());
+        // Renaming obeys it too, or it is a rule with a way round it.
+        let other = create(&catalog, "Prints", None).unwrap();
+        assert!(rename(&catalog, other, "PORTFOLIO").is_err());
+        // And the name somebody typed is what comes back, not the key.
+        assert!(all(&catalog).unwrap().iter().any(|c| c.name == "Portfolio"));
+    }
+
+    #[test]
+    fn the_quick_collections_name_is_not_taken() {
+        // Its identity is a flag and its name is an English label the migration
+        // chose. A library imported from somewhere else with a top-level
+        // collection called the same thing must not fail on a row the user
+        // never made.
+        let (_dir, catalog, _ids) = library_of(1);
+        create(&catalog, "Quick Collection", None).unwrap();
+        assert_eq!(
+            all(&catalog).unwrap().iter().filter(|c| c.is_quick).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_quick_collection_cannot_be_put_inside_another() {
+        // `remove` guards the id it is handed. Nested, the quick collection
+        // would go when its *parent* was deleted, and the shell cannot open a
+        // catalog that has none. Nothing re-parents yet; the rule is in the
+        // schema so that whatever does cannot get this wrong.
+        let (_dir, catalog, _ids) = library_of(1);
+        let parent = create(&catalog, "2026", None).unwrap();
+        let quick_id = quick(&catalog).unwrap();
+        assert!(catalog
+            .connection()
+            .execute(
+                "UPDATE collections SET parent_id = ?1 WHERE id = ?2",
+                rusqlite::params![parent, quick_id],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn removing_what_is_not_there_is_an_error() {
+        // The lookup used `.ok()`, which turned every failure — a locked
+        // database included — into "not the quick collection" and carried on.
+        let (_dir, catalog, _ids) = library_of(1);
+        assert!(remove(&catalog, 999_999).is_err());
+    }
+
+    #[test]
+    fn a_collection_is_made_with_its_photographs_or_not_at_all() {
+        let (_dir, catalog, ids) = library_of(2);
+        let made = create_holding(&catalog, "Edit", None, &ids).unwrap();
+        assert_eq!(ids_in(&catalog, made), ids);
+
+        // An image that does not exist fails the second half. As two
+        // transactions that left an empty collection called "Broken" behind.
+        assert!(create_holding(&catalog, "Broken", None, &[ids[0], 999_999]).is_err());
+        assert!(
+            !all(&catalog).unwrap().iter().any(|c| c.name == "Broken"),
+            "half of it happened"
+        );
+    }
+
+    #[test]
+    fn the_count_is_of_what_the_collection_will_show() {
+        // A photograph whose file has gone stays a member and is left out of
+        // the view. Counting it anyway put "40" on a chip that opened on
+        // "1 of 38".
+        let (_dir, catalog, ids) = library_of(3);
+        let id = create_holding(&catalog, "Edit", None, &ids).unwrap();
+        catalog
+            .connection()
+            .execute(
+                "UPDATE files SET missing = 1
+                  WHERE id = (SELECT file_id FROM images WHERE id = ?1)",
+                [ids[1]],
+            )
+            .unwrap();
+        let listed = all(&catalog).unwrap();
+        let counted = listed.iter().find(|c| c.id == id).unwrap().count;
+        assert_eq!(counted, ids_in(&catalog, id).len());
+        assert_eq!(counted, 2);
+    }
+
+    #[test]
+    fn deleting_a_photograph_takes_it_out_of_every_collection() {
+        // The cascade, which the image-first key turned from a scan of every
+        // membership into a search. It has to still *work*.
+        let (_dir, catalog, ids) = library_of(3);
+        let a = create_holding(&catalog, "A", None, &ids).unwrap();
+        let b = create_holding(&catalog, "B", None, &[ids[1]]).unwrap();
+        catalog
+            .connection()
+            .execute("DELETE FROM images WHERE id = ?1", [ids[1]])
+            .unwrap();
+        assert_eq!(ids_in(&catalog, a), [ids[0], ids[2]]);
+        assert!(ids_in(&catalog, b).is_empty());
     }
 
     #[test]
