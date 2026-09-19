@@ -444,6 +444,8 @@ pub(crate) mod tests {
             tables(&catalog),
             [
                 "camera_profiles",
+                "collection_images",
+                "collections",
                 "edit_states",
                 "files",
                 "folders",
@@ -453,8 +455,11 @@ pub(crate) mod tests {
                 "snapshots",
                 "volumes"
             ],
-            "the spine plus previews, camera profiles and the two ways of \
-             reusing an edit, and nothing speculative alongside them"
+            "the spine plus previews, camera profiles, the two ways of reusing \
+             an edit and the one way of ordering photographs by hand — and \
+             nothing speculative alongside them. There is deliberately no \
+             column here for smart collections: those are saved filters, and \
+             the filter language to save is the search work's to design."
         );
     }
 

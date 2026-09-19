@@ -232,6 +232,11 @@
     </span>
     <span class="set" id="filter-stars" title="at least this many stars"></span>
     <span class="set" id="filter-colours"></span>
+    <!-- Collections sit in the filter line because they answer the same
+         question it does — what the arrows walk through — and a cull is done
+         with both at once. The chip that is lit is the view; pressing it again
+         goes back to the whole library. -->
+    <span class="set" id="filter-collections"></span>
   </div>
 </div>
 
@@ -249,6 +254,24 @@
       <div class="row">
         <button id="preset-save">Save</button>
         <button id="preset-cancel">Cancel</button>
+      </div>
+    </div>
+  </details>
+
+  <details id="s-collections">
+    <summary>Collections</summary>
+    <!-- Switching between them is in the filter line, where it is reachable
+         mid-cull. This is only for making one, which needs a name typed and so
+         cannot be a keypress. -->
+    <p class="empty">K puts a frame in the quick collection. Shift-K empties it.</p>
+    <div class="row"><button id="collection-new">New from selection…</button></div>
+    <div class="form hidden" id="collection-form">
+      <div class="row">
+        <input id="collection-name" type="text" placeholder="Name this collection" maxlength="60">
+      </div>
+      <div class="row">
+        <button id="collection-save">Create</button>
+        <button id="collection-cancel">Cancel</button>
       </div>
     </div>
   </details>
@@ -1546,6 +1569,29 @@
   // into a field — otherwise a name containing a digit would rate the
   // photograph — so these two have to say what Enter means for themselves.
   presetName.addEventListener("keydown", e => { if (e.key === "Enter") savePreset(); });
+
+  // Collections: made from what is marked, or from the frame on screen when
+  // nothing is — the same rule paste follows, so the two keys agree about what
+  // "these photographs" means.
+  const collectionName = document.getElementById("collection-name");
+  const collectionForm = document.getElementById("collection-form");
+  document.getElementById("collection-new").addEventListener("click", () => {
+    collectionForm.classList.remove("hidden");
+    collectionName.focus();
+  });
+  document.getElementById("collection-cancel").addEventListener("click", () => {
+    collectionForm.classList.add("hidden");
+    collectionName.value = "";
+  });
+  const createCollection = async () => {
+    const name = collectionName.value.trim();
+    if (!name) return;
+    await act("new_collection", name);
+    collectionForm.classList.add("hidden");
+    collectionName.value = "";
+  };
+  document.getElementById("collection-save").addEventListener("click", createCollection);
+  collectionName.addEventListener("keydown", e => { if (e.key === "Enter") createCollection(); });
   snapshotName.addEventListener("keydown", e => { if (e.key === "Enter") takeSnapshot(); });
 
   // Snapshots belong to one photograph, and the selection moves without this
@@ -2108,8 +2154,12 @@
       `${view.picks} picked · ${view.rejects} rejected` +
       (view.marked ? ` · ${view.marked} marked${view.is_marked ? " ✓" : ""}` : "") +
       // A clipboard nobody can see is a key that sometimes does nothing.
-      (view.copied ? " · settings copied" : "");
+      (view.copied ? " · settings copied" : "") +
+      // Which way K will go on this frame. A toggle that does not say which
+      // state it is in is a key you have to press to find out.
+      (view.in_quick ? " · in quick" : "");
     drawFilter(view.filter ?? {});
+    drawCollections(view);
     setMode(view.mode);
   };
 
@@ -2167,6 +2217,31 @@
       button.classList.toggle("on", button.dataset.colour === filter.colour);
   };
 
+  // Drawn from what the shell says it is showing, the same way round as the
+  // filter chips above: the shell can drop a collection view on its own — one
+  // that has just been emptied cannot be honoured — and a page drawing its own
+  // intentions would keep a chip lit for a view nobody has.
+  const collectionRow = document.getElementById("filter-collections");
+  const drawCollections = view => {
+    const shown = view.collections ?? [];
+    collectionRow.replaceChildren();
+    for (const collection of shown) {
+      // An empty collection nobody is in is noise in a row that is read at a
+      // glance. The quick one always shows, because K is about to fill it.
+      if (!collection.count && !collection.is_quick) continue;
+      const button = document.createElement("button");
+      button.dataset.collection = String(collection.id);
+      button.textContent = collection.is_quick
+        ? `quick ${collection.count}`
+        : `${collection.name} ${collection.count}`;
+      button.title = collection.is_quick
+        ? "the quick collection — K adds and removes"
+        : `${collection.count} photograph${collection.count === 1 ? "" : "s"}`;
+      button.classList.toggle("on", view.viewing === collection.id);
+      collectionRow.append(button);
+    }
+  };
+
   document.getElementById("filter").addEventListener("click", event => {
     const button = event.target.closest("button");
     if (!button) return;
@@ -2183,6 +2258,11 @@
     } else if (button.dataset.colour) {
       const name = button.dataset.colour;
       narrow({ colour: filter.colour === name ? null : name });
+    } else if (button.dataset.collection) {
+      // Pressing the lit one goes back to the whole library, which is the same
+      // gesture the star chips use for "any rating" — one chip, both ways.
+      const id = Number(button.dataset.collection);
+      act("show_collection", button.classList.contains("on") ? null : id);
     }
   });
 
@@ -2352,10 +2432,23 @@
         else addMask("brush");
         break;
       // M sets a frame aside, C compares what you set aside.
+      // K for the quick collection: Lightroom uses B, which is the brush here.
+      // Shift-K empties it — the quick collection cannot be deleted, so
+      // starting again is the only other thing anyone wants from it.
+      case "k": act(event.shiftKey ? "clear_quick" : "quick_toggle"); break;
       case "m": act("mark"); break;
       case "c": act("survey"); break;
-      case "arrowright": case " ": act("next"); break;
-      case "arrowleft": act("previous"); break;
+      // Shift moves the photograph rather than the cursor, and only inside a
+      // collection — the hand-made order is the one thing a collection has that
+      // a filter never will, so there has to be a way to make one.
+      case "arrowright": case " ":
+        if (event.shiftKey && key !== " ") act("move_in_collection", 1);
+        else act("next");
+        break;
+      case "arrowleft":
+        if (event.shiftKey) act("move_in_collection", -1);
+        else act("previous");
+        break;
       // Rows in the grid; neighbours in the loupe. Which one is resolved by the
       // shell, because only it knows how many cells fit across.
       case "arrowdown": act("select_by", 1); break;

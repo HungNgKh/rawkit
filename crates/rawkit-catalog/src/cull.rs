@@ -125,7 +125,7 @@ impl Filter {
 ///
 /// Positional `?` throughout, so a caller that binds something of its own must
 /// bind it first. [`matches`] is the only one that does.
-fn narrowing(filter: &Filter) -> (String, Vec<Value>) {
+pub(crate) fn narrowing(filter: &Filter) -> (String, Vec<Value>) {
     let mut sql = String::new();
     let mut values = Vec::new();
     match filter.flagged {

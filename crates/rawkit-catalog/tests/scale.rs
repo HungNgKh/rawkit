@@ -30,6 +30,7 @@
 //!
 //! `cargo test -p rawkit-catalog --test scale -- --ignored --nocapture`
 
+use rawkit_catalog::collections;
 use rawkit_catalog::cull::{self, Filter, Flag, Flagged, Judgement};
 use rawkit_catalog::db::Catalog;
 use rawkit_catalog::previews::{self, Level, Preview};
@@ -70,6 +71,16 @@ fn tempdir() -> PathBuf {
 fn library_of(root: &Path, n: usize) -> Catalog {
     let photos = root.join("photos");
     let _ = std::fs::remove_dir_all(&photos);
+    // And the catalog, which the three sizes used to share.
+    //
+    // Only the *files* were cleared between them, so every row the previous
+    // size wrote stayed — surviving as `missing = 1`, which `sequence` filters,
+    // which is why this was invisible for as long as the table held nothing but
+    // images. It stopped being invisible the moment something in the fixture
+    // had a name: the second size tried to make a second collection called
+    // "Portfolio". A fixture that says "a library of n photographs" has to be
+    // one, or the numbers underneath belong to a library nobody described.
+    let _ = std::fs::remove_file(root.join("library.rawkit"));
     std::fs::create_dir_all(&photos).expect("photo dir");
     for i in 0..n {
         std::fs::write(photos.join(format!("DSC{i:06}.ARW")), b"raw").expect("write");
@@ -101,6 +112,7 @@ fn library_of(root: &Path, n: usize) -> Catalog {
     // a few rejected. A filter that matches everything or nothing measures the
     // wrong thing.
     let hash = fixture_hash();
+    let mut in_collection: Vec<i64> = Vec::new();
     let everything = cull::sequence(&catalog, &Filter::default()).expect("sequence");
     for (i, image) in everything.iter().enumerate() {
         let judgement = Judgement {
@@ -121,6 +133,14 @@ fn library_of(root: &Path, n: usize) -> Catalog {
             },
         };
         cull::set(&catalog, image.id, &judgement).expect("set");
+
+        // A tenth of the library goes into a collection, in an order that is
+        // not the library's. Membership is what makes `all`'s GROUP BY do real
+        // work, and the scrambled order is what makes `members` prove it is
+        // reading `position` rather than falling back to capture time.
+        if i % 10 == 3 {
+            in_collection.push(image.id);
+        }
 
         // Half the library already has its grid thumbnail, which is the state a
         // part-built library is in for most of its life — and the state that
@@ -143,6 +163,14 @@ fn library_of(root: &Path, n: usize) -> Catalog {
             .expect("record");
         }
     }
+
+    // Reversed, so the stored order disagrees with the library's on every row.
+    in_collection.reverse();
+    let shelf = collections::create(&catalog, "Portfolio", None).expect("create");
+    collections::add(&catalog, shelf, &in_collection).expect("add");
+    // And the quick collection, which every keystroke asks about.
+    let quick = collections::quick(&catalog).expect("quick");
+    collections::add(&catalog, quick, &in_collection[..in_collection.len() / 4]).expect("add");
     catalog
 }
 
@@ -172,6 +200,10 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
     println!(
         "{:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10}",
         "images", "scan", "open", "seq all", "seq pick", "match", "tally", "prev 1", "outstandng"
+    );
+    println!(
+        "{:>8} {:>9} {:>9} {:>9}",
+        "", "coll all", "members", "holds 1"
     );
 
     let mut worst = Duration::ZERO;
@@ -228,9 +260,40 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
             previews::outstanding(&catalog, &[Level::Thumb], RENDERER).expect("outstanding")
         });
 
+        // **These three are on the keystroke path**, which is why they are
+        // here. `CullView` is rebuilt after every key a cull presses, and it
+        // now asks for the list of collections and whether this frame is in the
+        // quick one. A GROUP BY over membership that grew with the library
+        // would make every keypress slower on a library that had used the
+        // feature — the shape `outstanding` is watched for, on a path a finger
+        // is actually waiting on.
+        let (coll_all, listed) = timed(|| collections::all(&catalog).expect("collections"));
+        assert!(
+            listed.iter().any(|c| c.is_quick) && listed.len() == 2,
+            "the fixture should have the quick collection and one more: {listed:?}"
+        );
+        let shelf = listed
+            .iter()
+            .find(|c| !c.is_quick)
+            .expect("a collection")
+            .id;
+        let (members, held) =
+            timed(|| collections::members(&catalog, shelf, &Filter::default()).expect("members"));
+        assert_eq!(held.len(), n / 10, "a tenth of the library is in it");
+        let (asked, _) = timed(|| {
+            for id in &ids {
+                collections::holds(&catalog, shelf, *id).expect("holds");
+            }
+        });
+        let per_holds = asked / ids.len() as u32;
+
         println!(
             "{n:>8} {:>8.0?} {:>8.1?} {:>8.1?} {:>8.1?} {:>8.1?} {:>8.1?} {:>8.1?} {:>9.1?}",
             build, open, all, pick, per_match, tally, per_lookup, left
+        );
+        println!(
+            "{:>8} {:>8.1?} {:>8.1?} {:>8.1?}",
+            "", coll_all, members, per_holds
         );
         assert!(
             !wanted.is_empty() && wanted.len() < n,
@@ -248,6 +311,9 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
             ("matches", per_match),
             ("tally", tally),
             ("preview lookup", per_lookup),
+            ("collection list", coll_all),
+            ("collection members", members),
+            ("collection holds", per_holds),
             // `outstanding` is excluded from the interaction budget and
             // reported anyway: it runs once, off the interactive path, to
             // decide what to build. What would matter is it growing faster than

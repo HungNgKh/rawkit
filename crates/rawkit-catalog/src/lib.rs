@@ -27,6 +27,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod backup;
+pub mod collections;
 pub mod copies;
 pub mod cull;
 pub mod db;
@@ -44,7 +45,7 @@ pub mod volume;
 /// The schema version this build expects, and the last entry in [`MIGRATIONS`].
 /// A catalog reporting anything higher was written by a newer build and is
 /// refused rather than half-understood.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -120,6 +121,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 5,
         name: "preview-renderer",
         sql: include_str!("../migrations/005-preview-renderer.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "collections",
+        sql: include_str!("../migrations/006-collections.sql"),
     },
 ];
 
