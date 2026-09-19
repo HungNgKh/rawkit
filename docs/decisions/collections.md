@@ -36,6 +36,8 @@ filter.
 | **D5** | Counts on demand, held by the shell | Asked for at open and when a membership changes — not per keypress. |
 | **D6** | Nesting is a parent pointer | `parent_id`. One kind of container. |
 | **D7** | What is on screen is one value | `Sequence { source, filter, rows, shown }`, with one constructor. |
+| **D8** | K has a target, and the catalog remembers it | `is_target`, one row at most, seeded on the quick collection. |
+| **D9** | Everything done to a collection is undone by Z | The catalog answers a removal with what it removed; the shell keeps that and hands it back. |
 
 Deferred, deliberately: **gapped keys and moving a block of frames**, until there
 is a drag to need them.
@@ -125,6 +127,44 @@ admission. True of flag, rating and colour; a filter about a frame's neighbours
 ("top of each stack") would break it. `Sequence::agrees_with` is the full re-read
 kept as a test oracle, and it runs after every action in every shell test.
 
+## D8 — where K goes
+
+K put a frame in the quick collection and nowhere else, so building a portfolio
+meant marking, naming and creating — every time. Now K goes to a **target**,
+which is the quick collection until somebody aims it elsewhere.
+
+| Where the target lives | |
+|---|---|
+| In the shell, per session | Reopen the catalog mid-project and K has quietly gone back to the quick collection. |
+| A settings file | A second place for the truth about a catalog, which travels without it. |
+| **A flag on the row** | Survives a restart, travels with the file, and a unique partial index makes "at most one" the schema's job. |
+
+`set_target` clears and sets inside one transaction, so a bad id leaves the old
+target standing. Deleting the target hands the key back to the quick collection
+in the same transaction as the delete — there is never a moment with nowhere
+for K to go.
+
+## D9 — undo, including for a deleted collection
+
+A delete cascades, so by the time anyone asks for it back the memberships are
+gone. The catalog therefore *answers* a removal with what it removed:
+`remove → Removed` (the whole subtree, each collection's members and their
+positions), `take_out` and `clear → Vec<Placed>`. The shell puts that on the
+same undo stack as a flag or a rating, and `restore` / `put_back` take it back.
+
+- **Restore uses fresh ids.** SQLite reuses rowids, so the old id may belong to
+  something else by now. Parents are remapped as the subtree is rebuilt, and the
+  shell drops any undo record that names a deleted id.
+- **A photograph deleted in between stays deleted.** `put_back` inserts only
+  where the image still exists; an undo does not conjure a row.
+- **A name taken in between is refused**, not silently suffixed.
+- The record lives in memory. Quit, and the delete is final — the same promise
+  every other undo in the shell makes.
+
+The page followed: a chip per collection stopped reading at about eight, so
+collections are a list in the panel — name, count, ★ for the target, rename,
+delete — and the filter line keeps **one** chip, for the view you are in.
+
 ## What it bought
 
 Twenty thousand photographs, a hundred collections, about six memberships each.
@@ -137,6 +177,14 @@ Twenty thousand photographs, a hundred collections, about six memberships each.
 | Set a filter | 19.8 ms | **1.4 ms** | linear; a deliberate act |
 | Move one frame | 70.7 ms | **80 µs** | flat |
 | Delete 200 photographs | 1.1 s | **5.1 ms** | |
+| Undo deleting a 20 000-member collection | 109 ms | **51 ms** | linear; the worst case a library has |
+| Undo emptying one | 101 ms | **43 ms** | linear |
+| Rewrite a 20 000-member order | 88 ms | **60 ms** | not on a keypress |
+
+The last three were one mistake: `Connection::execute` compiles its SQL on every
+call, and a loop over members paid for twenty thousand parses. Every loop sized
+by the caller now prepares once. The gate found it the first time it measured an
+undo — 109 ms is past the budget.
 | Open the catalog | 130 ms | **72 ms** | 27 ms with no collections |
 
 One machine; the shapes matter more than the absolutes. Both gates are in the
@@ -161,8 +209,9 @@ which the key already answers.
 - The collection list is serialised to the page on every key.
 - A second writer — the CLI scanning while the shell is open — leaves the held
   rows stale. `PRAGMA data_version` per key is microseconds.
-- A chip per collection does not scale as interface. The catalog handles a
-  hundred; the row does not.
+- The collections list is flat-with-indent and always fully drawn. Past a few
+  hundred it wants collapsing and a filter box.
+- "New from selection" closes its form even when the name is refused.
 
 ## If you change this
 
@@ -171,5 +220,8 @@ which the key already answers.
 | the tables or their indexes | `a_fresh_catalog_arrives_at_the_current_version`, and both scale gates |
 | what `position` promises | `a_collection_keeps_the_order_it_was_given`, `swapping_two_frames_moves_only_those_two` |
 | the naming or quick-collection rules | `a_name_is_compared_the_way_a_person_reads_it`, `the_quick_collection_cannot_be_put_inside_another` |
+| the target | `the_key_has_exactly_one_place_to_put_a_photograph`, `deleting_the_target_hands_the_key_back_to_the_quick_collection`, `the_key_goes_wherever_it_has_been_aimed` |
+| what a removal answers with, or how it is put back | `a_deleted_collection_comes_back_whole`, `an_undo_does_not_conjure_a_photograph_that_has_gone`, `what_is_taken_out_goes_back_where_it_was`, and the undo rows of the scale gate |
+| anything the shell holds about collections | the oracle compares the held list and target with the catalog after every action |
 | anything that re-reads what is on screen | `judging_inside_a_collection_stays_inside_it`, and the oracle on every action |
 | a filter whose answer depends on other frames | the oracle will fail — that is its job. Re-read in full for that filter. |

@@ -110,6 +110,14 @@
                        text-overflow: ellipsis; white-space: nowrap; }
   .saved button.drop { color: #8e8e98; padding: 4px 8px; flex-shrink: 0; }
   .saved button.drop.sure { color: #e0705f; border-color: #6a3a3a; }
+  /* A collection's row carries two more things than a preset's: which one K is
+     aimed at, and how many photographs it holds. The count is tabular so a
+     column of them reads as a column. */
+  .saved button.aim { color: #6d6d76; padding: 4px 7px; flex-shrink: 0; }
+  .saved button.aim.on { color: #d8bf63; border-color: #6a5f33; }
+  .saved button.pick.on { border-color: #7c8cff; }
+  .saved button.pick .count { color: #8e8e98; font-variant-numeric: tabular-nums;
+                              margin-left: 6px; }
   .empty { color: #7d7d87; margin: 8px 0 0; }
   .empty.hidden, .form.hidden { display: none; }
   input[type=text] { flex: 1; min-width: 0; background: #141418; color: inherit;
@@ -232,10 +240,10 @@
     </span>
     <span class="set" id="filter-stars" title="at least this many stars"></span>
     <span class="set" id="filter-colours"></span>
-    <!-- Collections sit in the filter line because they answer the same
-         question it does — what the arrows walk through — and a cull is done
-         with both at once. The chip that is lit is the view; pressing it again
-         goes back to the whole library. -->
+    <!-- One chip, for the collection being viewed, because it answers the
+         question the rest of this line does — what the arrows walk through.
+         Pressing it goes back to the whole library. Choosing a collection is in
+         the panel below: a chip each stopped being readable at about eight. -->
     <span class="set" id="filter-collections"></span>
   </div>
 </div>
@@ -260,10 +268,12 @@
 
   <details id="s-collections">
     <summary>Collections</summary>
-    <!-- Switching between them is in the filter line, where it is reachable
-         mid-cull. This is only for making one, which needs a name typed and so
-         cannot be a keypress. -->
-    <p class="empty">K puts a frame in the quick collection. Shift-K empties it.</p>
+    <!-- A list rather than chips: a name, a count, and the three things done
+         to a collection, in a shape that still reads with a hundred of them. -->
+    <ul class="saved" id="collection-list"></ul>
+    <p class="empty">K puts the frame in the ★ collection, or takes it back out.
+      Shift-K adds everything marked. Backspace takes the frame out of the
+      collection you are looking at. Z undoes any of them.</p>
     <div class="row"><button id="collection-new">New from selection…</button></div>
     <div class="form hidden" id="collection-form">
       <div class="row">
@@ -2155,9 +2165,9 @@
       (view.marked ? ` · ${view.marked} marked${view.is_marked ? " ✓" : ""}` : "") +
       // A clipboard nobody can see is a key that sometimes does nothing.
       (view.copied ? " · settings copied" : "") +
-      // Which way K will go on this frame. A toggle that does not say which
-      // state it is in is a key you have to press to find out.
-      (view.in_quick ? " · in quick" : "");
+      // Which way K will go on this frame, and where. A toggle that does not
+      // say which state it is in is a key you have to press to find out.
+      (view.in_target ? ` · in ${targetName(view)}` : "");
     drawFilter(view.filter ?? {});
     drawCollections(view);
     setMode(view.mode);
@@ -2220,33 +2230,142 @@
   // Drawn from what the shell says it is showing, the same way round as the
   // filter chips above: the shell can drop a collection view on its own — one
   // that has just been emptied cannot be honoured — and a page drawing its own
-  // intentions would keep a chip lit for a view nobody has.
+  // intentions would keep a row lit for a view nobody has.
   const collectionRow = document.getElementById("filter-collections");
-  // What was last drawn, so an arrow key does not rebuild the row. The view
-  // carries the list after every keypress and almost none of them change it;
-  // tearing down and recreating a button per collection each time is work that
-  // grows with how many collections somebody has made, spent on a row that
-  // reads the same as it did.
+  const collectionList = document.getElementById("collection-list");
+  const shortName = collection => collection.is_quick ? "quick" : collection.name;
+  const targetName = view =>
+    shortName((view.collections ?? []).find(c => c.is_target) ?? { is_quick: true });
+  // What was last drawn, so an arrow key does not rebuild the list. The view
+  // carries it after every keypress and almost none of them change it; tearing
+  // down and recreating a row per collection each time is work that grows with
+  // how many collections somebody has made, spent on a list that reads the same
+  // as it did. It also matters for a rename in progress, which a rebuild would
+  // take the text box out from under.
   let collectionsDrawn = "";
+  // Children after their parent, because the shell hands the list over flat and
+  // a nested collection listed before the one it is in reads as a sibling.
+  const inTreeOrder = shown => {
+    const under = new Map();
+    for (const c of shown) {
+      const key = c.parent_id ?? 0;
+      if (!under.has(key)) under.set(key, []);
+      under.get(key).push(c);
+    }
+    const out = [];
+    const walk = (key, depth) => {
+      for (const c of under.get(key) ?? []) {
+        out.push([c, depth]);
+        walk(c.id, depth + 1);
+      }
+    };
+    walk(0, 0);
+    return out;
+  };
+  const collectionRowFor = (collection, depth, view) => {
+    const li = document.createElement("li");
+    // Indented by how deep it is nested, which is the whole of the tree view.
+    if (depth) li.style.marginLeft = `${14 * depth}px`;
+
+    const aim = document.createElement("button");
+    aim.className = "aim";
+    aim.textContent = collection.is_target ? "★" : "☆";
+    aim.classList.toggle("on", collection.is_target);
+    aim.title = collection.is_target
+      ? "K puts photographs here"
+      : `make K put photographs in ${collection.name}`;
+    aim.addEventListener("click", () => {
+      aim.blur();
+      if (!collection.is_target) act("set_target", collection.id);
+    });
+
+    const pick = document.createElement("button");
+    pick.className = "pick";
+    pick.classList.toggle("on", view.viewing === collection.id);
+    const count = document.createElement("span");
+    count.className = "count";
+    count.textContent = String(collection.count);
+    pick.append(collection.name, count);
+    pick.title = view.viewing === collection.id
+      ? "back to the whole library"
+      : collection.count ? "walk through these" : "nothing in it yet";
+    pick.addEventListener("click", () => {
+      pick.blur();
+      act("show_collection", view.viewing === collection.id ? null : collection.id);
+    });
+
+    li.append(aim, pick);
+    if (collection.is_quick) {
+      // It cannot be deleted or renamed — the shell finds it by what it is, and
+      // K has to have somewhere to go — so starting again is the only other
+      // thing anyone wants from it.
+      const empty = document.createElement("button");
+      empty.className = "drop";
+      empty.textContent = "empty";
+      empty.title = "take everything out of the quick collection";
+      empty.addEventListener("click", () => {
+        empty.blur();
+        act("empty_collection", collection.id);
+      });
+      li.append(empty);
+      return li;
+    }
+
+    const rename = document.createElement("button");
+    rename.className = "drop";
+    rename.textContent = "✎";
+    rename.title = `rename ${collection.name}`;
+    rename.addEventListener("click", () => {
+      const box = document.createElement("input");
+      box.type = "text";
+      box.maxLength = 60;
+      box.value = collection.name;
+      box.id = `collection-rename-${collection.id}`;
+      let settled = false;
+      const settle = async keep => {
+        if (settled) return;
+        settled = true;
+        const name = box.value.trim();
+        // Forgotten, so whichever way this ends the row is drawn again from
+        // what the shell says — a refused name must not stay on the page.
+        collectionsDrawn = "";
+        if (keep && name && name !== collection.name)
+          await act("rename_collection", { id: collection.id, name });
+        else invoke("cull_view").then(show).catch(() => {});
+      };
+      box.addEventListener("keydown", e => { if (e.key === "Enter") settle(true); });
+      // Escape blurs a focused control before it reaches here, so leaving the
+      // box by any road other than Enter is the cancel.
+      box.addEventListener("blur", () => settle(false));
+      pick.replaceWith(box);
+      box.focus();
+      box.select();
+    });
+
+    const drop = document.createElement("button");
+    drop.className = "drop";
+    drop.textContent = "×";
+    drop.title = `delete ${collection.name} — the photographs stay, and Z brings it back`;
+    armDrop(drop, () => act("delete_collection", collection.id));
+    li.append(rename, drop);
+    return li;
+  };
   const drawCollections = view => {
     const shown = view.collections ?? [];
-    const signature = `${view.viewing}|` + shown.map(c => `${c.id}:${c.name}:${c.count}`).join(",");
+    const signature = `${view.viewing}|` +
+      shown.map(c => `${c.id}:${c.parent_id}:${c.name}:${c.count}:${c.is_target}`).join(",");
     if (signature === collectionsDrawn) return;
     collectionsDrawn = signature;
+    collectionList.replaceChildren(
+      ...inTreeOrder(shown).map(([c, depth]) => collectionRowFor(c, depth, view)));
     collectionRow.replaceChildren();
-    for (const collection of shown) {
-      // An empty collection nobody is in is noise in a row that is read at a
-      // glance. The quick one always shows, because K is about to fill it.
-      if (!collection.count && !collection.is_quick) continue;
+    const viewing = shown.find(c => c.id === view.viewing);
+    if (viewing) {
       const button = document.createElement("button");
-      button.dataset.collection = String(collection.id);
-      button.textContent = collection.is_quick
-        ? `quick ${collection.count}`
-        : `${collection.name} ${collection.count}`;
-      button.title = collection.is_quick
-        ? "the quick collection — K adds and removes"
-        : `${collection.count} photograph${collection.count === 1 ? "" : "s"}`;
-      button.classList.toggle("on", view.viewing === collection.id);
+      button.dataset.collection = String(viewing.id);
+      button.textContent = `${shortName(viewing)} ${viewing.count} ×`;
+      button.title = "back to the whole library";
+      button.classList.add("on");
       collectionRow.append(button);
     }
   };
@@ -2268,10 +2387,8 @@
       const name = button.dataset.colour;
       narrow({ colour: filter.colour === name ? null : name });
     } else if (button.dataset.collection) {
-      // Pressing the lit one goes back to the whole library, which is the same
-      // gesture the star chips use for "any rating" — one chip, both ways.
-      const id = Number(button.dataset.collection);
-      act("show_collection", button.classList.contains("on") ? null : id);
+      // The only chip there is, and it is the view — so pressing it leaves.
+      act("show_collection", null);
     }
   });
 
@@ -2441,10 +2558,13 @@
         else addMask("brush");
         break;
       // M sets a frame aside, C compares what you set aside.
-      // K for the quick collection: Lightroom uses B, which is the brush here.
-      // Shift-K empties it — the quick collection cannot be deleted, so
-      // starting again is the only other thing anyone wants from it.
-      case "k": act(event.shiftKey ? "clear_quick" : "quick_toggle"); break;
+      // K for the target collection: Lightroom uses B, which is the brush here.
+      // Shift-K sends everything marked the same way, which is what M is for —
+      // choose a set, then do one thing to all of it.
+      case "k": act(event.shiftKey ? "add_marked" : "target_toggle"); break;
+      // Out of the collection being looked at, never out of the library: the
+      // shell refuses this outside a collection, and says why.
+      case "backspace": case "delete": act("take_out"); event.preventDefault(); break;
       case "m": act("mark"); break;
       case "c": act("survey"); break;
       // Shift moves the photograph rather than the cursor, and only inside a

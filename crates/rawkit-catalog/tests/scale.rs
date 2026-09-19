@@ -232,6 +232,10 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
         "drop 1",
         "drop 200"
     );
+    println!(
+        "{:>8} {:>9} {:>9} {:>9} {:>9}",
+        "", "del whole", "undo", "empty", "undo"
+    );
 
     let mut worst = Duration::ZERO;
     let mut worst_what = String::new();
@@ -351,6 +355,37 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
         let (rewritten, _) =
             timed(|| collections::reorder(&catalog, whole, &wholesale).expect("reorder"));
 
+        // **Deleting the largest collection there is, and changing your mind.**
+        // `remove` reads every membership out before the cascade takes them,
+        // because that is what Z puts back; `restore` writes them all again.
+        // Both are linear in the collection and neither is a keypress — delete
+        // sits behind a confirmation — but Z *is* a keypress, and a user who
+        // pressed it is waiting on the second of these. So both are measured
+        // against the budget rather than excused from it, on the worst case a
+        // library has: a collection holding every photograph in it.
+        let (removed_whole, gone) =
+            timed(|| collections::remove(&catalog, whole).expect("remove the whole"));
+        assert_eq!(gone.photographs(), n, "the record of what was deleted");
+        let (restored_whole, whole) =
+            timed(|| collections::restore(&catalog, &gone).expect("restore the whole"));
+        let order_back: Vec<i64> = collections::members(&catalog, whole, &Filter::default())
+            .expect("members")
+            .iter()
+            .map(|image| image.id)
+            .collect();
+        assert_eq!(
+            order_back, wholesale,
+            "a restored collection is in the order it was deleted in"
+        );
+
+        // The same pair for emptying one: what "empty" on the quick collection
+        // costs when somebody has used it as a second library.
+        let (emptied_whole, placed) =
+            timed(|| collections::clear(&catalog, whole).expect("clear the whole"));
+        let (refilled_whole, back) =
+            timed(|| collections::put_back(&catalog, whole, &placed).expect("put back"));
+        assert_eq!(back, n, "every photograph taken out went back");
+
         // **What the missing index costs.** There is no index on `image_id`
         // alone, so the cascade when an image is deleted scans every membership
         // there is. That is a virtual copy being thrown away, not a keypress,
@@ -394,6 +429,10 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
             "{:>8} {:>8.1?} {:>8.1?} {:>8.1?} {:>9.1?} {:>9.1?} {:>9.1?} {:>9.1?} {:>9.1?} {:>9.1?}",
             "", coll_all, members, per_holds, members_whole, moved, moved_again, rewritten, dropped, dropped_many
         );
+        println!(
+            "{:>8} {:>9.1?} {:>9.1?} {:>9.1?} {:>9.1?}",
+            "", removed_whole, restored_whole, emptied_whole, refilled_whole
+        );
         assert!(
             !wanted.is_empty() && wanted.len() < n,
             "the fixture should leave some previews outstanding and not all: {} of {n}",
@@ -416,6 +455,10 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
             ("whole-library collection", members_whole),
             ("moving one photograph", moved),
             ("moving another", moved_again),
+            ("deleting the whole-library collection", removed_whole),
+            ("undoing that", restored_whole),
+            ("emptying the whole-library collection", emptied_whole),
+            ("undoing that", refilled_whole),
             ("deleting one image", dropped),
             ("deleting two hundred images", dropped_many),
             // `outstanding` is excluded from the interaction budget and

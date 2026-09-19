@@ -25,7 +25,7 @@
 
 use crate::sequence::{Dropped, Sequence, Source};
 use anyhow::{anyhow, Context, Result};
-use rawkit_catalog::collections::{self, Collection};
+use rawkit_catalog::collections::{self, Collection, Placed, Removed};
 use rawkit_catalog::cull::{self, Filter, Flag, Judgement, LibraryImage};
 use rawkit_catalog::db::Catalog;
 use rawkit_catalog::previews;
@@ -268,6 +268,24 @@ enum Undone {
     Pasted {
         frames: Vec<(i64, Option<EditState>)>,
     },
+    /// Photographs taken out of a collection, and the place each held — one
+    /// frame, the marked ones, or all of them when a collection is emptied.
+    ///
+    /// Every way of taking something out of a collection lands here, K included.
+    /// A hand-made order cannot be recomputed, and "some of the ways to lose it
+    /// can be undone" is a worse thing to live with than "all of them can".
+    TakenOut {
+        collection: i64,
+        placed: Vec<Placed>,
+    },
+    /// Photographs put into a collection. Only the ones that were not already
+    /// there, so taking this back never removes a frame somebody added earlier.
+    Added {
+        collection: i64,
+        images: Vec<i64>,
+    },
+    /// A collection that was deleted, with everything nested in it.
+    Deleted(Removed),
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -312,13 +330,30 @@ pub enum CullAction {
     /// Walk a collection instead of the whole library; `None` goes back to all
     /// of it. The filter still applies *within* it — see `Library::read`.
     ShowCollection(Option<i64>),
-    /// Put this frame in the quick collection, or take it out. The same key
+    /// Put this frame in the target collection, or take it out. The same key
     /// either way, like [`CullAction::Mark`]: a toggle is what a one-key gesture
     /// on a single frame can honestly be.
-    QuickToggle,
-    /// Empty the quick collection. It cannot be deleted — a key has to have
-    /// somewhere to put a photograph — so this is what "start again" is.
-    ClearQuick,
+    ///
+    /// The target is the quick collection until somebody aims it elsewhere, and
+    /// that is the whole of "add this frame to Portfolio" — no second key and no
+    /// menu, the one gesture pointed somewhere else.
+    TargetToggle,
+    /// Put every marked frame in the target, or this one if none are.
+    AddMarked,
+    /// Take this frame out of the collection being viewed. Refused outside one:
+    /// the library is not something a photograph is taken out of with a key.
+    TakeOut,
+    /// Aim the add-to-collection key at a collection. Remembered by the catalog.
+    SetTarget(i64),
+    /// Take every photograph out of a collection and leave it standing — what
+    /// "start again" is for the quick collection, which cannot be deleted.
+    EmptyCollection(i64),
+    RenameCollection {
+        id: i64,
+        name: String,
+    },
+    /// Delete a collection and everything nested in it. Z brings it back whole.
+    DeleteCollection(i64),
     /// Make a collection holding the frames set aside to compare, or this one if
     /// none are. Named, because a collection nobody named is one nobody can find
     /// again.
@@ -392,9 +427,9 @@ pub struct CullView {
     pub collections: Vec<Collection>,
     /// Which one is being walked through, and `None` for the whole library.
     pub viewing: Option<i64>,
-    /// Whether this frame is in the quick collection, so the key that toggles it
-    /// can say which way it will go.
-    pub in_quick: bool,
+    /// Whether this frame is in the target collection, so the key that toggles
+    /// it can say which way it will go.
+    pub in_target: bool,
     /// How many photographs there are altogether, against `total`'s "how many
     /// the filter admits". Both, because "12 of 47" is the only honest way to
     /// show a narrowed library — a bare count reads as a library that lost
@@ -441,9 +476,10 @@ pub struct Library {
     /// an answer that had not changed since the last one. Collections only
     /// change through [`Library::act`], so that is where this is refreshed.
     collections: Vec<Collection>,
-    /// The quick collection's id. It is created with the schema and never
-    /// changes, so it is read once.
-    quick: i64,
+    /// Where K puts a photograph. Held because `view` asks "is this frame in
+    /// it" after every keypress; changed only by [`CullAction::SetTarget`], by a
+    /// delete that takes the target with it, and by the undo of one.
+    target: i64,
     /// What each judgement replaced, most recent last.
     ///
     /// Bounded because it is a convenience, not a history: the versioned record
@@ -496,7 +532,7 @@ impl Library {
             sequence.len()
         );
         let listed = collections::all(&catalog)?;
-        let quick = collections::quick(&catalog)?;
+        let target = collections::target(&catalog)?;
         let tally = cull::tally(&catalog)?;
         Ok(Self {
             catalog,
@@ -506,7 +542,7 @@ impl Library {
             oracle: true,
             tally,
             collections: listed,
-            quick,
+            target,
             undo: Vec::new(),
             copied: None,
             paste_requested: false,
@@ -687,6 +723,10 @@ impl Library {
         self.undo.retain(|undone| match undone {
             Undone::Judged { image: id, .. } => *id != image.id,
             Undone::Pasted { frames } => !frames.iter().any(|(id, _)| *id == image.id),
+            // These are safe to keep. Putting a deleted photograph back is
+            // skipped by the catalog, and taking one out that is not there is
+            // nothing — neither can act on a row that is gone.
+            Undone::TakenOut { .. } | Undone::Added { .. } | Undone::Deleted(_) => true,
         });
         self.resequence(None)?;
         // Deleting an image takes it out of every collection it was in, and the
@@ -715,6 +755,76 @@ impl Library {
                 None => continue,
             };
             *count = (*count as i64 + step).max(0) as usize;
+        }
+        Ok(())
+    }
+
+    /// The photographs an action is about: what is marked, or what is under the
+    /// cursor when nothing is. The same rule paste follows, so every key agrees
+    /// about what "these photographs" means.
+    fn chosen(&self) -> Vec<i64> {
+        if self.marked.is_empty() {
+            vec![self.current().id]
+        } else {
+            self.marked.clone()
+        }
+    }
+
+    /// Keep something that can be taken back, and forget the oldest.
+    fn remember(&mut self, undone: Undone) {
+        self.undo.push(undone);
+        if self.undo.len() > UNDO_DEPTH {
+            self.undo.remove(0);
+        }
+    }
+
+    /// Put photographs in a collection, remembering only the ones that were not
+    /// already there — so taking this back never removes a frame somebody had
+    /// added before.
+    fn add_to(&mut self, collection: i64, images: &[i64]) -> Result<()> {
+        let mut fresh = Vec::new();
+        for image in images {
+            if !collections::holds(&self.catalog, collection, *image)? {
+                fresh.push(*image);
+            }
+        }
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        collections::add(&self.catalog, collection, &fresh)?;
+        self.remember(Undone::Added {
+            collection,
+            images: fresh,
+        });
+        let standing = self.current().id;
+        self.after_membership_changed(collection, Some(standing))
+    }
+
+    /// Take photographs out of a collection, remembering where each was.
+    fn take_out_of(&mut self, collection: i64, images: &[i64]) -> Result<()> {
+        let placed = collections::take_out(&self.catalog, collection, images)?;
+        if placed.is_empty() {
+            return Ok(());
+        }
+        self.remember(Undone::TakenOut { collection, placed });
+        self.after_membership_changed(collection, None)
+    }
+
+    /// What every change to a collection's members has to be followed by: the
+    /// held counts, and the view if it is *of* that collection. One place, so a
+    /// new way of changing membership cannot forget half of it.
+    ///
+    /// `stand_on` is the photograph the cursor should end up on, **and it must
+    /// be one the change left in the collection.** `resequence` reads "the frame
+    /// I asked for is not showing" as a reason to widen the view, which is right
+    /// for a copy a filter would hide and exactly wrong here: handed the frame
+    /// that had just been taken out, it widened all the way back to the library,
+    /// and taking one photograph out of a collection threw you out of it. `None`
+    /// keeps the slot, which after a removal holds whatever came next.
+    fn after_membership_changed(&mut self, collection: i64, stand_on: Option<i64>) -> Result<()> {
+        self.refresh_collections()?;
+        if self.sequence.source() == Source::Collection(collection) {
+            self.resequence(stand_on)?;
         }
         Ok(())
     }
@@ -951,48 +1061,77 @@ impl Library {
             CullAction::Crop | CullAction::CropApply | CullAction::CropCancel => {}
             CullAction::SetFilter(filter) => self.narrow(filter)?,
             CullAction::ShowCollection(id) => self.show_collection(id)?,
-            CullAction::QuickToggle => {
-                let quick = self.quick;
-                let id = self.current().id;
-                // The held count moves by what the catalog says it did, rather
-                // than by asking for the whole list again: K is the key this
-                // feature is pressed with, and a recount is every membership in
-                // the catalog to learn that one number went up by one.
-                let change = if collections::holds(&self.catalog, quick, id)? {
-                    -(collections::take_out(&self.catalog, quick, &[id])? as i64)
+            CullAction::TargetToggle => {
+                let (target, id) = (self.target, self.current().id);
+                if collections::holds(&self.catalog, target, id)? {
+                    self.take_out_of(target, &[id])?;
                 } else {
-                    collections::add(&self.catalog, quick, &[id])? as i64
-                };
-                if let Some(held) = self.collections.iter_mut().find(|c| c.id == quick) {
-                    held.count = (held.count as i64 + change).max(0) as usize;
-                }
-                // Only the view being *of* the quick collection can have
-                // changed shape; anywhere else this is a fact about the frame
-                // and the sequence is untouched.
-                if self.sequence.source() == Source::Collection(quick) {
-                    self.resequence(Some(id))?;
+                    self.add_to(target, &[id])?;
                 }
             }
-            CullAction::ClearQuick => {
-                let quick = self.quick;
-                collections::clear(&self.catalog, quick)?;
-                if self.sequence.source() == Source::Collection(quick) {
-                    let standing = self.current().id;
-                    self.resequence(Some(standing))?;
+            CullAction::AddMarked => {
+                let chosen = self.chosen();
+                self.add_to(self.target, &chosen)?;
+            }
+            CullAction::TakeOut => {
+                let Source::Collection(viewing) = self.sequence.source() else {
+                    return Err(anyhow!(
+                        "taking a photograph out is something done to a collection; \
+                         this is the whole library"
+                    ));
+                };
+                let id = self.current().id;
+                self.take_out_of(viewing, &[id])?;
+            }
+            CullAction::SetTarget(id) => {
+                collections::set_target(&self.catalog, id)?;
+                self.target = id;
+                for held in &mut self.collections {
+                    held.is_target = held.id == id;
                 }
-                if let Some(held) = self.collections.iter_mut().find(|c| c.id == quick) {
-                    held.count = 0;
+            }
+            CullAction::EmptyCollection(id) => {
+                let placed = collections::clear(&self.catalog, id)?;
+                if !placed.is_empty() {
+                    self.remember(Undone::TakenOut {
+                        collection: id,
+                        placed,
+                    });
+                }
+                self.after_membership_changed(id, None)?;
+            }
+            CullAction::RenameCollection { id, name } => {
+                collections::rename(&self.catalog, id, &name)?;
+                self.refresh_collections()?;
+            }
+            CullAction::DeleteCollection(id) => {
+                let removed = collections::remove(&self.catalog, id)?;
+                // The ids it had mean nothing now, and SQLite will give them to
+                // the next collections made. An undo record still naming one
+                // would put its photographs into a stranger.
+                let gone: Vec<i64> = removed.ids().collect();
+                self.undo.retain(|undone| match undone {
+                    Undone::TakenOut { collection, .. } | Undone::Added { collection, .. } => {
+                        !gone.contains(collection)
+                    }
+                    _ => true,
+                });
+                self.remember(Undone::Deleted(removed));
+                // A delete can take the target with it, directly or nested.
+                self.target = collections::target(&self.catalog)?;
+                self.refresh_collections()?;
+                if let Source::Collection(viewing) = self.sequence.source() {
+                    if gone.contains(&viewing) {
+                        let standing = self.current().id;
+                        self.resequence(Some(standing))?;
+                    }
                 }
             }
             CullAction::NewCollection(name) => {
                 // What is marked, or what is under the cursor — the same rule
                 // paste follows, so the two keys agree about what "these
                 // photographs" means.
-                let chosen: Vec<i64> = if self.marked.is_empty() {
-                    vec![self.current().id]
-                } else {
-                    self.marked.clone()
-                };
+                let chosen = self.chosen();
                 // With its photographs or not at all: as a create followed by
                 // an add, a failure between them left an empty collection
                 // carrying a name nobody chose to make empty.
@@ -1186,6 +1325,25 @@ impl Library {
                         self.index = self.index.min(self.sequence.len() - 1);
                     }
                 }
+                Some(Undone::TakenOut { collection, placed }) => {
+                    collections::put_back(&self.catalog, collection, &placed)?;
+                    // Standing on a frame that came back, when the view is of
+                    // that collection, so the reversal is seen rather than
+                    // trusted. It is in the collection again, so asking for it
+                    // cannot widen the view.
+                    let back = placed.first().map(|p| p.image);
+                    self.after_membership_changed(collection, back)?;
+                }
+                Some(Undone::Added { collection, images }) => {
+                    collections::take_out(&self.catalog, collection, &images)?;
+                    self.after_membership_changed(collection, None)?;
+                }
+                Some(Undone::Deleted(removed)) => {
+                    collections::restore(&self.catalog, &removed)?;
+                    // It may have been the target, and comes back as one.
+                    self.target = collections::target(&self.catalog)?;
+                    self.refresh_collections()?;
+                }
                 None => {}
             },
         }
@@ -1194,6 +1352,15 @@ impl Library {
         #[cfg(test)]
         if self.oracle {
             self.sequence.agrees_with(&self.catalog)?;
+            let listed = collections::all(&self.catalog)?;
+            anyhow::ensure!(
+                listed == self.collections,
+                "the held collection list has drifted from the catalog's"
+            );
+            anyhow::ensure!(
+                self.target == collections::target(&self.catalog)?,
+                "the held target has drifted from the catalog's"
+            );
             let counted = cull::tally(&self.catalog)?;
             anyhow::ensure!(
                 counted == self.tally,
@@ -1332,7 +1499,7 @@ impl Library {
             // An indexed point lookup, 4 µs and flat at twenty thousand — the
             // one collection question that really is about this frame, and so
             // the one still asked per keypress.
-            in_quick: collections::holds(&self.catalog, self.quick, image.id)?,
+            in_target: collections::holds(&self.catalog, self.target, image.id)?,
             in_library,
         })
     }
@@ -1714,13 +1881,36 @@ pub(crate) mod tests {
             CullAction::ShowCollection(Some(7))
         ));
         assert!(matches!(
-            parse(r#"{"action":"quick_toggle"}"#),
-            CullAction::QuickToggle
+            parse(r#"{"action":"target_toggle"}"#),
+            CullAction::TargetToggle
         ));
         assert!(matches!(
-            parse(r#"{"action":"clear_quick"}"#),
-            CullAction::ClearQuick
+            parse(r#"{"action":"add_marked"}"#),
+            CullAction::AddMarked
         ));
+        assert!(matches!(
+            parse(r#"{"action":"take_out"}"#),
+            CullAction::TakeOut
+        ));
+        assert!(matches!(
+            parse(r#"{"action":"set_target","value":4}"#),
+            CullAction::SetTarget(4)
+        ));
+        assert!(matches!(
+            parse(r#"{"action":"empty_collection","value":1}"#),
+            CullAction::EmptyCollection(1)
+        ));
+        assert!(matches!(
+            parse(r#"{"action":"delete_collection","value":4}"#),
+            CullAction::DeleteCollection(4)
+        ));
+        // The one action here whose value is an object rather than a scalar.
+        let CullAction::RenameCollection { id, name } =
+            parse(r#"{"action":"rename_collection","value":{"id":4,"name":"Prints"}}"#)
+        else {
+            panic!("not a rename");
+        };
+        assert_eq!((id, name.as_str()), (4, "Prints"));
         assert!(matches!(
             parse(r#"{"action":"move_in_collection","value":-1}"#),
             CullAction::MoveInCollection(-1)
@@ -1744,8 +1934,19 @@ pub(crate) mod tests {
             .iter()
             .map(|image| image.id)
             .collect();
-        let shelf = collections::create(library.catalog(), "Edit", None).unwrap();
-        collections::add(library.catalog(), shelf, &[ids[2], ids[0]]).unwrap();
+        // Made through the library, in the order the frames were marked. This
+        // first wrote to the catalog directly, and the oracle that checks the
+        // held list objects to that — rightly: a test that goes round the
+        // library is a second writer, and the library does not have one.
+        for at in [2, 0] {
+            library.select(at);
+            library.act(CullAction::Mark).unwrap();
+        }
+        library
+            .act(CullAction::NewCollection("Edit".into()))
+            .unwrap();
+        library.act(CullAction::ClearMarks).unwrap();
+        let shelf = named(&library, "Edit").id;
 
         library
             .act(CullAction::ShowCollection(Some(shelf)))
@@ -1783,8 +1984,19 @@ pub(crate) mod tests {
             .iter()
             .map(|image| image.id)
             .collect();
-        let shelf = collections::create(library.catalog(), "Edit", None).unwrap();
-        collections::add(library.catalog(), shelf, &[ids[1], ids[3]]).unwrap();
+        // Made through the library, in the order the frames were marked. This
+        // first wrote to the catalog directly, and the oracle that checks the
+        // held list objects to that — rightly: a test that goes round the
+        // library is a second writer, and the library does not have one.
+        for at in [1, 3] {
+            library.select(at);
+            library.act(CullAction::Mark).unwrap();
+        }
+        library
+            .act(CullAction::NewCollection("Edit".into()))
+            .unwrap();
+        library.act(CullAction::ClearMarks).unwrap();
+        let shelf = named(&library, "Edit").id;
 
         library
             .act(CullAction::ShowCollection(Some(shelf)))
@@ -1818,9 +2030,9 @@ pub(crate) mod tests {
     fn the_quick_key_puts_a_frame_in_and_takes_it_out() {
         let dir = Scratch::new("collection-quick");
         let mut library = library_at(&dir.0, 2);
-        assert!(!library.view().unwrap().in_quick);
-        library.act(CullAction::QuickToggle).unwrap();
-        assert!(library.view().unwrap().in_quick, "K did not add it");
+        assert!(!library.view().unwrap().in_target);
+        library.act(CullAction::TargetToggle).unwrap();
+        assert!(library.view().unwrap().in_target, "K did not add it");
         // The list the page draws is *held* rather than asked for on every key,
         // so it has to be refreshed by whatever changes it. A count that stayed
         // at zero here would be a chip reading "quick 0" with a photograph in
@@ -1834,8 +2046,8 @@ pub(crate) mod tests {
             1,
             "the held list did not follow the key"
         );
-        library.act(CullAction::QuickToggle).unwrap();
-        assert!(!library.view().unwrap().in_quick, "K did not take it out");
+        library.act(CullAction::TargetToggle).unwrap();
+        assert!(!library.view().unwrap().in_target, "K did not take it out");
         assert_eq!(quick_count(&library), 0);
         // And a new collection shows up in it without being asked for again.
         library
@@ -1909,7 +2121,7 @@ pub(crate) mod tests {
             library.current().copy_name.is_some(),
             "standing on the copy"
         );
-        library.act(CullAction::QuickToggle).unwrap();
+        library.act(CullAction::TargetToggle).unwrap();
         assert_eq!(quick_count(&library), 1);
 
         library.remove_copy().unwrap();
@@ -1918,6 +2130,186 @@ pub(crate) mod tests {
             0,
             "the copy is gone from the catalog and still counted on the chip"
         );
+    }
+
+    /// The photographs in a collection, as the catalog has them.
+    fn members_of(library: &Library, id: i64) -> Vec<i64> {
+        collections::members(library.catalog(), id, &Filter::default())
+            .unwrap()
+            .iter()
+            .map(|image| image.id)
+            .collect()
+    }
+
+    fn named(library: &Library, name: &str) -> Collection {
+        let view = library.view().unwrap();
+        let found = view.collections.iter().find(|c| c.name == name);
+        found
+            .unwrap_or_else(|| panic!("no collection called {name}"))
+            .clone()
+    }
+
+    #[test]
+    fn the_key_goes_wherever_it_has_been_aimed() {
+        // "Add this frame to Portfolio" is not a second key or a menu. It is K,
+        // pointed somewhere else — and the catalog remembers where, because an
+        // edit takes days and a target that reset every launch would put a
+        // sitting's worth of frames in the wrong place.
+        let dir = Scratch::new("collection-target");
+        let mut library = library_at(&dir.0, 3);
+        library
+            .act(CullAction::NewCollection("Portfolio".into()))
+            .unwrap();
+        let portfolio = named(&library, "Portfolio");
+        assert!(
+            !portfolio.is_target,
+            "the quick collection is, to begin with"
+        );
+
+        library.act(CullAction::SetTarget(portfolio.id)).unwrap();
+        assert!(named(&library, "Portfolio").is_target);
+        library.select(1);
+        library.act(CullAction::TargetToggle).unwrap();
+        assert!(library.view().unwrap().in_target);
+        assert_eq!(members_of(&library, portfolio.id).len(), 2);
+        assert_eq!(named(&library, "Quick Collection").count, 0, "not there");
+
+        // Remembered by the catalog, not by the session.
+        drop(library);
+        let reopened = Library::open(&dir.0.join("library.rawkit")).unwrap();
+        assert!(named(&reopened, "Portfolio").is_target);
+    }
+
+    #[test]
+    fn marked_frames_go_in_together_and_come_out_together() {
+        let dir = Scratch::new("collection-marked");
+        let mut library = library_at(&dir.0, 4);
+        let quick = named(&library, "Quick Collection").id;
+        // One of the three is already in, and has to survive the undo: taking
+        // back "add these" must not remove a frame somebody added before.
+        library.select(1);
+        library.act(CullAction::TargetToggle).unwrap();
+        let already = library.current().id;
+        for at in [0, 1, 2] {
+            library.select(at);
+            library.act(CullAction::Mark).unwrap();
+        }
+        library.act(CullAction::AddMarked).unwrap();
+        assert_eq!(members_of(&library, quick).len(), 3);
+
+        library.act(CullAction::Undo).unwrap();
+        assert_eq!(members_of(&library, quick), [already]);
+    }
+
+    #[test]
+    fn a_frame_taken_out_of_a_collection_comes_back_where_it_was() {
+        let dir = Scratch::new("collection-takeout");
+        let mut library = library_at(&dir.0, 3);
+        for at in [0, 1, 2] {
+            library.select(at);
+            library.act(CullAction::Mark).unwrap();
+        }
+        library
+            .act(CullAction::NewCollection("Edit".into()))
+            .unwrap();
+        let edit = named(&library, "Edit").id;
+        let before = members_of(&library, edit);
+
+        library.act(CullAction::ShowCollection(Some(edit))).unwrap();
+        library.select(1);
+        let middle = library.current().id;
+        library.act(CullAction::TakeOut).unwrap();
+        assert_eq!(library.count(), 2, "and the view followed");
+        assert!(!members_of(&library, edit).contains(&middle));
+
+        // The middle again, not the end. The order is the thing being kept.
+        library.act(CullAction::Undo).unwrap();
+        assert_eq!(members_of(&library, edit), before);
+        assert_eq!(library.current().id, middle, "standing on what came back");
+
+        // And outside a collection the key is refused rather than ignored.
+        library.act(CullAction::ShowCollection(None)).unwrap();
+        assert!(library.act(CullAction::TakeOut).is_err());
+    }
+
+    #[test]
+    fn a_deleted_collection_is_one_keypress_from_coming_back() {
+        // Nothing here asks "are you sure". Everything can be taken back,
+        // which is the only kind of safety a keyboard-first cull can have.
+        let dir = Scratch::new("collection-delete");
+        let mut library = library_at(&dir.0, 3);
+        for at in [2, 0] {
+            library.select(at);
+            library.act(CullAction::Mark).unwrap();
+        }
+        library
+            .act(CullAction::NewCollection("Edit".into()))
+            .unwrap();
+        let edit = named(&library, "Edit").id;
+        let before = members_of(&library, edit);
+        library.act(CullAction::SetTarget(edit)).unwrap();
+        library.act(CullAction::ShowCollection(Some(edit))).unwrap();
+
+        library.act(CullAction::DeleteCollection(edit)).unwrap();
+        let view = library.view().unwrap();
+        assert!(!view.collections.iter().any(|c| c.name == "Edit"));
+        assert_eq!(
+            view.viewing, None,
+            "a view of nothing falls back to the library"
+        );
+        assert!(
+            named(&library, "Quick Collection").is_target,
+            "and K still has somewhere to put a photograph"
+        );
+
+        library.act(CullAction::Undo).unwrap();
+        let back = named(&library, "Edit");
+        assert_eq!(members_of(&library, back.id), before);
+        assert!(back.is_target, "aimed at again, as it was");
+
+        // The quick collection cannot be deleted, only emptied — and that can
+        // be taken back too.
+        let quick = named(&library, "Quick Collection").id;
+        assert!(library.act(CullAction::DeleteCollection(quick)).is_err());
+    }
+
+    #[test]
+    fn emptying_and_renaming() {
+        let dir = Scratch::new("collection-empty");
+        let mut library = library_at(&dir.0, 3);
+        let quick = named(&library, "Quick Collection").id;
+        for at in [0, 2] {
+            library.select(at);
+            library.act(CullAction::TargetToggle).unwrap();
+        }
+        let before = members_of(&library, quick);
+        library.act(CullAction::EmptyCollection(quick)).unwrap();
+        assert_eq!(named(&library, "Quick Collection").count, 0);
+        library.act(CullAction::Undo).unwrap();
+        assert_eq!(members_of(&library, quick), before);
+
+        library
+            .act(CullAction::NewCollection("Portfolio".into()))
+            .unwrap();
+        let id = named(&library, "Portfolio").id;
+        library
+            .act(CullAction::RenameCollection {
+                id,
+                name: "Prints".into(),
+            })
+            .unwrap();
+        assert_eq!(named(&library, "Prints").id, id);
+        // The naming rule reaches a rename: no second "prints".
+        library
+            .act(CullAction::NewCollection("Other".into()))
+            .unwrap();
+        let other = named(&library, "Other").id;
+        assert!(library
+            .act(CullAction::RenameCollection {
+                id: other,
+                name: "PRINTS".into(),
+            })
+            .is_err());
     }
 
     #[test]

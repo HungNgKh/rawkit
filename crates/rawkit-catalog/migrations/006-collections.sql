@@ -32,6 +32,15 @@ CREATE TABLE collections (
     -- collection has. A column rather than a reserved name, because a name is
     -- something a person can type, rename, or collide with by accident.
     is_quick   INTEGER NOT NULL DEFAULT 0 CHECK (is_quick IN (0, 1)),
+    -- Where the add-to-collection key puts a photograph. The quick collection
+    -- to begin with, and any collection somebody points it at afterwards — which
+    -- is the whole of "add this frame to Portfolio": no second key, no menu,
+    -- the one gesture aimed somewhere else.
+    --
+    -- In the catalog rather than in the session, because an edit takes days and
+    -- a target that went back to the default every launch would put a sitting's
+    -- worth of frames in the wrong place the first time somebody forgot.
+    is_target  INTEGER NOT NULL DEFAULT 0 CHECK (is_target IN (0, 1)),
     created_at INTEGER NOT NULL,
     -- The quick collection lives at the top level and cannot be moved under
     -- anything. `collections::remove` refuses to delete it, but it guards the id
@@ -59,6 +68,11 @@ CREATE UNIQUE INDEX collections_root_name
 -- one arriving through an import or a future migration should fail loudly
 -- instead of leaving the keypress with two places to put a photograph.
 CREATE UNIQUE INDEX collections_one_quick ON collections (is_quick) WHERE is_quick = 1;
+-- And at most one target, for the same reason. "At least one" is the code's to
+-- keep — an index cannot require a row to exist — and `collections::remove`
+-- keeps it by handing the target back to the quick collection, which cannot be
+-- deleted, whenever a delete takes the target with it.
+CREATE UNIQUE INDEX collections_one_target ON collections (is_target) WHERE is_target = 1;
 
 -- Membership, and the order it was put in.
 --
@@ -129,5 +143,5 @@ CREATE INDEX collection_images_order ON collection_images (collection_id, positi
 -- collection" needs no code to be true. Making it lazily would mean a name that
 -- might already be taken by a collection the user made, and a first press of the
 -- key that can fail for a reason nobody would connect to it.
-INSERT INTO collections (parent_id, name, name_key, is_quick, created_at)
-VALUES (NULL, 'Quick Collection', 'quick collection', 1, CAST(strftime('%s', 'now') AS INTEGER));
+INSERT INTO collections (parent_id, name, name_key, is_quick, is_target, created_at)
+VALUES (NULL, 'Quick Collection', 'quick collection', 1, 1, CAST(strftime('%s', 'now') AS INTEGER));

@@ -57,6 +57,10 @@ pub struct Collection {
     /// The one a keypress adds to. Exactly one row has this, and the catalog
     /// enforces it rather than the code that creates them.
     pub is_quick: bool,
+    /// Where the add-to-collection key puts a photograph. Exactly one row has
+    /// this too; it starts on the quick collection and moves when somebody
+    /// points it elsewhere.
+    pub is_target: bool,
     /// Members, counted here because a list of collections is always drawn with
     /// them and asking per row is the N+1 this avoids.
     pub count: usize,
@@ -96,7 +100,7 @@ pub fn all(catalog: &Catalog) -> Result<Vec<Collection>, CatalogError> {
               CROSS JOIN collection_images m ON m.image_id = i.id
               WHERE f.missing = 1
               GROUP BY m.collection_id)
-         SELECT c.id, c.parent_id, c.name, c.is_quick,
+         SELECT c.id, c.parent_id, c.name, c.is_quick, c.is_target,
                 (SELECT COUNT(*) FROM collection_images m WHERE m.collection_id = c.id)
                     - COALESCE(gone.n, 0)
            FROM collections c
@@ -110,7 +114,8 @@ pub fn all(catalog: &Catalog) -> Result<Vec<Collection>, CatalogError> {
                 parent_id: r.get(1)?,
                 name: r.get(2)?,
                 is_quick: r.get::<_, i64>(3)? == 1,
-                count: r.get::<_, i64>(4)?.max(0) as usize,
+                is_target: r.get::<_, i64>(4)? == 1,
+                count: r.get::<_, i64>(5)?.max(0) as usize,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -124,6 +129,39 @@ pub fn quick(catalog: &Catalog) -> Result<i64, CatalogError> {
         [],
         |r| r.get(0),
     )?)
+}
+
+/// The collection the add-to-collection key puts a photograph in.
+pub fn target(catalog: &Catalog) -> Result<i64, CatalogError> {
+    Ok(catalog.connection().query_row(
+        "SELECT id FROM collections WHERE is_target = 1",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// Point the key somewhere else.
+///
+/// The old target is cleared first and in the same transaction: the index
+/// allows one, so setting the new one before clearing the old is a constraint
+/// failure, and clearing without setting would leave a key with nowhere to put
+/// a photograph if the second half failed.
+pub fn set_target(catalog: &Catalog, id: i64) -> Result<(), CatalogError> {
+    let transaction = catalog.connection().unchecked_transaction()?;
+    transaction.execute(
+        "UPDATE collections SET is_target = 0 WHERE is_target = 1",
+        [],
+    )?;
+    let set = transaction.execute(
+        "UPDATE collections SET is_target = 1 WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    if set == 0 {
+        // Dropped without a commit, so the old target is still the target.
+        return Err(CatalogError::Unsupported("there is no such collection"));
+    }
+    transaction.commit()?;
+    Ok(())
 }
 
 /// Make one, and answer with its id.
@@ -178,15 +216,17 @@ fn append(connection: &Connection, id: i64, images: &[i64]) -> Result<usize, Cat
         rusqlite::params![id],
         |r| r.get(0),
     )?;
+    // Prepared once, for the reason `place` is: shift-K on a marked shoot is a
+    // row per photograph, and compiling the statement cost more than running it.
+    let mut insert = connection.prepare(
+        "INSERT INTO collection_images (collection_id, image_id, position)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT (image_id, collection_id) DO NOTHING",
+    )?;
     let mut added = 0;
     for image in images {
         next += 1;
-        added += connection.execute(
-            "INSERT INTO collection_images (collection_id, image_id, position)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT (image_id, collection_id) DO NOTHING",
-            rusqlite::params![id, image, next],
-        )?;
+        added += insert.execute(rusqlite::params![id, image, next])?;
     }
     Ok(added)
 }
@@ -205,17 +245,72 @@ pub fn rename(catalog: &Catalog, id: i64, name: &str) -> Result<(), CatalogError
     Ok(())
 }
 
-/// Delete one, and everything nested inside it. The photographs are untouched.
+/// A photograph and the place it held in a collection.
+///
+/// What taking something out hands back, so that it can be put back where it
+/// was. The order is the one thing about a collection that cannot be recomputed
+/// — nobody can re-derive why frame forty came before frame twelve — so
+/// everything that destroys some of it says exactly what it destroyed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placed {
+    pub image: i64,
+    pub position: i64,
+}
+
+/// A deleted collection and everything that was nested in it, as [`restore`]
+/// needs them. Opaque: the only thing to do with one is hand it back.
+#[derive(Debug, Clone)]
+pub struct Removed {
+    /// Parents before children, so restoring in order never names a parent that
+    /// is not there yet.
+    nodes: Vec<RemovedNode>,
+}
+
+#[derive(Debug, Clone)]
+struct RemovedNode {
+    id: i64,
+    parent_id: Option<i64>,
+    name: String,
+    was_target: bool,
+    created_at: i64,
+    members: Vec<Placed>,
+}
+
+impl Removed {
+    /// How many photographs the deleted collections held between them.
+    pub fn photographs(&self) -> usize {
+        self.nodes.iter().map(|node| node.members.len()).sum()
+    }
+
+    /// The ids the deleted collections had. They mean nothing any more — SQLite
+    /// will hand them to the next collections made — which is exactly why a
+    /// caller holding one needs to know to let go of it.
+    pub fn ids(&self) -> impl Iterator<Item = i64> + '_ {
+        self.nodes.iter().map(|node| node.id)
+    }
+
+    /// What the deleted collection was called.
+    pub fn name(&self) -> &str {
+        self.nodes.first().map_or("", |node| node.name.as_str())
+    }
+}
+
+/// Delete one, and everything nested inside it, and say what that was. The
+/// photographs are untouched.
 ///
 /// Refuses the quick collection: a keypress has to have somewhere to put a
 /// frame, and "there is exactly one" stops being true the moment this can make
 /// it zero. Emptying it is [`clear`].
-pub fn remove(catalog: &Catalog, id: i64) -> Result<(), CatalogError> {
+///
+/// **What it answers with is the whole of what it destroyed** — every nested
+/// collection, every member and the place each held — because a hand-made order
+/// cannot be recomputed and an undo has to be able to put it back.
+pub fn remove(catalog: &Catalog, id: i64) -> Result<Removed, CatalogError> {
+    let transaction = catalog.connection().unchecked_transaction()?;
     // `optional`, not `ok`. The first version turned *every* failure here into
     // "not the quick collection" — a locked database included — and went on to
     // run the delete. No row is an answer; an error is not one.
-    let is_quick: Option<i64> = catalog
-        .connection()
+    let is_quick: Option<i64> = transaction
         .query_row(
             "SELECT is_quick FROM collections WHERE id = ?1",
             rusqlite::params![id],
@@ -230,19 +325,160 @@ pub fn remove(catalog: &Catalog, id: i64) -> Result<(), CatalogError> {
             "the quick collection cannot be deleted; empty it instead",
         ));
     }
-    catalog.connection().execute(
+
+    // The collection and everything under it, shallowest first.
+    let mut nodes: Vec<RemovedNode> = {
+        let mut statement = transaction.prepare(
+            "WITH RECURSIVE under (id, depth) AS (
+                 SELECT ?1, 0
+                 UNION ALL
+                 SELECT c.id, under.depth + 1
+                   FROM collections c JOIN under ON c.parent_id = under.id)
+             SELECT c.id, c.parent_id, c.name, c.is_target, c.created_at
+               FROM under JOIN collections c ON c.id = under.id
+              ORDER BY under.depth, c.id",
+        )?;
+        let rows = statement
+            .query_map(rusqlite::params![id], |r| {
+                Ok(RemovedNode {
+                    id: r.get(0)?,
+                    parent_id: r.get(1)?,
+                    name: r.get(2)?,
+                    was_target: r.get::<_, i64>(3)? == 1,
+                    created_at: r.get(4)?,
+                    members: Vec::new(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    for node in &mut nodes {
+        node.members = placed_in(&transaction, node.id)?;
+    }
+
+    transaction.execute(
         "DELETE FROM collections WHERE id = ?1",
         rusqlite::params![id],
     )?;
-    Ok(())
+    // The index allows at most one target; this is what keeps it at *least*
+    // one. Asked of the table rather than of `nodes`, so it is right however
+    // the target came to be missing — the collection itself, or something
+    // nested in it that the cascade took.
+    transaction.execute(
+        "UPDATE collections SET is_target = 1
+          WHERE is_quick = 1
+            AND NOT EXISTS (SELECT 1 FROM collections WHERE is_target = 1)",
+        [],
+    )?;
+    transaction.commit()?;
+    Ok(Removed { nodes })
 }
 
-/// Take every photograph out, and leave the collection.
-pub fn clear(catalog: &Catalog, id: i64) -> Result<usize, CatalogError> {
-    Ok(catalog.connection().execute(
+/// Put back what [`remove`] took, and answer with the collection's new id.
+///
+/// **New ids, deliberately.** SQLite hands a deleted row's id to the next
+/// insert, so by the time an undo arrives the old id may belong to a collection
+/// made in between — and restoring under it would either fail or, worse, merge
+/// into a stranger. The ids are mapped as the tree is rebuilt, and nothing
+/// outside this function is given the old ones to hold.
+///
+/// A photograph deleted since is quietly not restored: the collection coming
+/// back without a frame that no longer exists is what an undo can honestly do.
+/// A *name* taken since is an error, because two collections a person cannot
+/// tell apart is the thing the naming rule exists to prevent.
+pub fn restore(catalog: &Catalog, removed: &Removed) -> Result<i64, CatalogError> {
+    let transaction = catalog.connection().unchecked_transaction()?;
+    let mut renumbered = std::collections::HashMap::new();
+    let mut root = None;
+    let mut target = None;
+    for node in &removed.nodes {
+        // A parent inside the deleted tree has a new id now; one outside it is
+        // whatever it always was.
+        let parent = node
+            .parent_id
+            .map(|old| renumbered.get(&old).copied().unwrap_or(old));
+        transaction.execute(
+            "INSERT INTO collections (parent_id, name, name_key, is_quick, is_target, created_at)
+             VALUES (?1, ?2, ?3, 0, 0, ?4)",
+            rusqlite::params![parent, node.name, name_key(&node.name), node.created_at],
+        )?;
+        let id = transaction.last_insert_rowid();
+        renumbered.insert(node.id, id);
+        root.get_or_insert(id);
+        if node.was_target {
+            target = Some(id);
+        }
+        place(&transaction, id, &node.members)?;
+    }
+    if let Some(id) = target {
+        transaction.execute(
+            "UPDATE collections SET is_target = 0 WHERE is_target = 1",
+            [],
+        )?;
+        transaction.execute(
+            "UPDATE collections SET is_target = 1 WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+    }
+    transaction.commit()?;
+    root.ok_or(CatalogError::Unsupported("there was nothing to restore"))
+}
+
+/// Everything in a collection and where it sits, in order.
+fn placed_in(connection: &Connection, id: i64) -> Result<Vec<Placed>, CatalogError> {
+    let mut statement = connection.prepare(
+        "SELECT image_id, position FROM collection_images
+          WHERE collection_id = ?1 ORDER BY position, image_id",
+    )?;
+    let rows = statement
+        .query_map(rusqlite::params![id], |r| {
+            Ok(Placed {
+                image: r.get(0)?,
+                position: r.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Put photographs at the places they are recorded as having held.
+///
+/// Skips one that no longer exists, and one that is already a member — the
+/// place it has now is the newer decision.
+fn place(connection: &Connection, id: i64, placed: &[Placed]) -> Result<usize, CatalogError> {
+    // Prepared once. `Connection::execute` compiles its SQL on every call, and
+    // undoing the deletion of a collection that held a whole library is twenty
+    // thousand calls — the scale gate put that at 109 ms, most of it parsing.
+    let mut insert = connection.prepare(
+        "INSERT INTO collection_images (collection_id, image_id, position)
+         SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM images WHERE id = ?2)
+         ON CONFLICT (image_id, collection_id) DO NOTHING",
+    )?;
+    let mut back = 0;
+    for entry in placed {
+        back += insert.execute(rusqlite::params![id, entry.image, entry.position])?;
+    }
+    Ok(back)
+}
+
+/// Put back what [`take_out`] or [`clear`] took, where it was.
+pub fn put_back(catalog: &Catalog, id: i64, placed: &[Placed]) -> Result<usize, CatalogError> {
+    let transaction = catalog.connection().unchecked_transaction()?;
+    let back = place(&transaction, id, placed)?;
+    transaction.commit()?;
+    Ok(back)
+}
+
+/// Take every photograph out, leave the collection, and say what was in it.
+pub fn clear(catalog: &Catalog, id: i64) -> Result<Vec<Placed>, CatalogError> {
+    let transaction = catalog.connection().unchecked_transaction()?;
+    let were = placed_in(&transaction, id)?;
+    transaction.execute(
         "DELETE FROM collection_images WHERE collection_id = ?1",
         rusqlite::params![id],
-    )?)
+    )?;
+    transaction.commit()?;
+    Ok(were)
 }
 
 /// Put photographs at the end, in the order given, and answer with how many were
@@ -258,23 +494,37 @@ pub fn add(catalog: &Catalog, id: i64, images: &[i64]) -> Result<usize, CatalogE
     Ok(added)
 }
 
-/// Take photographs out, and answer with how many were in.
+/// Take photographs out, and answer with the ones that were in and the place
+/// each held — which is what [`put_back`] needs to undo it.
 ///
 /// The gap this leaves in `position` is left alone. Nothing reads the absolute
 /// value, so closing it would be a write per remaining row for no visible
-/// difference — see the migration.
-pub fn take_out(catalog: &Catalog, id: i64, images: &[i64]) -> Result<usize, CatalogError> {
-    let connection = catalog.connection();
-    let transaction = connection.unchecked_transaction()?;
-    let mut removed = 0;
-    for image in images {
-        removed += transaction.execute(
-            "DELETE FROM collection_images WHERE collection_id = ?1 AND image_id = ?2",
-            rusqlite::params![id, image],
+/// difference — and an undo puts the frame straight back into it.
+pub fn take_out(catalog: &Catalog, id: i64, images: &[i64]) -> Result<Vec<Placed>, CatalogError> {
+    let transaction = catalog.connection().unchecked_transaction()?;
+    let mut taken = Vec::new();
+    {
+        // One statement that deletes and says where the row was, rather than a
+        // read and then a write: a photograph that was never in the collection
+        // returns no row, which is the "skip it" the undo record needs.
+        let mut remove = transaction.prepare(
+            "DELETE FROM collection_images WHERE collection_id = ?1 AND image_id = ?2
+             RETURNING position",
         )?;
+        for image in images {
+            let position: Option<i64> = remove
+                .query_row(rusqlite::params![id, image], |r| r.get(0))
+                .optional()?;
+            if let Some(position) = position {
+                taken.push(Placed {
+                    image: *image,
+                    position,
+                });
+            }
+        }
     }
     transaction.commit()?;
-    Ok(removed)
+    Ok(taken)
 }
 
 /// Whether this photograph is in this collection.
@@ -344,12 +594,14 @@ pub fn reorder(catalog: &Catalog, id: i64, images: &[i64]) -> Result<(), Catalog
         "UPDATE collection_images SET position = position + ?2 WHERE collection_id = ?1",
         rusqlite::params![id, images.len() as i64],
     )?;
-    for (at, image) in images.iter().enumerate() {
-        transaction.execute(
+    {
+        let mut put = transaction.prepare(
             "UPDATE collection_images SET position = ?3
               WHERE collection_id = ?1 AND image_id = ?2",
-            rusqlite::params![id, image, at as i64 + 1],
         )?;
+        for (at, image) in images.iter().enumerate() {
+            put.execute(rusqlite::params![id, image, at as i64 + 1])?;
+        }
     }
     transaction.commit()?;
     Ok(())
@@ -516,8 +768,11 @@ mod tests {
         let (_dir, catalog, ids) = library_of(3);
         let id = create(&catalog, "Edit", None).unwrap();
         add(&catalog, id, &ids).unwrap();
-        assert_eq!(take_out(&catalog, id, &[ids[1]]).unwrap(), 1);
-        assert_eq!(take_out(&catalog, id, &[ids[1]]).unwrap(), 0, "already out");
+        assert_eq!(take_out(&catalog, id, &[ids[1]]).unwrap().len(), 1);
+        assert!(
+            take_out(&catalog, id, &[ids[1]]).unwrap().is_empty(),
+            "already out"
+        );
         assert_eq!(ids_in(&catalog, id), [ids[0], ids[2]]);
     }
 
@@ -567,7 +822,7 @@ mod tests {
 
         assert!(remove(&catalog, quick_id).is_err(), "it must survive");
         // Emptying it is the thing that was actually wanted.
-        assert_eq!(clear(&catalog, quick_id).unwrap(), 1);
+        assert_eq!(clear(&catalog, quick_id).unwrap().len(), 1);
         assert!(!holds(&catalog, quick_id, ids[0]).unwrap());
         assert_eq!(quick(&catalog).unwrap(), quick_id, "still exactly one");
     }
@@ -714,6 +969,126 @@ mod tests {
             .unwrap();
         assert_eq!(ids_in(&catalog, a), [ids[0], ids[2]]);
         assert!(ids_in(&catalog, b).is_empty());
+    }
+
+    #[test]
+    fn the_key_has_exactly_one_place_to_put_a_photograph() {
+        let (_dir, catalog, _ids) = library_of(1);
+        let quick_id = quick(&catalog).unwrap();
+        assert_eq!(
+            target(&catalog).unwrap(),
+            quick_id,
+            "it starts on the quick one"
+        );
+
+        let portfolio = create(&catalog, "Portfolio", None).unwrap();
+        set_target(&catalog, portfolio).unwrap();
+        assert_eq!(target(&catalog).unwrap(), portfolio);
+        let targets = all(&catalog)
+            .unwrap()
+            .iter()
+            .filter(|c| c.is_target)
+            .count();
+        assert_eq!(targets, 1, "moved, not copied");
+
+        // Aiming it at nothing fails *and leaves it where it was*. Clearing the
+        // old target and then failing to set the new one would leave a key with
+        // nowhere to put a photograph.
+        assert!(set_target(&catalog, 999_999).is_err());
+        assert_eq!(target(&catalog).unwrap(), portfolio);
+    }
+
+    #[test]
+    fn deleting_the_target_hands_the_key_back_to_the_quick_collection() {
+        // The index allows at most one target. "At least one" is `remove`'s to
+        // keep — including when the target goes by *cascade*, nested inside the
+        // collection that was actually deleted.
+        let (_dir, catalog, _ids) = library_of(1);
+        let quick_id = quick(&catalog).unwrap();
+        let parent = create(&catalog, "2026", None).unwrap();
+        let child = create(&catalog, "March", Some(parent)).unwrap();
+        set_target(&catalog, child).unwrap();
+
+        remove(&catalog, parent).unwrap();
+        assert_eq!(target(&catalog).unwrap(), quick_id);
+    }
+
+    #[test]
+    fn a_deleted_collection_comes_back_whole() {
+        // A hand-made order cannot be recomputed, so deleting one has to be
+        // something that can be taken back: the name, the nesting, every member
+        // and the place each held, and whether the key was aimed at it.
+        let (_dir, catalog, ids) = library_of(4);
+        let parent = create(&catalog, "2026", None).unwrap();
+        let child = create(&catalog, "March", Some(parent)).unwrap();
+        add(&catalog, parent, &[ids[3], ids[0]]).unwrap();
+        add(&catalog, child, &[ids[2], ids[1], ids[0]]).unwrap();
+        set_target(&catalog, child).unwrap();
+
+        let removed = remove(&catalog, parent).unwrap();
+        assert_eq!(removed.name(), "2026");
+        assert_eq!(removed.photographs(), 5);
+        assert!(!all(&catalog).unwrap().iter().any(|c| c.name == "March"));
+
+        // Something else takes the id the deleted collection had, which SQLite
+        // will hand to the very next insert. Restoring under the old id would
+        // fail — or merge into a stranger.
+        let stranger = create(&catalog, "Unrelated", None).unwrap();
+
+        let back = restore(&catalog, &removed).unwrap();
+        assert_ne!(back, stranger);
+        let listed = all(&catalog).unwrap();
+        let march = listed.iter().find(|c| c.name == "March").unwrap();
+        assert_eq!(
+            march.parent_id,
+            Some(back),
+            "nested under the *new* parent id"
+        );
+        assert!(march.is_target, "and the key is aimed at it again");
+        assert_eq!(ids_in(&catalog, back), [ids[3], ids[0]]);
+        assert_eq!(ids_in(&catalog, march.id), [ids[2], ids[1], ids[0]]);
+        assert!(
+            ids_in(&catalog, stranger).is_empty(),
+            "nothing leaked into it"
+        );
+    }
+
+    #[test]
+    fn an_undo_does_not_conjure_a_photograph_that_has_gone() {
+        let (_dir, catalog, ids) = library_of(3);
+        let id = create_holding(&catalog, "Edit", None, &ids).unwrap();
+        let removed = remove(&catalog, id).unwrap();
+        catalog
+            .connection()
+            .execute("DELETE FROM images WHERE id = ?1", [ids[1]])
+            .unwrap();
+        let back = restore(&catalog, &removed).unwrap();
+        assert_eq!(ids_in(&catalog, back), [ids[0], ids[2]]);
+
+        // But a *name* taken in the meantime is refused: two collections nobody
+        // can tell apart is what the naming rule is for.
+        let again = remove(&catalog, back).unwrap();
+        create(&catalog, "edit", None).unwrap();
+        assert!(restore(&catalog, &again).is_err());
+    }
+
+    #[test]
+    fn what_is_taken_out_goes_back_where_it_was() {
+        // Not at the end. The middle frame of three, taken out and put back,
+        // has to be the middle frame again — and so does a whole collection
+        // that was emptied.
+        let (_dir, catalog, ids) = library_of(3);
+        let id = create_holding(&catalog, "Edit", None, &[ids[2], ids[0], ids[1]]).unwrap();
+        let taken = take_out(&catalog, id, &[ids[0]]).unwrap();
+        assert_eq!(ids_in(&catalog, id), [ids[2], ids[1]]);
+        assert_eq!(put_back(&catalog, id, &taken).unwrap(), 1);
+        assert_eq!(ids_in(&catalog, id), [ids[2], ids[0], ids[1]]);
+        assert_eq!(put_back(&catalog, id, &taken).unwrap(), 0, "already back");
+
+        let were = clear(&catalog, id).unwrap();
+        assert!(ids_in(&catalog, id).is_empty());
+        put_back(&catalog, id, &were).unwrap();
+        assert_eq!(ids_in(&catalog, id), [ids[2], ids[0], ids[1]]);
     }
 
     #[test]
