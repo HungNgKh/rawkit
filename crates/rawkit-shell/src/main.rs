@@ -139,6 +139,7 @@
 mod canvas;
 mod library;
 mod pointer;
+mod sequence;
 mod session_canvas;
 mod window_state;
 

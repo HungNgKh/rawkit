@@ -23,6 +23,7 @@
 //! sharpness-check workflow the design calls out Lightroom for handling badly,
 //! and here it is the absence of code rather than the presence of it.
 
+use crate::sequence::{Dropped, Sequence, Source};
 use anyhow::{anyhow, Context, Result};
 use rawkit_catalog::collections::{self, Collection};
 use rawkit_catalog::cull::{self, Filter, Flag, Judgement, LibraryImage};
@@ -404,20 +405,33 @@ pub struct CullView {
 /// An open catalog and where we are in it.
 pub struct Library {
     catalog: Catalog,
-    /// The photographs the filter admits, in shoot order. Never empty — see
-    /// [`Library::narrow`] for what that costs and why it is worth it.
-    images: Vec<LibraryImage>,
+    /// What is being walked through: where the photographs come from, which of
+    /// them the filter shows, and the photographs themselves — as one value,
+    /// because they were three fields once and a keypress could change one
+    /// without the others. See [`crate::sequence`]. Never empty.
+    sequence: Sequence,
+    /// The slot in `sequence` the cursor is on.
     index: usize,
-    /// Which part of the library is being looked at.
-    filter: Filter,
-    /// Which collection is being walked through, and `None` for the whole
-    /// library.
+    /// Whether every action checks the sequence against a full read of the
+    /// catalog. On in tests, which is where a shortcut that drifted would
+    /// otherwise pass; the scale test turns it off, since the full read is the
+    /// cost that test exists to show is no longer being paid.
+    #[cfg(test)]
+    oracle: bool,
+    /// How many photographs there are, and how many are picked and rejected.
     ///
-    /// Beside the filter rather than folded into it, because they are different
-    /// questions that compose: a collection says *which photographs and in what
-    /// order*, a filter says *which of those to show*. Folding one into the
-    /// other would mean choosing which of them a pick is allowed to change.
-    viewing: Option<i64>,
+    /// **Held, because it was a scan of the whole library per keypress.** The
+    /// page shows these after every key, and asking the catalog each time is a
+    /// count over every image there is: 1.6 ms at twenty thousand and linear,
+    /// for three numbers of which at most one has moved by one. Once the
+    /// sequence stopped re-reading itself this was all that was left of a
+    /// keypress's cost — every action measured the same, because every action
+    /// was mostly this.
+    ///
+    /// Changed in one place, [`Library::write_judgement`], which is the only
+    /// thing that writes a flag; recounted where photographs are added or
+    /// removed. The tests check it against the catalog after every action.
+    tally: (usize, usize, usize),
     /// Every collection and its count, as of the last time one changed.
     ///
     /// **Held, because the page is sent it after every keypress.** Asking the
@@ -469,26 +483,28 @@ impl Library {
     /// Open a catalog and stand at the first photograph in it.
     pub fn open(path: &Path) -> Result<Self> {
         let catalog = Catalog::open(path)?;
-        let images = cull::sequence(&catalog, &Filter::default())?;
-        if images.is_empty() {
-            return Err(anyhow!(
-                "{} has no images; run `rawkit catalog <path> --scan <folder>` first",
-                path.display()
-            ));
-        }
+        let sequence =
+            Sequence::read(&catalog, Source::Library, Filter::default())?.ok_or_else(|| {
+                anyhow!(
+                    "{} has no images; run `rawkit catalog <path> --scan <folder>` first",
+                    path.display()
+                )
+            })?;
         eprintln!(
             "library    : {} · {} image(s)",
             path.display(),
-            images.len()
+            sequence.len()
         );
         let listed = collections::all(&catalog)?;
         let quick = collections::quick(&catalog)?;
+        let tally = cull::tally(&catalog)?;
         Ok(Self {
             catalog,
-            images,
+            sequence,
             index: 0,
-            filter: Filter::default(),
-            viewing: None,
+            #[cfg(test)]
+            oracle: true,
+            tally,
             collections: listed,
             quick,
             undo: Vec::new(),
@@ -617,13 +633,13 @@ impl Library {
 
     /// Where a photograph sits in the sequence, if the filter admits it.
     fn position_of(&self, id: i64) -> Option<usize> {
-        self.images.iter().position(|image| image.id == id)
+        self.sequence.position_of(id)
     }
 
     /// Which part of the library is on screen — what an export of "what is
     /// shown" is an export of.
     pub fn filter(&self) -> &Filter {
-        &self.filter
+        self.sequence.filter()
     }
 
     /// A second interpretation of the photograph under the cursor.
@@ -646,9 +662,11 @@ impl Library {
         // off — the same rule as a filter that empties, and for the same reason:
         // the view has to be able to explain itself, and the chips follow it.
         self.resequence(Some(id))?;
+        // A copy is a photograph: the library is one larger.
+        self.tally = cull::tally(&self.catalog)?;
         let name = self
             .position_of(id)
-            .and_then(|at| self.images[at].copy_name.clone())
+            .and_then(|at| self.sequence.get(at)?.copy_name.clone())
             .unwrap_or_default();
         Ok(name)
     }
@@ -677,7 +695,28 @@ impl Library {
         // one, which is not in `act` at all, left a chip reading one more than
         // the collection held.
         self.refresh_collections()?;
+        // And one smaller, possibly by a pick or a reject as well.
+        self.tally = cull::tally(&self.catalog)?;
         Ok(image.label())
+    }
+
+    /// Write a judgement, and move the held tally by what it changed.
+    ///
+    /// **The only thing in this file that writes a flag**, so that the count
+    /// and the catalog cannot be changed apart. A judgement and the undo of one
+    /// both come through here, which is every way a flag moves.
+    fn write_judgement(&mut self, id: i64, before: &Judgement, after: &Judgement) -> Result<()> {
+        cull::set(&self.catalog, id, after)?;
+        let (_, picks, rejects) = &mut self.tally;
+        for (flag, step) in [(before.flag, -1i64), (after.flag, 1)] {
+            let count = match flag {
+                Some(Flag::Pick) => &mut *picks,
+                Some(Flag::Reject) => &mut *rejects,
+                None => continue,
+            };
+            *count = (*count as i64 + step).max(0) as usize;
+        }
+        Ok(())
     }
 
     /// Ask the catalog for the collection list again.
@@ -692,58 +731,35 @@ impl Library {
         Ok(())
     }
 
-    /// The sequence as it now stands: the collection being viewed if there is
-    /// one, the whole library otherwise, narrowed by `filter` either way.
-    ///
-    /// **Every re-read goes through here.** There were five `cull::sequence`
-    /// calls scattered through this file, and each one that kept its own copy of
-    /// "what am I walking through" was a way for a keypress to drop you back
-    /// into the whole library without saying so — judging the last frame of a
-    /// collection would have done it silently.
-    fn read(&self, filter: &Filter) -> Result<Vec<LibraryImage>> {
-        Ok(match self.viewing {
-            Some(id) => collections::members(&self.catalog, id, filter)?,
-            None => cull::sequence(&self.catalog, filter)?,
-        })
-    }
-
     /// Walk a collection instead of the whole library, or `None` to go back.
     ///
     /// Refuses an empty one for the reason [`Library::narrow`] refuses a filter
     /// that matches nothing: the sequence is never empty, so `current` always
     /// names a photograph, and "this collection is empty" is a message rather
     /// than a view.
+    ///
+    /// The new view is built before anything is assigned, so a refusal leaves
+    /// the library exactly where it was. This used to write `viewing`, read, and
+    /// put `viewing` back by hand on each of three ways out.
     pub fn show_collection(&mut self, id: Option<i64>) -> Result<()> {
-        let was = self.viewing;
-        self.viewing = id;
-        let images = match self.read(&self.filter) {
-            Ok(images) => images,
-            Err(e) => {
-                self.viewing = was;
-                return Err(e);
+        let source = id.map_or(Source::Library, Source::Collection);
+        let filter = self.sequence.filter().clone();
+        let next = match Sequence::read(&self.catalog, source, filter.clone())? {
+            Some(next) => Some(next),
+            // A collection with nothing in it that the filter admits is worth
+            // showing *whole* rather than refusing outright — the filter is a
+            // view of the collection, and dropping it is the smaller surprise.
+            None if !filter.is_everything() => {
+                Sequence::read(&self.catalog, source, Filter::default())?
             }
+            None => None,
         };
-        // A collection with nothing in it that the filter admits is worth
-        // showing *whole* rather than refusing outright — the filter is a view
-        // of the collection, and dropping it is the smaller surprise.
-        let images = if images.is_empty() && !self.filter.is_everything() {
-            self.filter = Filter::default();
-            self.read(&self.filter)?
-        } else {
-            images
-        };
-        if images.is_empty() {
-            self.viewing = was;
-            return Err(anyhow!("that collection is empty"));
-        }
+        let next = next.ok_or_else(|| anyhow!("that collection is empty"))?;
         // Stay on the same photograph when it is in both views, which is what
         // switching to a collection the current frame is already in should do.
         let standing = self.current().id;
-        self.index = images
-            .iter()
-            .position(|image| image.id == standing)
-            .unwrap_or(0);
-        self.images = images;
+        self.index = next.position_of(standing).unwrap_or(0);
+        self.sequence = next;
         self.request = Some(self.index);
         Ok(())
     }
@@ -755,26 +771,27 @@ impl Library {
     /// particular photograph is what the action was about, while it can show
     /// that one. Everything else about a filter is the user's decision; this is
     /// the case where honouring it would mean acting and showing nothing.
+    ///
+    /// Widening in order — the filter goes first, then the collection — and the
+    /// first view that has anything in it is the one assigned. A collection
+    /// somebody has just emptied cannot be honoured at the cost of an empty
+    /// sequence.
     fn resequence(&mut self, prefer: Option<i64>) -> Result<()> {
-        let mut images = self.read(&self.filter)?;
-        let hidden = prefer.is_some_and(|id| !images.iter().any(|image| image.id == id));
-        if images.is_empty() || hidden {
-            self.filter = Filter::default();
-            images = self.read(&self.filter)?;
+        let source = self.sequence.source();
+        let filter = self.sequence.filter().clone();
+        let mut next = Sequence::read(&self.catalog, source, filter.clone())?
+            .filter(|next| prefer.is_none_or(|id| next.position_of(id).is_some()));
+        if next.is_none() && !filter.is_everything() {
+            next = Sequence::read(&self.catalog, source, Filter::default())?;
         }
-        // And if the collection itself is what has nothing left in it, the view
-        // goes too. The rule is that the sequence is never empty; a collection
-        // somebody has just emptied cannot be honoured at the cost of breaking
-        // it.
-        if images.is_empty() {
-            self.viewing = None;
-            images = self.read(&self.filter)?;
+        if next.is_none() && source != Source::Library {
+            next = Sequence::read(&self.catalog, Source::Library, Filter::default())?;
         }
-        self.images = images;
-        self.index = match prefer.and_then(|id| self.images.iter().position(|i| i.id == id)) {
-            Some(at) => at,
-            None => self.index.min(self.images.len() - 1),
-        };
+        let next = next.ok_or_else(|| anyhow!("the library has no photographs left in it"))?;
+        self.index = prefer
+            .and_then(|id| next.position_of(id))
+            .unwrap_or_else(|| self.index.min(next.len() - 1));
+        self.sequence = next;
         self.request = Some(self.index);
         Ok(())
     }
@@ -793,34 +810,18 @@ impl Library {
     /// showing nothing cannot say why it is showing nothing.
     pub fn narrow(&mut self, filter: Filter) -> Result<()> {
         let standing = self.current().id;
-        let images = self.read(&filter)?;
-        if images.is_empty() {
+        let Some(index) = self.sequence.narrow(&self.catalog, filter, self.index)? else {
             return Err(anyhow!("no photograph matches that filter"));
-        }
-        // Both sequences are in shoot order, so the first of the remaining
-        // frames that survives is the nearest one forward. Indexed first so
-        // this stays linear on a library that has twenty thousand of them.
-        let where_now: std::collections::HashMap<i64, usize> = images
-            .iter()
-            .enumerate()
-            .map(|(at, image)| (image.id, at))
-            .collect();
-        let index = self.images[self.index..]
-            .iter()
-            .find_map(|image| where_now.get(&image.id).copied())
-            .unwrap_or(images.len() - 1);
-        let moved = images[index].id != standing;
-        self.filter = filter;
-        self.images = images;
+        };
         self.index = index;
-        if moved {
+        if self.current().id != standing {
             self.request = Some(index);
         }
         Ok(())
     }
 
     pub fn count(&self) -> usize {
-        self.images.len()
+        self.sequence.len()
     }
 
     pub fn index(&self) -> usize {
@@ -832,7 +833,7 @@ impl Library {
     /// What a grid does: moving across a contact sheet must not decode anything,
     /// because the cell it lands on is already on screen.
     pub fn select(&mut self, index: usize) {
-        self.index = index.min(self.images.len() - 1);
+        self.index = index.min(self.sequence.len() - 1);
     }
 
     /// Ask for the current photograph to be loaded even though the selection did
@@ -849,8 +850,7 @@ impl Library {
     /// looks like straight away.
     #[allow(clippy::type_complexity)]
     pub fn flags_in(&self, from: usize, to: usize) -> Result<Vec<(Option<Flag>, Option<String>)>> {
-        let from = from.min(self.images.len());
-        let slice = &self.images[from..to.min(self.images.len())];
+        let slice: Vec<&LibraryImage> = self.sequence.slice(from, to).collect();
         if slice.is_empty() {
             return Ok(Vec::new());
         }
@@ -887,7 +887,7 @@ impl Library {
         needed: u32,
         hash: Option<&str>,
     ) -> Result<Option<Decoded>> {
-        let Some(image) = self.images.get(index) else {
+        let Some(image) = self.sequence.get(index) else {
             return Ok(None);
         };
         let resolved;
@@ -931,7 +931,14 @@ impl Library {
     }
 
     pub fn current(&self) -> &LibraryImage {
-        &self.images[self.index]
+        // The sequence is never empty and every write to `index` clamps to it,
+        // so there is always a photograph here. The fallback is the first one
+        // rather than a panic, because a window that shows the wrong frame can
+        // be corrected and one that has crashed cannot.
+        self.sequence
+            .get(self.index)
+            .or_else(|| self.sequence.get(0))
+            .expect("a sequence is never empty")
     }
 
     /// Carry out an action and report the new state.
@@ -962,14 +969,14 @@ impl Library {
                 // Only the view being *of* the quick collection can have
                 // changed shape; anywhere else this is a fact about the frame
                 // and the sequence is untouched.
-                if self.viewing == Some(quick) {
+                if self.sequence.source() == Source::Collection(quick) {
                     self.resequence(Some(id))?;
                 }
             }
             CullAction::ClearQuick => {
                 let quick = self.quick;
                 collections::clear(&self.catalog, quick)?;
-                if self.viewing == Some(quick) {
+                if self.sequence.source() == Source::Collection(quick) {
                     let standing = self.current().id;
                     self.resequence(Some(standing))?;
                 }
@@ -993,28 +1000,27 @@ impl Library {
                 self.refresh_collections()?;
             }
             CullAction::MoveInCollection(step) => {
-                let Some(id) = self.viewing else {
+                let Source::Collection(id) = self.sequence.source() else {
                     return Err(anyhow!(
                         "moving a photograph changes a collection's order; the \
                          library's own order is the shoot's"
                     ));
                 };
                 let target = self.index as i64 + step as i64;
-                if target >= 0 && (target as usize) < self.images.len() {
+                if target >= 0 && (target as usize) < self.sequence.len() {
                     let target = target as usize;
                     // Two rows in the catalog and two entries here. This first
                     // handed the whole sequence to `reorder` and then read the
                     // collection back — a write per member followed by a read
                     // of all of them, 90 ms at twenty thousand, to exchange two
                     // neighbours. The sequence in hand is already the answer.
-                    collections::swap(
-                        &self.catalog,
-                        id,
-                        self.images[self.index].id,
-                        self.images[target].id,
-                    )?;
-                    self.images.swap(self.index, target);
-                    self.index = target;
+                    let moved = self.current().id;
+                    let past = self.sequence.get(target).map(|image| image.id);
+                    if let Some(past) = past {
+                        collections::swap(&self.catalog, id, moved, past)?;
+                        self.sequence.swap(self.index, target);
+                        self.index = target;
+                    }
                 }
             }
             // Both are resolved before they arrive: making one needs the
@@ -1031,7 +1037,7 @@ impl Library {
             CullAction::SelectPrevious => self.select(self.index.saturating_sub(1)),
             CullAction::SelectBy(step) => {
                 let target = self.index as i64 + step as i64;
-                self.select(target.clamp(0, self.images.len() as i64 - 1) as usize);
+                self.select(target.clamp(0, self.sequence.len() as i64 - 1) as usize);
             }
             // Saturating, not wrapping: backing off the front of a shoot must
             // stay at the first frame, and `wrapping_sub` would clamp to the
@@ -1151,12 +1157,18 @@ impl Library {
                     image,
                     before: previous,
                 }) => {
-                    cull::set(&self.catalog, image, &previous)?;
+                    let standing = cull::judgement(&self.catalog, image)?;
+                    self.write_judgement(image, &standing, &previous)?;
                     // Putting the judgement back can put the *frame* back: a
                     // filtered pass drops what it judges, and an undo that could
                     // not return you to the photograph you were wrong about
                     // would be no use at all.
-                    self.images = self.read(&self.filter)?;
+                    // Asked about the one frame whose judgement changed, in
+                    // both directions: it may be coming back into a filtered
+                    // view, or — if the filter was changed since — leaving one.
+                    // This was a full re-read of the sequence, and the one of
+                    // six that forgot which collection it was in.
+                    self.settle(image)?;
                     // A survey drops what it judges too, so the same keypress
                     // has to restore the comparison — otherwise the key that
                     // reverses a mistake leaves you looking at a comparison the
@@ -1171,11 +1183,23 @@ impl Library {
                         // Only reachable if the frame went missing from disk
                         // between the judgement and the undo. The judgement is
                         // restored either way; the cursor stays where it can be.
-                        self.index = self.index.min(self.images.len() - 1);
+                        self.index = self.index.min(self.sequence.len() - 1);
                     }
                 }
                 None => {}
             },
+        }
+        // Every shortcut the sequence takes is a claim that it ends where a full
+        // read of the catalog would. In tests, hold it to that after each action.
+        #[cfg(test)]
+        if self.oracle {
+            self.sequence.agrees_with(&self.catalog)?;
+            let counted = cull::tally(&self.catalog)?;
+            anyhow::ensure!(
+                counted == self.tally,
+                "the held tally {:?} has drifted from the catalog's {counted:?}",
+                self.tally
+            );
         }
         self.view()
     }
@@ -1193,7 +1217,7 @@ impl Library {
         if after == before {
             return Ok(false);
         }
-        cull::set(&self.catalog, id, &after)?;
+        self.write_judgement(id, &before, &after)?;
         self.undo.push(Undone::Judged { image: id, before });
         if self.undo.len() > UNDO_DEPTH {
             self.undo.remove(0);
@@ -1214,34 +1238,43 @@ impl Library {
     /// that decides what *is* shown. A second opinion here is a second chance
     /// to disagree.
     fn settle(&mut self, judged: i64) -> Result<bool> {
-        if self.filter.is_everything() || cull::matches(&self.catalog, judged, &self.filter)? {
+        let filter = self.sequence.filter();
+        if filter.is_everything() || cull::matches(&self.catalog, judged, filter)? {
+            // Shown, or shown again: an undo can bring a frame *back* into a
+            // filtered view, and that is this same question with the other
+            // answer. A no-op when it never left.
+            self.sequence.admit(judged);
             return Ok(false);
         }
-        let images = self.read(&self.filter)?;
-        if images.is_empty() {
-            // The end of a pass, and the ordinary way one ends: nothing is
-            // unflagged any more, or the last pick has been taken back. The
-            // filter goes rather than the window emptying — an empty sequence
-            // is a state `current` cannot answer for, and a blank canvas cannot
-            // explain itself. The view carries the filter back to the page, so
-            // the controls follow rather than going on claiming to be set.
-            self.filter = Filter::default();
-            self.images = self.read(&self.filter)?;
-            // The collection emptying is the same end-of-pass, one level out.
-            if self.images.is_empty() {
-                self.viewing = None;
-                self.images = self.read(&self.filter)?;
+        // **One frame's admission changed, so one frame goes.** This read the
+        // whole sequence again — four joined tables and a path per photograph,
+        // 20 ms at twenty thousand and linear — to learn what `matches` had
+        // just said about the only photograph that could have moved.
+        match self.sequence.drop_shown(judged) {
+            Dropped::NotShown => return Ok(false),
+            Dropped::Gone => {}
+            Dropped::WouldEmpty => {
+                // The end of a pass, and the ordinary way one ends: nothing is
+                // unflagged any more, or the last pick has been taken back. The
+                // filter goes rather than the window emptying — an empty
+                // sequence is a state `current` cannot answer for, and a blank
+                // canvas cannot explain itself. The view carries the filter
+                // back to the page, so the controls follow rather than going on
+                // claiming to be set.
+                let index = self
+                    .sequence
+                    .narrow(&self.catalog, Filter::default(), self.index)?
+                    .ok_or_else(|| anyhow!("the source of the frame just judged is empty"))?;
+                self.index = self.position_of(judged).unwrap_or(index);
+                return Ok(true);
             }
-            self.index = self.position_of(judged).unwrap_or(0);
-            return Ok(true);
         }
-        self.images = images;
-        self.index = self.index.min(self.images.len() - 1);
+        self.index = self.index.min(self.sequence.len() - 1);
         // Only when a different photograph is now under the cursor. Judging the
         // last frame of a filtered set leaves you standing on the one before
         // it, which is already on screen, and asking for it again would decode
         // a RAW to redraw what is already there.
-        if self.images[self.index].id != judged {
+        if self.current().id != judged {
             self.request = Some(self.index);
         }
         Ok(true)
@@ -1253,7 +1286,7 @@ impl Library {
     /// a shoot, and silently starting again is how a frame gets judged twice
     /// while its neighbour is missed.
     fn go(&mut self, index: usize) {
-        let index = index.min(self.images.len() - 1);
+        let index = index.min(self.sequence.len() - 1);
         if index == self.index {
             return;
         }
@@ -1264,7 +1297,7 @@ impl Library {
     /// The photograph the render loop should now be showing, if it changed.
     pub fn take_request(&mut self) -> Option<String> {
         let index = self.request.take()?;
-        Some(self.images[index].path.clone())
+        self.sequence.get(index).map(|image| image.path.clone())
     }
 
     pub fn view(&self) -> Result<CullView> {
@@ -1274,12 +1307,12 @@ impl Library {
         // indicator for a cull — how much of the shoot has been decided about —
         // and one that shrank as you narrowed the view would be measuring the
         // view instead of the work.
-        let (in_library, picks, rejects) = cull::tally(&self.catalog)?;
+        let (in_library, picks, rejects) = self.tally;
         Ok(CullView {
             filename: image.filename.clone(),
             copy: image.copy_name.clone(),
             position: self.index + 1,
-            total: self.images.len(),
+            total: self.sequence.len(),
             rating: judgement.rating,
             flag: judgement.flag.map(Flag::column),
             colour: judgement.colour,
@@ -1290,9 +1323,12 @@ impl Library {
             marked: self.marked().len(),
             is_marked: self.marked.contains(&image.id),
             mode: crate::mode_name(),
-            filter: self.filter.clone(),
+            filter: self.sequence.filter().clone(),
             collections: self.collections.clone(),
-            viewing: self.viewing,
+            viewing: match self.sequence.source() {
+                Source::Collection(id) => Some(id),
+                Source::Library => None,
+            },
             // An indexed point lookup, 4 µs and flat at twenty thousand — the
             // one collection question that really is about this frame, and so
             // the one still asked per keypress.
@@ -1427,7 +1463,7 @@ impl Saver {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rawkit_catalog::scan::FileMetadata;
 
@@ -1436,7 +1472,7 @@ mod tests {
     /// Real files on disk, because a scan walks a directory — but never decoded:
     /// everything here is about which image is *selected*, and selecting one
     /// costs nothing. Loading it is the render loop's job and needs a GPU.
-    pub(super) fn library_at(dir: &Path, n: usize) -> Library {
+    pub(crate) fn library_at(dir: &Path, n: usize) -> Library {
         let photos = dir.join("photos");
         std::fs::create_dir_all(&photos).unwrap();
         for i in 0..n {
@@ -1469,10 +1505,10 @@ mod tests {
     /// A directory that cleans itself up, the same shape the catalog's own tests
     /// use — duplicated rather than shared because a `#[cfg(test)]` helper in
     /// another crate is not something this one can reach.
-    pub(super) struct Scratch(pub std::path::PathBuf);
+    pub(crate) struct Scratch(pub std::path::PathBuf);
 
     impl Scratch {
-        pub(super) fn new(name: &str) -> Self {
+        pub(crate) fn new(name: &str) -> Self {
             let path =
                 std::env::temp_dir().join(format!("rawkit-shell-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&path);
@@ -1495,8 +1531,8 @@ mod tests {
 
     fn filenames(library: &Library) -> Vec<String> {
         library
-            .images
-            .iter()
+            .sequence
+            .slice(0, library.sequence.len())
             .map(|image| image.filename.clone())
             .collect()
     }
@@ -1543,6 +1579,119 @@ mod tests {
         let view = serde_json::to_value(library.view().unwrap()).unwrap();
         assert_eq!(view["filter"]["flagged"], serde_json::Value::Null);
         assert_eq!(view["in_library"], 1);
+    }
+
+    /// How long one keypress may take, and the same number the catalog's gate
+    /// uses: roughly where a key stops appearing to cause its own result. It is
+    /// the budget for the *whole* keypress — this, the render request and the
+    /// redraw — so a library that eats it has eaten the budget.
+    const INSTANT: std::time::Duration = std::time::Duration::from_millis(100);
+
+    #[test]
+    #[ignore = "writes twenty thousand files; a few seconds and a lot of inodes"]
+    fn a_cull_stays_instant_at_the_size_of_a_real_library() {
+        // The catalog has a scale gate and the shell had none — and the shell is
+        // where a keypress is actually spent. What it costs is not what any one
+        // query costs: it is whatever the shell *chooses to ask* per key, and a
+        // full re-read of twenty thousand rows per pick is invisible on the ten
+        // photographs every other test here uses.
+        let sizes = [2_000usize, 20_000];
+        println!(
+            "{:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+            "images", "open", "next", "view", "pick*", "undo*", "filter", "on+off"
+        );
+        let mut worst = (std::time::Duration::ZERO, String::new());
+        for n in sizes {
+            let dir = Scratch::new(&format!("shell-scale-{n}"));
+            let start = std::time::Instant::now();
+            let mut library = library_at(&dir.0, n);
+            let open = start.elapsed();
+            // Every other test here checks each action against a full read of
+            // the catalog. That read is the cost this test exists to show is no
+            // longer being paid, so here — and only here — it is off.
+            library.oracle = false;
+
+            // The median of several, because the first write after an open
+            // also pays for creating the write-ahead log and that is not the
+            // keypress's cost.
+            fn median(
+                library: &mut Library,
+                f: &mut dyn FnMut(&mut Library),
+            ) -> std::time::Duration {
+                let mut runs: Vec<std::time::Duration> = (0..9)
+                    .map(|_| {
+                        let start = std::time::Instant::now();
+                        f(library);
+                        start.elapsed()
+                    })
+                    .collect();
+                runs.sort();
+                runs[runs.len() / 2]
+            }
+
+            let next = median(&mut library, &mut |l| {
+                l.act(CullAction::Next).unwrap();
+            });
+            let view = median(&mut library, &mut |l| {
+                l.view().unwrap();
+            });
+            // The pass everybody makes: look at what is undecided, and decide.
+            // Every pick drops a frame out of the filter, which is the case
+            // that rebuilds the sequence.
+            library
+                .act(CullAction::SetFilter(Filter::flagged(Flagged::Unflagged)))
+                .unwrap();
+            let pick = median(&mut library, &mut |l| {
+                l.act(CullAction::Pick).unwrap();
+            });
+            let undo = median(&mut library, &mut |l| {
+                l.act(CullAction::Undo).unwrap();
+            });
+            // Each direction on its own. Timed as one alternating closure, the
+            // median of nine landed on clearing the filter — which asks the
+            // catalog nothing — and reported 22 µs for an operation whose other
+            // half is a query. A median hides whichever half is rarer.
+            let narrowing = Filter::flagged(Flagged::Unflagged);
+            // Setting one, with the clearing done outside the clock: the last of
+            // several, so the write-ahead log is already there.
+            let mut filter_on = std::time::Duration::ZERO;
+            for _ in 0..5 {
+                library
+                    .act(CullAction::SetFilter(Filter::default()))
+                    .unwrap();
+                let start = std::time::Instant::now();
+                library
+                    .act(CullAction::SetFilter(narrowing.clone()))
+                    .unwrap();
+                filter_on = start.elapsed();
+            }
+            let filter_off = median(&mut library, &mut |l| {
+                l.act(CullAction::SetFilter(Filter::default())).unwrap();
+                l.act(CullAction::SetFilter(narrowing.clone())).unwrap();
+            });
+            for (what, took) in [
+                ("next", next),
+                ("view", view),
+                ("pick under a filter", pick),
+                ("undo under a filter", undo),
+                ("setting a filter", filter_on),
+                ("setting and clearing a filter", filter_off),
+            ] {
+                if took > worst.0 {
+                    worst = (took, format!("{what} at {n}"));
+                }
+            }
+            println!(
+                "{n:>8} {open:>9.1?} {next:>9.1?} {view:>9.1?} {pick:>9.1?} {undo:>9.1?} {filter_on:>9.1?} {filter_off:>9.1?}"
+            );
+        }
+        assert!(
+            worst.0 < INSTANT,
+            "{} took {:.1?}, past the {INSTANT:?} a keypress has. Two sizes are \
+             printed so a constant cost can be told from one that grows.",
+            worst.1,
+            worst.0
+        );
     }
 
     #[test]
@@ -1704,6 +1853,43 @@ mod tests {
         // has somewhere to put a photograph from the first keystroke.
         let view = library.view().unwrap();
         assert!(view.collections.iter().any(|c| c.is_quick));
+    }
+
+    #[test]
+    fn the_held_tally_follows_everything_that_can_move_it() {
+        // The counts are held rather than scanned for on every keypress, so
+        // they are only as good as the places that change them. Judgements and
+        // their undo go through `act`, where every test checks the tally
+        // against the catalog; copies do not, so they are checked here.
+        let dir = Scratch::new("tally-held");
+        let mut library = library_at(&dir.0, 3);
+        let agrees = |library: &Library| {
+            let view = library.view().unwrap();
+            let held = (view.in_library, view.picks, view.rejects);
+            assert_eq!(held, cull::tally(library.catalog()).unwrap());
+            held
+        };
+        assert_eq!(agrees(&library), (3, 0, 0));
+        library.act(CullAction::Pick).unwrap();
+        library.act(CullAction::Reject).unwrap();
+        assert_eq!(agrees(&library), (3, 1, 1));
+        // A reject turned into a pick is one of each moving, not one.
+        library.select(1);
+        library.act(CullAction::Pick).unwrap();
+        assert_eq!(agrees(&library), (3, 2, 0));
+        library.act(CullAction::Undo).unwrap();
+        assert_eq!(agrees(&library), (3, 1, 1));
+
+        // A copy is a photograph, and throwing one away can take a pick with it.
+        library.select(0);
+        library.add_copy(&EditState::default()).unwrap();
+        assert_eq!(agrees(&library), (4, 1, 1));
+        library.act(CullAction::Pick).unwrap();
+        library.select(1);
+        assert!(library.current().copy_name.is_some());
+        assert_eq!(agrees(&library), (4, 2, 1));
+        library.remove_copy().unwrap();
+        assert_eq!(agrees(&library), (3, 1, 1));
     }
 
     #[test]
@@ -2378,7 +2564,7 @@ mod marked_set_tests {
 
     /// The look one frame carries, as stored.
     fn stored(library: &Library, index: usize) -> Option<EditState> {
-        rawkit_catalog::edits::latest(&library.catalog, library.images[index].id)
+        rawkit_catalog::edits::latest(&library.catalog, library.sequence.get(index).unwrap().id)
             .unwrap()
             .map(|(_, state)| state)
     }
@@ -2414,7 +2600,7 @@ mod marked_set_tests {
         };
         rawkit_catalog::edits::save(
             &library.catalog,
-            library.images[2].id,
+            library.sequence.get(2).unwrap().id,
             &framed,
             rawkit_editstate::EditSource::User,
         )
@@ -2470,7 +2656,8 @@ mod marked_set_tests {
         assert_eq!(library.paste_into_marked().unwrap(), 0);
         assert!(stored(&library, 1).is_none(), "no version was written");
         let history =
-            rawkit_catalog::edits::history(&library.catalog, library.images[0].id).unwrap();
+            rawkit_catalog::edits::history(&library.catalog, library.sequence.get(0).unwrap().id)
+                .unwrap();
         assert_eq!(history.len(), 1);
     }
 
@@ -2486,7 +2673,7 @@ mod marked_set_tests {
         had.tone.exposure_ev = -1.5;
         rawkit_catalog::edits::save(
             &library.catalog,
-            library.images[1].id,
+            library.sequence.get(1).unwrap().id,
             &had,
             rawkit_editstate::EditSource::User,
         )

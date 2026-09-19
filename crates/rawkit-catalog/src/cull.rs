@@ -266,6 +266,32 @@ pub fn sequence(catalog: &Catalog, filter: &Filter) -> Result<Vec<LibraryImage>,
     Ok(rows)
 }
 
+/// The ids a filter admits, and nothing else about them.
+///
+/// For a caller that already holds the photographs and only needs to know which
+/// of them to show. [`sequence`] answers that by reading every row again — four
+/// tables joined and a path assembled per photograph — which is the right cost
+/// for opening a library and the wrong one for changing a filter on a library
+/// that is already open: measured, 19 ms against about one at twenty thousand.
+///
+/// **The predicate is still [`narrowing`]'s**, which is the point. Evaluating a
+/// filter in Rust over rows in memory would be faster still and would be a
+/// second opinion about what a pick is; this keeps SQL the only one.
+///
+/// Missing files are *not* excluded here, deliberately: nothing in a filter is
+/// about the file, so this is one table with no joins, and the caller's own
+/// list — which came from [`sequence`] — has already left them out.
+pub fn admitted(catalog: &Catalog, filter: &Filter) -> Result<Vec<i64>, CatalogError> {
+    let (narrowed, values) = narrowing(filter);
+    let mut statement = catalog
+        .connection()
+        .prepare(&format!("SELECT i.id FROM images i WHERE 1 = 1{narrowed}"))?;
+    let ids = statement
+        .query_map(rusqlite::params_from_iter(values), |r| r.get(0))?
+        .collect::<Result<Vec<i64>, _>>()?;
+    Ok(ids)
+}
+
 /// Whether one image would appear in a filtered [`sequence`].
 ///
 /// The question a cull asks the moment after a keypress. Rating a frame down to
