@@ -198,3 +198,14 @@ The design rationale for this project lives outside the repo and is not
 public. If a change turns on a decision that is not written down here or in
 `docs/`, ask rather than inferring it from the code — the code is downstream of
 the reasoning, not a substitute for it.
+
+Decisions that *are* written down live in `docs/decisions/`, one file per
+subject, named for the subject rather than numbered. Each says what was chosen,
+what was weighed against it and what it measured, and ends with a table of which
+tests guard which part — so read it before changing the thing it describes, and
+change it in the same commit when you do. A record that has drifted from the code
+is worse than none, for the reason a stale comment is.
+
+- [`docs/decisions/collections.md`](docs/decisions/collections.md) — the
+  collections schema, the contract on `position`, and why what is on screen is
+  one `Sequence` value.
