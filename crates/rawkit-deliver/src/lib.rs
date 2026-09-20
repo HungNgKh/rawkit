@@ -317,7 +317,13 @@ pub fn write(
                     report.bytes += bytes;
                 }
                 Ok(None) => report.skipped += 1,
-                Err(e) => report.failed.push((image.filename.clone(), e.to_string())),
+                // The whole chain. `to_string` is the outermost context alone —
+                // "writing /some/path" — and the cause underneath it, a folder
+                // that cannot be written or a disk that is full, is the only
+                // part anyone can act on.
+                Err(e) => report
+                    .failed
+                    .push((image.filename.clone(), format!("{e:#}"))),
             }
         }
     });

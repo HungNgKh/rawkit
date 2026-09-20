@@ -138,6 +138,8 @@
 #[cfg(target_os = "linux")]
 mod canvas;
 mod library;
+#[cfg(test)]
+mod page_contract;
 mod pointer;
 mod sequence;
 mod session_canvas;
@@ -498,7 +500,9 @@ fn choose_profile(app: tauri::AppHandle, state: tauri::State<'_, Shelf>) -> Resu
                     &path.to_string_lossy(),
                     name.as_deref(),
                 ) {
-                    eprintln!("profile    : could not remember it: {e}");
+                    failure(format!(
+                        "The profile is in use but the catalog could not remember it: {e}"
+                    ));
                     return;
                 }
                 eprintln!("profile    : {model} renders with {}", path.display());
@@ -652,7 +656,9 @@ fn apply_preset(
         &applied,
         rawkit_editstate::EditSource::Preset,
     ) {
-        eprintln!("preset     : applied but not recorded: {e}");
+        failure(format!(
+            "The preset is applied but could not be written to the catalog: {e}"
+        ));
     }
     Ok(event)
 }
@@ -847,7 +853,7 @@ fn cull(
     state: tauri::State<'_, Shelf>,
     session: tauri::State<'_, Shared>,
     action: CullAction,
-) -> Result<CullView, String> {
+) -> Result<CullView, Told> {
     let Some(library) = &state.0 else {
         return Err("no library is open; pass a .rawkit catalog".into());
     };
@@ -887,8 +893,8 @@ fn cull(
                 .lock()
                 .expect("library lock")
                 .add_copy(&state)
-                .map_err(|e| e.to_string())?;
-            eprintln!("copy       : made {name}");
+                .map_err(|e| Told::from_error(&e))?;
+            notice(format!("Made {name}"));
             CullAction::SelectBy(0)
         }
         CullAction::RemoveCopy => {
@@ -896,8 +902,8 @@ fn cull(
                 .lock()
                 .expect("library lock")
                 .remove_copy()
-                .map_err(|e| e.to_string())?;
-            eprintln!("copy       : removed {gone}");
+                .map_err(|e| Told::from_error(&e))?;
+            notice(format!("Removed {gone}"));
             CullAction::SelectBy(0)
         }
         // Crop is a mode of the loupe rather than a view of its own: the same
@@ -983,7 +989,17 @@ fn cull(
         .lock()
         .expect("library lock")
         .act(action)
-        .map_err(|e| e.to_string())
+        .map_err(|e| {
+            let mut told = Told::from_error(&e);
+            // "database is locked" says what broke and not what it cost. The
+            // key was pressed for a reason, and that is the thing to be told
+            // did not happen — not "nothing changed", which an action of
+            // several writes cannot promise.
+            if told.level == Told::FAILED {
+                told.text = format!("That could not be done: {}", told.text);
+            }
+            told
+        })
 }
 
 /// The status line as it stands, for a page that has just loaded.
@@ -1433,9 +1449,13 @@ fn main() -> Result<()> {
                     saver.flush();
                     let library = navigating.as_ref().expect("a paste implies a library");
                     let outcome = library.lock().expect("library lock").paste_into_marked();
+                    // The paste key returns before any of this runs, so this is
+                    // the only place its outcome can be said — and both of its
+                    // refusals ("nothing copied", "nothing selected") used to be
+                    // said to a terminal nobody was reading.
                     match outcome {
-                        Ok(count) => eprintln!("paste      : {count} frame(s)"),
-                        Err(e) => eprintln!("paste      : {e}"),
+                        Ok(count) => notice(format!("Pasted the settings onto {count}")),
+                        Err(e) => complain(&e),
                     }
                     // The frame on screen may have been one of them, so its edit
                     // is re-read rather than assumed unchanged.
@@ -2576,14 +2596,24 @@ fn begin_export(
                 }
                 if !report.failed.is_empty() {
                     line += &format!(" · {} failed", report.failed.len());
-                    for (name, why) in &report.failed {
+                    // Which, and why, where it will be read. "1 failed" beside a
+                    // folder with nothing new in it is a question; the answer
+                    // was being given to a terminal. The first is named and the
+                    // rest counted, because the cause is nearly always shared —
+                    // a folder that cannot be written fails every file the same way.
+                    let (name, why) = &report.failed[0];
+                    failure(match report.failed.len() {
+                        1 => format!("{name} was not exported: {why}"),
+                        n => format!("{n} photographs were not exported. The first, {name}: {why}"),
+                    });
+                    for (name, why) in report.failed.iter().skip(1) {
                         eprintln!("export     : {name}: {why}");
                     }
                 }
                 line
             }
             Err(e) => {
-                eprintln!("export     : {e:#}");
+                failure(format!("The export did not run: {e:#}"));
                 format!("export failed: {e}")
             }
         };
@@ -2995,13 +3025,76 @@ pub(crate) static RANGE_PICK: Mutex<Option<[f64; 2]>> = Mutex::new(None);
 /// through the notice line, like the pick does.
 static MEASURE_LENS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Something said to the person at the window, and how much it matters.
+///
+/// Three levels, and the difference between the last two is whose fault it is.
+/// A refusal is the shell declining something it understood — Backspace in the
+/// whole library, a name already taken — and the next keypress makes it
+/// history. A failure is the shell not managing something it agreed to do, an
+/// edit that did not reach the catalog, and that has to stay on screen until
+/// somebody has read it. The page cannot tell the two apart from a string, so
+/// the distinction is made here, where the cause is known.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Told {
+    level: &'static str,
+    text: String,
+}
+
+impl Told {
+    const INFO: &'static str = "info";
+    const REFUSED: &'static str = "refused";
+    const FAILED: &'static str = "failed";
+
+    /// How much a level matters, for deciding which of two messages survives.
+    fn weight(&self) -> u8 {
+        match self.level {
+            Self::FAILED => 2,
+            Self::REFUSED => 1,
+            _ => 0,
+        }
+    }
+
+    /// A refusal, unless something underneath actually broke.
+    ///
+    /// Asked of the error's chain rather than its text: a catalog that could
+    /// not be written and a filter nothing matches both arrive as `anyhow`, and
+    /// only one of them means work was lost.
+    fn from_error(error: &anyhow::Error) -> Self {
+        use rawkit_catalog::CatalogError;
+        let broke = error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<CatalogError>(),
+                Some(CatalogError::Sqlite(_) | CatalogError::Io(_) | CatalogError::Corrupt { .. })
+            ) || cause.downcast_ref::<std::io::Error>().is_some()
+        });
+        Told {
+            level: if broke { Self::FAILED } else { Self::REFUSED },
+            text: format!("{error:#}"),
+        }
+    }
+}
+
+/// Every refusal the command handlers write as a plain sentence.
+impl From<&str> for Told {
+    fn from(text: &str) -> Self {
+        Told {
+            level: Self::REFUSED,
+            text: text.into(),
+        }
+    }
+}
+
 /// Something the shell needs to say, for the page to show once.
 ///
-/// The status line is fed by the events commands return, and a refusal decided
-/// in the render loop has no command to return through. Taken rather than read,
-/// so a message appears once and does not sit there describing a click from two
-/// photographs ago.
-pub(crate) static NOTICE: Mutex<Option<String>> = Mutex::new(None);
+/// The status line is fed by what commands return, and anything decided in the
+/// render loop — a refused pick, a save that failed — has no command to return
+/// through. Taken rather than read, so a message appears once and does not sit
+/// there describing a click from two photographs ago.
+///
+/// One slot, and the page asks four times a second, so two things said inside
+/// one interval collide. The one that matters more is kept: "could not save"
+/// must not be replaced by the white-balance readout that happened to follow it.
+pub(crate) static NOTICE: Mutex<Option<Told>> = Mutex::new(None);
 
 /// The square a pick averages, in canvas pixels.
 ///
@@ -3052,8 +3145,41 @@ pub(crate) fn neutralising(
     Ok((kelvin, tint))
 }
 
+fn tell(told: Told) {
+    let mut slot = NOTICE.lock().expect("notice lock");
+    if slot
+        .as_ref()
+        .is_none_or(|waiting| waiting.weight() <= told.weight())
+    {
+        *slot = Some(told);
+    }
+}
+
+/// Something that happened, worth a line and no more.
 pub(crate) fn notice(what: impl Into<String>) {
-    *NOTICE.lock().expect("notice lock") = Some(what.into());
+    tell(Told {
+        level: Told::INFO,
+        text: what.into(),
+    });
+}
+
+/// Something that went wrong and cost the person something. It goes to the
+/// terminal as well, because a failure is also what a bug report is made of.
+pub(crate) fn failure(what: impl Into<String>) {
+    let text = what.into();
+    eprintln!("failed     : {text}");
+    tell(Told {
+        level: Told::FAILED,
+        text,
+    });
+}
+
+/// An error from somewhere with no command to return it through: a refusal or
+/// a failure, by what caused it.
+pub(crate) fn complain(error: &anyhow::Error) {
+    let told = Told::from_error(error);
+    eprintln!("{:<11}: {}", told.level, told.text);
+    tell(told);
 }
 
 /// Two canvas positions to the shape they describe, in the kind already there.
@@ -4177,11 +4303,12 @@ fn read_profile_or_warn(
         // Named rather than silently ignored. A profile that has moved should
         // say so; the alternative is a photograph quietly changing colour
         // between one session and the next.
-        eprintln!(
-            "profile    : {} is missing or not a camera profile; rendering with the \
-             decoder's own matrix",
+        let said = format!(
+            "{} is missing or is not a camera profile; rendering with the decoder's own matrix",
             path.display()
         );
+        eprintln!("profile    : {said}");
+        tell(Told::from(said.as_str()));
     }
     found
 }
@@ -5648,6 +5775,64 @@ fn crop_from(session: &Session, rect: [f32; 4]) -> Option<rawkit_editstate::Crop
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The notice slot is one process-wide value, so the tests that use it take
+    /// turns rather than reading each other's messages.
+    static SAYING: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn a_failure_is_not_talked_over() {
+        let _turn = SAYING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        NOTICE.lock().unwrap().take();
+
+        // The order they happen in when a save fails mid-drag: the failure,
+        // then whatever the render loop had to say next, inside one poll.
+        failure("This edit could not be saved: disk full");
+        notice("white balance 5200 K, tint 4");
+        let kept = NOTICE.lock().unwrap().take().expect("something was said");
+        assert_eq!(kept.level, Told::FAILED);
+        assert!(kept.text.contains("could not be saved"), "{}", kept.text);
+        assert!(NOTICE.lock().unwrap().is_none(), "said once, then gone");
+
+        // And the other way round, so it is the weight and not the order.
+        notice("white balance 5200 K, tint 4");
+        failure("This edit could not be saved: disk full");
+        assert_eq!(NOTICE.lock().unwrap().take().unwrap().level, Told::FAILED);
+
+        // Between equals the newer one wins — a second pick replaces the first.
+        notice("first");
+        notice("second");
+        assert_eq!(NOTICE.lock().unwrap().take().unwrap().text, "second");
+    }
+
+    #[test]
+    fn a_refusal_and_a_failure_are_told_apart_by_cause() {
+        let refused = anyhow::anyhow!("taking a photograph out is something done to a collection");
+        assert_eq!(Told::from_error(&refused).level, Told::REFUSED);
+
+        // The same kind of error whether it arrives bare or wrapped in context,
+        // which is how most of them arrive.
+        let broke = anyhow::Error::from(rawkit_catalog::CatalogError::Sqlite(
+            "disk I/O error".into(),
+        ));
+        assert_eq!(Told::from_error(&broke).level, Told::FAILED);
+        let wrapped = broke.context("saving the judgement");
+        let told = Told::from_error(&wrapped);
+        assert_eq!(told.level, Told::FAILED);
+        assert!(
+            told.text.contains("disk I/O error"),
+            "the cause is in the sentence: {}",
+            told.text
+        );
+
+        // A name already taken comes from the catalog too, and is nobody's loss.
+        let taken = anyhow::Error::from(rawkit_catalog::CatalogError::Unsupported(
+            "that name is taken",
+        ));
+        assert_eq!(Told::from_error(&taken).level, Told::REFUSED);
+    }
 
     /// A camera whose primaries are XYZ's, so the profile stage contributes
     /// nothing and what is measured is the eyedropper's own arithmetic.

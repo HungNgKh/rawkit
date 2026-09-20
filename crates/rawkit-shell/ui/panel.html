@@ -76,9 +76,36 @@
            border-radius: 5px; padding: 4px 11px; font: inherit; cursor: pointer; }
   button:hover { background: #3a3a44; }
   .row { display: flex; gap: 7px; margin-top: 10px; flex-wrap: wrap; }
-  #log { color: #7d7d87; margin-top: 12px; font-variant-numeric: tabular-nums;
-         overflow-wrap: anywhere; }
-  #log.refused { color: #e0705f; }
+  /* The status line: the one place the application says what happened, pinned
+     under the column so it is on screen whatever has been scrolled to. It used
+     to be a line inside the last-but-one section, which meant every refusal was
+     written somewhere nobody was looking.
+     Three levels and three behaviours. What was done fades, because it is only
+     news for a moment. What was refused stays until the next thing is said. What
+     failed gets a line of its own and stays until it is dismissed — an edit that
+     did not reach the catalog must not be replaced by "Picked" a second later.
+     Colours are checked against the #1e1e22 ground: 10.4, 5.9, 8.6 and 6.6 to 1. */
+  #status { flex-shrink: 0; border-top: 1px solid #2c2c34; padding: 8px 16px 9px;
+            font-size: 12px; line-height: 1.45; }
+  #said { color: #c9c9d1; min-height: 1.45em; overflow-wrap: anywhere;
+          transition: color .6s ease; }
+  #said.old { color: #9a9aa2; }
+  #said.refused { color: #e6b866; }
+  #failed { color: #ff9384; overflow-wrap: anywhere; cursor: pointer;
+            padding-bottom: 6px; margin-bottom: 6px; border-bottom: 1px solid #2c2c34; }
+  #failed::after { content: "  dismiss"; color: #9a9aa2; }
+  #failed.hidden, #job.hidden { display: none; }
+  #standing { display: flex; gap: 10px; color: #9a9aa2; margin-top: 2px;
+              font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #standing > span { overflow: hidden; text-overflow: ellipsis; }
+  /* Nothing selected is nothing to say, and an empty span would still claim its
+     gap and push the rest of the row in by it. */
+  #standing > span:empty { display: none; }
+  #aim { flex: 0 1 auto; min-width: 0; }
+  /* A row to itself. Sharing one with the standing facts in a 330-pixel column
+     ellipsised all three — "2 sele…  K → q…  exported 0 file(s), 0.0 MB in 2.3s…". */
+  #job { color: #c9c9d1; margin-top: 2px; overflow-wrap: anywhere;
+         font-variant-numeric: tabular-nums; }
   #keys { color: #7d7d87; font-size: 11px; line-height: 1.7; }
   .reading { color: #7d7d87; font-size: 11px; margin-top: 8px;
              font-variant-numeric: tabular-nums; }
@@ -163,10 +190,6 @@
   .clip { font-size: 11px; color: #56565e; }
   .clip.lit#clip-white { color: #e0705f; }
   .clip.lit#clip-black { color: #6f9ade; }
-  #export { color: #9a9aa2; font-size: 11px; margin-left: auto;
-            overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #export.hidden { display: none; }
-  #export.failed { color: #e0705f; }
 
   /* The culling readout, stacked rather than strung along a bar. In a column
      there is no room for a row, and there is no need for one either. */
@@ -213,7 +236,6 @@
   <div id="readout">
     <span class="clip" id="clip-white" title="pixels with a channel at full scale">–</span>
     <span class="clip" id="clip-black" title="pixels with nothing in any channel">–</span>
-    <span id="export" class="hidden"></span>
   </div>
 </div>
 <div id="cull" class="hidden">
@@ -586,13 +608,22 @@
       <button data-pan="0,200">↓</button>
       <button data-pan="200,0">→</button>
     </div>
-    <div id="log">ready</div>
   </details>
   <details id="s-keys">
     <summary>Keys</summary>
     <div id="keys">G grid · E loupe · R crop · Q spots · O mask · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · 0–5 rate · 6–9 label · F fit · V copy · \ filter · Z undo cull · ⌃Z undo edit · ⌃E export · ⌃⇧E export what is shown · F11 fullscreen</div>
   </details>
 </main>
+<footer id="status">
+  <!-- An alert, so a failure is announced when it happens rather than found. -->
+  <div id="failed" class="hidden" role="alert" title="click to dismiss"></div>
+  <div id="said" role="status" aria-live="polite">ready</div>
+  <div id="standing">
+    <span id="chosen"></span>
+    <span id="aim"></span>
+  </div>
+  <div id="job" class="hidden"></div>
+</footer>
 </div>
 
 <script type="module">
@@ -600,7 +631,48 @@
   // come back; no pixels cross in either direction, and there is no API here
   // that could carry one.
   const invoke = window.__TAURI__.core.invoke;
-  const log = document.getElementById("log");
+
+  // ---- Saying what happened --------------------------------------------------
+  //
+  // Everything the application has to tell the person at it goes through
+  // `tell`, and lands in the status line. One way in, for the same reason the
+  // shell's held state has one: the old line was written to from nine places,
+  // two of them with debug strings, and what that taught the eye was to stop
+  // reading it.
+  const saidLine = document.getElementById("said");
+  const failedLine = document.getElementById("failed");
+  let fading = null;
+  const tell = (level, text) => {
+    text = String(text ?? "").trim();
+    if (!text) return;
+    // The shell's refusals are written as clauses and its reports as sentences.
+    // Here they are all lines in the same place, so they start the same way.
+    text = text[0].toUpperCase() + text.slice(1);
+    if (level === "failed") {
+      failedLine.textContent = text;
+      failedLine.classList.remove("hidden");
+      return;
+    }
+    clearTimeout(fading);
+    saidLine.className = level === "refused" ? "refused" : "";
+    saidLine.textContent = text;
+    // News for a moment and then only a record. Dimmed rather than removed: a
+    // line that empties itself makes you wonder what you missed.
+    if (level !== "refused") fading = setTimeout(() => saidLine.classList.add("old"), 4000);
+  };
+  failedLine.addEventListener("click", () => failedLine.classList.add("hidden"));
+
+  // What a rejected command means. The shell marks its own failures — it knows
+  // whether a catalog write broke or a request was declined — so anything it
+  // sends as a bare string is a refusal. An exception thrown by the page is
+  // neither: it is a bug, and it is reported as loudly as one.
+  const say = e => {
+    if (e && typeof e === "object" && e.level) tell(e.level, e.text);
+    else if (e instanceof Error) tell("failed", `the panel broke: ${e.message}`);
+    else tell("refused", e);
+  };
+  // How to use the thing just picked up. Not an event, so it never outranks one.
+  const hint = text => tell("info", text);
 
   // ---- The hue mixer's twenty-four controls --------------------------------
   //
@@ -671,13 +743,8 @@
 
   async function send(command) {
     const event = await invoke("apply", { command });
-    log.className = event.event === "refused" ? "refused" : "";
-    log.textContent =
-      event.event === "refused"
-        ? `refused ${event.command}: ${event.reason}`
-        : event.event === "edit_changed"
-          ? `edit ${event.generation}`
-          : "view changed";
+    // Only the refusal. A slider that moved the photograph has already said so.
+    if (event.event === "refused") tell("refused", event.reason);
     return event;
   }
 
@@ -796,10 +863,7 @@
   // own X window, which is exactly what stops it fighting the webview. Drag and
   // scroll therefore need native event handling on that window, and until then
   // the view is driven by these buttons.
-  invoke("snapshot").then(s => {
-    scale = s.viewport.scale;
-    log.textContent = `${s.image[0]}x${s.image[1]}`;
-  });
+  invoke("snapshot").then(s => { scale = s.viewport.scale; });
 
   // Put the controls where the *session* says they are.
   //
@@ -941,7 +1005,7 @@
       seen = s.generation;
       // Reported rather than swallowed. A throw in here is invisible — there is
       // no console to watch — and one lived for a whole slice because of that.
-      try { sync(s.state, s.image); } catch (e) { say(`sync: ${e && e.message || e}`); }
+      try { sync(s.state, s.image); } catch (e) { tell("failed", `the panel broke in sync: ${e && e.message || e}`); }
     }
     // The panel's width is the shell's answer, not ours: a window too narrow
     // for the width someone chose gets less, and the page finds out here.
@@ -955,12 +1019,12 @@
     // photograph that opens sideways would otherwise be doing it for a reason
     // nobody can see, which is the same as doing it for no reason.
     // Anything the render loop needed to say — a refused pick, most often.
-    if (s.notice) { log.className = ""; log.textContent = s.notice; }
+    if (s.notice) tell(s.notice.level, s.notice.text);
     // Not gated on the generation: selecting a local adjustment does not change
     // the edit, and neither does arming a placement.
-    try { showMasks(s); } catch (e) { say(`masks: ${e && e.message || e}`); }
-    try { showSpots(s); } catch (e) { say(`spots: ${e && e.message || e}`); }
-    try { showLens(s); } catch (e) { say(`lens: ${e && e.message || e}`); }
+    try { showMasks(s); } catch (e) { tell("failed", `the panel broke in masks: ${e && e.message || e}`); }
+    try { showSpots(s); } catch (e) { tell("failed", `the panel broke in spots: ${e && e.message || e}`); }
+    try { showLens(s); } catch (e) { tell("failed", `the panel broke in lens: ${e && e.message || e}`); }
     showOrientation(s.orientation);
     // Not gated on the generation: a profile is not part of the edit, so
     // choosing one does not move it.
@@ -1073,10 +1137,7 @@
   // property of the camera you are working with rather than of the frame.
   const profileName = document.getElementById("profile-name");
   const profileAction = (command) => () =>
-    invoke(command).catch(e => {
-      log.className = "refused";
-      log.textContent = String(e);
-    });
+    invoke(command).catch(say);
   document.getElementById("profile-choose").addEventListener("click", profileAction("choose_profile"));
   document.getElementById("profile-clear").addEventListener("click", profileAction("clear_profile"));
 
@@ -1409,7 +1470,7 @@
 
   drawCurve();
 
-  const exportLine = document.getElementById("export");
+  const exportLine = document.getElementById("job");
   /// The generation the histogram on screen was drawn at; `null` asks for it
   /// again whatever it is, which is how a column that changed width gets a
   /// redraw rather than a stretched copy of the old one.
@@ -1428,7 +1489,6 @@
     const job = await invoke("export_progress");
     exportLine.classList.toggle("hidden", !job);
     if (!job) return;
-    exportLine.classList.toggle("failed", (job.finished ?? "").startsWith("export failed"));
     exportLine.textContent = job.finished
       ? job.finished
       : `exporting ${job.done}/${job.total}` + (job.filename ? ` · ${job.filename}` : "");
@@ -1455,7 +1515,6 @@
   const snapshotEmpty = document.getElementById("snapshot-empty");
   const snapshotName = document.getElementById("snapshot-name");
 
-  const say = e => { log.className = "refused"; log.textContent = String(e); };
 
   // Removing something saved takes two clicks, and the button says so in
   // between. `confirm` would be the obvious answer and is the wrong one here:
@@ -1872,7 +1931,7 @@
 
   document.getElementById("spot-tool").addEventListener("click", () => {
     act("spot").then(() =>
-      say("drag on the photograph to cover a mark; drag a circle to move it"));
+      hint("drag on the photograph to cover a mark; drag a circle to move it"));
   });
   document.getElementById("spot-remove").addEventListener("click", () => {
     if (spot === null) return say("nothing selected to remove");
@@ -1885,7 +1944,7 @@
   document.getElementById("spot-source").addEventListener("click", () => {
     if (spot === null) return;
     invoke("find_spot_source", { index: spot })
-      .then(() => say("looking for somewhere to borrow from"))
+      .then(() => hint("looking for somewhere to borrow from"))
       .catch(say);
   });
   for (const [id, control] of [["spot-radius", "radius"], ["spot-feather", "feather"]]) {
@@ -1903,7 +1962,7 @@
         // A range has nowhere to be dragged to: it selects by what the light is,
         // so the next press belongs to the photograph and not to the mask.
         placing = kind !== "range";
-        say(placing
+        hint(placing
           ? "drag across the photograph to place it"
           : "a band on brightness — move From and To, or pick a place to centre it on");
       })
@@ -1914,7 +1973,7 @@
   // a frame that has not changed, and the first one is what you get anyway.
   document.getElementById("lens-measure").addEventListener("click", (e) => {
     e.target.disabled = true;
-    say("measuring the lens…");
+    hint("measuring the lens…");
     invoke("measure_lens")
       .catch(say)
       .finally(() => { e.target.disabled = false; });
@@ -1968,7 +2027,7 @@
       // A refinement starts as a brush: it is the shape somebody reaches for to
       // take a corner off a gradient, and it needs no placement to be visible.
       invoke("add_refinement", { op, kind: "brush" })
-        .then(() => say(`${op} — paint on the photograph`))
+        .then(() => hint(`${op} — paint on the photograph`))
         .catch(say);
     });
   }
@@ -1980,7 +2039,7 @@
     if (selected === null || rangeChannel === null) return;
     if (!pickingRange && armed !== null) arm(null);
     pickRange(!pickingRange);
-    if (pickingRange) say("click the colour or brightness you want the band around");
+    if (pickingRange) hint("click the colour or brightness you want the band around");
   });
   document.getElementById("mask-channel").addEventListener("click", () => {
     if (selected === null || rangeChannel === null) return;
@@ -2162,12 +2221,15 @@
     label.style.color = { red: "#e0705f", yellow: "#d8bf63", green: "#6fc27a", blue: "#6f9ade" }[view.colour] ?? "";
     document.getElementById("counts").textContent =
       `${view.picks} picked · ${view.rejects} rejected` +
-      (view.marked ? ` · ${view.marked} marked${view.is_marked ? " ✓" : ""}` : "") +
       // A clipboard nobody can see is a key that sometimes does nothing.
-      (view.copied ? " · settings copied" : "") +
-      // Which way K will go on this frame, and where. A toggle that does not
-      // say which state it is in is a key you have to press to find out.
-      (view.in_target ? ` · in ${targetName(view)}` : "");
+      (view.copied ? " · settings copied" : "");
+    // What the next key will act on, which is a standing fact rather than an
+    // event and so lives beside the messages rather than in them. The tick is
+    // this frame: whether M and K would add it or take it back.
+    document.getElementById("chosen").textContent =
+      view.marked ? `${view.marked} selected${view.is_marked ? " ✓" : ""}` : "";
+    document.getElementById("aim").textContent =
+      `K → ${targetName(view)}${view.in_target ? " ✓" : ""}`;
     drawFilter(view.filter ?? {});
     drawCollections(view);
     setMode(view.mode);
@@ -2452,12 +2514,18 @@
     }, { passive: false });
   }
 
+  // The shell says what happened and whether it can be taken back; which key
+  // does that is the page's to say, because the keys are the page's — and this
+  // is the one line to change when undo moves to Ctrl+Z.
+  const UNDO_HINT = " · Z undoes it";
   const act = async (action, value) => {
     try {
-      show(await invoke("cull", { action: value === undefined ? { action } : { action, value } }));
+      const view = await invoke("cull", { action: value === undefined ? { action } : { action, value } });
+      show(view);
+      if (view.said)
+        tell("info", view.said + (view.takes_back ? UNDO_HINT : ""));
     } catch (e) {
-      log.className = "refused";
-      log.textContent = String(e);
+      say(e);
       // A refusal means the controls and the library may now disagree — a
       // filter nothing matches is not applied. Redraw from what the shell is
       // actually showing rather than leaving a chip lit for a filter that never
@@ -2497,10 +2565,7 @@
       // The picker decides the rest: a name for one photograph, a folder for a
       // set, so the two cannot be asked for the wrong thing.
       if (held === "e") {
-        invoke("export", { scope: event.shiftKey ? "shown" : "current" }).catch(e => {
-          log.className = "refused";
-          log.textContent = String(e);
-        });
+        invoke("export", { scope: event.shiftKey ? "shown" : "current" }).catch(say);
         event.preventDefault();
       }
       return;

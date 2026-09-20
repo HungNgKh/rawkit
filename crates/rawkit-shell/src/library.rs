@@ -430,6 +430,21 @@ pub struct CullView {
     /// Whether this frame is in the target collection, so the key that toggles
     /// it can say which way it will go.
     pub in_target: bool,
+    /// What the action that produced this view did, in words.
+    ///
+    /// A key that changes the catalog and says nothing is a key you have to
+    /// check up on — Z most of all, which reversed *something* and left you to
+    /// work out what. Only the view an action returns carries it: a view that
+    /// was merely asked for describes the state, not an event, so it is `None`
+    /// there and a message is never said twice.
+    pub said: Option<String>,
+    /// Whether *this action* left something for undo to take back.
+    ///
+    /// Not the same question as `undoable`, and the difference is a lie waiting
+    /// to be told: pressing P on a frame that is already a pick records nothing,
+    /// so "undo takes this back" would be promising to reverse whatever happened
+    /// to be on the stack from earlier.
+    pub takes_back: bool,
     /// How many photographs there are altogether, against `total`'s "how many
     /// the filter admits". Both, because "12 of 47" is the only honest way to
     /// show a narrowed library — a bare count reads as a library that lost
@@ -509,6 +524,12 @@ pub struct Library {
     /// land afterwards would put the old edit back, and the paste would look
     /// like it had silently skipped one frame.
     paste_requested: bool,
+    /// What the action in progress has to say for itself; taken by the view
+    /// that reports it. See [`CullView::said`].
+    said: Option<String>,
+    /// How many things undo has ever been given. Only ever compared with
+    /// itself across one action, to answer [`CullView::takes_back`].
+    recorded: u64,
 }
 
 /// How many judgements can be taken back. Enough to cover a mis-keyed run
@@ -546,6 +567,8 @@ impl Library {
             undo: Vec::new(),
             copied: None,
             paste_requested: false,
+            said: None,
+            recorded: 0,
             request: None,
             marked: Vec::new(),
         })
@@ -639,10 +662,7 @@ impl Library {
             }
         }
         if !undo.is_empty() {
-            self.undo.push(Undone::Pasted { frames: undo });
-            if self.undo.len() > UNDO_DEPTH {
-                self.undo.remove(0);
-            }
+            self.remember(Undone::Pasted { frames: undo });
         }
         Ok(changed)
     }
@@ -770,8 +790,39 @@ impl Library {
         }
     }
 
+    /// Say what just happened. The last thing said wins, which is what lets an
+    /// arm describe the whole action after the helpers it called have described
+    /// their part of it.
+    fn say(&mut self, what: impl Into<String>) {
+        self.said = Some(what.into());
+    }
+
+    /// A photograph's name for a sentence: the file, and the copy if it is one.
+    /// Falls back to saying less rather than failing — a frame the filter has
+    /// just hidden is exactly the frame an undo most needs to name.
+    fn name_of(&self, id: i64) -> String {
+        match self.position_of(id).and_then(|at| self.sequence.get(at)) {
+            Some(image) => match &image.copy_name {
+                Some(copy) => format!("{} ({copy})", image.filename),
+                None => image.filename.clone(),
+            },
+            None => "a photograph not showing".into(),
+        }
+    }
+
+    /// A collection's name for a sentence. The quick collection is called what
+    /// the page calls it.
+    fn collection_name(&self, id: i64) -> String {
+        match self.collections.iter().find(|held| held.id == id) {
+            Some(held) if held.is_quick => "the quick collection".into(),
+            Some(held) => held.name.clone(),
+            None => "a collection that has gone".into(),
+        }
+    }
+
     /// Keep something that can be taken back, and forget the oldest.
     fn remember(&mut self, undone: Undone) {
+        self.recorded += 1;
         self.undo.push(undone);
         if self.undo.len() > UNDO_DEPTH {
             self.undo.remove(0);
@@ -781,7 +832,7 @@ impl Library {
     /// Put photographs in a collection, remembering only the ones that were not
     /// already there — so taking this back never removes a frame somebody had
     /// added before.
-    fn add_to(&mut self, collection: i64, images: &[i64]) -> Result<()> {
+    fn add_to(&mut self, collection: i64, images: &[i64]) -> Result<usize> {
         let mut fresh = Vec::new();
         for image in images {
             if !collections::holds(&self.catalog, collection, *image)? {
@@ -789,25 +840,29 @@ impl Library {
             }
         }
         if fresh.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
+        let added = fresh.len();
         collections::add(&self.catalog, collection, &fresh)?;
         self.remember(Undone::Added {
             collection,
             images: fresh,
         });
         let standing = self.current().id;
-        self.after_membership_changed(collection, Some(standing))
+        self.after_membership_changed(collection, Some(standing))?;
+        Ok(added)
     }
 
     /// Take photographs out of a collection, remembering where each was.
-    fn take_out_of(&mut self, collection: i64, images: &[i64]) -> Result<()> {
+    fn take_out_of(&mut self, collection: i64, images: &[i64]) -> Result<usize> {
         let placed = collections::take_out(&self.catalog, collection, images)?;
         if placed.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
+        let taken = placed.len();
         self.remember(Undone::TakenOut { collection, placed });
-        self.after_membership_changed(collection, None)
+        self.after_membership_changed(collection, None)?;
+        Ok(taken)
     }
 
     /// What every change to a collection's members has to be followed by: the
@@ -1053,6 +1108,13 @@ impl Library {
 
     /// Carry out an action and report the new state.
     pub fn act(&mut self, action: CullAction) -> Result<CullView> {
+        // An action that fails says so through its error; whatever an earlier
+        // one left unsaid is not this one's to say.
+        self.said = None;
+        // Counted rather than read off the stack's length, which does not
+        // change when a full stack takes a new entry and drops its oldest.
+        let recorded = self.recorded;
+        let undoing = matches!(action, CullAction::Undo);
         match action {
             // Resolved before they reach here — they change which view is
             // showing, not which photograph. Listed rather than caught by a
@@ -1063,15 +1125,25 @@ impl Library {
             CullAction::ShowCollection(id) => self.show_collection(id)?,
             CullAction::TargetToggle => {
                 let (target, id) = (self.target, self.current().id);
+                let (frame, into) = (self.name_of(id), self.collection_name(target));
                 if collections::holds(&self.catalog, target, id)? {
                     self.take_out_of(target, &[id])?;
+                    self.say(format!("Took {frame} out of {into}"));
                 } else {
                     self.add_to(target, &[id])?;
+                    self.say(format!("Added {frame} to {into}"));
                 }
             }
             CullAction::AddMarked => {
                 let chosen = self.chosen();
-                self.add_to(self.target, &chosen)?;
+                let into = self.collection_name(self.target);
+                let added = self.add_to(self.target, &chosen)?;
+                // Both numbers when they differ: "added 2" after selecting five
+                // reads as three going missing, unless it says where they were.
+                self.say(match chosen.len() - added {
+                    0 => format!("Added {added} to {into}"),
+                    there => format!("Added {added} to {into}; {there} already in it"),
+                });
             }
             CullAction::TakeOut => {
                 let Source::Collection(viewing) = self.sequence.source() else {
@@ -1081,7 +1153,9 @@ impl Library {
                     ));
                 };
                 let id = self.current().id;
+                let (frame, from) = (self.name_of(id), self.collection_name(viewing));
                 self.take_out_of(viewing, &[id])?;
+                self.say(format!("Took {frame} out of {from}"));
             }
             CullAction::SetTarget(id) => {
                 collections::set_target(&self.catalog, id)?;
@@ -1089,9 +1163,18 @@ impl Library {
                 for held in &mut self.collections {
                     held.is_target = held.id == id;
                 }
+                let name = self.collection_name(id);
+                // Capitalised by the page, so the quick collection's lower-case
+                // name can lead the sentence.
+                self.say(format!("{name} is the target now"));
             }
             CullAction::EmptyCollection(id) => {
                 let placed = collections::clear(&self.catalog, id)?;
+                self.say(format!(
+                    "Emptied {} of {}",
+                    self.collection_name(id),
+                    placed.len()
+                ));
                 if !placed.is_empty() {
                     self.remember(Undone::TakenOut {
                         collection: id,
@@ -1103,9 +1186,14 @@ impl Library {
             CullAction::RenameCollection { id, name } => {
                 collections::rename(&self.catalog, id, &name)?;
                 self.refresh_collections()?;
+                self.say(format!("Renamed to {name}"));
             }
             CullAction::DeleteCollection(id) => {
+                let name = self.collection_name(id);
                 let removed = collections::remove(&self.catalog, id)?;
+                // The reassurance is the message. "Deleted" beside a list of
+                // photographs reads as the photographs having gone.
+                self.say(format!("Deleted {name}; its photographs stay"));
                 // The ids it had mean nothing now, and SQLite will give them to
                 // the next collections made. An undo record still naming one
                 // would put its photographs into a stranger.
@@ -1137,6 +1225,7 @@ impl Library {
                 // carrying a name nobody chose to make empty.
                 collections::create_holding(&self.catalog, &name, None, &chosen)?;
                 self.refresh_collections()?;
+                self.say(format!("Made {name} with {}", chosen.len()));
             }
             CullAction::MoveInCollection(step) => {
                 let Source::Collection(id) = self.sequence.source() else {
@@ -1184,13 +1273,20 @@ impl Library {
             CullAction::Previous => self.go(self.index.saturating_sub(1)),
             CullAction::Rate(stars) => {
                 let rating = (stars > 0).then_some(stars);
+                let frame = self.name_of(self.current().id);
                 self.judge(|j| Judgement { rating, ..j })?;
+                self.say(match stars {
+                    0 => format!("No stars on {frame}"),
+                    n => format!("{} {frame}", "★".repeat(n as usize)),
+                });
             }
             // A frame that leaves the filter has already carried the cursor
             // forward — everything after it moved up a place — so advancing as
             // well would step over its neighbour. That is the one thing a
             // filtered pass must not do: skip a photograph silently.
             CullAction::Pick => {
+                let frame = self.name_of(self.current().id);
+                self.say(format!("Picked {frame}"));
                 let dropped = self.judge(|j| Judgement {
                     flag: Some(Flag::Pick),
                     ..j
@@ -1200,6 +1296,8 @@ impl Library {
                 }
             }
             CullAction::Reject => {
+                let frame = self.name_of(self.current().id);
+                self.say(format!("Rejected {frame}"));
                 let dropped = self.judge(|j| Judgement {
                     flag: Some(Flag::Reject),
                     ..j
@@ -1209,12 +1307,19 @@ impl Library {
                 }
             }
             CullAction::ClearFlag => {
+                let frame = self.name_of(self.current().id);
                 self.judge(|j| Judgement { flag: None, ..j })?;
+                self.say(format!("Unflagged {frame}"));
             }
             CullAction::Colour(name) => {
                 // Pressing the same label again clears it, the way Lightroom's
                 // colour keys behave. Without that there is no key for "I was
                 // wrong about this one" except reaching for another.
+                // Named before it is judged, like every other judgement here:
+                // under a colour filter this is the key that takes the frame
+                // out of the view, and it cannot be named from there afterwards.
+                let id = self.current().id;
+                let frame = self.name_of(id);
                 self.judge(|j| {
                     let colour = if j.colour.as_deref() == Some(name.as_str()) {
                         None
@@ -1223,23 +1328,39 @@ impl Library {
                     };
                     Judgement { colour, ..j }
                 })?;
+                // Asked of the catalog rather than worked out twice: the key is
+                // a toggle, and which way it went is the whole message.
+                self.say(match cull::judgement(&self.catalog, id)?.colour {
+                    Some(colour) => format!("Labelled {frame} {colour}"),
+                    None => format!("Label off {frame}"),
+                });
             }
             CullAction::ClearColour => {
+                let frame = self.name_of(self.current().id);
                 self.judge(|j| Judgement { colour: None, ..j })?;
+                self.say(format!("Label off {frame}"));
             }
             // Handled by the shell, which owns the layout and the render loop.
             // Listed here so the page has one vocabulary rather than two.
             CullAction::Grid | CullAction::Loupe | CullAction::Survey | CullAction::Cells(_) => {}
             CullAction::Mark => {
                 let id = self.current().id;
+                let frame = self.name_of(id);
                 match self.marked.iter().position(|marked| *marked == id) {
                     Some(at) => {
                         self.marked.remove(at);
+                        self.say(format!("Deselected {frame}"));
                     }
-                    None => self.marked.push(id),
+                    None => {
+                        self.marked.push(id);
+                        self.say(format!("Selected {frame}"));
+                    }
                 }
             }
-            CullAction::ClearMarks => self.marked.clear(),
+            CullAction::ClearMarks => {
+                self.marked.clear();
+                self.say("Nothing selected");
+            }
             CullAction::SelectMarked(step) => {
                 let shown = self.marked();
                 if !shown.is_empty() {
@@ -1251,6 +1372,12 @@ impl Library {
             CullAction::SurveyJudge(keep) => {
                 let id = self.current().id;
                 let flag = if keep { Flag::Pick } else { Flag::Reject };
+                let frame = self.name_of(id);
+                self.say(if keep {
+                    format!("Picked {frame}; out of the comparison")
+                } else {
+                    format!("Rejected {frame}; out of the comparison")
+                });
                 self.judge(|j| Judgement {
                     flag: Some(flag),
                     ..j
@@ -1291,6 +1418,7 @@ impl Library {
                         self.go(index);
                         self.index = index;
                     }
+                    self.say(format!("Undid the paste onto {}", frames.len()));
                 }
                 Some(Undone::Judged {
                     image,
@@ -1324,6 +1452,9 @@ impl Library {
                         // restored either way; the cursor stays where it can be.
                         self.index = self.index.min(self.sequence.len() - 1);
                     }
+                    // Named after the frame came back, so a judgement that had
+                    // dropped it out of the filter can still be called by name.
+                    self.say(format!("Undid the judgement on {}", self.name_of(image)));
                 }
                 Some(Undone::TakenOut { collection, placed }) => {
                     collections::put_back(&self.catalog, collection, &placed)?;
@@ -1333,18 +1464,31 @@ impl Library {
                     // cannot widen the view.
                     let back = placed.first().map(|p| p.image);
                     self.after_membership_changed(collection, back)?;
+                    self.say(format!(
+                        "Put {} back in {}",
+                        placed.len(),
+                        self.collection_name(collection)
+                    ));
                 }
                 Some(Undone::Added { collection, images }) => {
                     collections::take_out(&self.catalog, collection, &images)?;
                     self.after_membership_changed(collection, None)?;
+                    self.say(format!(
+                        "Took {} back out of {}",
+                        images.len(),
+                        self.collection_name(collection)
+                    ));
                 }
                 Some(Undone::Deleted(removed)) => {
                     collections::restore(&self.catalog, &removed)?;
                     // It may have been the target, and comes back as one.
                     self.target = collections::target(&self.catalog)?;
                     self.refresh_collections()?;
+                    self.say(format!("Brought {} back", removed.name()));
                 }
-                None => {}
+                // Said, because a key that does nothing looks broken and this
+                // one has a reason.
+                None => self.say("Nothing to undo"),
             },
         }
         // Every shortcut the sequence takes is a claim that it ends where a full
@@ -1368,7 +1512,10 @@ impl Library {
                 self.tally
             );
         }
-        self.view()
+        let mut view = self.view()?;
+        view.said = self.said.take();
+        view.takes_back = !undoing && self.recorded != recorded;
+        Ok(view)
     }
 
     /// Apply a change to the current image's judgement, remembering what it
@@ -1385,10 +1532,7 @@ impl Library {
             return Ok(false);
         }
         self.write_judgement(id, &before, &after)?;
-        self.undo.push(Undone::Judged { image: id, before });
-        if self.undo.len() > UNDO_DEPTH {
-            self.undo.remove(0);
-        }
+        self.remember(Undone::Judged { image: id, before });
         self.settle(id)
     }
 
@@ -1501,6 +1645,8 @@ impl Library {
             // the one still asked per keypress.
             in_target: collections::holds(&self.catalog, self.target, image.id)?,
             in_library,
+            said: None,
+            takes_back: false,
         })
     }
 }
@@ -1589,7 +1735,9 @@ impl Saver {
         ) {
             Ok(Some(version)) => eprintln!("edit       : saved v{version} for image {image}"),
             Ok(None) => {}
-            Err(e) => eprintln!("edit       : could not save: {e}"),
+            // The one failure here that costs work. It went to a terminal, and
+            // the window went on looking as though the edit was safe.
+            Err(e) => crate::failure(format!("This edit could not be saved: {e}")),
         }
     }
 
@@ -1622,7 +1770,18 @@ impl Saver {
                 // holds it, because the previous image's edit is what it holds.
                 session.load(EditState::default());
             }
-            Err(e) => eprintln!("edit       : could not read: {e}"),
+            Err(e) => {
+                // As shot, for the reason above and more so: what the session
+                // holds is the *previous* photograph's edit, and leaving it
+                // there rendered this frame with another frame's settings while
+                // the only explanation went to a terminal. Edits are versioned,
+                // so what could not be read is still in the catalog.
+                session.load(EditState::default());
+                crate::failure(format!(
+                    "The edit saved for this photograph could not be read, so it is showing \
+                     as shot: {e}"
+                ));
+            }
         }
         self.settled = None;
         self.opened_at = session.generation();
@@ -2271,6 +2430,137 @@ pub(crate) mod tests {
         // be taken back too.
         let quick = named(&library, "Quick Collection").id;
         assert!(library.act(CullAction::DeleteCollection(quick)).is_err());
+    }
+
+    #[test]
+    fn every_change_says_what_it_did_and_says_it_once() {
+        let dir = Scratch::new("said");
+        let mut library = library_at(&dir.0, 5);
+        let first = library.current().filename.clone();
+        let said = |view: CullView| view.said.expect("the action should say what it did");
+
+        // Moving is not an event worth a sentence; the photograph changing is
+        // the feedback, and a line that flickered on every arrow would teach
+        // the eye to ignore the one place a failure is reported.
+        assert_eq!(library.act(CullAction::SelectNext).unwrap().said, None);
+        library.act(CullAction::SelectPrevious).unwrap();
+
+        assert_eq!(
+            said(library.act(CullAction::Rate(3)).unwrap()),
+            format!("★★★ {first}")
+        );
+        assert_eq!(
+            said(library.act(CullAction::Mark).unwrap()),
+            format!("Selected {first}")
+        );
+        assert_eq!(
+            said(library.act(CullAction::TargetToggle).unwrap()),
+            format!("Added {first} to the quick collection")
+        );
+        // Asked for rather than produced by an action: the state, not an event.
+        assert_eq!(library.view().unwrap().said, None);
+
+        // The frame is already in there, and the sentence has to admit it —
+        // "added 1" after choosing two reads as one having gone missing.
+        library.select(1);
+        library.act(CullAction::Mark).unwrap();
+        assert_eq!(
+            said(library.act(CullAction::AddMarked).unwrap()),
+            "Added 1 to the quick collection; 1 already in it"
+        );
+
+        // Undo names what it reversed, newest first, and then admits it has
+        // run out rather than doing nothing silently.
+        assert_eq!(
+            said(library.act(CullAction::Undo).unwrap()),
+            "Took 1 back out of the quick collection"
+        );
+        assert_eq!(
+            said(library.act(CullAction::Undo).unwrap()),
+            "Took 1 back out of the quick collection"
+        );
+        assert_eq!(
+            said(library.act(CullAction::Undo).unwrap()),
+            format!("Undid the judgement on {first}")
+        );
+        assert_eq!(
+            said(library.act(CullAction::Undo).unwrap()),
+            "Nothing to undo"
+        );
+
+        // Pressing a key that changes nothing leaves nothing to take back, and
+        // must not borrow the promise from whatever is already on the stack.
+        let once = library.act(CullAction::Pick).unwrap();
+        assert!(once.takes_back, "a pick is something undo reverses");
+        library.act(CullAction::SelectPrevious).unwrap();
+        let again = library.act(CullAction::Pick).unwrap();
+        assert!(again.undoable, "the first pick is still on the stack");
+        assert!(
+            !again.takes_back,
+            "picking a pick recorded nothing, so undo would reverse something else"
+        );
+        // Undo itself is not something undo takes back.
+        assert!(!library.act(CullAction::Undo).unwrap().takes_back);
+
+        // A refusal is an error, and leaves nothing behind for the next action
+        // to say on its behalf.
+        assert!(library.act(CullAction::TakeOut).is_err());
+        assert_eq!(library.act(CullAction::SelectNext).unwrap().said, None);
+    }
+
+    #[test]
+    fn an_undo_can_name_a_frame_the_filter_had_hidden() {
+        let dir = Scratch::new("said-hidden");
+        let mut library = library_at(&dir.0, 4);
+        let first = library.current().filename.clone();
+        library
+            .act(CullAction::SetFilter(Filter {
+                flagged: Some(Flagged::Unflagged),
+                ..Filter::default()
+            }))
+            .unwrap();
+        // Rejecting it takes it out of "undecided", so by the time the undo
+        // runs the frame is not in the sequence to be named from.
+        library.act(CullAction::Reject).unwrap();
+        let view = library.act(CullAction::Undo).unwrap();
+        assert_eq!(view.said, Some(format!("Undid the judgement on {first}")));
+        assert_eq!(view.filename, first);
+    }
+
+    #[test]
+    fn a_label_that_takes_the_frame_out_of_view_still_names_it() {
+        let dir = Scratch::new("said-colour");
+        let mut library = library_at(&dir.0, 3);
+        let first = library.current().filename.clone();
+        // Two red frames, so that taking the label off one leaves a view of
+        // the other rather than an empty one, which the sequence would refuse.
+        library.act(CullAction::Colour("red".into())).unwrap();
+        library.select(1);
+        library.act(CullAction::Colour("red".into())).unwrap();
+        library
+            .act(CullAction::SetFilter(Filter {
+                colour: Some("red".into()),
+                ..Filter::default()
+            }))
+            .unwrap();
+        library.select(0);
+        // The same key again clears the label, and the frame leaves the view
+        // in the same keypress that has to name it.
+        let view = library.act(CullAction::Colour("red".into())).unwrap();
+        assert_eq!(view.said, Some(format!("Label off {first}")));
+        assert_eq!(view.total, 1);
+    }
+
+    #[test]
+    fn the_stack_being_full_does_not_hide_a_new_entry() {
+        let dir = Scratch::new("said-full");
+        let mut library = library_at(&dir.0, 2);
+        // Alternate so every press is a real change, past the depth undo keeps.
+        for press in 0..UNDO_DEPTH + 3 {
+            let stars = if press % 2 == 0 { 1 } else { 2 };
+            let view = library.act(CullAction::Rate(stars)).unwrap();
+            assert!(view.takes_back, "press {press} changed the rating");
+        }
     }
 
     #[test]

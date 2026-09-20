@@ -209,3 +209,6 @@ is worse than none, for the reason a stale comment is.
 - [`docs/decisions/collections.md`](docs/decisions/collections.md) — the
   collections schema, the contract on `position`, and why what is on screen is
   one `Sequence` value.
+- [`docs/decisions/interface.md`](docs/decisions/interface.md) — the status line
+  and its three levels, the test that holds the page to the shell's types, and
+  the constraints every interface slice lives under.
