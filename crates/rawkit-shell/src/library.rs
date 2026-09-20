@@ -1267,6 +1267,22 @@ impl Library {
         })
     }
 
+    /// What is outstanding among these photographs, in the order given — for
+    /// the ones somebody is looking at, which cannot wait for the walk to reach
+    /// them. An id the source does not hold is passed over.
+    pub fn outstanding_among(&self, ids: &[i64], renderer: &str) -> Result<Vec<previews::Wanted>> {
+        let images: Vec<LibraryImage> = ids
+            .iter()
+            .filter_map(|id| self.sequence.by_id(*id).cloned())
+            .collect();
+        Ok(previews::outstanding_in(
+            &self.catalog,
+            &images,
+            previews::Level::BULK,
+            renderer,
+        )?)
+    }
+
     /// Record what the builder made. The only way a preview built in the window
     /// reaches the catalog, and called from the render loop alone — the builder
     /// has no connection, which is what makes `SQLITE_BUSY` somebody else's

@@ -38,7 +38,7 @@ use crate::library::Library;
 use crate::sequence::Source;
 use rawkit_catalog::previews::{Preview, Wanted};
 use rawkit_engine::{render::DEFAULT_TILE, Gpu, Renderer};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
@@ -57,6 +57,13 @@ pub const PREVIEW_JOBS: usize = 1;
 /// How many photographs one frame asks about. The scale gate's `page 64`.
 const PAGE: usize = 64;
 
+/// How many of the cells on screen are asked about at once.
+///
+/// The same 64 and the same 1.4 ms, and far more than it sounds: the builder
+/// finishes a photograph or two a second, so this is half a minute of work
+/// queued in the right order, re-read whenever what is on screen changes.
+pub const NEAR: usize = PAGE;
+
 /// The most finished photographs one frame records.
 ///
 /// A backstop and not the governor: the channel the builder sends on holds
@@ -68,15 +75,23 @@ const RECORDS_PER_FRAME: usize = 8;
 ///
 /// It owns its own rule — **a photograph is dispatched once** — rather than
 /// trusting its callers to check. There is more than one source of work (the
-/// walk through the library now; what is on screen and what was just edited,
+/// walk through the library, and what is on screen; what was just edited,
 /// next) and they do not know about each other, so "is this already wanted" has
 /// to be answered here or it is answered nowhere, and the price of nowhere is
 /// one RAW being decoded twice at once on a GPU this is trying to stay off.
 #[derive(Default)]
 pub struct Queue {
-    far: VecDeque<Wanted>,
-    /// Every id in `far`.
-    queued: HashSet<i64>,
+    /// Everything wanted and not yet started, by photograph. The two orders
+    /// below are lists of ids into this, which is what lets one photograph be
+    /// in both without being two pieces of work: taking it from either takes it
+    /// from here, and the other order finds it gone and moves on.
+    waiting: HashMap<i64, Wanted>,
+    /// What somebody is looking at and cannot see, nearest the selection first.
+    /// **Replaced, never added to**: it is a statement about this frame, and
+    /// what was on screen a scroll ago has no claim on the front of the queue.
+    near: Vec<i64>,
+    /// Everything else, in the order the walk through the library found it.
+    far: VecDeque<i64>,
     /// Every id handed to a worker and not yet accounted for.
     ///
     /// **An id leaves this exactly when its result arrives, or when the result
@@ -89,19 +104,58 @@ pub struct Queue {
 impl Queue {
     /// Ask for a photograph. `false` if it was already wanted or is being built.
     pub fn push_far(&mut self, wanted: Wanted) -> bool {
-        if self.in_flight.contains(&wanted.image_id) || !self.queued.insert(wanted.image_id) {
+        let id = wanted.image_id;
+        if self.in_flight.contains(&id) || self.waiting.contains_key(&id) {
             return false;
         }
-        self.far.push_back(wanted);
+        self.waiting.insert(id, wanted);
+        self.far.push_back(id);
         true
+    }
+
+    /// Say what is on screen and missing, nearest first, and hear how many of
+    /// those nobody had asked for before.
+    ///
+    /// Each also joins the back of `far` the first time it is seen. `near` is
+    /// forgotten at the next scroll, and a photograph that was only ever in it
+    /// would then be wanted by nothing that will ever offer it — waiting for
+    /// good, and the run with it, since a run ends when nothing is waiting.
+    ///
+    /// What is handed in replaces what was held for that photograph. It was
+    /// read from the catalog a moment ago, and what the walk read may be
+    /// minutes old.
+    pub fn set_near(&mut self, wanted: Vec<Wanted>) -> usize {
+        self.near.clear();
+        let mut newly = 0;
+        for wanted in wanted {
+            let id = wanted.image_id;
+            if self.in_flight.contains(&id) {
+                continue;
+            }
+            self.near.push(id);
+            if self.waiting.insert(id, wanted).is_none() {
+                self.far.push_back(id);
+                newly += 1;
+            }
+        }
+        newly
     }
 
     /// The next photograph to build, which from this moment is in flight.
     /// Both halves under the caller's one lock, so there is no instant at which
     /// it is neither and could be asked for again.
     pub fn take_next(&mut self) -> Option<Wanted> {
-        let wanted = self.far.pop_front()?;
-        self.queued.remove(&wanted.image_id);
+        // An id in either order with nothing behind it was taken through the
+        // other one. Skipped here rather than hunted down there.
+        let near = std::mem::take(&mut self.near);
+        let mut near = near.into_iter();
+        let mut found = near.find_map(|id| self.waiting.remove(&id));
+        self.near = near.collect();
+        while found.is_none() {
+            let id = self.far.pop_front()?;
+            found = self.waiting.remove(&id);
+        }
+        let wanted = found?;
         self.in_flight.insert(wanted.image_id);
         Some(wanted)
     }
@@ -115,14 +169,20 @@ impl Queue {
     /// that was. What is in flight finishes: it is most of a second of work
     /// already spent, and its result is as good as any other.
     pub fn forget(&mut self) -> usize {
-        let forgotten = self.far.len();
+        let forgotten = self.waiting.len();
+        self.waiting.clear();
+        self.near.clear();
         self.far.clear();
-        self.queued.clear();
         forgotten
     }
 
+    /// Whether there is anything for a worker to take.
+    pub fn has_work(&self) -> bool {
+        !self.waiting.is_empty()
+    }
+
     pub fn is_idle(&self) -> bool {
-        self.far.is_empty() && self.in_flight.is_empty()
+        self.waiting.is_empty() && self.in_flight.is_empty()
     }
 }
 
@@ -264,6 +324,9 @@ pub struct Builder {
     filename: String,
     started: Option<std::time::Instant>,
     was_stopped: bool,
+    /// What the grid last said it could not show, so that the catalog is asked
+    /// about it when it changes and not sixty times a second while it does not.
+    near: Vec<i64>,
 }
 
 impl Builder {
@@ -292,6 +355,7 @@ impl Builder {
             filename: String::new(),
             started: None,
             was_stopped: false,
+            near: Vec::new(),
         }
     }
 
@@ -321,7 +385,10 @@ impl Builder {
     /// Never an error. This runs inside the frame, and an error out of the
     /// frame ends the render loop — a preview that could not be recorded is a
     /// thing to say, not a reason for the window to stop drawing.
-    pub fn pump(&mut self, library: &Mutex<Library>) -> Pumped {
+    ///
+    /// `near` is what is on screen with nothing to show, nearest the selection
+    /// first — the grid's own list, or nothing when the grid is not up.
+    pub fn pump(&mut self, library: &Mutex<Library>, near: &[i64]) -> Pumped {
         let mut said = Vec::new();
         let mut recorded_now = Vec::new();
         if self.shared.broken.load(Ordering::Relaxed) {
@@ -335,10 +402,12 @@ impl Builder {
         if self.shared.restart.swap(false, Ordering::Relaxed) {
             self.gave_up.clear();
             self.source = None;
+            self.near.clear();
         }
         let stopped = self.shared.stopped.load(Ordering::Relaxed);
         let just_stopped = stopped && !self.was_stopped;
         if just_stopped {
+            self.near.clear();
             self.cursor = None;
             let forgotten = self.shared.queue.lock().expect("preview queue").forget();
             self.found -= forgotten.min(self.found);
@@ -360,7 +429,17 @@ impl Builder {
             }
         }
 
+        // What is on screen, less what has already failed: asking for those
+        // again would put a photograph that cannot be built at the front of
+        // the queue every frame it stayed in view.
+        let near: Vec<i64> = near
+            .iter()
+            .copied()
+            .filter(|id| !self.gave_up.contains(id))
+            .take(NEAR)
+            .collect();
         let mut page = None;
+        let mut looked_at = None;
         {
             let library = library.lock().expect("library lock");
             for built in arrived {
@@ -390,7 +469,27 @@ impl Builder {
                 if let Some(from) = self.cursor {
                     page = Some(library.outstanding_page(from, PAGE, &self.stamp));
                 }
+                // Read from the catalog rather than looked up in the queue: the
+                // walk may not have reached these yet — somebody who scrolls to
+                // the middle of twenty thousand is five seconds ahead of it —
+                // and where it has, what it read is older than this.
+                if near != self.near {
+                    looked_at = Some(library.outstanding_among(&near, &self.stamp));
+                }
             }
+        }
+        // A catalog that could not be read is not worth a sentence of its own
+        // here: the walk reads the same catalog a moment later and says so if
+        // it cannot. `self.near` is left as it was, so this is tried again.
+        if let Some(Ok(wanted)) = looked_at {
+            self.near = near;
+            self.found += self
+                .shared
+                .queue
+                .lock()
+                .expect("preview queue")
+                .set_near(wanted);
+            self.shared.woken.notify_all();
         }
 
         match page {
@@ -484,7 +583,7 @@ fn run(shared: &Shared, results: &SyncSender<Built>, dir: &std::path::Path, stam
     // megabytes of driver state to hold for a job that is not going to happen.
     {
         let mut queue = shared.queue.lock().expect("preview queue");
-        while queue.far.is_empty() {
+        while !queue.has_work() {
             queue = shared.woken.wait(queue).expect("preview queue");
         }
     }
@@ -627,6 +726,109 @@ mod tests {
         assert!(queue.take_next().is_none());
     }
 
+    fn order(queue: &mut Queue) -> Vec<i64> {
+        std::iter::from_fn(|| queue.take_next().map(|w| w.image_id)).collect()
+    }
+
+    #[test]
+    fn what_is_on_screen_is_built_before_what_is_not() {
+        let mut queue = Queue::default();
+        for id in 1..=5 {
+            queue.push_far(wanted(id));
+        }
+        assert_eq!(queue.set_near(vec![wanted(4), wanted(3)]), 0, "both known");
+        // Nearest first, then the library's order — and neither of the two
+        // comes round a second time when the walk's order reaches them.
+        assert_eq!(order(&mut queue), vec![4, 3, 1, 2, 5]);
+    }
+
+    #[test]
+    fn what_was_on_screen_a_scroll_ago_has_no_claim() {
+        let mut queue = Queue::default();
+        for id in 1..=4 {
+            queue.push_far(wanted(id));
+        }
+        queue.set_near(vec![wanted(4)]);
+        queue.set_near(vec![wanted(2)]);
+        assert_eq!(order(&mut queue), vec![2, 1, 3, 4]);
+    }
+
+    #[test]
+    fn a_photograph_only_the_screen_asked_for_is_still_built_after_a_scroll() {
+        // The walk has not reached 9; the grid has. Then somebody scrolls away.
+        // If `near` were the only thing holding 9 it would now be wanted by
+        // nothing that will ever offer it, and the run could never end.
+        let mut queue = Queue::default();
+        assert_eq!(queue.set_near(vec![wanted(9)]), 1);
+        queue.set_near(Vec::new());
+        assert!(
+            !queue.push_far(wanted(9)),
+            "the walk arrives: already wanted"
+        );
+        assert_eq!(order(&mut queue), vec![9]);
+        queue.arrived(9);
+        assert!(queue.is_idle());
+    }
+
+    #[test]
+    fn what_is_being_built_is_not_offered_again_by_being_on_screen() {
+        let mut queue = Queue::default();
+        queue.push_far(wanted(1));
+        queue.take_next();
+        assert_eq!(queue.set_near(vec![wanted(1)]), 0);
+        assert!(queue.take_next().is_none());
+    }
+
+    #[test]
+    fn what_the_screen_read_a_moment_ago_replaces_what_the_walk_read() {
+        let mut queue = Queue::default();
+        queue.push_far(Wanted {
+            filename: "as the walk found it".into(),
+            ..wanted(1)
+        });
+        let fresh = Wanted {
+            filename: "as it is now".into(),
+            ..wanted(1)
+        };
+        assert_eq!(queue.set_near(vec![fresh]), 0, "not a second piece of work");
+        assert_eq!(queue.take_next().unwrap().filename, "as it is now");
+        assert!(queue.take_next().is_none());
+    }
+
+    #[test]
+    fn the_pump_asks_about_what_is_on_screen_before_the_walk_gets_there() {
+        // Seventy photographs, so the walk's first page stops short of the
+        // last one — which is the one somebody has scrolled to.
+        let scratch = Scratch::new("building-near");
+        let library = Mutex::new(library_at(&scratch.0, 70));
+        let last = library.lock().unwrap().id_at(69).unwrap();
+        let (mut builder, worker) = builder("test-build");
+
+        builder.pump(&library, &[last]);
+        let progress = builder.shared.progress.lock().unwrap().clone().unwrap();
+        assert_eq!(progress.total, 65, "a page of 64, and the one on screen");
+        assert!(progress.counting);
+        let first = take(&builder).unwrap();
+        assert_eq!(first.image_id, last);
+
+        // The walk reaches it a frame later and does not count it twice.
+        builder.pump(&library, &[last]);
+        let progress = builder.shared.progress.lock().unwrap().clone().unwrap();
+        assert_eq!(progress.total, 70);
+
+        // One that failed is not put back at the front for staying in view.
+        worker
+            .send(Built {
+                image_id: last,
+                filename: first.filename,
+                outcome: Err(anyhow::anyhow!("not a RAW file")),
+            })
+            .unwrap();
+        builder.pump(&library, &[last]);
+        builder.pump(&library, &[last]);
+        assert_ne!(take(&builder).unwrap().image_id, last);
+    }
+
     #[test]
     fn a_result_of_any_kind_lets_the_photograph_be_asked_for_again() {
         // `arrived` is called before anyone looks at what arrived. An id that
@@ -661,7 +863,7 @@ mod tests {
         let (mut builder, worker) = builder("test-build");
 
         // One frame finds all three, and says nothing yet.
-        assert_eq!(builder.pump(&library), Pumped::default());
+        assert_eq!(builder.pump(&library, &[]), Pumped::default());
         let progress = builder.shared.progress.lock().unwrap().clone().unwrap();
         assert_eq!((progress.done, progress.total), (0, 3));
         assert!(!progress.counting, "three photographs are one page");
@@ -669,7 +871,7 @@ mod tests {
         let mut recorded = Vec::new();
         while let Some(next) = take(&builder) {
             worker.send(rendered(&next, "test-build")).unwrap();
-            recorded.extend(builder.pump(&library).recorded);
+            recorded.extend(builder.pump(&library, &[]).recorded);
         }
         assert_eq!(recorded.len(), 3);
         assert!(builder.shared.progress.lock().unwrap().is_none());
@@ -677,7 +879,7 @@ mod tests {
         // Asked from the top, the way "build the previews" asks: nothing is
         // wanting, so nothing is queued and there is nothing to report.
         builder.shared.ask(true);
-        assert_eq!(builder.pump(&library), Pumped::default());
+        assert_eq!(builder.pump(&library, &[]), Pumped::default());
         assert!(take(&builder).is_none());
     }
 
@@ -686,7 +888,7 @@ mod tests {
         let scratch = Scratch::new("building-says");
         let library = Mutex::new(library_at(&scratch.0, 2));
         let (mut builder, worker) = builder("test-build");
-        builder.pump(&library);
+        builder.pump(&library, &[]);
 
         let first = take(&builder).unwrap();
         worker
@@ -696,28 +898,28 @@ mod tests {
                 outcome: Err(anyhow::anyhow!("not a RAW file")),
             })
             .unwrap();
-        assert_eq!(builder.pump(&library).said, vec![], "one still to go");
+        assert_eq!(builder.pump(&library, &[]).said, vec![], "one still to go");
 
         let second = take(&builder).unwrap();
         worker.send(rendered(&second, "test-build")).unwrap();
         assert_eq!(
-            builder.pump(&library).said,
+            builder.pump(&library, &[]).said,
             vec![
                 Said::Info("Previews built for 1 photograph".into()),
                 Said::Failed(format!("{} has no preview: not a RAW file", first.filename)),
             ]
         );
-        assert_eq!(builder.pump(&library), Pumped::default(), "said once");
+        assert_eq!(builder.pump(&library, &[]), Pumped::default(), "said once");
 
         // A second walk — coming back from a collection starts one — finds the
         // failed photograph still wanting, and leaves it alone: it has been
         // reported, and trying it every walk would report it every walk.
         builder.source = None;
-        builder.pump(&library);
+        builder.pump(&library, &[]);
         assert!(take(&builder).is_none());
         // Until somebody asks by name, which is them saying something changed.
         builder.shared.ask(true);
-        builder.pump(&library);
+        builder.pump(&library, &[]);
         assert_eq!(take(&builder).map(|w| w.image_id), Some(first.image_id));
     }
 
@@ -726,18 +928,18 @@ mod tests {
         let scratch = Scratch::new("building-last-asked");
         let library = Mutex::new(library_at(&scratch.0, 3));
         let (mut builder, _worker) = builder("test-build");
-        builder.pump(&library);
+        builder.pump(&library, &[]);
 
         // Build and then Stop, both before the next frame: stopped.
         assert!(builder.shared.ask(true));
         assert!(builder.shared.ask(false));
-        builder.pump(&library);
+        builder.pump(&library, &[]);
         assert!(take(&builder).is_none(), "Stop was pressed last");
 
         // Stop and then Build, the same way: building, from the top.
         builder.shared.ask(false);
         builder.shared.ask(true);
-        builder.pump(&library);
+        builder.pump(&library, &[]);
         assert!(take(&builder).is_some(), "Build was pressed last");
     }
 
@@ -767,19 +969,19 @@ mod tests {
         let scratch = Scratch::new("building-stops");
         let library = Mutex::new(library_at(&scratch.0, 3));
         let (mut builder, worker) = builder("test-build");
-        builder.pump(&library);
+        builder.pump(&library, &[]);
         let first = take(&builder).unwrap();
 
         builder.shared.stopped.store(true, Ordering::Relaxed);
         assert_eq!(
-            builder.pump(&library).said,
+            builder.pump(&library, &[]).said,
             vec![],
             "one is still in flight"
         );
         assert!(take(&builder).is_none(), "nothing else starts");
 
         worker.send(rendered(&first, "test-build")).unwrap();
-        let pumped = builder.pump(&library);
+        let pumped = builder.pump(&library, &[]);
         assert_eq!(pumped.recorded, vec![first.image_id]);
         assert_eq!(
             pumped.said,
@@ -788,7 +990,7 @@ mod tests {
             )]
         );
         // And it stays stopped: a frame later nothing has been queued again.
-        builder.pump(&library);
+        builder.pump(&library, &[]);
         assert!(take(&builder).is_none());
     }
 }

@@ -1366,6 +1366,7 @@ fn main() -> Result<()> {
             let mut grid = Grid {
                 cells: std::collections::HashMap::new(),
                 absent: std::collections::HashSet::new(),
+                wanting: Vec::new(),
                 scroll: 0.0,
             };
             let mut showing = Showing {
@@ -1472,7 +1473,10 @@ fn main() -> Result<()> {
                 // Before anything that can return early: the grid does, below,
                 // and the grid is where somebody is sitting while this matters.
                 if let (Some(library), Some(building)) = (&navigating, &mut building) {
-                    let pumped = building.pump(library);
+                    // Only while the grid is up. Its list is from the last frame
+                    // it drew, and in the loupe that may be a long time ago.
+                    let near: &[i64] = if in_grid() { &grid.wanting } else { &[] };
+                    let pumped = building.pump(library, near);
                     for said in pumped.said {
                         match said {
                             building::Said::Info(text) => notice(text),
@@ -4784,6 +4788,11 @@ struct Grid {
     /// misses and never arrive. A photograph leaves here when the builder
     /// records its previews, which is the only thing that changes the answer.
     absent: std::collections::HashSet<i64>,
+    /// The cells on screen with nothing to show, nearest the selection first,
+    /// as of the last frame the grid drew. What the preview builder is told to
+    /// do next: the point of building in the background is lost on somebody
+    /// watching placeholders while the far end of the library fills in.
+    wanting: Vec<i64>,
     /// Vertical offset in canvas pixels.
     scroll: f64,
 }
@@ -4999,6 +5008,18 @@ fn draw_grid(
     let keep: std::collections::HashSet<i64> = nearby.iter().map(|(_, id)| *id).collect();
     grid.cells.retain(|id, _| keep.contains(id));
     grid.absent.retain(|id| keep.contains(id));
+    // In the order the loads above go in, for the same reason.
+    let mut wanting: Vec<(usize, i64)> = shown[from.min(count)..to.min(count)]
+        .iter()
+        .filter_map(|index| Some((*index, *id_of.get(index)?)))
+        .filter(|(_, id)| grid.absent.contains(id))
+        .collect();
+    wanting.sort_by_key(|(index, _)| index.abs_diff(selected));
+    grid.wanting = wanting
+        .into_iter()
+        .map(|(_, id)| id)
+        .take(building::NEAR)
+        .collect();
 
     let mut cells = Vec::new();
     for (slot, &index) in shown

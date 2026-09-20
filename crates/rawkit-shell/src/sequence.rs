@@ -206,6 +206,11 @@ impl Sequence {
         &self.rows
     }
 
+    /// A photograph the source holds, by id, whether or not it is showing.
+    pub fn by_id(&self, id: i64) -> Option<&LibraryImage> {
+        self.place.get(&id).map(|place| &self.rows[*place as usize])
+    }
+
     /// Which slot a photograph is showing in, if it is showing.
     pub fn position_of(&self, id: i64) -> Option<usize> {
         let place = self.place.get(&id)?;

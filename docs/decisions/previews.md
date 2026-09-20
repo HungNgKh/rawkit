@@ -3,7 +3,7 @@
 **Status:** accepted, part built · **Decided:** 2026-09-21 ·
 **Code:** `rawkit-shell::building`, `rawkit-deliver::previews`,
 `rawkit-catalog::previews::outstanding_in` ·
-**Commits:** `b2f3b13` `b776ee9` `f36100c`, and the one this file arrived in
+**Commits:** `b2f3b13` `b776ee9` `f36100c` `8db22c2` `1a931bc`, and visible-first in the one after
 
 Open a catalog nobody has built previews for and the grid fills in while you
 cull. Before this, that catalog was a black rectangle, and the cure was a
@@ -31,7 +31,9 @@ terminal command the window never mentioned.
 | P4 | The pump runs at the top of every frame, before the grid's early return | `tick` is a 16 ms GTK timer and runs with no input, so it can be relied on; the grid is where somebody is sitting while previews matter. |
 | P5 | What is outstanding is asked **a page of 64 at a time** | The whole walk is ~270 ms at 20 000 under the keypress lock. A page is 1.4 ms and flat in the size of the library (scale gate, `page 64`). |
 | P6 | Workers take **one photograph at a time from a queue** | A list fixed up front cannot be re-ordered by a scroll. The terminal keeps its fixed list; it has no scroll. |
-| P7 | The queue owns "dispatched once" | `queued` and `in_flight` sets inside it; an id leaves `in_flight` when its result *arrives* — recorded, failed or discarded alike — or the send fails, and for no other reason. |
+| P7 | The queue owns "dispatched once" | What is waiting is one map by photograph, and the orders are lists of ids into it — so a photograph can be in both orders and still be one piece of work. An id leaves `in_flight` when its result *arrives* — recorded, failed or discarded alike — or the send fails, and for no other reason. |
+| P15 | **What you are looking at, first** | The grid names the cells on screen it has nothing for, nearest the selection first, at most 64. They go to the front, and the list is *replaced* each time: what was on screen a scroll ago has no claim. Each also joins the back of the walk's order the first time it is seen, or a photograph only the screen had asked for would, after a scroll, be wanted by nothing that would ever offer it — and a run ends when nothing is waiting. |
+| P16 | On-screen cells are read from the catalog, not looked up in the queue | The walk may not have reached them: scroll to the middle of twenty thousand and you are five seconds ahead of it. And where it has, what it read is older. Asked only when the list changes — 1.4 ms, about once a photograph — not every frame. Failed photographs are left out, or one that cannot be built would be put back at the front for as long as it stayed in view. |
 | P8 | `sync_channel(PREVIEW_JOBS)` | A stalled pump makes the builder wait; results cannot pile up for one unlucky frame to record. |
 | P9 | **One job**, and held while an edit is moving | Measured, below. Export uses two; somebody asked for an export. |
 | P10 | The walk covers everything the source holds, not what the filter shows | A build that followed the view would finish on three picks and leave the shoot black. A change of source restarts the walk; what is built is skipped by the test that found it wanting. |
@@ -62,10 +64,11 @@ In the scale gate, at 20 000: a page of 64 is **1.4 ms**; recording 8 previews
 **2–7 ms**, which is the connection going from reading to writing and is paid
 once each time the builder wakes — not a per-row price.
 
+With 64 cells on screen and the builder working, the grid measures 2.0 ms a
+frame, worst 12 ms: the near list costs nothing that shows.
+
 ## Not built yet
 
-- **What you are looking at, first.** The queue has one tier. A `near` tier
-  replaced each frame from the cells the grid could not fill is the next change.
 - **An edit made while its photograph is queued or in flight** builds the old
   edit. Harmless — the hash declines it on lookup — and wasted. The cure is one
   door for every edit write (there are **six** `edits::save` call sites in the
@@ -87,6 +90,9 @@ once each time the builder wakes — not a per-row price.
 |---|---|
 | who records previews, or when `in_flight` is cleared | `a_result_of_any_kind_lets_the_photograph_be_asked_for_again`, `what_the_builder_finishes_reaches_the_catalog_and_is_not_asked_for_again` |
 | what the queue admits | `a_photograph_asked_for_twice_is_built_once`, `forgetting_the_queue_lets_what_was_started_finish` |
+| the order things are built in | `what_is_on_screen_is_built_before_what_is_not`, `what_was_on_screen_a_scroll_ago_has_no_claim`, `what_is_being_built_is_not_offered_again_by_being_on_screen` |
+| who else holds a photograph the screen asked for | `a_photograph_only_the_screen_asked_for_is_still_built_after_a_scroll` — without it a run never ends |
+| where an on-screen cell's edit is read from | `what_the_screen_read_a_moment_ago_replaces_what_the_walk_read`, `the_pump_asks_about_what_is_on_screen_before_the_walk_gets_there` |
 | what a run says, and how often | `the_run_says_what_it_came_to_once_and_names_a_failure`, `stopping_forgets_what_is_waiting_and_counts_what_was_done` |
 | what Stop and Build do to each other | `the_last_thing_asked_is_what_happens` |
 | how the builder is held or woken | `a_held_builder_starts_nothing_and_wakes_when_let_go` — a lost wakeup is a build that stops for good |
