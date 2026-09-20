@@ -639,7 +639,8 @@ pub fn members(
         "SELECT i.id,
                 v.last_mount_path || '/' || d.relative_path || '/' || f.filename,
                 f.filename,
-                i.copy_name
+                i.copy_name,
+                v.id
            FROM collection_images m
            JOIN images i ON i.id = m.image_id
            JOIN files f ON f.id = i.file_id
@@ -659,6 +660,7 @@ pub fn members(
                 path: r.get::<_, String>(1)?.replace("//", "/"),
                 filename: r.get(2)?,
                 copy_name: r.get(3)?,
+                volume: r.get(4)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

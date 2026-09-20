@@ -280,3 +280,23 @@ fn the_page_and_the_shell_agree_about_what_waits_for_a_tool() {
         );
     }
 }
+
+#[test]
+fn the_shell_writes_an_edit_through_one_door() {
+    // `Library::save_edit` tells the preview builder that a photograph's
+    // previews are now of an edit it no longer has. A second place that wrote
+    // edits would compile, pass, and leave that photograph's thumbnail showing
+    // the edit before last — so the sources are read, and the door is counted.
+    const LIBRARY: &str = include_str!("library.rs");
+    let production = |source: &'static str| {
+        let code = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        code.matches("edits::save(").count()
+    };
+    assert_eq!(production(SHELL), 0, "main.rs writes an edit for itself");
+    assert_eq!(
+        production(LIBRARY),
+        1,
+        "library.rs has more than the one door"
+    );
+    assert_eq!(production(include_str!("building.rs")), 0);
+}

@@ -650,6 +650,9 @@ pub struct Library {
     /// land afterwards would put the old edit back, and the paste would look
     /// like it had silently skipped one frame.
     paste_requested: bool,
+    /// Photographs whose edit was written since the preview builder last
+    /// asked. See [`Library::save_edit`].
+    dirtied: Vec<i64>,
     /// What the action in progress has to say for itself; taken by the view
     /// that reports it. See [`CullView::said`].
     said: Option<String>,
@@ -693,6 +696,7 @@ impl Library {
             undo: Vec::new(),
             copied: None,
             paste_requested: false,
+            dirtied: Vec::new(),
             said: None,
             recorded: 0,
             request: None,
@@ -702,6 +706,57 @@ impl Library {
 
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// Write an edit. **The only way the shell does**, and a test holds it to
+    /// that.
+    ///
+    /// One door, because an edit changes what a photograph's previews should
+    /// show and the builder has to hear about it: a photograph already waiting
+    /// to be built is waiting with the edit it had when it was found, and would
+    /// be rendered — most of a second of GPU — into a preview nothing will ever
+    /// show. Four places write edits, on two threads, and "remember to tell the
+    /// builder" is not a rule four places keep.
+    pub fn save_edit(
+        &mut self,
+        image: i64,
+        state: &EditState,
+        source: rawkit_editstate::EditSource,
+    ) -> std::result::Result<Option<u32>, rawkit_catalog::CatalogError> {
+        let saved = rawkit_catalog::edits::save(&self.catalog, image, state, source)?;
+        // `None` is an edit identical to the one already stored: nothing about
+        // the photograph changed, so nothing about its previews did.
+        if saved.is_some() {
+            self.dirtied.push(image);
+        }
+        Ok(saved)
+    }
+
+    /// The hash of the edit a photograph has now — what its previews are
+    /// keyed by, and so what a preview just built has to match to be of it.
+    pub fn edit_hash(&self, image: i64) -> Result<String> {
+        Ok(rawkit_catalog::edits::latest(&self.catalog, image)?
+            .map(|(_, state)| state)
+            .unwrap_or_default()
+            .content_hash())
+    }
+
+    /// The photographs whose edit has changed since this was last asked.
+    pub fn take_dirtied(&mut self) -> Vec<i64> {
+        std::mem::take(&mut self.dirtied)
+    }
+
+    /// Where a volume was last mounted, for naming it to a person.
+    pub fn volume_path(&self, volume: i64) -> Option<String> {
+        self.catalog
+            .connection()
+            .query_row(
+                "SELECT last_mount_path FROM volumes WHERE id = ?1",
+                [volume],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
     }
 
     /// How big the current photograph is, without decoding it.
@@ -775,13 +830,9 @@ impl Library {
             if merged == before.clone().unwrap_or_default() {
                 continue;
             }
-            if rawkit_catalog::edits::save(
-                &self.catalog,
-                id,
-                &merged,
-                rawkit_editstate::EditSource::User,
-            )?
-            .is_some()
+            if self
+                .save_edit(id, &merged, rawkit_editstate::EditSource::User)?
+                .is_some()
             {
                 undo.push((id, before));
                 changed += 1;
@@ -1312,6 +1363,7 @@ impl Library {
                     edit_state_hash: state.content_hash(),
                     state,
                     missing,
+                    volume: image.volume,
                 });
             }
             // Back into the order asked for, which is nearest first.
@@ -1648,12 +1700,7 @@ impl Library {
                 Some(Undone::Pasted { frames }) => {
                     for (id, before) in &frames {
                         let state = before.clone().unwrap_or_default();
-                        rawkit_catalog::edits::save(
-                            &self.catalog,
-                            *id,
-                            &state,
-                            rawkit_editstate::EditSource::User,
-                        )?;
+                        self.save_edit(*id, &state, rawkit_editstate::EditSource::User)?;
                     }
                     // Back to a frame it touched, so the reversal is visible
                     // rather than something the user has to go and check.
@@ -1975,13 +2022,8 @@ impl Saver {
             return;
         };
         let state = self.session.lock().expect("session lock").state().clone();
-        let library = library.lock().expect("library lock");
-        match rawkit_catalog::edits::save(
-            library.catalog(),
-            image,
-            &state,
-            rawkit_editstate::EditSource::User,
-        ) {
+        let mut library = library.lock().expect("library lock");
+        match library.save_edit(image, &state, rawkit_editstate::EditSource::User) {
             Ok(Some(version)) => eprintln!("edit       : saved v{version} for image {image}"),
             Ok(None) => {}
             // The one failure here that costs work. It went to a terminal, and

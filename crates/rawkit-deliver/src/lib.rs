@@ -453,6 +453,7 @@ mod tests {
                     path: format!("/nowhere/{i}.arw"),
                     filename: format!("{i}.arw"),
                     copy_name: None,
+                    volume: 1,
                 },
                 state: EditState::default(),
                 profile: None,
@@ -507,6 +508,7 @@ mod copy_naming_tests {
             path: format!("/nowhere/{filename}"),
             filename: filename.into(),
             copy_name: copy.map(str::to_string),
+            volume: 1,
         }
     }
 

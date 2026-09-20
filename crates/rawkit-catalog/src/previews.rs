@@ -258,6 +258,8 @@ pub struct Wanted {
     pub state: EditState,
     pub edit_state_hash: String,
     pub missing: Vec<Level>,
+    /// The volume the RAW is on. See [`crate::cull::LibraryImage::volume`].
+    pub volume: i64,
 }
 
 /// Every present image whose previews are missing or describe a different edit.
@@ -322,6 +324,7 @@ pub fn outstanding_in(
                 state,
                 edit_state_hash: hash,
                 missing,
+                volume: image.volume,
             });
         }
     }

@@ -37,6 +37,7 @@
 use crate::library::Library;
 use crate::sequence::Source;
 use rawkit_catalog::previews::{Preview, Wanted};
+use rawkit_deliver::previews::Outcome;
 use rawkit_engine::{render::DEFAULT_TILE, Gpu, Renderer};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -165,6 +166,54 @@ impl Queue {
         self.in_flight.remove(&image_id);
     }
 
+    /// A worker was interrupted part-way: the photograph is as wanted as it
+    /// was, and goes to the front, since it is the one most nearly done.
+    pub fn put_back(&mut self, wanted: Wanted) {
+        let id = wanted.image_id;
+        self.in_flight.remove(&id);
+        // Unless somebody has asked for it again in the meantime, with an edit
+        // newer than the one this worker was given.
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.waiting.entry(id) {
+            slot.insert(wanted);
+            self.far.push_front(id);
+        }
+    }
+
+    /// The photograph's edit changed: `fresh` is what is outstanding for it
+    /// *now*, or `None` if nothing is — an undo can land back on an edit whose
+    /// previews are already made.
+    ///
+    /// A photograph in flight is left alone. Its result is checked against the
+    /// catalog when it arrives, which catches this whoever wrote the edit.
+    pub fn refresh(&mut self, id: i64, fresh: Option<Wanted>) -> Refreshed {
+        if self.in_flight.contains(&id) {
+            return Refreshed::Unchanged;
+        }
+        match (fresh, self.waiting.contains_key(&id)) {
+            (Some(fresh), true) => {
+                self.waiting.insert(id, fresh);
+                Refreshed::Unchanged
+            }
+            (Some(fresh), false) => {
+                self.waiting.insert(id, fresh);
+                self.far.push_back(id);
+                Refreshed::Added
+            }
+            (None, true) => {
+                self.waiting.remove(&id);
+                Refreshed::Removed
+            }
+            (None, false) => Refreshed::Unchanged,
+        }
+    }
+
+    /// Stop wanting everything on one volume, and say how many that was.
+    pub fn drop_volume(&mut self, volume: i64) -> usize {
+        let before = self.waiting.len();
+        self.waiting.retain(|_, wanted| wanted.volume != volume);
+        before - self.waiting.len()
+    }
+
     /// Stop wanting everything that has not been started, and say how many
     /// that was. What is in flight finishes: it is most of a second of work
     /// already spent, and its result is as good as any other.
@@ -186,12 +235,34 @@ impl Queue {
     }
 }
 
+/// What [`Queue::refresh`] did to how much work there is.
+#[derive(Debug, PartialEq)]
+pub enum Refreshed {
+    Unchanged,
+    Added,
+    Removed,
+}
+
 /// What the builder sends back for one photograph.
 pub struct Built {
     pub image_id: i64,
     pub filename: String,
+    pub volume: i64,
+    /// Whether the RAW was not there to be read — as opposed to there and not
+    /// readable. Only this kind of failure says anything about a drive: ten
+    /// corrupt files in a row are ten corrupt files.
+    pub unreachable: bool,
     pub outcome: anyhow::Result<Vec<Preview>>,
 }
+
+/// How many photographs in a row have to be unreachable before it is the
+/// volume that is, and not the photographs.
+///
+/// Reachability is not remembered between launches, deliberately: it is a fact
+/// about this moment, and a stored opinion about what is plugged in would be
+/// wrong the moment the card went back. What being wrong costs this way round
+/// is ten failed `stat`s a launch.
+const UNREACHABLE_IN_A_ROW: usize = 10;
 
 /// How far along a build is, for the page to draw.
 #[derive(Clone, Debug, PartialEq)]
@@ -315,8 +386,24 @@ pub struct Builder {
     source: Option<Source>,
     found: usize,
     done: usize,
+    /// How many of `done` reached the catalog.
+    built: usize,
+    /// Whether this run holds anything the walk or the grid found — as opposed
+    /// to being nothing but photographs rebuilt because they were just edited.
+    ///
+    /// Those are kept quiet: no row, no sentence. Every edit ends in one, and
+    /// a status line that answered each slider with "Previews built for 1
+    /// photograph" would be reporting the machinery, to somebody who asked
+    /// about none of it. A failure is still said.
+    noticed: bool,
     written: usize,
-    failed: Vec<(String, String)>,
+    /// Name, reason, volume.
+    failed: Vec<(String, String, i64)>,
+    /// Unreachable photographs in a row, by volume; reset by anything on that
+    /// volume that could at least be read.
+    unreachable: HashMap<i64, usize>,
+    /// Volumes given up on until somebody asks for a build by name.
+    skipped: HashSet<i64>,
     /// Photographs that failed this session, so a second walk does not try them
     /// again and report them again. Forgotten when somebody asks for a build by
     /// name: that is them saying the world has changed.
@@ -349,8 +436,12 @@ impl Builder {
             source: None,
             found: 0,
             done: 0,
+            built: 0,
+            noticed: false,
             written: 0,
             failed: Vec::new(),
+            unreachable: HashMap::new(),
+            skipped: HashSet::new(),
             gave_up: HashSet::new(),
             filename: String::new(),
             started: None,
@@ -367,9 +458,9 @@ impl Builder {
     /// second. One job was already the least it could take, so the rest of the
     /// answer is to take nothing while somebody is watching a slider.
     ///
-    /// Between photographs only: the one in flight finishes, so the first
-    /// second of a drag can still be shared. Stopping inside a photograph needs
-    /// the renderer to be interruptible, and is its own change.
+    /// A worker waiting for a photograph does not take one while this is set,
+    /// and one part-way through a photograph asks between its stages and puts
+    /// it back. With that, the first second of the same drag is 28 ms.
     pub fn hold(&self, moving: bool) {
         if self.shared.held.swap(moving, Ordering::Relaxed) && !moving {
             // Under the queue's lock, or the wakeup can be lost: a worker that
@@ -401,6 +492,8 @@ impl Builder {
         }
         if self.shared.restart.swap(false, Ordering::Relaxed) {
             self.gave_up.clear();
+            self.skipped.clear();
+            self.unreachable.clear();
             self.source = None;
             self.near.clear();
         }
@@ -440,9 +533,30 @@ impl Builder {
             .collect();
         let mut page = None;
         let mut looked_at = None;
+        // Photographs to read again: ones whose edit was saved since the last
+        // frame, and ones whose result has just turned out to be of an edit
+        // they no longer have. The second kind were counted when first found.
+        let (mut edited, mut overtaken) = (Vec::new(), Vec::new());
+        let mut reread = None;
         {
-            let library = library.lock().expect("library lock");
+            let mut library = library.lock().expect("library lock");
             for built in arrived {
+                // Rendered from an edit the photograph has since moved on from.
+                // Asked of the catalog rather than inferred from who saved
+                // what: it is one lookup a photograph, and it is right even
+                // for a writer nobody remembered to route through the door.
+                let stale = match &built.outcome {
+                    Ok(previews) => previews.first().is_some_and(|preview| {
+                        library
+                            .edit_hash(built.image_id)
+                            .is_ok_and(|now| now != preview.edit_state_hash)
+                    }),
+                    Err(_) => false,
+                };
+                if stale {
+                    overtaken.push(built.image_id);
+                    continue;
+                }
                 self.done += 1;
                 self.filename.clone_from(&built.filename);
                 let recorded = built.outcome.and_then(|previews| {
@@ -451,13 +565,45 @@ impl Builder {
                 });
                 match recorded {
                     Ok(written) => {
+                        self.built += 1;
                         self.written += written;
                         recorded_now.push(built.image_id);
+                        self.unreachable.remove(&built.volume);
                     }
                     Err(why) => {
                         self.gave_up.insert(built.image_id);
-                        self.failed.push((built.filename, format!("{why:#}")));
+                        // One that was already being tried when its drive was
+                        // given up on. It belongs to the sentence about the
+                        // drive, which has been said.
+                        if built.unreachable && self.skipped.contains(&built.volume) {
+                            self.done -= 1;
+                            self.found = self.found.saturating_sub(1);
+                            continue;
+                        }
+                        self.failed
+                            .push((built.filename, format!("{why:#}"), built.volume));
+                        if !built.unreachable {
+                            self.unreachable.remove(&built.volume);
+                            continue;
+                        }
+                        let in_a_row = self.unreachable.entry(built.volume).or_default();
+                        *in_a_row += 1;
+                        if *in_a_row == UNREACHABLE_IN_A_ROW {
+                            said.push(self.skip(built.volume, &library));
+                        }
                     }
+                }
+            }
+            if stopped {
+                // Nothing is wanted, so nothing needs reading again. Taken all
+                // the same, or the list grows for as long as the stop lasts.
+                library.take_dirtied();
+            } else {
+                edited = library.take_dirtied();
+                edited.retain(|id| !self.gave_up.contains(id));
+                let ids: Vec<i64> = edited.iter().chain(&overtaken).copied().collect();
+                if !ids.is_empty() {
+                    reread = library.outstanding_among(&ids, &self.stamp).ok();
                 }
             }
             if !stopped {
@@ -481,14 +627,45 @@ impl Builder {
         // A catalog that could not be read is not worth a sentence of its own
         // here: the walk reads the same catalog a moment later and says so if
         // it cannot. `self.near` is left as it was, so this is tried again.
-        if let Some(Ok(wanted)) = looked_at {
+        if let Some(Ok(mut wanted)) = looked_at {
+            wanted.retain(|wanted| !self.skipped.contains(&wanted.volume));
             self.near = near;
-            self.found += self
+            let newly = self
                 .shared
                 .queue
                 .lock()
                 .expect("preview queue")
                 .set_near(wanted);
+            self.found += newly;
+            self.noticed |= newly > 0;
+            self.shared.woken.notify_all();
+        }
+        if let Some(fresh) = reread {
+            let mut queue = self.shared.queue.lock().expect("preview queue");
+            for (id, counted) in edited
+                .iter()
+                .map(|id| (*id, false))
+                .chain(overtaken.iter().map(|id| (*id, true)))
+            {
+                let fresh = fresh
+                    .iter()
+                    .find(|wanted| wanted.image_id == id)
+                    .filter(|wanted| !self.skipped.contains(&wanted.volume))
+                    .cloned();
+                // A photograph overtaken by an edit was counted when it was
+                // first found and has not been counted done, so putting it
+                // back changes nothing — and finding it needs no build after
+                // all takes one away.
+                match (queue.refresh(id, fresh.clone()), counted) {
+                    (Refreshed::Added, false) => self.found += 1,
+                    (Refreshed::Removed, _) => self.found = self.found.saturating_sub(1),
+                    (Refreshed::Unchanged, true) if fresh.is_none() => {
+                        self.found = self.found.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+            }
+            drop(queue);
             self.shared.woken.notify_all();
         }
 
@@ -497,7 +674,11 @@ impl Builder {
                 self.cursor = (!page.finished).then_some(page.next);
                 let mut queue = self.shared.queue.lock().expect("preview queue");
                 for wanted in page.wanted {
-                    if !self.gave_up.contains(&wanted.image_id) && queue.push_far(wanted) {
+                    if !self.gave_up.contains(&wanted.image_id)
+                        && !self.skipped.contains(&wanted.volume)
+                        && queue.push_far(wanted)
+                    {
+                        self.noticed = true;
                         self.found += 1;
                     }
                 }
@@ -524,7 +705,7 @@ impl Builder {
         if !running && (self.found > 0 || just_stopped) {
             said.extend(self.finish(stopped));
         }
-        let progress = (running && self.found > 0).then(|| Progress {
+        let progress = (running && self.found > 0 && self.noticed).then(|| Progress {
             done: self.done,
             total: self.found,
             counting: self.cursor.is_some(),
@@ -537,9 +718,36 @@ impl Builder {
         }
     }
 
+    /// Give up on a volume until somebody asks for a build by name, and say so
+    /// — once, in place of a sentence for every photograph on it.
+    fn skip(&mut self, volume: i64, library: &Library) -> Said {
+        self.skipped.insert(volume);
+        let dropped = self
+            .shared
+            .queue
+            .lock()
+            .expect("preview queue")
+            .drop_volume(volume);
+        self.found = self.found.saturating_sub(dropped);
+        // The ten that found this out are part of this sentence, not of the
+        // one the run ends with.
+        let before = self.failed.len();
+        self.failed.retain(|(_, _, on)| *on != volume);
+        let absorbed = before - self.failed.len();
+        self.done = self.done.saturating_sub(absorbed);
+        self.found = self.found.saturating_sub(absorbed);
+        let place = library
+            .volume_path(volume)
+            .unwrap_or_else(|| "one of the drives".into());
+        Said::Failed(format!(
+            "Nothing on {place} can be reached, so its previews are being left alone. \
+             Is the drive plugged in?"
+        ))
+    }
+
     /// The run is over: say what it came to, once, and forget the counts.
     fn finish(&mut self, stopped: bool) -> Vec<Said> {
-        let built = self.done - self.failed.len();
+        let built = self.built;
         let seconds = self
             .started
             .take()
@@ -550,26 +758,32 @@ impl Builder {
             if stopped { ", stopped" } else { "" }
         );
         let photographs = |n: usize| if n == 1 { "photograph" } else { "photographs" };
-        let mut said = vec![Said::Info(if stopped {
-            format!(
+        let mut said = Vec::new();
+        if stopped {
+            said.push(Said::Info(format!(
                 "Stopped building previews. {built} {} done",
                 photographs(built)
-            )
-        } else {
-            format!("Previews built for {built} {}", photographs(built))
-        })];
+            )));
+        } else if built > 0 && self.noticed {
+            // A run that built nothing has already said why, or is about to.
+            said.push(Said::Info(format!(
+                "Previews built for {built} {}",
+                photographs(built)
+            )));
+        }
         // The first named and the rest counted, as an export does it and for
         // the same reason: the cause is nearly always shared.
-        if let Some((name, why)) = self.failed.first() {
+        if let Some((name, why, _)) = self.failed.first() {
             said.push(Said::Failed(match self.failed.len() {
                 1 => format!("{name} has no preview: {why}"),
                 n => format!("{n} photographs have no preview. The first, {name}: {why}"),
             }));
-            for (name, why) in self.failed.iter().skip(1) {
+            for (name, why, _) in self.failed.iter().skip(1) {
                 eprintln!("previews   : {name}: {why}");
             }
         }
-        (self.found, self.done, self.written) = (0, 0, 0);
+        (self.found, self.done, self.built, self.written) = (0, 0, 0, 0);
+        self.noticed = false;
         self.failed.clear();
         self.filename.clear();
         said
@@ -626,19 +840,45 @@ fn work(
     dir: &std::path::Path,
     stamp: &str,
 ) {
+    // Asked between the stages of one photograph. Held is somebody dragging a
+    // slider, stopped is somebody saying stop; either way the GPU is wanted
+    // back sooner than the end of this photograph.
+    let keep_going =
+        || !shared.held.load(Ordering::Relaxed) && !shared.stopped.load(Ordering::Relaxed);
     loop {
         let wanted = next(shared);
+        let unreachable = !std::path::Path::new(&wanted.path).exists();
         // A decoder meeting a file it was not written for is the likeliest
         // panic in the project, and here it would take the only worker with it:
         // the photograph would stay in flight for good and the count on screen
         // would stop one short of finishing, with nothing to say why.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            rawkit_deliver::previews::one(gpu, renderer, dir, &wanted, stamp)
+            rawkit_deliver::previews::one(gpu, renderer, dir, &wanted, stamp, &keep_going)
         }))
         .unwrap_or_else(|_| Err(anyhow::anyhow!("rendering it crashed; see the terminal")));
+        let outcome = match outcome {
+            Ok(Outcome::Built(previews)) => Ok(previews),
+            Ok(Outcome::Interrupted) => {
+                let mut queue = shared.queue.lock().expect("preview queue");
+                // Stopped means the queue has been, or is about to be,
+                // forgotten: putting this back would leave one photograph
+                // waiting that nothing is going to take, and a run ends when
+                // nothing is waiting.
+                if shared.stopped.load(Ordering::Relaxed) {
+                    queue.arrived(wanted.image_id);
+                } else {
+                    queue.put_back(wanted);
+                }
+                continue;
+            }
+            Err(why) => Err(why),
+        };
+        let image_id = wanted.image_id;
         let built = Built {
-            image_id: wanted.image_id,
+            image_id,
             filename: wanted.filename,
+            volume: wanted.volume,
+            unreachable,
             outcome,
         };
         if results.send(built).is_err() {
@@ -648,7 +888,7 @@ fn work(
                 .queue
                 .lock()
                 .expect("preview queue")
-                .arrived(wanted.image_id);
+                .arrived(image_id);
             return;
         }
     }
@@ -670,6 +910,7 @@ mod tests {
             edit_state_hash: state.content_hash(),
             state,
             missing: Level::BULK.to_vec(),
+            volume: 1,
         }
     }
 
@@ -688,6 +929,8 @@ mod tests {
         Built {
             image_id: wanted.image_id,
             filename: wanted.filename.clone(),
+            volume: wanted.volume,
+            unreachable: false,
             outcome: Ok(wanted
                 .missing
                 .iter()
@@ -821,6 +1064,8 @@ mod tests {
             .send(Built {
                 image_id: last,
                 filename: first.filename,
+                volume: 1,
+                unreachable: false,
                 outcome: Err(anyhow::anyhow!("not a RAW file")),
             })
             .unwrap();
@@ -895,6 +1140,8 @@ mod tests {
             .send(Built {
                 image_id: first.image_id,
                 filename: first.filename.clone(),
+                volume: 1,
+                unreachable: false,
                 outcome: Err(anyhow::anyhow!("not a RAW file")),
             })
             .unwrap();
@@ -941,6 +1188,198 @@ mod tests {
         builder.shared.ask(true);
         builder.pump(&library, &[]);
         assert!(take(&builder).is_some(), "Build was pressed last");
+    }
+
+    #[test]
+    fn a_photograph_interrupted_goes_back_to_the_front() {
+        let mut queue = Queue::default();
+        for id in 1..=3 {
+            queue.push_far(wanted(id));
+        }
+        let first = queue.take_next().unwrap();
+        queue.put_back(first);
+        assert_eq!(order(&mut queue), vec![1, 2, 3]);
+
+        // Unless it was asked for again while it was out, with a newer edit:
+        // then what is waiting is the newer one, and this one is dropped.
+        let mut queue = Queue::default();
+        queue.push_far(wanted(1));
+        let old = queue.take_next().unwrap();
+        queue.arrived(1);
+        queue.push_far(Wanted {
+            filename: "as it is now".into(),
+            ..wanted(1)
+        });
+        queue.put_back(old);
+        assert_eq!(queue.take_next().unwrap().filename, "as it is now");
+        assert!(queue.take_next().is_none());
+    }
+
+    fn brighter(by: f32) -> EditState {
+        let mut state = EditState::default();
+        state.tone.exposure_ev = by;
+        state
+    }
+
+    #[test]
+    fn an_edit_replaces_what_is_waiting_to_be_built() {
+        let scratch = Scratch::new("building-edited-waiting");
+        let library = Mutex::new(library_at(&scratch.0, 2));
+        let (mut builder, _worker) = builder("test-build");
+        builder.pump(&library, &[]);
+        let first = library.lock().unwrap().id_at(0).unwrap();
+
+        let edit = brighter(1.0);
+        library
+            .lock()
+            .unwrap()
+            .save_edit(first, &edit, rawkit_editstate::EditSource::User)
+            .unwrap();
+        builder.pump(&library, &[]);
+
+        let progress = builder.shared.progress.lock().unwrap().clone().unwrap();
+        assert_eq!(progress.total, 2, "the same two photographs, not three");
+        let taken = take(&builder).unwrap();
+        assert_eq!(taken.image_id, first);
+        assert_eq!(taken.edit_state_hash, edit.content_hash());
+    }
+
+    #[test]
+    fn a_result_overtaken_by_an_edit_is_dropped_and_the_photograph_built_again() {
+        let scratch = Scratch::new("building-overtaken");
+        let library = Mutex::new(library_at(&scratch.0, 1));
+        let (mut builder, worker) = builder("test-build");
+        builder.pump(&library, &[]);
+        let taken = take(&builder).unwrap();
+
+        // Edited while it renders. The door says so, and a photograph in flight
+        // is left alone: the check is made when its result comes back.
+        let edit = brighter(0.5);
+        library
+            .lock()
+            .unwrap()
+            .save_edit(taken.image_id, &edit, rawkit_editstate::EditSource::User)
+            .unwrap();
+        builder.pump(&library, &[]);
+        assert!(take(&builder).is_none(), "in flight, so not queued twice");
+
+        worker.send(rendered(&taken, "test-build")).unwrap();
+        let pumped = builder.pump(&library, &[]);
+        assert!(
+            pumped.recorded.is_empty(),
+            "a preview of an edit it has left"
+        );
+        let progress = builder.shared.progress.lock().unwrap().clone().unwrap();
+        assert_eq!((progress.done, progress.total), (0, 1));
+
+        let again = take(&builder).unwrap();
+        assert_eq!(again.edit_state_hash, edit.content_hash());
+        worker.send(rendered(&again, "test-build")).unwrap();
+        let pumped = builder.pump(&library, &[]);
+        assert_eq!(pumped.recorded, vec![taken.image_id]);
+        assert_eq!(
+            pumped.said,
+            vec![Said::Info("Previews built for 1 photograph".into())]
+        );
+    }
+
+    #[test]
+    fn an_edit_to_a_photograph_already_built_makes_it_wanted_again() {
+        let scratch = Scratch::new("building-edited-built");
+        let library = Mutex::new(library_at(&scratch.0, 1));
+        let (mut builder, worker) = builder("test-build");
+        builder.pump(&library, &[]);
+        let taken = take(&builder).unwrap();
+        worker.send(rendered(&taken, "test-build")).unwrap();
+        builder.pump(&library, &[]);
+        assert!(builder.shared.progress.lock().unwrap().is_none());
+
+        let edit = brighter(-1.0);
+        library
+            .lock()
+            .unwrap()
+            .save_edit(taken.image_id, &edit, rawkit_editstate::EditSource::User)
+            .unwrap();
+        builder.pump(&library, &[]);
+        let again = take(&builder).unwrap();
+        assert_eq!(again.edit_state_hash, edit.content_hash());
+
+        // And quietly. Every edit ends in one of these, and nobody asked.
+        assert!(builder.shared.progress.lock().unwrap().is_none());
+        worker.send(rendered(&again, "test-build")).unwrap();
+        let pumped = builder.pump(&library, &[]);
+        assert_eq!(pumped.recorded, vec![taken.image_id]);
+        assert_eq!(pumped.said, vec![]);
+    }
+
+    #[test]
+    fn a_drive_that_is_not_there_is_said_once_and_left_alone() {
+        let scratch = Scratch::new("building-unplugged");
+        let library = Mutex::new(library_at(&scratch.0, 14));
+        let (mut builder, worker) = builder("test-build");
+        builder.pump(&library, &[]);
+
+        let mut said = Vec::new();
+        // With two workers one would be part-way through its own photograph
+        // when the tenth failure came back from the other.
+        let straggler = take(&builder).unwrap();
+        for _ in 0..UNREACHABLE_IN_A_ROW {
+            let next = take(&builder).expect("still trying");
+            worker
+                .send(Built {
+                    image_id: next.image_id,
+                    filename: next.filename,
+                    volume: next.volume,
+                    unreachable: true,
+                    outcome: Err(anyhow::anyhow!("is not there")),
+                })
+                .unwrap();
+            said.extend(builder.pump(&library, &[]).said);
+        }
+        worker
+            .send(Built {
+                image_id: straggler.image_id,
+                filename: straggler.filename,
+                volume: straggler.volume,
+                unreachable: true,
+                outcome: Err(anyhow::anyhow!("is not there")),
+            })
+            .unwrap();
+        said.extend(builder.pump(&library, &[]).said);
+        // One sentence, about the drive, and none about the photographs on it —
+        // not the ten that found it out, and not the one that came back after.
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(matches!(&said[0], Said::Failed(text) if text.contains("plugged in")));
+        assert!(take(&builder).is_none(), "the other three are left alone");
+        assert!(builder.shared.progress.lock().unwrap().is_none());
+        assert_eq!(builder.pump(&library, &[]), Pumped::default());
+
+        // Asking for a build by name is somebody saying the drive is back.
+        builder.shared.ask(true);
+        builder.pump(&library, &[]);
+        assert!(take(&builder).is_some());
+    }
+
+    #[test]
+    fn files_that_are_there_and_unreadable_do_not_condemn_the_drive() {
+        let scratch = Scratch::new("building-corrupt");
+        let library = Mutex::new(library_at(&scratch.0, 14));
+        let (mut builder, worker) = builder("test-build");
+        builder.pump(&library, &[]);
+        for _ in 0..12 {
+            let next = take(&builder).expect("twelve corrupt files are twelve files");
+            worker
+                .send(Built {
+                    image_id: next.image_id,
+                    filename: next.filename,
+                    volume: next.volume,
+                    unreachable: false,
+                    outcome: Err(anyhow::anyhow!("not a RAW file")),
+                })
+                .unwrap();
+            builder.pump(&library, &[]);
+        }
+        assert!(take(&builder).is_some());
     }
 
     #[test]

@@ -180,6 +180,13 @@ pub struct LibraryImage {
     /// itself. Two rows here can name the same `path` and the same `filename`;
     /// this is the only thing that tells them apart.
     pub copy_name: Option<String>,
+    /// The volume the file is on, as the catalog numbers them.
+    ///
+    /// Carried because "missing" is only ever written by a scan. A card pulled
+    /// out since the last one still has every photograph listed here as
+    /// present, and the only way anything downstream can tell a drive that has
+    /// gone from a file that has is to notice the failures share one of these.
+    pub volume: i64,
 }
 
 impl LibraryImage {
@@ -246,7 +253,8 @@ pub fn sequence(catalog: &Catalog, filter: &Filter) -> Result<Vec<LibraryImage>,
         "SELECT i.id,
                 v.last_mount_path || '/' || d.relative_path || '/' || f.filename,
                 f.filename,
-                i.copy_name
+                i.copy_name,
+                v.id
            FROM images i
            JOIN files f ON f.id = i.file_id
            JOIN folders d ON d.id = f.folder_id
@@ -261,6 +269,7 @@ pub fn sequence(catalog: &Catalog, filter: &Filter) -> Result<Vec<LibraryImage>,
                 path: r.get::<_, String>(1)?.replace("//", "/"),
                 filename: r.get(2)?,
                 copy_name: r.get(3)?,
+                volume: r.get(4)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

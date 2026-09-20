@@ -689,14 +689,9 @@ fn apply_preset(
     // by hand corrections is exactly the pair it was put there to capture. The
     // autosave's own write lands on the same hash a moment later and does
     // nothing, so this costs one row rather than two.
-    let library = library.lock().expect("library lock");
+    let mut library = library.lock().expect("library lock");
     let image = library.current().id;
-    if let Err(e) = rawkit_catalog::edits::save(
-        library.catalog(),
-        image,
-        &applied,
-        rawkit_editstate::EditSource::Preset,
-    ) {
+    if let Err(e) = library.save_edit(image, &applied, rawkit_editstate::EditSource::Preset) {
         failure(format!(
             "The preset is applied but could not be written to the catalog: {e}"
         ));

@@ -128,7 +128,9 @@ pub fn build(
                 let Some(wanted) = outstanding.get(index) else {
                     break;
                 };
-                let built = one(gpu, renderer, dir, wanted, stamp);
+                // Nothing interrupts a build from the terminal: it was asked
+                // for, and whoever asked is waiting for it.
+                let built = one(gpu, renderer, dir, wanted, stamp, &|| true);
                 // A closed channel means this thread's work is no longer wanted.
                 if sender.send((index, built)).is_err() {
                     break;
@@ -142,7 +144,11 @@ pub fn build(
             let wanted = &outstanding[index];
             progress(done, report.images, &wanted.filename);
             match built {
-                Ok(built) => {
+                Ok(Outcome::Interrupted) => report.failed.push((
+                    wanted.filename.clone(),
+                    "interrupted, though nothing here interrupts".into(),
+                )),
+                Ok(Outcome::Built(built)) => {
                     for preview in &built {
                         previews::record(catalog, wanted.image_id, preview)?;
                         report.bytes += preview.bytes;
@@ -157,6 +163,17 @@ pub fn build(
 
     progress(report.images, report.images, "");
     Ok(report)
+}
+
+/// What [`one`] came to.
+#[derive(Debug)]
+pub enum Outcome {
+    Built(Vec<Preview>),
+    /// The caller stopped wanting it part-way. Not a failure, and deliberately
+    /// not an `Err`: the photograph is as buildable as it was, and whoever
+    /// asked is expected to ask again. Files already written for the larger
+    /// levels are left; the next attempt writes the same names over them.
+    Interrupted,
 }
 
 /// Render one photograph's previews, largest first so the smaller ones are made
@@ -174,7 +191,12 @@ pub fn one(
     wanted: &previews::Wanted,
     // Which build is writing these, from `rawkit_engine::renderer_version`.
     stamp: &str,
-) -> Result<Vec<Preview>> {
+    // Asked between stages — after the decode, the pyramid, the render, each
+    // level — so that a window with a slider moving gets its GPU back within
+    // one stage rather than one photograph. The stages are the ones already
+    // timed below; nothing is interrupted *inside* one.
+    keep_going: &dyn Fn() -> bool,
+) -> Result<Outcome> {
     let raw_path = Path::new(&wanted.path);
     let (image_id, state, edit_state_hash, levels): (i64, &EditState, &str, &[Level]) = (
         wanted.image_id,
@@ -211,6 +233,9 @@ pub fn one(
         .with_context(|| format!("{:?} is not a Bayer sensor", raw.cfa))?;
     let profile = rawkit_engine::render::profile_for(&raw);
     lap("decode", &mut clock);
+    if !keep_going() {
+        return Ok(Outcome::Interrupted);
+    }
     let mosaic = rawkit_engine::normalise(&raw);
     lap("normalise", &mut clock);
     let frame = Frame {
@@ -237,6 +262,11 @@ pub fn one(
 
     let pyramid = Pyramid::build(&frame, DEFAULT_TILE);
     lap("pyramid", &mut clock);
+    // The last chance before the GPU is asked for anything, which is the part
+    // a window is actually short of.
+    if !keep_going() {
+        return Ok(Outcome::Interrupted);
+    }
     let level = coarsest_level(raw.width.max(raw.height), largest, pyramid.levels());
     let (data, width, height) = pyramid
         .level(level)
@@ -263,6 +293,9 @@ pub fn one(
     let mut source = (developed.pixels, developed.width, developed.height);
     let mut built = Vec::new();
     for size in order {
+        if !keep_going() {
+            return Ok(Outcome::Interrupted);
+        }
         let edge = size.longest_edge().unwrap_or(source.1.max(source.2));
         let (scaled, w, h) = resample(&source.0, source.1, source.2, edge);
         lap("resample", &mut clock);
@@ -298,7 +331,7 @@ pub fn one(
         });
         source = (scaled, w, h);
     }
-    Ok(built)
+    Ok(Outcome::Built(built))
 }
 
 /// Scale to an exact longest edge by averaging the area each output pixel covers.
