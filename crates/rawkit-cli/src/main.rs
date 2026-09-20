@@ -7,12 +7,12 @@
 
 mod chart;
 mod measure;
-mod previews;
 mod render;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use rawkit_catalog::previews::Level as PreviewLevel;
+use rawkit_deliver::previews;
 use rawkit_engine::sharpen::OutputSharpening;
 use std::path::PathBuf;
 

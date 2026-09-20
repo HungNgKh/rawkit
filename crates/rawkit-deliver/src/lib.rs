@@ -24,7 +24,11 @@
 //! This reads the stored edit and renders with it. Same renderer, same output
 //! transform, same embedded profile as every other file this project writes.
 //!
-//! # Always level zero
+//! # A delivery is always level zero
+//!
+//! This crate composes two things from the same stages — a delivery and a
+//! [preview](previews) — and the difference between them is this section. What
+//! follows is about deliveries.
 //!
 //! A preview is rendered from a reduced mosaic and says so; an export is not.
 //! The pyramid's averaging softens the edge of a blown highlight, which is
@@ -37,6 +41,8 @@
 //! otherwise. Exports are the one thing here that writes outside the catalog's
 //! own directory, and silently replacing somebody's file is the kind of thing an
 //! application gets to do exactly once.
+
+pub mod previews;
 
 use anyhow::{bail, Context, Result};
 use rawkit_catalog::cull::{self, Filter, Flagged};

@@ -1,11 +1,19 @@
 //! Building a library's previews.
 //!
-//! # Why this is a command and not a background thread
+//! # Why this is here and not in the command-line binary
 //!
-//! It needs a GPU, and the shell's GPU belongs to the render loop on the thread
-//! the compositor drives. A CLI run gets its own adapter and its own device with
-//! nothing to contend with, which is also why it can be interrupted and resumed
-//! by simply running it again — the catalog knows what is already current.
+//! It used to be, and the reason given was that it "needs a GPU, and the shell's
+//! GPU belongs to the render loop". That stopped being a reason when export
+//! moved into this crate: [`write`](crate::write()) makes a device of its own on a
+//! thread of its own, inside the window's process, beside the render loop's. A
+//! second device is something this crate already does.
+//!
+//! What it cost to leave it there was the window's grid. The shell cannot depend
+//! on a binary, so nothing in the window could build a preview, and a catalog
+//! nobody had run `rawkit catalog --previews` on was a black rectangle. Here,
+//! both front ends reach one implementation: [`build`] for a whole library from
+//! the terminal, which can still be interrupted and resumed by running it again
+//! — the catalog knows what is already current.
 //!
 //! # Rendering from the pyramid, not from the full frame
 //!
