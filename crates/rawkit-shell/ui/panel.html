@@ -53,6 +53,10 @@
   :focus-visible { outline: 2px solid #7c8cff; outline-offset: 2px; border-radius: 3px; }
   input[type=range]:focus-visible { outline-offset: 4px; }
 
+  /* `hidden` means hidden. `label { display: flex }` further down outranks the
+     attribute's own rule, so a row marked hidden was on screen all along. */
+  [hidden] { display: none !important; }
+
   details { border-bottom: 1px solid #26262e; }
   details:last-child { border-bottom: 0; }
   summary { font-size: 13px; font-weight: 600; letter-spacing: .02em;
@@ -84,6 +88,53 @@
            border-radius: 5px; padding: 4px 11px; font: inherit; cursor: pointer; }
   button:hover { background: #3a3a44; }
   .row { display: flex; gap: 7px; margin-top: 10px; flex-wrap: wrap; }
+  /* Two workspaces in one column. The Library's controls and Develop's are all
+     in the page all the time, and the body says which set is showing — so a
+     slider is never beside a photograph that is not the one on screen. They
+     were dimmed to 45 % in the grid and still took clicks. */
+  body[data-workspace="library"] .develop-only,
+  body[data-workspace="develop"] .library-only { display: none !important; }
+  #workspaces { display: flex; gap: 4px; padding: 10px 16px 0; }
+  #workspaces.hidden { display: none; }
+  #workspaces button[role=tab] { flex: 1 1 0; font-weight: 600; letter-spacing: .02em; }
+  #workspaces button[role=tab][aria-selected=true] {
+    color: #1e1e22; background: #e8e8ea; border-color: #e8e8ea; }
+  #zoom { margin-left: auto; display: flex; gap: 3px; }
+  #zoom button { padding: 1px 7px; font-size: 11px; }
+
+  /* The judgement, as controls. */
+  #s-info { padding: 12px 0 6px; border-bottom: 1px solid #26262e; }
+  #s-info .judge { gap: 5px; margin: 0 0 8px; }
+  #s-info .judge button { flex: 1 1 0; min-width: 0; padding: 7px 0; }
+  #s-info .judge button.on { color: #1e1e22; background: #e8e8ea; border-color: #e8e8ea; }
+  #info-flag button[data-command=pick].on { background: #6fc27a; border-color: #6fc27a; }
+  #info-flag button[data-command=reject].on { background: #e0705f; border-color: #e0705f; }
+  #info-stars button { font-size: 15px; letter-spacing: 0; }
+  #info-labels button i { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+                          vertical-align: -1px; }
+  #info-facts { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; margin: 10px 0 4px;
+                font-size: 12px; }
+  #info-facts dt { color: #9a9aa2; }
+  #info-facts dd { margin: 0; color: #e8e8ea; overflow-wrap: anywhere; }
+
+  /* One of the mixer's three at a time. */
+  #mixer-tabs { gap: 4px; margin-bottom: 6px; }
+  #mixer-tabs button { flex: 1 1 0; }
+  #mixer-tabs button[aria-selected=true] { color: #1e1e22; background: #e8e8ea; border-color: #e8e8ea; }
+  #mixer-bands label.hidden { display: none; }
+
+  /* The shortcut sheet. Inside the column because that is all the page has: it
+     cannot be drawn over the photograph. It covers the column while it is up. */
+  #sheet { position: absolute; inset: 0; z-index: 20; background: #1e1e22; overflow-y: auto;
+           padding: 14px 16px 24px; }
+  #sheet.hidden { display: none; }
+  #sheet h2 { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: #9a9aa2;
+              margin: 16px 0 6px; font-weight: 600; }
+  #sheet h2:first-child { margin-top: 0; }
+  #sheet .key { display: flex; gap: 10px; align-items: baseline; padding: 2px 0; font-size: 12px; }
+  #sheet .key kbd { flex: 0 0 96px; font: inherit; color: #d8bf63; }
+  #sheet .key span { color: #c9c9d1; }
+
   /* The tools, under the histogram where a Lightroom hand looks for them. Lit
      from what the shell says is in hand, never from having been clicked — the
      shell puts tools down on its own, and a button still lit for a picker that
@@ -267,19 +318,31 @@
 
 <div id="chrome">
 <div id="divider" title="drag to resize the panel"></div>
+<div id="workspaces" class="hidden" role="tablist" aria-label="workspace">
+  <button data-command="grid" role="tab">Library</button>
+  <button data-command="develop" role="tab">Develop</button>
+  <button data-command="shortcuts" id="sheet-open" aria-label="keyboard shortcuts">?</button>
+</div>
+<div id="sheet" class="hidden" role="dialog" aria-label="keyboard shortcuts"></div>
 <div id="bar">
   <canvas id="histogram" title="the developed photograph, in the values a file would carry"></canvas>
   <div id="readout">
     <span class="clip" id="clip-white" title="pixels with a channel at full scale">–</span>
     <span class="clip" id="clip-black" title="pixels with nothing in any channel">–</span>
+    <span id="zoom">
+      <button data-zoom="0.5" title="zoom out">−</button>
+      <button data-fit data-command="fit">Fit</button>
+      <button data-zoom="1" data-absolute title="every pixel of the photograph on a pixel of the screen">1:1</button>
+      <button data-zoom="2" title="zoom in">+</button>
+    </span>
   </div>
-  <div id="tools" role="toolbar" aria-label="tools">
-    <button data-tool="crop" title="crop and straighten">Crop<kbd>R</kbd></button>
-    <button data-tool="spot" title="remove spots">Spot<kbd>Q</kbd></button>
-    <button data-tool="linear" title="add a graduated adjustment">Gradient<kbd>L</kbd></button>
-    <button data-tool="radial" title="add a radial adjustment">Radial<kbd>⇧L</kbd></button>
-    <button data-tool="brush" title="add a brushed adjustment">Brush<kbd>B</kbd></button>
-    <button data-tool="wb" title="pick something neutral for the white balance">WB<kbd>W</kbd></button>
+  <div id="tools" class="develop-only" role="toolbar" aria-label="tools">
+    <button data-tool="crop" data-command="crop">Crop<kbd>R</kbd></button>
+    <button data-tool="spot" data-command="spot">Spot<kbd>Q</kbd></button>
+    <button data-tool="linear" data-command="gradient">Gradient<kbd>L</kbd></button>
+    <button data-tool="radial" data-command="radial">Radial<kbd>⇧L</kbd></button>
+    <button data-tool="brush" data-command="brush">Brush<kbd>B</kbd></button>
+    <button data-tool="wb" data-command="wb">WB<kbd>W</kbd></button>
   </div>
 </div>
 <div id="cull" class="hidden">
@@ -315,7 +378,39 @@
 </div>
 
 <main>
-  <details id="s-presets">
+  <section id="s-info" class="library-only">
+    <!-- The judgement as controls, at a size a hand can hit. The header above
+         says the same things in eleven pixels, which is a readout; this is
+         where they are changed by somebody who has not learned the keys yet. -->
+    <div class="row judge" id="info-flag">
+      <button data-command="pick">Pick</button>
+      <button data-command="unflag">Unflagged</button>
+      <button data-command="reject">Reject</button>
+    </div>
+    <div class="row judge" id="info-stars"></div>
+    <div class="row judge" id="info-labels"></div>
+    <dl id="info-facts"></dl>
+  </section>
+
+  <details id="s-collections" class="library-only">
+    <summary>Collections</summary>
+    <!-- A list rather than chips: a name, a count, and the three things done
+         to a collection, in a shape that still reads with a hundred of them. -->
+    <ul class="saved" id="collection-list"></ul>
+    <p class="empty">★ is where K sends a photograph.</p>
+    <div class="row"><button id="collection-new">New from selection…</button></div>
+    <div class="form hidden" id="collection-form">
+      <div class="row">
+        <input id="collection-name" type="text" placeholder="Name this collection" maxlength="60">
+      </div>
+      <div class="row">
+        <button id="collection-save">Create</button>
+        <button id="collection-cancel">Cancel</button>
+      </div>
+    </div>
+  </details>
+
+  <details id="s-presets" class="develop-only">
     <summary>Presets</summary>
     <ul class="saved" id="preset-list"></ul>
     <p class="empty" id="preset-empty">Nothing saved yet.</p>
@@ -332,27 +427,7 @@
     </div>
   </details>
 
-  <details id="s-collections">
-    <summary>Collections</summary>
-    <!-- A list rather than chips: a name, a count, and the three things done
-         to a collection, in a shape that still reads with a hundred of them. -->
-    <ul class="saved" id="collection-list"></ul>
-    <p class="empty">K puts the frame in the ★ collection, or takes it back out.
-      Shift-K adds everything marked. Backspace takes the frame out of the
-      collection you are looking at. Z undoes any of them.</p>
-    <div class="row"><button id="collection-new">New from selection…</button></div>
-    <div class="form hidden" id="collection-form">
-      <div class="row">
-        <input id="collection-name" type="text" placeholder="Name this collection" maxlength="60">
-      </div>
-      <div class="row">
-        <button id="collection-save">Create</button>
-        <button id="collection-cancel">Cancel</button>
-      </div>
-    </div>
-  </details>
-
-  <details id="s-snapshots">
+  <details id="s-snapshots" class="develop-only">
     <summary>Snapshots</summary>
     <ul class="saved" id="snapshot-list"></ul>
     <p class="empty" id="snapshot-empty">Nowhere to go back to yet.</p>
@@ -362,7 +437,20 @@
     </div>
   </details>
 
-  <details id="s-tone" open><summary>Tone</summary>
+  <details id="s-white-balance" class="develop-only"><summary>White balance</summary>
+    <label><span>Temp</span>
+      <input id="temperature" type="range" min="2000" max="12000" step="10" value="5500">
+      <output id="temperature-value">as shot</output></label>
+    <label><span>Tint</span>
+      <input id="tint" type="range" min="-100" max="100" step="1" value="0">
+      <output id="tint-value">0</output></label>
+    <div class="row">
+      <button id="as-shot">As shot</button>
+      <button id="pick-wb" class="target">Pick neutral</button>
+    </div>
+  </details>
+
+  <details id="s-tone" class="develop-only" open><summary>Tone</summary>
     <label><span>Exposure</span>
       <input id="exposure" type="range" min="-4" max="4" step="0.01" value="0">
       <output id="exposure-value">0.00</output></label>
@@ -381,6 +469,12 @@
     <label><span>Blacks</span>
       <input id="blacks" type="range" min="-1" max="1" step="0.01" value="0">
       <output id="blacks-value">0.00</output></label>
+  </details>
+
+  <details id="s-presence" class="develop-only"><summary>Presence</summary>
+    <!-- What Lightroom calls Presence: how much a photograph is *there*, which
+         is a different question from how bright it is. Clarity, texture and
+         dehaze were in Tone because they were built with it. -->
     <label><span>Clarity</span>
       <input id="clarity" type="range" min="-1" max="1" step="0.01" value="0">
       <output id="clarity-value">0.00</output></label>
@@ -390,9 +484,30 @@
     <label><span>Dehaze</span>
       <input id="dehaze" type="range" min="-1" max="1" step="0.01" value="0">
       <output id="dehaze-value">0.00</output></label>
+    <label><span>Saturation</span>
+      <input id="saturation" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="saturation-value">0.00</output></label>
+    <label><span>Vibrance</span>
+      <input id="vibrance" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="vibrance-value">0.00</output></label>
   </details>
 
-  <details id="s-grade">
+  <details id="s-curve" class="develop-only">
+    <summary>Tone curve</summary>
+    <canvas id="curve"></canvas>
+    <div class="row"><button id="curve-reset">Reset</button></div>
+  </details>
+
+  <details id="s-mixer" class="develop-only">
+    <summary>Colour mixer<button class="target" id="mixer-target">◎</button></summary>
+    <!-- Three sections of eight sliders were one idea in three places. One
+         section, one of the three showing, and the target beside the name says
+         which of them a drag on the photograph will move. -->
+    <div class="row tabs" id="mixer-tabs" role="tablist"></div>
+    <div id="mixer-bands"></div>
+  </details>
+
+  <details id="s-grade" class="develop-only">
     <summary>Colour grading</summary>
     <div id="wheels">
       <div class="wheel-group"><canvas class="wheel" data-range="shadows"></canvas>
@@ -417,38 +532,22 @@
     <div class="row"><button id="grade-reset">Reset</button></div>
   </details>
 
-  <details id="s-curve">
-    <summary>Tone curve</summary>
-    <canvas id="curve"></canvas>
-    <div class="row"><button id="curve-reset">Reset</button></div>
+  <details id="s-detail" class="develop-only"><summary>Detail</summary>
+    <label><span>Sharpen</span>
+      <input id="sharpen" type="range" min="0" max="1" step="0.01" value="0.4">
+      <output id="sharpen-value">0.40</output></label>
+    <label><span>Radius</span>
+      <input id="sharpen_radius" type="range" min="0.1" max="2" step="0.05" value="1">
+      <output id="sharpen_radius-value">1.00</output></label>
+    <label><span>Colour NR</span>
+      <input id="chroma_noise" type="range" min="0" max="1" step="0.01" value="0.5">
+      <output id="chroma_noise-value">0.50</output></label>
+    <label><span>Luma NR</span>
+      <input id="luminance_noise" type="range" min="0" max="1" step="0.01" value="0">
+      <output id="luminance_noise-value">0.00</output></label>
   </details>
 
-  <details id="s-calibration"><summary>Calibration</summary>
-    <label><span>Shadows tint</span>
-      <input id="shadow_tint" type="range" min="-1" max="1" step="0.01" value="0">
-      <output id="shadow_tint-value">0.00</output></label>
-    <label><span>Red hue</span>
-      <input id="red_hue" type="range" min="-1" max="1" step="0.01" value="0">
-      <output id="red_hue-value">0.00</output></label>
-    <label><span>Red saturation</span>
-      <input id="red_saturation" type="range" min="-1" max="1" step="0.01" value="0">
-      <output id="red_saturation-value">0.00</output></label>
-    <label><span>Green hue</span>
-      <input id="green_hue" type="range" min="-1" max="1" step="0.01" value="0">
-      <output id="green_hue-value">0.00</output></label>
-    <label><span>Green saturation</span>
-      <input id="green_saturation" type="range" min="-1" max="1" step="0.01" value="0">
-      <output id="green_saturation-value">0.00</output></label>
-    <label><span>Blue hue</span>
-      <input id="blue_hue" type="range" min="-1" max="1" step="0.01" value="0">
-      <output id="blue_hue-value">0.00</output></label>
-    <label><span>Blue saturation</span>
-      <input id="blue_saturation" type="range" min="-1" max="1" step="0.01" value="0">
-      <output id="blue_saturation-value">0.00</output></label>
-    <div class="row"><button id="calibration-reset">Reset calibration</button></div>
-  </details>
-
-  <details id="s-geometry"><summary>Geometry</summary>
+  <details id="s-geometry" class="develop-only"><summary>Lens &amp; geometry</summary>
     <div id="orientation">upright</div>
     <label><span>Straighten</span>
       <input id="straighten" type="range" min="-15" max="15" step="0.1" value="0">
@@ -471,30 +570,8 @@
       <button data-rotate="1">↻</button>
       <button id="perspective-reset">Reset perspective</button>
     </div>
-  </details>
-
-  <details id="s-colour"><summary>Colour</summary>
-    <label><span>Saturation</span>
-      <input id="saturation" type="range" min="-1" max="1" step="0.01" value="0">
-      <output id="saturation-value">0.00</output></label>
-    <label><span>Vibrance</span>
-      <input id="vibrance" type="range" min="-1" max="1" step="0.01" value="0">
-      <output id="vibrance-value">0.00</output></label>
-  </details>
-
-  <details id="s-detail"><summary>Detail</summary>
-    <label><span>Sharpen</span>
-      <input id="sharpen" type="range" min="0" max="1" step="0.01" value="0.4">
-      <output id="sharpen-value">0.40</output></label>
-    <label><span>Radius</span>
-      <input id="sharpen_radius" type="range" min="0.1" max="2" step="0.05" value="1">
-      <output id="sharpen_radius-value">1.00</output></label>
-    <label><span>Colour NR</span>
-      <input id="chroma_noise" type="range" min="0" max="1" step="0.01" value="0.5">
-      <output id="chroma_noise-value">0.50</output></label>
-    <label><span>Luma NR</span>
-      <input id="luminance_noise" type="range" min="0" max="1" step="0.01" value="0">
-      <output id="luminance_noise-value">0.00</output></label>
+    <!-- What the lens did, beside what the tripod did: both are about where the
+         light landed and neither is about what it looked like. -->
     <div class="row">
       <button id="lens-measure">Fix colour fringing</button>
       <button id="lens-clear">Clear</button>
@@ -511,20 +588,7 @@
     <div id="lens-reading" class="reading">no lens correction</div>
   </details>
 
-  <details id="s-white-balance"><summary>White balance</summary>
-    <label><span>Temp</span>
-      <input id="temperature" type="range" min="2000" max="12000" step="10" value="5500">
-      <output id="temperature-value">as shot</output></label>
-    <label><span>Tint</span>
-      <input id="tint" type="range" min="-100" max="100" step="1" value="0">
-      <output id="tint-value">0</output></label>
-    <div class="row">
-      <button id="as-shot">As shot</button>
-      <button id="pick-wb" class="target">Pick neutral</button>
-    </div>
-  </details>
-
-  <details id="s-masks"><summary>Local adjustments</summary>
+  <details id="s-masks" class="develop-only"><summary>Local adjustments</summary>
     <div class="row">
       <button id="mask-add">Add gradient</button>
       <button id="mask-add-radial">Add radial</button>
@@ -588,7 +652,7 @@
     </div>
   </details>
 
-  <details id="s-spots"><summary>Spot removal</summary>
+  <details id="s-spots" class="develop-only"><summary>Spot removal</summary>
     <div class="row">
       <button id="spot-tool" class="target">Place spots</button>
       <button id="spot-remove">Remove</button>
@@ -609,7 +673,7 @@
     </div>
   </details>
 
-  <details id="s-effects"><summary>Effects</summary>
+  <details id="s-effects" class="develop-only"><summary>Effects</summary>
     <label><span>Vignette</span>
       <input id="vignette" type="range" min="-1" max="1" step="0.01" value="0">
       <output id="vignette-value">0.00</output></label>
@@ -630,7 +694,32 @@
       <output id="grain_size-value">2.0</output></label>
   </details>
 
-  <details id="s-profile">
+  <details id="s-calibration" class="develop-only"><summary>Calibration</summary>
+    <label><span>Shadows tint</span>
+      <input id="shadow_tint" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="shadow_tint-value">0.00</output></label>
+    <label><span>Red hue</span>
+      <input id="red_hue" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="red_hue-value">0.00</output></label>
+    <label><span>Red saturation</span>
+      <input id="red_saturation" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="red_saturation-value">0.00</output></label>
+    <label><span>Green hue</span>
+      <input id="green_hue" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="green_hue-value">0.00</output></label>
+    <label><span>Green saturation</span>
+      <input id="green_saturation" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="green_saturation-value">0.00</output></label>
+    <label><span>Blue hue</span>
+      <input id="blue_hue" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="blue_hue-value">0.00</output></label>
+    <label><span>Blue saturation</span>
+      <input id="blue_saturation" type="range" min="-1" max="1" step="0.01" value="0">
+      <output id="blue_saturation-value">0.00</output></label>
+    <div class="row"><button id="calibration-reset">Reset calibration</button></div>
+  </details>
+
+  <details id="s-profile" class="develop-only">
     <summary>Camera profile</summary>
     <div id="profile-name">camera matrix</div>
     <div class="row">
@@ -639,24 +728,6 @@
     </div>
   </details>
 
-  <details id="s-view"><summary>View</summary>
-    <div class="row">
-      <button data-zoom="0.5">−</button>
-      <button data-fit>Fit</button>
-      <button data-zoom="1" data-absolute>1:1</button>
-      <button data-zoom="2">+</button>
-    </div>
-    <div class="row">
-      <button data-pan="-200,0">←</button>
-      <button data-pan="0,-200">↑</button>
-      <button data-pan="0,200">↓</button>
-      <button data-pan="200,0">→</button>
-    </div>
-  </details>
-  <details id="s-keys">
-    <summary>Keys</summary>
-    <div id="keys">G grid · E loupe · R crop · Q spots · W white balance picker · O mask · [ ] rotate · M mark · C compare · ⌃⇧C copy settings · ⌃⇧V paste onto selected · P pick · X reject · 0–5 rate · 6–9 label · F fit · V copy · \ filter · Z undo cull · ⌃Z undo edit · ⌃E export · ⌃⇧E export what is shown · F11 fullscreen</div>
-  </details>
 </main>
 <footer id="status">
   <div id="inhand" class="hidden">
@@ -755,26 +826,39 @@
     ["luminance", "Luminance"],
   ];
 
-  // Reversed, because each is inserted directly after Colour: the last one
-  // inserted ends up first.
-  for (const [control, controlName] of [...HSL_CONTROLS].reverse()) {
-    const section = document.createElement("details");
-    section.id = `s-hsl-${control}`;
-    const summary = document.createElement("summary");
-    summary.textContent = `HSL · ${controlName}`;
-    // The targeted adjustment. Armed per control rather than as one mode with
-    // modifiers, so which of the three a drag will move is on screen — the whole
-    // difficulty of a hue mixer is not knowing what you are aiming at, and a
-    // tool that hid its own aim would be an odd answer to that.
-    const target = document.createElement("button");
-    target.className = "target";
-    target.dataset.control = control;
-    target.textContent = "◎";
-    target.title = `drag on the photograph to set ${controlName.toLowerCase()} for the colour you point at`;
-    summary.append(target);
-    section.append(summary);
+  // One section with one of the three showing. All twenty-four sliders exist
+  // the whole time under the ids they always had — what changes with the tab is
+  // only which eight are displayed — so the code that reads the edit into them
+  // and sends their changes out did not have to hear about this.
+  let mixerShowing = "hue";
+  const mixerTarget = document.getElementById("mixer-target");
+  const showMixer = (control) => {
+    mixerShowing = control;
+    for (const tab of document.getElementById("mixer-tabs").children)
+      tab.setAttribute("aria-selected", String(tab.dataset.control === control));
+    for (const label of document.getElementById("mixer-bands").children)
+      label.classList.toggle("hidden", label.dataset.control !== control);
+    // The target aims whichever of the three is showing, and says so: the whole
+    // difficulty of a hue mixer is not knowing what a drag is about to move.
+    mixerTarget.dataset.control = control;
+    mixerTarget.title = `drag on the photograph to set ${control} for the colour you point at`;
+  };
+  for (const [control, controlName] of HSL_CONTROLS) {
+    const tab = document.createElement("button");
+    tab.dataset.control = control;
+    tab.textContent = controlName;
+    tab.setAttribute("role", "tab");
+    tab.addEventListener("click", () => {
+      // Armed and then switched means aiming the new one: a target left on a
+      // tab that is no longer showing is the hidden aim this was built to avoid.
+      const wasArmed = armed !== null;
+      showMixer(control);
+      if (wasArmed) arm(control);
+    });
+    document.getElementById("mixer-tabs").append(tab);
     for (const [band, bandName, colour] of BANDS) {
       const label = document.createElement("label");
+      label.dataset.control = control;
       const name = document.createElement("span");
       const swatch = document.createElement("i");
       swatch.className = "swatch";
@@ -787,11 +871,10 @@
       readout.id = `${input.id}-value`;
       readout.textContent = "0.00";
       label.append(name, input, readout);
-      section.append(label);
+      document.getElementById("mixer-bands").append(label);
     }
-    // After Colour, which is what these refine.
-    document.getElementById("s-colour").after(section);
   }
+  showMixer(mixerShowing);
 
   let scale = 1;
 
@@ -1804,7 +1887,7 @@
   let armed = null;
   const arm = (control) => ask("arm_target", { control });
 
-  for (const button of document.querySelectorAll(".target")) {
+  for (const button of document.querySelectorAll(".target[data-control]")) {
     button.addEventListener("click", event => {
       // The button lives inside a <summary>, which would otherwise open and
       // close the section every time the tool is picked up.
@@ -1843,6 +1926,7 @@
     armed = target;
     dropper.classList.toggle("armed", picking);
     document.getElementById("mask-pick-range").classList.toggle("armed", pickingRange);
+    if (armed !== null && armed !== mixerShowing) showMixer(armed);
     for (const button of document.querySelectorAll(".target[data-control]"))
       button.classList.toggle("armed", button.dataset.control === armed);
     document.body.classList.toggle("aiming", picking || pickingRange || armed !== null);
@@ -2289,6 +2373,96 @@
   // exists.
 
   const strip = document.getElementById("cull");
+  // ---- Library and Develop ------------------------------------------------------
+  // What has been drawn, kept apart from what is so: the page starts out
+  // believing Develop, and a shell that agrees must still get its tab lit.
+  let drawnWorkspace = null;
+  const setWorkspace = name => {
+    document.getElementById("workspaces").classList.remove("hidden");
+    if (name === drawnWorkspace) return;
+    drawnWorkspace = name;
+    workspace = name;
+    document.body.dataset.workspace = name;
+    for (const tab of document.querySelectorAll("#workspaces [role=tab]"))
+      tab.setAttribute("aria-selected",
+        String((tab.dataset.command === "develop") === (name === "develop")));
+    // The column is a different column now; start it from the top.
+    document.querySelector("main").scrollTop = 0;
+  };
+
+  // The Library's panel: the judgement as things to press, and what is known
+  // about the photograph. Drawn only when what it shows has changed — it comes
+  // round four times a second with the poll.
+  // The same four and the same colours as the filter line's, which the header
+  // uses too; one table, further down with the filter it was written for.
+  const infoStars = document.getElementById("info-stars");
+  for (let stars = 1; stars <= 5; stars++) {
+    const button = document.createElement("button");
+    button.textContent = "★";
+    button.dataset.stars = String(stars);
+    infoStars.append(button);
+  }
+  // Pressing the rating it already has takes the stars off, as the filter's
+  // star chips do for "any rating".
+  infoStars.addEventListener("click", event => {
+    const stars = Number(event.target.closest("button")?.dataset.stars);
+    if (stars) run(`rate-${shownRating === stars ? 0 : stars}`);
+  });
+  const infoLabels = document.getElementById("info-labels");
+  let shownRating = 0;
+  let drawnInfo = "";
+  // The header carries no offset, so this is the camera's wall clock and is
+  // shown as one: read back through UTC so the viewer's own zone is not added.
+  const when = seconds => {
+    if (seconds == null) return null;
+    const at = new Date(seconds * 1000);
+    const two = n => String(n).padStart(2, "0");
+    return `${at.getUTCFullYear()}-${two(at.getUTCMonth() + 1)}-${two(at.getUTCDate())} ` +
+           `${two(at.getUTCHours())}:${two(at.getUTCMinutes())}`;
+  };
+  const drawInfo = view => {
+    // Built on the first draw rather than at load: the table of labels is
+    // declared further down the file, beside the filter it was written for.
+    if (!infoLabels.children.length) {
+      for (const [name, colour] of LABELS) {
+        const button = document.createElement("button");
+        button.dataset.command = `label-${name}`;
+        button.title = `Label ${name}; again to take it off`;
+        const dot = document.createElement("i");
+        dot.style.background = colour;
+        button.append(dot);
+        infoLabels.append(button);
+      }
+    }
+    const held = (view.in_collections ?? [])
+      .map(id => (view.collections ?? []).find(c => c.id === id))
+      .filter(Boolean).map(c => c.is_quick ? "Quick Collection" : c.name);
+    const taken = view.taken ?? {};
+    const key = [view.flag, view.rating, view.colour, taken.captured_at, taken.camera,
+                 taken.lens, held.join("|")].join("~");
+    if (key === drawnInfo) return;
+    drawnInfo = key;
+    shownRating = view.rating ?? 0;
+    for (const button of document.getElementById("info-flag").children) {
+      const is = { pick: "pick", reject: "reject", unflag: null }[button.dataset.command];
+      button.classList.toggle("on", (view.flag ?? null) === is);
+    }
+    for (const button of infoStars.children)
+      button.classList.toggle("on", Number(button.dataset.stars) <= shownRating);
+    for (const button of infoLabels.children)
+      button.classList.toggle("on", button.dataset.command === `label-${view.colour}`);
+    const facts = [["Taken", when(taken.captured_at)], ["Camera", taken.camera],
+                   ["Lens", taken.lens], ["In", held.join(", ") || null]];
+    document.getElementById("info-facts").replaceChildren(...facts.flatMap(([name, value]) => {
+      if (!value) return [];
+      const term = document.createElement("dt");
+      const detail = document.createElement("dd");
+      term.textContent = name;
+      detail.textContent = value;
+      return [term, detail];
+    }));
+  };
+
   const show = view => {
     if (!view) return;
     strip.classList.remove("hidden");
@@ -2326,6 +2500,8 @@
       `K → ${targetName(view)}${view.in_target ? " ✓" : ""}`;
     drawFilter(view.filter ?? {});
     drawCollections(view);
+    setWorkspace(view.workspace);
+    drawInfo(view);
     setMode(view.mode, view.tool);
   };
 
@@ -2611,7 +2787,7 @@
   // ---- A tool in hand owns the keyboard ---------------------------------------
   //
   // Crop, the spot tool, and a local adjustment waiting to be placed: three
-  // states with something half-made in them. While one is up, the keys that
+  // states with something half-made in them. While one is up, the commands that
   // judge or move are not carried out and are not ignored either — they say
   // what is in the way and how to put it down. Silence would read as a broken
   // key; doing it anyway is how a Lightroom hand pressing X to flip a crop
@@ -2619,59 +2795,32 @@
   //
   // The shell holds the same line (`CullAction::waits_for`) and names no keys
   // when it does; the exits are said here because the keys are the page's.
-  // `keys` is what each tool keeps for itself, by `event.key` lower-cased.
-  // The keys that wait. A list of what is held back rather than of what is let
-  // through, because the keyboard has a hundred keys that do nothing here —
-  // Shift on its way to a chord, a stray H — and a tool that complained about
-  // each of them would be the noise the status line was built to get away from.
-  // "paste" is not a key; it is the chord's name, so the chord can ask too.
-  const WAITS = new Set(["0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
-    "p", "x", "u", "m", "c", "k", "z", "v", "g", "e", "enter", "r", "q", "l", "b",
-    "w", "[", "]", "arrowleft", "arrowright", "arrowup", "arrowdown", " ",
-    "backspace", "delete", "-", "=", "+", "\\", "paste"]);
+  // Which commands wait is each command's own `waits`, in the registry below —
+  // it used to be a second list of key names that had to be kept in step with
+  // the handler by hand. `keeps` is what each tool keeps for itself, by id.
   const inHand = () => {
     if (mode === "crop")
-      return { name: "Crop", exits: "Enter keeps it, Esc cancels", keys: ["enter", "r"] };
+      return { name: "Crop", exits: "Enter keeps it, Esc cancels", keeps: ["confirm", "crop"] };
     if (mode === "spot")
       return { name: "Spot removal", exits: "Esc or Q puts it down",
-               // E with the rest: the shell lets the loupe through as this
-               // tool's way out, and a key it would accept must not be refused
-               // here on its behalf.
-               keys: ["q", "e", "enter", "backspace", "delete"] };
+               // Leaving for the loupe with the rest: the shell lets it through
+               // as this tool's way out, and a command it would accept must not
+               // be refused here on its behalf.
+               keeps: ["spot", "loupe", "confirm", "remove"] };
     if (placing)
       return { name: "An adjustment", exits: "drag on the photograph to place it, or Esc",
-               keys: [] };
+               keeps: [] };
     return null;
   };
-  // Whether the tool in hand takes this key. Says so when it does not.
-  const heldBack = key => {
+  // Whether the tool in hand holds this command back. Says so when it does.
+  const heldBack = command => {
     const tool = inHand();
-    if (!tool || !WAITS.has(key) || tool.keys.includes(key)) return false;
+    if (!tool || !command.waits || tool.keeps.includes(command.id)) return false;
     tell("refused", `${tool.name} is in hand — ${tool.exits}`);
     return true;
   };
-  const MOD = /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘⇧" : "Ctrl+Shift+";
+  const MAC = /Mac|iPhone|iPad/.test(navigator.platform);
 
-  // The same things the keys do, so there is one behaviour with two ways in. A
-  // lit tool is put down by pressing it again, which is what R and Q already do.
-  const useTool = name => {
-    if (name === "crop" || name === "spot") return act(name);
-    if (name === "wb") return pickWb(!picking);
-    const lit = (tool === "mask" || tool === "placing") && selectedKind === name;
-    if (lit) return ask("select_mask", { index: null });
-    addMask(name === "linear" ? "gradient" : name);
-  };
-  document.getElementById("tools").addEventListener("click", event => {
-    const button = event.target.closest("button");
-    if (!button) return;
-    // The strip is a second way to press a key, so it waits for the same thing.
-    const key = { crop: "r", spot: "q", linear: "l", radial: "l", brush: "b", wb: "w" }[button.dataset.tool];
-    if (!heldBack(key)) useTool(button.dataset.tool);
-  });
-
-  // The shell says what happened and whether it can be taken back; which key
-  // does that is the page's to say, because the keys are the page's — and this
-  // is the one line to change when undo moves to Ctrl+Z.
   const UNDO_HINT = " · Z undoes it";
   const act = async (action, value) => {
     try {
@@ -2702,6 +2851,10 @@
   // badge *says* would have changed what Enter *does*.
   let mode = "loupe";
   let tool = "";
+  // Library or Develop, as the shell has it. Develop until told otherwise, which
+  // is what a RAW opened on its own stays: there is no library for it to be in.
+  let workspace = "develop";
+  document.body.dataset.workspace = workspace;
   let selectedKind = null;
   const KIND = { linear: "gradient", radial: "radial", brush: "brush", range: "range" };
   // What each tool is called, how it is put down, which section is about it,
@@ -2723,7 +2876,7 @@
              how: "click the colour or brightness to centre the band on · Esc puts it down",
              section: "s-masks", does: [["Put down", () => pickRange(false)]] },
     target: { name: "Mixer target", how: "drag on a colour in the photograph · Esc puts it down",
-              section: null, does: [["Put down", () => arm(null)]] },
+              section: "s-mixer", does: [["Put down", () => arm(null)]] },
     mask: { name: "Adjustment", how: "drag its handles · O shows what it covers · Esc puts it down",
             section: "s-masks",
             does: [["Deselect", () => ask("select_mask", { index: null })]] },
@@ -2779,6 +2932,11 @@
   // Ask the shell what is in hand now, after the page has asked for a change to
   // it. The poll would say the same within a quarter of a second, which is long
   // enough to watch a badge be wrong.
+  const useMask = kind => {
+    const lit = (tool === "mask" || tool === "placing") && selectedKind === kind;
+    if (lit) return ask("select_mask", { index: null });
+    addMask(kind === "linear" ? "gradient" : kind);
+  };
   const retool = () => invoke("cull_view").then(show).catch(() => {});
 
   function setMode(name, inHandNow) {
@@ -2788,181 +2946,301 @@
     mode = name;
     drawTool();
     outlived();
-    // The grid is laid out from the canvas, so the view controls beside it are
-    // about a photograph that is not on screen. Dimmed rather than removed, so
-    // the panel does not jump when the mode changes.
-    document.querySelector("main").style.opacity = name === "grid" ? 0.45 : 1;
   }
 
-  document.addEventListener("keydown", event => {
-    // Ctrl/Cmd+Z steps the *edit* back; shift, or Y, steps it forward. Bare Z
-    // stays with culling, which had it first.
-    //
-    // Two undo histories in one application, and the seam is worth stating
-    // rather than leaving someone to find: the develop controls and the
-    // judgements are undone separately, because nothing joins their timelines —
-    // the library outlives the session, and a session is rebuilt for every
-    // photograph. Merging them is a design decision, not a refactor.
-    if ((event.metaKey || event.ctrlKey) && !event.altKey) {
-      const held = event.key.toLowerCase();
-      if (held === "z" || held === "y") {
-        send({ command: held === "y" || event.shiftKey ? "redo" : "undo" });
-        event.preventDefault();
-      }
-      // E for export, and shift for the whole cull rather than this one frame.
-      // The picker decides the rest: a name for one photograph, a folder for a
-      // set, so the two cannot be asked for the wrong thing.
-      if (held === "e") {
-        invoke("export", { scope: event.shiftKey ? "shown" : "current" }).catch(say);
-        event.preventDefault();
-      }
-      // Copy and paste the settings, as Lightroom has them. They were bare S
-      // and A, and a bare A is one slip from rewriting every selected
-      // photograph — the most expensive key on the board should not also be the
-      // easiest to hit. Not while typing: there the chord is the text box's.
-      if (event.shiftKey && (held === "c" || held === "v") &&
-          !event.target.closest("input[type=text], textarea")) {
-        if (held === "c") act("copy_edit");
-        else if (!heldBack("paste")) act("paste_edit");
-        event.preventDefault();
-      }
-      return;
+  // ---- Commands ----------------------------------------------------------------
+  //
+  // Everything that can be asked for, once. The keys, the buttons, the tooltips
+  // and the shortcut sheet are all read from this, because they used to be four
+  // accounts of the same thing: the handler had the bindings, a hand-typed line
+  // at the bottom of the column listed two thirds of them and called survey
+  // "compare", and the buttons knew nothing of either.
+  //
+  //   keys   as `combo()` spells them: "p", "shift+k", "mod+shift+c", "arrowleft".
+  //          mod is Ctrl, or ⌘ on a Mac. The first is the one shown.
+  //   scope  "library" or "develop" — where it means something — or "any".
+  //   waits  it can change which photograph is on screen or what is recorded
+  //          about it, so it waits for a tool in hand (`heldBack`).
+  //   act    a cull action by the shell's name, with `value`; or `run` for the
+  //          rest. `act: "…"` is spelt this way so the contract test can read it.
+  const toggleFilter = () => {
+    if (narrowing(filter)) act("set_filter", {});
+    else if (remembered) act("set_filter", remembered);
+  };
+  const escape = () => {
+    // A ladder, one rung a press: a control (in the handler, before this),
+    // whatever the pointer is armed to mean, the tool in hand, and then the
+    // view — survey and grid step back to the loupe. The armed things come
+    // first because they are the most recently picked up.
+    if (!document.getElementById("sheet").classList.contains("hidden")) return toggleSheet();
+    if (armed !== null) return arm(null);
+    if (picking) return pickWb(false);
+    if (pickingRange) return pickRange(false);
+    if (placing) return place(false);
+    if (mode === "crop") return act("crop_cancel");
+    if (mode === "spot") return act("spot");
+    // A selected adjustment is in hand as far as the badge and the pointer are
+    // concerned — a press grabs its handles — so it is a rung too.
+    if (tool === "mask") return ask("select_mask", { index: null });
+    // And the bottom rung is the loupe. In Develop there is nothing under it:
+    // Escape used to send `loupe` from there, which now means the Library, and
+    // a key for putting things down should not also change where you are.
+    if (mode === "grid" || mode === "survey") return act("loupe");
+  };
+  const COMMANDS = [
+    // -- where you are
+    { id: "grid", keys: ["g"], scope: "any", waits: true, group: "Views",
+      title: "Library, as a grid", act: "grid" },
+    { id: "loupe", keys: ["e"], scope: "any", waits: true, group: "Views",
+      title: "Library, one photograph", act: "loupe" },
+    { id: "develop", keys: ["d"], scope: "any", waits: true, group: "Views",
+      title: "Develop this photograph", act: "develop" },
+    { id: "survey", keys: ["n", "c"], scope: "library", waits: true, group: "Views",
+      title: "Survey the selected photographs side by side", act: "survey" },
+    { id: "confirm", keys: ["enter"], scope: "any", waits: true, group: "Views",
+      title: "Open the photograph; in Crop, keep the crop",
+      run: () => act(mode === "crop" ? "crop_apply" : "loupe") },
+    { id: "escape", keys: ["escape"], scope: "any", waits: false, group: "Views",
+      title: "Put down whatever is in hand; then back to one photograph", run: escape },
+    { id: "cells-smaller", keys: ["-"], scope: "library", waits: true, group: "Views",
+      title: "Smaller cells in the grid", act: "cells", value: -1 },
+    { id: "cells-larger", keys: ["=", "+"], scope: "library", waits: true, group: "Views",
+      title: "Larger cells in the grid", act: "cells", value: 1 },
+    { id: "fit", keys: ["f"], scope: "any", waits: false, group: "Views",
+      title: "Fit the photograph in the window", run: () => send({ command: "fit_to_view" }) },
+    { id: "fullscreen", keys: ["f11"], scope: "any", waits: false, group: "Views",
+      title: "Full screen", run: () => invoke("toggle_fullscreen").catch(say) },
+    { id: "shortcuts", keys: ["?", "f1"], scope: "any", waits: false, group: "Views",
+      title: "This list", run: () => toggleSheet() },
+
+    // -- moving
+    { id: "next", keys: ["arrowright", " "], scope: "any", waits: true, group: "Moving",
+      title: "Next photograph", act: "next" },
+    { id: "previous", keys: ["arrowleft"], scope: "any", waits: true, group: "Moving",
+      title: "Previous photograph", act: "previous" },
+    // Rows in the grid; neighbours in the loupe. Which one is resolved by the
+    // shell, because only it knows how many cells fit across.
+    { id: "down", keys: ["arrowdown"], scope: "any", waits: true, group: "Moving",
+      title: "Down a row; in the loupe, next", act: "select_by", value: 1 },
+    { id: "up", keys: ["arrowup"], scope: "any", waits: true, group: "Moving",
+      title: "Up a row; in the loupe, previous", act: "select_by", value: -1 },
+    { id: "filter-toggle", keys: ["\\"], scope: "library", waits: true, group: "Moving",
+      title: "Put the filter down, and pick it up again", run: toggleFilter },
+
+    // -- judging: the active photograph, always, and never a selection
+    { id: "pick", keys: ["p"], scope: "any", waits: true, group: "Judging",
+      title: "Pick, and move on", act: "pick" },
+    { id: "reject", keys: ["x"], scope: "any", waits: true, group: "Judging",
+      title: "Reject, and move on", act: "reject" },
+    { id: "unflag", keys: ["u"], scope: "any", waits: true, group: "Judging",
+      title: "Take the flag off", act: "clear_flag" },
+    ...[0, 1, 2, 3, 4, 5].map(stars => ({
+      id: `rate-${stars}`, keys: [String(stars)], scope: "any", waits: true, group: "Judging",
+      title: stars ? `${stars} star${stars > 1 ? "s" : ""}` : "No stars",
+      act: "rate", value: stars, sheet: stars === 0 ? "0 – 5  stars" : null })),
+    ...[["6", "red"], ["7", "yellow"], ["8", "green"], ["9", "blue"]].map(([key, colour]) => ({
+      id: `label-${colour}`, keys: [key], scope: "any", waits: true, group: "Judging",
+      title: `Label ${colour}; again to take it off`,
+      act: "colour", value: colour, sheet: key === "6" ? "6 – 9  colour label" : null })),
+    { id: "undo", keys: ["z"], scope: "any", waits: true, group: "Judging",
+      title: "Undo the last judgement or collection change", act: "undo" },
+
+    // -- selecting and collecting
+    { id: "select", keys: ["m"], scope: "library", waits: true, group: "Collecting",
+      title: "Select this photograph, or let it go", act: "mark" },
+    { id: "target", keys: ["k"], scope: "any", waits: true, group: "Collecting",
+      title: "Into the ★ collection, or back out", act: "target_toggle" },
+    { id: "target-selected", keys: ["shift+k"], scope: "any", waits: true, group: "Collecting",
+      title: "Everything selected into the ★ collection", act: "add_marked" },
+    // "Remove the selected thing from where I am", which is one meaning with two
+    // places to be: the selected mark in the spot tool, as every other editor has
+    // it, and otherwise out of the collection being looked at — never out of the
+    // library; the shell refuses that and says why.
+    { id: "remove", keys: ["backspace", "delete"], scope: "any", waits: true, group: "Collecting",
+      title: "Out of the collection being viewed; in Spot removal, the selected mark",
+      run: () => mode === "spot" ? document.getElementById("spot-remove").click() : act("take_out") },
+    { id: "move-later", keys: ["shift+arrowright"], scope: "library", waits: true,
+      group: "Collecting", title: "Move later in the collection's order",
+      act: "move_in_collection", value: 1 },
+    { id: "move-earlier", keys: ["shift+arrowleft"], scope: "library", waits: true,
+      group: "Collecting", title: "Move earlier in the collection's order",
+      act: "move_in_collection", value: -1 },
+    // V for a virtual copy. Not Lightroom's ⌃-apostrophe, which needs two hands
+    // on a keyboard whose other culling keys need one.
+    { id: "copy", keys: ["v"], scope: "any", waits: true, group: "Collecting",
+      title: "Make a virtual copy", act: "make_copy" },
+    { id: "copy-remove", keys: ["shift+v"], scope: "any", waits: true, group: "Collecting",
+      title: "Remove this virtual copy", act: "remove_copy" },
+
+    // -- tools: Develop's. Pressed from the Library they go there first.
+    { id: "crop", keys: ["r"], scope: "develop", waits: true, group: "Tools",
+      title: "Crop and straighten", act: "crop" },
+    { id: "spot", keys: ["q"], scope: "develop", waits: true, group: "Tools",
+      title: "Spot removal", act: "spot" },
+    { id: "gradient", keys: ["l"], scope: "develop", waits: true, group: "Tools",
+      title: "Add a graduated adjustment", run: () => useMask("linear") },
+    { id: "radial", keys: ["shift+l"], scope: "develop", waits: true, group: "Tools",
+      title: "Add a radial adjustment", run: () => useMask("radial") },
+    { id: "brush", keys: ["b"], scope: "develop", waits: true, group: "Tools",
+      title: "Add a brushed adjustment", run: () => useMask("brush") },
+    // Shift toggles the eraser rather than adding a second brush: erasing is what
+    // you reach for in the middle of painting, not a new mask.
+    { id: "eraser", keys: ["shift+b"], scope: "develop", waits: false, group: "Tools",
+      title: "Brush: paint, or erase", run: () => invoke("set_brush", { erase: !erasing }).catch(say) },
+    { id: "wb", keys: ["w"], scope: "develop", waits: true, group: "Tools",
+      title: "White balance: pick something neutral", run: () => pickWb(!picking) },
+    { id: "overlay", keys: ["o"], scope: "develop", waits: false, group: "Tools",
+      title: "Show what the adjustment covers", run: () => invoke("show_mask", { on: !showingMask }).catch(say) },
+    { id: "rotate-left", keys: ["["], scope: "any", waits: true, group: "Tools",
+      title: "Rotate a quarter turn left", run: () => send({ command: "rotate_by", params: -1 }) },
+    { id: "rotate-right", keys: ["]"], scope: "any", waits: true, group: "Tools",
+      title: "Rotate a quarter turn right", run: () => send({ command: "rotate_by", params: 1 }) },
+
+    // -- the edit
+    // Two undo histories, and the seam is worth stating rather than leaving
+    // someone to find: the develop controls and the judgements are undone
+    // separately, because nothing joins their timelines — the library outlives
+    // the session, and a session is rebuilt for every photograph.
+    { id: "edit-undo", keys: ["mod+z"], scope: "any", waits: false, group: "The edit",
+      title: "Undo the last change to the edit", run: () => send({ command: "undo" }) },
+    { id: "edit-redo", keys: ["mod+shift+z", "mod+y"], scope: "any", waits: false, group: "The edit",
+      title: "Redo it", run: () => send({ command: "redo" }) },
+    // They were bare S and A, and a bare A is one slip from rewriting every
+    // selected photograph — the most expensive key on the board should not also
+    // be the easiest to hit.
+    { id: "settings-copy", keys: ["mod+shift+c"], scope: "any", waits: false, group: "The edit",
+      title: "Copy this photograph's settings", act: "copy_edit" },
+    { id: "settings-paste", keys: ["mod+shift+v"], scope: "any", waits: true, group: "The edit",
+      title: "Paste them onto everything selected", act: "paste_edit" },
+    // The picker decides the rest: a name for one photograph, a folder for a
+    // set, so the two cannot be asked for the wrong thing.
+    { id: "export", keys: ["mod+e"], scope: "any", waits: false, group: "The edit",
+      title: "Export this photograph", run: () => invoke("export", { scope: "current" }).catch(say) },
+    { id: "export-shown", keys: ["mod+shift+e"], scope: "any", waits: false, group: "The edit",
+      title: "Export everything the filter shows", run: () => invoke("export", { scope: "shown" }).catch(say) },
+  ];
+  // Where two keys went, said for as long as hands remember them. Not commands:
+  // there is nothing to run, and nothing to list.
+  const MOVED = {
+    s: "Copying the settings is ⌃⇧C now",
+    a: "Pasting the settings onto what is selected is ⌃⇧V now",
+  };
+
+  const byId = new Map(COMMANDS.map(command => [command.id, command]));
+  const byKey = new Map();
+  for (const command of COMMANDS)
+    for (const key of command.keys) {
+      // Two commands on one key is a bug nobody would find by pressing it: the
+      // second would simply never run.
+      if (byKey.has(key)) throw new Error(`${key} is bound twice: ${byKey.get(key).id}, ${command.id}`);
+      byKey.set(key, command);
     }
+
+  // A key as the registry spells it. Shift is part of a letter or a named key
+  // and not of a symbol, which already is what Shift made it: "?" arrives as
+  // "?" with Shift held, and "shift+?" is not a thing anyone would write.
+  const combo = event => {
+    const key = event.key.toLowerCase();
+    const shifts = key.length > 1 || /^[a-z]$/.test(key);
+    return (event.metaKey || event.ctrlKey ? "mod+" : "") +
+           (event.shiftKey && shifts ? "shift+" : "") + key;
+  };
+  const spelt = key => key.split("+").map(part => ({
+    mod: MAC ? "⌘" : "Ctrl", shift: MAC ? "⇧" : "Shift", " ": "Space", escape: "Esc",
+    arrowleft: "←", arrowright: "→", arrowup: "↑", arrowdown: "↓",
+    backspace: "⌫", delete: "Del", enter: "Enter" }[part] ?? part.toUpperCase())).join(MAC ? "" : "+");
+
+  // Carry a command out, from wherever it was asked for — a key, a button, the
+  // tool strip. One road, so a button cannot do what its key would have refused.
+  const run = async id => {
+    const command = byId.get(id);
+    if (!command) return;
+    if (heldBack(command)) return;
+    if (command.scope === "library" && workspace === "develop") {
+      return tell("refused",
+        `${spelt(command.keys[0])} is a Library key (${command.title.toLowerCase()}) — G or E goes there`);
+    }
+    if (command.scope === "develop" && workspace === "library") {
+      // Crop and the spot tool are views as far as the shell is concerned, and
+      // it opens the photograph for them from anywhere. The rest work on the
+      // edit in the session, which from a grid is still the *last* photograph's
+      // until this one has loaded — so from there this only goes to Develop,
+      // and the key is pressed again on a photograph that is really open.
+      const opens = command.id === "crop" || command.id === "spot";
+      if (!opens) {
+        const fromMany = mode === "grid" || mode === "survey";
+        await act("develop");
+        if (fromMany)
+          return tell("info", `In Develop now — ${spelt(command.keys[0])} again to ${command.title.toLowerCase()}`);
+      }
+    }
+    if (command.act) return act(command.act, command.value);
+    return command.run();
+  };
+
+  document.addEventListener("keydown", event => {
     if (event.altKey) return;
-    const key = event.key;
+    const key = combo(event);
     // A focused control owns its own keys. Without this, arrows move the slider
     // *and* the selection, and a digit rates the photograph while you are
-    // trying to type into something — which was survivable with two sliders and
-    // is not with six. Escape is the way back out, so it stays ours.
+    // trying to type into something. Escape is the way back out, so it stays
+    // ours — and so do the chords, except in a text box, where they are its.
     const editing = event.target.closest("input, button, select, textarea");
-    if (editing && key !== "Escape") return;
-    // One level per press, and leaving a control is a level. It used to blur
-    // *and* fall through, so Escape out of a text box also threw away the crop
-    // behind it.
-    if (editing) return event.target.blur(), event.preventDefault();
-    if (heldBack(key.toLowerCase())) return event.preventDefault();
-    if (key >= "0" && key <= "5") return act("rate", Number(key)), event.preventDefault();
-    // Lightroom's colour keys, and pressing the same one again clears it.
-    const labels = { "6": "red", "7": "yellow", "8": "green", "9": "blue" };
-    if (labels[key]) return act("colour", labels[key]), event.preventDefault();
-    switch (key.toLowerCase()) {
-      // G and E, because that is what a Lightroom user's hands already do.
-      case "g": act("grid"); break;
-      // In crop the same two keys mean take it and throw it away, which is why
-      // crop is a mode rather than a flag.
-      case "enter":
-        if (mode === "crop") { act("crop_apply"); break; }
-        act("loupe"); break;
-      case "escape":
-        // A ladder, one rung a press: a control (above), whatever the pointer
-        // is armed to mean, the tool in hand, and then the view — survey and
-        // grid both step back to the loupe. The armed things come first because
-        // they are the most recently picked up, and leaving crop as well would
-        // be two answers to one key. The range picker was missing from this and
-        // could only be put down with the mouse.
-        if (armed !== null) { arm(null); break; }
-        if (picking) { pickWb(false); break; }
-        if (pickingRange) { pickRange(false); break; }
-        if (placing) { place(false); break; }
-        if (mode === "crop") { act("crop_cancel"); break; }
-        // A selected adjustment is in hand as far as the badge and the pointer
-        // are concerned — a press grabs its handles — so it is a rung too. It
-        // was not, and Escape with GRADIENT 2 lit did nothing anyone could see.
-        if (tool === "mask") { ask("select_mask", { index: null }); break; }
-        act("loupe"); break;
-      case "e": act("loupe"); break;
-      // R for the crop tool, as in Lightroom; the brackets rotate, as in
-      // Lightroom's Ctrl+[ and Ctrl+].
-      case "r": act("crop"); break;
-      // Q for the spot tool, as in Lightroom.
-      case "q": act("spot"); break;
-      // W for the white-balance eyedropper, as in Lightroom. It had a button and
-      // no key, in a section ten down the column.
-      case "w": pickWb(!picking); break;
-      // O for the coverage tint, which is the other half of seeing a mask.
-      case "o": invoke("show_mask", { on: !showingMask }).catch(say); break;
-      case "[": send({ command: "rotate_by", params: -1 }); break;
-      case "]": send({ command: "rotate_by", params: 1 }); break;
-      // L adds a graduated local adjustment and arms the drag that places it;
-      // shift makes it a radial, which is the pairing Lightroom uses for its
-      // two. Lightroom puts them on M and shift-M; M sets a frame aside here
-      // and had it first, which is the same reason bare Z stayed with culling.
-      case "l": addMask(event.shiftKey ? "radial" : "gradient"); break;
-      // B for brush, as everywhere else that has one. Shift toggles the eraser
-      // rather than adding a second brush: erasing is what you reach for in the
-      // middle of painting, not a new mask.
-      case "b":
-        if (event.shiftKey) invoke("set_brush", { erase: !erasing }).catch(say);
-        else addMask("brush");
-        break;
-      // M sets a frame aside, C compares what you set aside.
-      // K for the target collection: Lightroom uses B, which is the brush here.
-      // Shift-K sends everything marked the same way, which is what M is for —
-      // choose a set, then do one thing to all of it.
-      case "k": act(event.shiftKey ? "add_marked" : "target_toggle"); break;
-      // "Remove the selected thing from where I am", which is one meaning with
-      // two places to be: the selected mark in the spot tool, as every other
-      // editor has it, and otherwise out of the collection being looked at —
-      // never out of the library; the shell refuses that and says why.
-      case "backspace": case "delete":
-        if (mode === "spot") document.getElementById("spot-remove").click();
-        else act("take_out");
-        break;
-      case "m": act("mark"); break;
-      case "c": act("survey"); break;
-      // Shift moves the photograph rather than the cursor, and only inside a
-      // collection — the hand-made order is the one thing a collection has that
-      // a filter never will, so there has to be a way to make one.
-      case "arrowright": case " ":
-        if (event.shiftKey && key !== " ") act("move_in_collection", 1);
-        else act("next");
-        break;
-      case "arrowleft":
-        if (event.shiftKey) act("move_in_collection", -1);
-        else act("previous");
-        break;
-      // Rows in the grid; neighbours in the loupe. Which one is resolved by the
-      // shell, because only it knows how many cells fit across.
-      case "arrowdown": act("select_by", 1); break;
-      case "arrowup": act("select_by", -1); break;
-      case "-": act("cells", -1); break;
-      case "=": case "+": act("cells", 1); break;
-      // Backslash puts the filter down and picks it up again, which is the key
-      // Lightroom uses for the same gesture. Toggling rather than clearing,
-      // because looking at the whole shoot for a moment and going back to what
-      // you had narrowed to is the reason anyone reaches for it.
-      case "\\":
-        if (narrowing(filter)) act("set_filter", {});
-        else if (remembered) act("set_filter", remembered);
-        break;
-      // V for a virtual copy, shift-V to throw one away. Not Lightroom's
-      // ⌃-apostrophe, which needs two hands on a keyboard whose other culling
-      // keys need one.
-      case "v":
-        act(event.shiftKey ? "remove_copy" : "make_copy");
-        break;
-      // F fits the whole photograph in the window. The way back from a view
-      // that has got away from you — and the fit button beside the zoom
-      // controls has been the only way to reach it, which is a mouse trip for
-      // something you want mid-edit.
-      case "f":
-        send({ command: "fit_to_view" });
-        break;
-      case "p": act("pick"); break;
-      case "x": act("reject"); break;
-      case "u": act("clear_flag"); break;
-      // Where these went, said once per press for as long as hands remember
-      // them. Refusing quietly would be a key that stopped working.
-      case "s": tell("refused", `Copying the settings is ${MOD}C now`); break;
-      case "a": tell("refused", `Pasting the settings onto what is selected is ${MOD}V now`); break;
-      case "z": act("undo"); break;
-      // The window's own key, handled here for the same reason every other key
-      // is: the webview has focus, so this is where a keypress arrives.
-      case "f11": invoke("toggle_fullscreen").catch(say); break;
-      default: return;
-    }
-    event.preventDefault();
+    const typing = event.target.closest("input[type=text], textarea");
+    const chord = key.startsWith("mod+");
+    if (editing && key !== "escape" && (!chord || typing)) return;
+    // One level per press, and leaving a control is a level.
+    if (editing && key === "escape") return event.target.blur(), event.preventDefault();
+
+    // Shift on a key that does not use it is still the key: Shift+X rejects, as
+    // it always did, and Caps Lock changes nothing.
+    const command = byKey.get(key) ?? byKey.get(key.replace("shift+", ""));
+    if (command) return run(command.id), event.preventDefault();
+    if (MOVED[key]) return tell("refused", MOVED[key].replace("⌃⇧", MAC ? "⌘⇧" : "Ctrl+Shift+")), event.preventDefault();
   });
+
+  // Buttons that are a command say so with `data-command`, and get its name and
+  // its key as a tooltip — so the key is learnt from the button it replaces.
+  for (const element of document.querySelectorAll("[data-command]")) {
+    const command = byId.get(element.dataset.command);
+    if (command) element.title = `${command.title} (${spelt(command.keys[0])})`;
+  }
+  document.addEventListener("click", event => {
+    const element = event.target.closest("[data-command]");
+    if (element) run(element.dataset.command);
+  });
+
+  // The sheet, drawn from the registry when it is asked for.
+  const sheet = document.getElementById("sheet");
+  const toggleSheet = () => {
+    if (!sheet.classList.toggle("hidden")) {
+      const groups = new Map();
+      for (const command of COMMANDS) {
+        if (command.sheet === null) continue;
+        if (!groups.has(command.group)) groups.set(command.group, []);
+        groups.get(command.group).push(command);
+      }
+      sheet.replaceChildren(...[...groups].flatMap(([name, commands]) => {
+        const heading = document.createElement("h2");
+        heading.textContent = name;
+        return [heading, ...commands.map(command => {
+          const row = document.createElement("div");
+          row.className = "key";
+          const keys = document.createElement("kbd");
+          const what = document.createElement("span");
+          // A run of commands written as one line — "0 – 5  stars" — says so
+          // itself; the rest are their keys and their title.
+          const [spelling, saying] = command.sheet
+            ? command.sheet.split("  ") : [command.keys.map(spelt).join("  "), command.title];
+          keys.textContent = spelling;
+          what.textContent = saying;
+          row.append(keys, what);
+          return row;
+        })];
+      }));
+    }
+  };
+  sheet.addEventListener("click", toggleSheet);
 
   invoke("cull_view").then(show);
 </script>

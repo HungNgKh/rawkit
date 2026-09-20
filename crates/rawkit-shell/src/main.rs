@@ -883,6 +883,7 @@ fn cull(
     // the library knows about photographs, not pixels.
     let action = match action {
         CullAction::Grid => {
+            enter(LIBRARY);
             MODE.store(MODE_GRID, std::sync::atomic::Ordering::Relaxed);
             CullAction::SelectBy(0)
         }
@@ -894,6 +895,7 @@ fn cull(
             if !enough {
                 return Err("mark at least two frames with M before comparing them".into());
             }
+            enter(LIBRARY);
             MODE.store(MODE_SURVEY, std::sync::atomic::Ordering::Relaxed);
             CullAction::SelectMarked(0)
         }
@@ -941,6 +943,7 @@ fn cull(
             *CROP_DRAG.lock().expect("crop drag lock") = None;
             if next == MODE_CROP {
                 put_down_the_rest();
+                pick_up_from_anywhere(library);
             }
             MODE.store(next, std::sync::atomic::Ordering::Relaxed);
             CullAction::SelectBy(0)
@@ -957,6 +960,7 @@ fn cull(
             *SPOT_GRAB.lock().expect("spot grab lock") = None;
             if next == MODE_SPOT {
                 put_down_the_rest();
+                pick_up_from_anywhere(library);
             }
             MODE.store(next, std::sync::atomic::Ordering::Relaxed);
             CullAction::SelectBy(0)
@@ -982,7 +986,20 @@ fn cull(
             MODE.store(MODE_LOUPE, std::sync::atomic::Ordering::Relaxed);
             CullAction::SelectBy(0)
         }
+        CullAction::Develop => {
+            enter(DEVELOP);
+            if matches!(mode(), MODE_GRID | MODE_SURVEY) {
+                MODE.store(MODE_LOUPE, std::sync::atomic::Ordering::Relaxed);
+                library.lock().expect("library lock").reopen();
+            }
+            CullAction::SelectBy(0)
+        }
         CullAction::Loupe => {
+            // The loupe is the Library's, except as the way the spot tool is put
+            // down — which happens in Develop and should leave you there.
+            if mode() != MODE_SPOT {
+                enter(LIBRARY);
+            }
             MODE.store(MODE_LOUPE, std::sync::atomic::Ordering::Relaxed);
             // The loupe has been showing something else since it last ran, so
             // the selection has to be asked for even though it did not move.
@@ -1259,6 +1276,11 @@ fn main() -> Result<()> {
                 )),
                 None => target.clone().filter(|p| !is_catalog(p)),
             };
+            // A catalog opens in the Library, which is where a session with one
+            // starts: choosing, before changing.
+            if library.is_some() {
+                enter(LIBRARY);
+            }
             app.manage(Shelf(library.clone()));
 
             let mut loaded = Loaded::open(raw.as_deref(), DEFAULT_TILE)?;
@@ -2910,6 +2932,39 @@ fn build_window(
 /// changes it — a keypress arrives on the IPC thread and the next frame has to
 /// act on it. Two values, so a byte is enough and no lock is needed.
 static MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Library or Develop.
+///
+/// Not derivable from `MODE`, because the loupe is in both: the same
+/// photograph at the same size is being *judged* in one and *changed* in the
+/// other, and what differs is which controls belong beside it. Develop until a
+/// catalog is opened — a RAW opened on its own has no library to be in.
+static WORKSPACE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(DEVELOP);
+const LIBRARY: u8 = 0;
+const DEVELOP: u8 = 1;
+
+pub(crate) fn workspace_name() -> &'static str {
+    match WORKSPACE.load(std::sync::atomic::Ordering::Relaxed) {
+        LIBRARY => "library",
+        _ => "develop",
+    }
+}
+
+fn enter(workspace: u8) {
+    WORKSPACE.store(workspace, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A tool needs one photograph on screen, at a size it can be worked on. Asked
+/// by every command that picks one up, so none can arm itself over a grid —
+/// where the press it is waiting for would land on a thumbnail.
+fn one_photograph() -> Result<(), String> {
+    match mode() {
+        MODE_GRID | MODE_SURVEY => {
+            Err("that works on one photograph; open it in Develop first".into())
+        }
+        _ => Ok(()),
+    }
+}
 /// How many cells the grid currently fits across, written by the render loop and
 /// read by the page's up/down keys.
 ///
@@ -4476,6 +4531,19 @@ struct Survey {
 /// Set when the page asks for the rectangle to be taken.
 static CROP_COMMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Picking a tool up is entering Develop, from wherever it was pressed.
+///
+/// From the grid as well, as Lightroom's R does: the selected photograph is
+/// asked for, and the tool is up by the time it arrives. Safe because the render
+/// loop re-asserts crop mode on every frame rather than on the keypress — a
+/// session replaced under an open tool is a case it already handles.
+fn pick_up_from_anywhere(library: &Arc<Mutex<Library>>) {
+    enter(DEVELOP);
+    if matches!(mode(), MODE_GRID | MODE_SURVEY) {
+        library.lock().expect("library lock").reopen();
+    }
+}
+
 /// The other half of one tool at a time: nothing else is picked up while a crop,
 /// the spot tool or a placement is in hand.
 ///
@@ -4484,6 +4552,8 @@ static CROP_COMMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// pressed mid-crop put a gradient's handles on top of the crop rectangle and
 /// left one press on the photograph meaning two things.
 fn hands_free() -> Result<(), String> {
+    one_photograph()?;
+    enter(DEVELOP);
     match tool_in_hand() {
         Some(tool) => Err(format!(
             "{} is in hand; finish or cancel it first",

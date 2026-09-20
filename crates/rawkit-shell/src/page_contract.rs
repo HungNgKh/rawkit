@@ -71,10 +71,12 @@ fn names_passed_to(name: &str) -> Vec<&'static str> {
         let first = first_argument(arguments);
         // The definition itself — `const act = async (action, value) =>` is not
         // a call, and neither is a wrapper forwarding its own parameter.
+        // `act(command.act, command.value)` is the registry carrying a command
+        // out: the names it forwards are the `act: "…"` entries, read below.
         let forwarded = first
             .trim()
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '_');
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.');
         if forwarded {
             continue;
         }
@@ -87,9 +89,64 @@ fn names_passed_to(name: &str) -> Vec<&'static str> {
         );
         names.extend(found);
     }
+    // The command registry names its actions as data, `act: "pick"`, rather than
+    // as calls — and a name the scrape cannot see is a name nothing checks.
+    if name == "act" {
+        names.extend(registry().iter().filter_map(|command| command.act));
+    }
     names.sort_unstable();
     names.dedup();
     names
+}
+
+/// One entry of the page's command registry, as far as this needs to read it.
+struct Registered {
+    id: &'static str,
+    act: Option<&'static str>,
+    value: Option<&'static str>,
+    waits: bool,
+}
+
+/// What comes after `key: ` in an entry, up to the comma or brace that ends it.
+fn field(entry: &'static str, key: &str) -> Option<&'static str> {
+    let at = entry.find(&format!("{key}: "))? + key.len() + 2;
+    let rest = &entry[at..];
+    let end = if let Some(quoted) = rest.strip_prefix('"') {
+        quoted.find('"')? + 2
+    } else {
+        rest.find([',', '}', '\n'])?
+    };
+    Some(rest[..end].trim().trim_matches('"'))
+}
+
+/// The registry, entry by entry. Every entry opens with `{ id: ` and nothing
+/// else in the list does, which is what lets a scrape find them.
+fn registry() -> Vec<Registered> {
+    let list = PAGE
+        .split_once("const COMMANDS = [")
+        .and_then(|(_, rest)| rest.split_once("\n  ];"))
+        .map(|(list, _)| list)
+        .expect("the command registry");
+    let entries: Vec<Registered> = list
+        .split("{ id: ")
+        .skip(1)
+        .map(|entry| Registered {
+            id: entry.split(['"', '`']).nth(1).unwrap_or(""),
+            act: field(entry, "act"),
+            value: field(entry, "value"),
+            waits: match field(entry, "waits") {
+                Some("true") => true,
+                Some("false") => false,
+                other => panic!("an entry says `waits: {other:?}`: {}", &entry[..60]),
+            },
+        })
+        .collect();
+    assert!(
+        entries.len() > 40,
+        "the scrape found {} commands, which is too few to be the real registry",
+        entries.len()
+    );
+    entries
 }
 
 #[test]
@@ -172,6 +229,54 @@ fn every_field_the_page_reads_is_one_the_view_has() {
         assert!(
             has.contains_key(&field),
             "the page reads `view.{field}`, which the shell does not send"
+        );
+    }
+}
+
+/// An action by name, with whatever value makes it one. The page's `value` when
+/// it is a literal; otherwise something of each shape, since the entries built
+/// in a loop (`value: stars`) carry a variable this cannot read.
+fn action(name: &str, value: Option<&str>) -> Option<CullAction> {
+    let literal = value.and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok());
+    let shapes = [
+        literal,
+        None,
+        Some(serde_json::json!(1)),
+        Some(serde_json::json!("red")),
+        Some(serde_json::json!({})),
+    ];
+    shapes.into_iter().find_map(|value| {
+        let sent = match value {
+            Some(value) => serde_json::json!({ "action": name, "value": value }),
+            None => serde_json::json!({ "action": name }),
+        };
+        serde_json::from_value(sent).ok()
+    })
+}
+
+#[test]
+fn the_page_and_the_shell_agree_about_what_waits_for_a_tool() {
+    use crate::library::Tool;
+    // The rule is held twice on purpose — the page names the exits, the shell
+    // does not depend on a string — and two lists of one rule is two chances to
+    // be wrong. A command the page lets through and the shell refuses is a key
+    // that answers with a sentence naming no way out; the reverse is a key that
+    // tells you to put down a tool the shell would not have minded.
+    for command in registry() {
+        let Some(name) = command.act else { continue };
+        let action = action(name, command.value).unwrap_or_else(|| {
+            panic!(
+                "`{}` sends `{name}` with a value nothing here can guess",
+                command.id
+            )
+        });
+        let shell = [Tool::Crop, Tool::Spot, Tool::Placing]
+            .into_iter()
+            .any(|tool| action.waits_for(tool));
+        assert_eq!(
+            command.waits, shell,
+            "`{}` ({name}): the page says waits = {}, and the shell's `waits_for` says {shell}",
+            command.id, command.waits
         );
     }
 }

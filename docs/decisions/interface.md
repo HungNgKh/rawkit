@@ -32,6 +32,9 @@ what a contributor would otherwise undo.
 | **I8** | What is showing and what is in hand are two words | `mode` is the view; `tool` is what a press on the photograph would do. Both come from the shell. |
 | **I9** | One tool at a time, in both directions | Picking up crop or the spot tool puts the rest down; while one is in hand, nothing else is picked up — by key *or* by button. |
 | **I10** | The tool's exits are always on screen | A row in the footer: what is in hand, how to leave it, and buttons that do it. |
+| **I11** | Library and Develop are a word the shell owns | `workspace`, beside `mode` and `tool`. The loupe is in both, so it cannot be derived. |
+| **I12** | One registry of commands | Keys, buttons, tooltips and the shortcut sheet are read from `COMMANDS`; a test holds its `waits` to the shell's `waits_for`. |
+| **I13** | The column shows one workspace's controls | Sections carry `library-only` / `develop-only`; the body says which. In the file in the order they display. |
 | **I7** | Copying settings is a chord | `Ctrl+Shift+C` / `Ctrl+Shift+V`; bare `S` and `A` say where they went. |
 
 ## I1 — one status line
@@ -241,6 +244,88 @@ calls what they call and waits for what they wait for. It is lit from `tool`,
 never from having been clicked. Picking a tool up opens its section and brings it
 to the top — once, when the tool changes, not on every poll.
 
+## I11 — two workspaces
+
+In the grid the develop sliders were dimmed to 45 % and still took clicks; in a
+survey the header named one photograph while the histogram and the tone values
+were another's. Both are a panel showing controls for a photograph that is not
+the one on screen.
+
+| | |
+|---|---|
+| One adaptive column that guesses | A loupe means "I am judging" or "I am editing", and the guess is exactly what produced the mode errors S2 and S3 fixed. |
+| Lightroom's seven modules | The product has two jobs. Import and export are dialogs. |
+| **Library and Develop** | What the owner's hands and every migrant already know: G and E, and D. |
+
+`workspace` is shell state because the loupe is in both — the same photograph at
+the same size is being *judged* in one and *changed* in the other — so it cannot
+be derived from `mode`. A catalog opens in the Library; a RAW opened on its own
+has no library to be in and stays in Develop.
+
+**Picking a tool up is entering Develop**, from anywhere. `R` from the grid opens
+the selected photograph with the crop up, as Lightroom does. That is safe because
+the render loop re-asserts crop mode on every frame rather than on the keypress:
+a session replaced under an open tool is a case it already handled. It is *not*
+safe for the tools that work on the edit in the session — from a grid that is
+still the **last** photograph's edit until this one has loaded — so `L`, `B` and
+`W` from the grid only go to Develop and say to press again, and the shell
+refuses them over a grid on its own account (`one_photograph`).
+
+Escape's bottom rung is the loupe **from a grid or a survey only**. It used to
+send `loupe` from anywhere, which now means the Library, and a key for putting
+things down should not also change where you are.
+
+## I12 — one registry
+
+The handler had the bindings. A hand-typed line at the bottom of the column
+listed two thirds of them and called survey "compare". The buttons knew nothing
+of either. S2 added a fourth account — a list of key names that wait for a tool —
+to be kept in step with the handler by hand.
+
+`COMMANDS` is the one account: `{ id, keys, scope, waits, group, title }` and
+either `act` (a cull action by the shell's name) or `run`. Everything goes
+through `run(id)` — a key, a button marked `data-command`, the tool strip — so a
+button cannot do what its key would have refused.
+
+- **`scope`** is where a command means something. A Develop command pressed in
+  the Library goes there first; a Library command pressed in Develop says so and
+  does nothing.
+- **`waits`** replaces S2's list of key names. `the_page_and_the_shell_agree_…`
+  scrapes every entry and holds its `waits` to `CullAction::waits_for`, which
+  closes the gap S2 recorded as "kept in step by hand". It fails on a Reject
+  that does not wait — the bug S2 was for.
+- A key bound twice throws at load. The second would simply never run, and
+  nobody finds that by pressing it.
+- Shift on a key that does not use it is still the key (Shift+X rejects, as it
+  did), and is not part of a symbol, which is already what Shift made it.
+
+Entries are written `{ id: "…", … act: "…" }` so the contract test can read them.
+That is a constraint on how the registry is formatted, and the test says so when
+it cannot find forty of them.
+
+## I13 — one workspace's controls
+
+Sections are in the file in the order they are shown: **White balance → Tone →
+Presence → Curve → Colour mixer → Grading → Detail → Lens & geometry → Local
+adjustments → Spot removal → Effects → Calibration → Profile**. White balance
+first because everything after it is judged through it; it was eleventh.
+
+- **Presence** takes clarity, texture and dehaze from Tone. **Lens & geometry**
+  takes the lens corrections from Detail. Moved as markup; every id is unchanged,
+  which is why none of the wiring had to hear about it.
+- **Colour mixer** is one section with one of hue / saturation / luminance
+  showing. All twenty-four sliders exist the whole time under the ids they
+  always had. One target button aims whichever is showing, and the tab follows
+  the shell if something else gets armed.
+- **View** and **Keys** are gone: zoom is beside the clipping readout, the pan
+  arrows went (the pointer pans), and the sheet is `?`.
+- The Library's panel is the judgement as controls and what the catalog knows
+  about the photograph. `taken` and `in_collections` are two seeks per keypress,
+  measured at 5.7 µs and 2.5 µs and flat to twenty thousand.
+
+`[hidden] { display: none !important }` — `label { display: flex }` outranked
+the attribute, so every row the page had marked hidden was on screen.
+
 ## If you change this
 
 | If you touch… | …this will tell you |
@@ -254,4 +339,7 @@ to the top — once, when the tool changes, not on every poll.
 | which *keys* a tool holds back | nothing automatic — `WAITS` and `inHand()` in the page are checked by hand in the window. Keep them in step with `waits_for`. |
 | the order of precedence between tools | `the_badge_names_what_a_press_would_do` |
 | a new tool, or a new way to pick one up | add it to `tool_name_of`, to `TOOLS` in the page, and put `hands_free()?` at the top of the command that arms it |
+| what a command does, which keys it has, or whether it waits | `page_contract::the_page_and_the_shell_agree_about_what_waits_for_a_tool`, and the registry throws at load on a key bound twice |
+| the shape of a registry entry | the same test — it reads `{ id: `, `act: "…"`, `value: …`, `waits: …` as text |
+| what the view carries per keypress | `the_view_says_where_a_photograph_is_kept`; the `holding 1` and `taken 1` columns of the scale gate |
 | anything that writes a message in the page | there must be exactly one writer: `grep -n 'saidLine\.\|failedLine\.' panel.html` shows only `tell` and the dismiss handler |

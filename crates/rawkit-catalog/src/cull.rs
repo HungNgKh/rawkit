@@ -20,6 +20,7 @@
 
 use crate::{db::Catalog, CatalogError};
 use rusqlite::types::Value;
+use rusqlite::OptionalExtension;
 
 /// The keep/discard decision, which is deliberately not a rating.
 ///
@@ -316,6 +317,60 @@ pub fn matches(catalog: &Catalog, image_id: i64, filter: &Filter) -> Result<bool
         |r| r.get(0),
     )?;
     Ok(found > 0)
+}
+
+/// What a photograph is, as opposed to what anybody thinks of it: when it was
+/// taken, and with what.
+///
+/// From the file's row rather than the image's, because a virtual copy is the
+/// same exposure. All three are optional — a scan records what the header
+/// offered, and a header can offer nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Taken {
+    /// Seconds since the epoch, in whatever zone the camera's clock was set to:
+    /// the header carries no offset, so this is wall-clock time where the
+    /// photograph was taken and is shown as such, never converted.
+    pub captured_at: Option<i64>,
+    pub camera: Option<String>,
+    pub lens: Option<String>,
+}
+
+/// Look up [`Taken`] for one image. A primary-key lookup on each of two tables.
+pub fn taken(catalog: &Catalog, image_id: i64) -> Result<Taken, CatalogError> {
+    let row = catalog
+        .connection()
+        .query_row(
+            "SELECT f.captured_at, f.camera_make, f.camera_model, f.lens
+               FROM images i JOIN files f ON f.id = i.file_id
+              WHERE i.id = ?1",
+            [image_id],
+            |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((captured_at, make, model, lens)) = row else {
+        return Ok(Taken::default());
+    };
+    // "SONY" and "ILCE-6400" read as one thing to a person. Most models do not
+    // repeat the make, and the ones that do ("Canon Canon EOS R5") should not.
+    let camera = match (make, model) {
+        (Some(make), Some(model)) if model.to_lowercase().starts_with(&make.to_lowercase()) => {
+            Some(model)
+        }
+        (Some(make), Some(model)) => Some(format!("{make} {model}")),
+        (make, model) => model.or(make),
+    };
+    Ok(Taken {
+        captured_at,
+        camera,
+        lens,
+    })
 }
 
 /// What has been decided about one image.

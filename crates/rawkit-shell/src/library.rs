@@ -390,6 +390,9 @@ pub enum CullAction {
     Grid,
     Loupe,
     Survey,
+    /// Into Develop, on the photograph that is selected. Where it is edited, as
+    /// against the loupe, which is where it is looked at and judged.
+    Develop,
     /// Larger or smaller cells, in steps.
     Cells(i32),
 }
@@ -483,6 +486,9 @@ impl CullAction {
             | CullAction::RemoveCopy
             | CullAction::Grid
             | CullAction::Survey
+            // Already there — a tool is only ever in hand in Develop — so this
+            // waits with the rest rather than being a way round the rule.
+            | CullAction::Develop
             | CullAction::Cells(_) => true,
         }
     }
@@ -515,6 +521,15 @@ pub struct CullView {
     /// double-click on a cell opens the loupe — and the page would otherwise go
     /// on claiming the grid was up.
     pub mode: &'static str,
+    /// Library or Develop: whether this photograph is being chosen or changed.
+    /// The panel shows one set of controls or the other, and never sliders for
+    /// a photograph that is not the one on screen — which is what a grid with
+    /// the develop controls dimmed beside it was.
+    pub workspace: &'static str,
+    /// When and with what, for the Library's panel.
+    pub taken: cull::Taken,
+    /// The collections this frame is in, by id; the names are in `collections`.
+    pub in_collections: Vec<i64>,
     /// What is in hand, which is a different question from which view is
     /// showing and used to be answered by the same badge: it read LOUPE while a
     /// gradient was live on the photograph, because a gradient is not a view.
@@ -1447,7 +1462,11 @@ impl Library {
             }
             // Handled by the shell, which owns the layout and the render loop.
             // Listed here so the page has one vocabulary rather than two.
-            CullAction::Grid | CullAction::Loupe | CullAction::Survey | CullAction::Cells(_) => {}
+            CullAction::Grid
+            | CullAction::Loupe
+            | CullAction::Survey
+            | CullAction::Develop
+            | CullAction::Cells(_) => {}
             CullAction::Mark => {
                 let id = self.current().id;
                 let frame = self.name_of(id);
@@ -1739,6 +1758,11 @@ impl Library {
             marked: self.marked().len(),
             is_marked: self.marked.contains(&image.id),
             mode: crate::mode_name(),
+            workspace: crate::workspace_name(),
+            // Two seeks, measured at 2.5 and 5.7 µs and flat to twenty thousand
+            // photographs — which is what lets them be asked per keypress.
+            taken: cull::taken(&self.catalog, image.id)?,
+            in_collections: collections::holding(&self.catalog, image.id)?,
             tool: crate::tool_name(),
             filter: self.sequence.filter().clone(),
             collections: self.collections.clone(),
@@ -2539,6 +2563,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_view_says_where_a_photograph_is_kept() {
+        let dir = Scratch::new("in-collections");
+        let mut library = library_at(&dir.0, 3);
+        let quick = named(&library, "Quick Collection").id;
+        assert!(library.view().unwrap().in_collections.is_empty());
+
+        library.act(CullAction::Mark).unwrap();
+        library
+            .act(CullAction::NewCollection("Portfolio".into()))
+            .unwrap();
+        let view = library.act(CullAction::TargetToggle).unwrap();
+        let portfolio = named(&library, "Portfolio").id;
+        let mut held = view.in_collections.clone();
+        held.sort_unstable();
+        assert_eq!(held, vec![quick, portfolio]);
+
+        // About this frame and no other.
+        let next = library.act(CullAction::SelectNext).unwrap();
+        assert!(next.in_collections.is_empty());
+        // And it follows an undo, because it is read and not remembered.
+        library.act(CullAction::SelectPrevious).unwrap();
+        let undone = library.act(CullAction::Undo).unwrap();
+        assert_eq!(undone.in_collections, vec![portfolio]);
+    }
+
+    #[test]
     fn a_tool_in_hand_keeps_the_keyboard() {
         // The key a Lightroom hand presses to flip a crop, and what it would
         // have done here: rejected the photograph and moved on.
@@ -2580,6 +2630,8 @@ pub(crate) mod tests {
         assert!(CullAction::Spot.waits_for(Tool::Crop));
         assert!(CullAction::Crop.waits_for(Tool::Spot));
         assert!(CullAction::Crop.waits_for(Tool::Placing));
+        // Develop is where a tool already is, not a way round the rule.
+        assert!(CullAction::Develop.waits_for(Tool::Crop));
     }
 
     #[test]

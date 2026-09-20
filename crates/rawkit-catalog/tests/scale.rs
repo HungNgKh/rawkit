@@ -233,8 +233,8 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
         "drop 200"
     );
     println!(
-        "{:>8} {:>9} {:>9} {:>9} {:>9}",
-        "", "del whole", "undo", "empty", "undo"
+        "{:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "", "del whole", "undo", "empty", "undo", "holding 1", "taken 1"
     );
 
     let mut worst = Duration::ZERO;
@@ -324,6 +324,30 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
             }
         });
         let per_holds = asked / ids.len() as u32;
+
+        // **What the Library's photo panel asks on every keypress**: which
+        // collections hold this frame, and when and with what it was taken.
+        // Both are meant to be seeks — the membership key leads with the image
+        // for exactly this — and a heavy user has every frame in the
+        // whole-library collection and a few more, so this is the worst case.
+        let (asked, in_how_many) = timed(|| {
+            let mut most = 0;
+            for id in &ids {
+                most = most.max(collections::holding(&catalog, *id).expect("holding").len());
+            }
+            most
+        });
+        assert!(
+            in_how_many >= 2,
+            "the fixture puts frames in several collections"
+        );
+        let per_holding = asked / ids.len() as u32;
+        let (asked, _) = timed(|| {
+            for id in &ids {
+                cull::taken(&catalog, *id).expect("taken");
+            }
+        });
+        let per_taken = asked / ids.len() as u32;
 
         // The largest collection there can be, read whole — what switching the
         // grid to it costs.
@@ -430,8 +454,14 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
             "", coll_all, members, per_holds, members_whole, moved, moved_again, rewritten, dropped, dropped_many
         );
         println!(
-            "{:>8} {:>9.1?} {:>9.1?} {:>9.1?} {:>9.1?}",
-            "", removed_whole, restored_whole, emptied_whole, refilled_whole
+            "{:>8} {:>9.1?} {:>9.1?} {:>9.1?} {:>9.1?} {:>9.1?} {:>9.1?}",
+            "",
+            removed_whole,
+            restored_whole,
+            emptied_whole,
+            refilled_whole,
+            per_holding,
+            per_taken
         );
         assert!(
             !wanted.is_empty() && wanted.len() < n,
@@ -452,6 +482,8 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
             ("collection list", coll_all),
             ("collection members", members),
             ("collection holds", per_holds),
+            ("collections holding a frame", per_holding),
+            ("when and with what", per_taken),
             ("whole-library collection", members_whole),
             ("moving one photograph", moved),
             ("moving another", moved_again),

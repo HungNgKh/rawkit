@@ -537,6 +537,23 @@ pub fn holds(catalog: &Catalog, id: i64, image: i64) -> Result<bool, CatalogErro
     )? == 1)
 }
 
+/// Which collections hold this photograph.
+///
+/// The question the membership table was sorted *for*: its primary key leads
+/// with the image, so this is one seek and a walk along however many
+/// collections the frame is in — two or three, not the hundred there are.
+/// Ids only. The shell already holds every collection's name, and joining for
+/// them here would be asking the catalog for something the caller has.
+pub fn holding(catalog: &Catalog, image: i64) -> Result<Vec<i64>, CatalogError> {
+    let connection = catalog.connection();
+    let mut statement = connection
+        .prepare_cached("SELECT collection_id FROM collection_images WHERE image_id = ?1")?;
+    let ids = statement
+        .query_map([image], |r| r.get(0))?
+        .collect::<Result<Vec<i64>, _>>()?;
+    Ok(ids)
+}
+
 /// Exchange two photographs' places, and nothing else.
 ///
 /// **What moving one frame one place has to cost**, and the reason this exists
@@ -969,6 +986,27 @@ mod tests {
             .unwrap();
         assert_eq!(ids_in(&catalog, a), [ids[0], ids[2]]);
         assert!(ids_in(&catalog, b).is_empty());
+    }
+
+    #[test]
+    fn a_photograph_knows_which_collections_hold_it() {
+        let (_dir, catalog, ids) = library_of(3);
+        let a = create(&catalog, "A", None).unwrap();
+        let b = create(&catalog, "B", None).unwrap();
+        add(&catalog, a, &ids[..2]).unwrap();
+        add(&catalog, b, &ids[1..]).unwrap();
+
+        let mut both = holding(&catalog, ids[1]).unwrap();
+        both.sort_unstable();
+        assert_eq!(both, vec![a, b]);
+        assert_eq!(holding(&catalog, ids[0]).unwrap(), vec![a]);
+        assert_eq!(holding(&catalog, ids[2]).unwrap(), vec![b]);
+
+        // And it follows the membership, in both directions.
+        take_out(&catalog, a, &[ids[1]]).unwrap();
+        assert_eq!(holding(&catalog, ids[1]).unwrap(), vec![b]);
+        remove(&catalog, b).unwrap();
+        assert!(holding(&catalog, ids[1]).unwrap().is_empty());
     }
 
     #[test]
