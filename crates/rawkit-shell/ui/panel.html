@@ -45,6 +45,14 @@
   main { flex: 1; overflow-y: auto; overscroll-behavior: contain;
          padding: 4px 16px 20px; }
 
+  /* Where the keyboard is, for whoever is driving with it. `:focus-visible` and
+     not `:focus`: a ring on every clicked button is noise, and the engine
+     already knows which of the two just happened. There was no focus style at
+     all, which is how a slider could hold the keyboard with nothing to show it.
+     6.0 to 1 against the panel. */
+  :focus-visible { outline: 2px solid #7c8cff; outline-offset: 2px; border-radius: 3px; }
+  input[type=range]:focus-visible { outline-offset: 4px; }
+
   details { border-bottom: 1px solid #26262e; }
   details:last-child { border-bottom: 0; }
   summary { font-size: 13px; font-weight: 600; letter-spacing: .02em;
@@ -611,7 +619,7 @@
   </details>
   <details id="s-keys">
     <summary>Keys</summary>
-    <div id="keys">G grid · E loupe · R crop · Q spots · O mask · [ ] rotate · M mark · C compare · S copy · A apply · P pick · X reject · 0–5 rate · 6–9 label · F fit · V copy · \ filter · Z undo cull · ⌃Z undo edit · ⌃E export · ⌃⇧E export what is shown · F11 fullscreen</div>
+    <div id="keys">G grid · E loupe · R crop · Q spots · O mask · [ ] rotate · M mark · C compare · ⌃⇧C copy settings · ⌃⇧V paste onto selected · P pick · X reject · 0–5 rate · 6–9 label · F fit · V copy · \ filter · Z undo cull · ⌃Z undo edit · ⌃E export · ⌃⇧E export what is shown · F11 fullscreen</div>
   </details>
 </main>
 <footer id="status">
@@ -661,6 +669,13 @@
     if (level !== "refused") fading = setTimeout(() => saidLine.classList.add("old"), 4000);
   };
   failedLine.addEventListener("click", () => failedLine.classList.add("hidden"));
+  // A refusal stays until the next thing is said, and putting a tool down says
+  // nothing — so "Crop is in hand" went on being claimed, in amber, about a
+  // crop that had just been cancelled. What it was about has changed, so it is
+  // a record now and is drawn as one.
+  const outlived = () => {
+    if (saidLine.classList.contains("refused")) saidLine.className = "old";
+  };
 
   // What a rejected command means. The shell marks its own failures — it knows
   // whether a catalog write broke or a request was declined — so anything it
@@ -1691,6 +1706,24 @@
     const button = event.target.closest("button");
     if (button && event.detail > 0) button.blur();
   });
+  // The same for a slider, which was the worse case: it keeps focus after the
+  // drag that moved it, a focused control owns its keys, and so after any
+  // adjustment made with the mouse the arrows nudged Exposure instead of
+  // changing photograph and P and X did nothing at all — with no focus ring to
+  // say why. Only after a pointer: somebody who tabbed to a slider is driving
+  // it with the arrows on purpose, and keeps it until they leave.
+  //
+  // The slider the pointer went down on, and not whichever one has focus when a
+  // pointer comes up: releasing a crop drag on the photograph would otherwise
+  // take the keyboard from a slider somebody had tabbed to.
+  let pressedSlider = null;
+  document.addEventListener("pointerdown", event => {
+    pressedSlider = event.target.closest("input[type=range]");
+  }, true);
+  document.addEventListener("pointerup", () => {
+    if (pressedSlider) pressedSlider.blur();
+    pressedSlider = null;
+  });
 
   // ---- Targeted adjustment -------------------------------------------------
   //
@@ -1782,6 +1815,7 @@
 
   const place = (on) => {
     placing = on;
+    if (!on) outlived();
     document.getElementById("mask-place").classList.toggle("armed", on);
     document.body.classList.toggle("aiming", on || picking || armed !== null);
     invoke("place_mask", { armed: on }).catch(say);
@@ -2514,6 +2548,51 @@
     }, { passive: false });
   }
 
+  // ---- A tool in hand owns the keyboard ---------------------------------------
+  //
+  // Crop, the spot tool, and a local adjustment waiting to be placed: three
+  // states with something half-made in them. While one is up, the keys that
+  // judge or move are not carried out and are not ignored either — they say
+  // what is in the way and how to put it down. Silence would read as a broken
+  // key; doing it anyway is how a Lightroom hand pressing X to flip a crop
+  // rejected the photograph instead.
+  //
+  // The shell holds the same line (`CullAction::waits_for`) and names no keys
+  // when it does; the exits are said here because the keys are the page's.
+  // `keys` is what each tool keeps for itself, by `event.key` lower-cased.
+  // The keys that wait. A list of what is held back rather than of what is let
+  // through, because the keyboard has a hundred keys that do nothing here —
+  // Shift on its way to a chord, a stray H — and a tool that complained about
+  // each of them would be the noise the status line was built to get away from.
+  // "paste" is not a key; it is the chord's name, so the chord can ask too.
+  const WAITS = new Set(["0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "p", "x", "u", "m", "c", "k", "z", "v", "g", "e", "enter", "r", "q", "l", "b",
+    "[", "]", "arrowleft", "arrowright", "arrowup", "arrowdown", " ",
+    "backspace", "delete", "-", "=", "+", "\\", "paste"]);
+  const inHand = () => {
+    const mode = document.getElementById("mode").textContent;
+    if (mode === "crop")
+      return { name: "Crop", exits: "Enter keeps it, Esc cancels", keys: ["enter", "r"] };
+    if (mode === "spot")
+      return { name: "Spot removal", exits: "Esc or Q puts it down",
+               // E with the rest: the shell lets the loupe through as this
+               // tool's way out, and a key it would accept must not be refused
+               // here on its behalf.
+               keys: ["q", "e", "enter", "backspace", "delete"] };
+    if (placing)
+      return { name: "An adjustment", exits: "drag on the photograph to place it, or Esc",
+               keys: [] };
+    return null;
+  };
+  // Whether the tool in hand takes this key. Says so when it does not.
+  const heldBack = key => {
+    const tool = inHand();
+    if (!tool || !WAITS.has(key) || tool.keys.includes(key)) return false;
+    tell("refused", `${tool.name} is in hand — ${tool.exits}`);
+    return true;
+  };
+  const MOD = /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘⇧" : "Ctrl+Shift+";
+
   // The shell says what happened and whether it can be taken back; which key
   // does that is the page's to say, because the keys are the page's — and this
   // is the one line to change when undo moves to Ctrl+Z.
@@ -2540,6 +2619,7 @@
   function setMode(name) {
     if (document.getElementById("mode").textContent === name) return;
     document.getElementById("mode").textContent = name;
+    outlived();
     // The grid is laid out from the canvas, so the view controls beside it are
     // about a photograph that is not on screen. Dimmed rather than removed, so
     // the panel does not jump when the mode changes.
@@ -2568,6 +2648,16 @@
         invoke("export", { scope: event.shiftKey ? "shown" : "current" }).catch(say);
         event.preventDefault();
       }
+      // Copy and paste the settings, as Lightroom has them. They were bare S
+      // and A, and a bare A is one slip from rewriting every selected
+      // photograph — the most expensive key on the board should not also be the
+      // easiest to hit. Not while typing: there the chord is the text box's.
+      if (event.shiftKey && (held === "c" || held === "v") &&
+          !event.target.closest("input[type=text], textarea")) {
+        if (held === "c") act("copy_edit");
+        else if (!heldBack("paste")) act("paste_edit");
+        event.preventDefault();
+      }
       return;
     }
     if (event.altKey) return;
@@ -2578,7 +2668,11 @@
     // is not with six. Escape is the way back out, so it stays ours.
     const editing = event.target.closest("input, button, select, textarea");
     if (editing && key !== "Escape") return;
-    if (editing) event.target.blur();
+    // One level per press, and leaving a control is a level. It used to blur
+    // *and* fall through, so Escape out of a text box also threw away the crop
+    // behind it.
+    if (editing) return event.target.blur(), event.preventDefault();
+    if (heldBack(key.toLowerCase())) return event.preventDefault();
     if (key >= "0" && key <= "5") return act("rate", Number(key)), event.preventDefault();
     // Lightroom's colour keys, and pressing the same one again clears it.
     const labels = { "6": "red", "7": "yellow", "8": "green", "9": "blue" };
@@ -2592,11 +2686,15 @@
         if (document.getElementById("mode").textContent === "crop") { act("crop_apply"); break; }
         act("loupe"); break;
       case "escape":
-        // Putting the targeted tool down comes first: it is the mode most
-        // recently picked up, and leaving crop as well would be two answers to
-        // one key.
+        // A ladder, one rung a press: a control (above), whatever the pointer
+        // is armed to mean, the tool in hand, and then the view — survey and
+        // grid both step back to the loupe. The armed things come first because
+        // they are the most recently picked up, and leaving crop as well would
+        // be two answers to one key. The range picker was missing from this and
+        // could only be put down with the mouse.
         if (armed !== null) { arm(null); break; }
         if (picking) { pickWb(false); break; }
+        if (pickingRange) { pickRange(false); break; }
         if (placing) { place(false); break; }
         if (document.getElementById("mode").textContent === "crop") { act("crop_cancel"); break; }
         act("loupe"); break;
@@ -2627,9 +2725,15 @@
       // Shift-K sends everything marked the same way, which is what M is for —
       // choose a set, then do one thing to all of it.
       case "k": act(event.shiftKey ? "add_marked" : "target_toggle"); break;
-      // Out of the collection being looked at, never out of the library: the
-      // shell refuses this outside a collection, and says why.
-      case "backspace": case "delete": act("take_out"); event.preventDefault(); break;
+      // "Remove the selected thing from where I am", which is one meaning with
+      // two places to be: the selected mark in the spot tool, as every other
+      // editor has it, and otherwise out of the collection being looked at —
+      // never out of the library; the shell refuses that and says why.
+      case "backspace": case "delete":
+        if (document.getElementById("mode").textContent === "spot")
+          document.getElementById("spot-remove").click();
+        else act("take_out");
+        break;
       case "m": act("mark"); break;
       case "c": act("survey"); break;
       // Shift moves the photograph rather than the cursor, and only inside a
@@ -2673,9 +2777,10 @@
       case "p": act("pick"); break;
       case "x": act("reject"); break;
       case "u": act("clear_flag"); break;
-      // S takes this frame's look, A applies it to everything marked.
-      case "s": act("copy_edit"); break;
-      case "a": act("paste_edit"); break;
+      // Where these went, said once per press for as long as hands remember
+      // them. Refusing quietly would be a key that stopped working.
+      case "s": tell("refused", `Copying the settings is ${MOD}C now`); break;
+      case "a": tell("refused", `Pasting the settings onto what is selected is ${MOD}V now`); break;
       case "z": act("undo"); break;
       // The window's own key, handled here for the same reason every other key
       // is: the webview has focus, so this is where a keypress arrives.

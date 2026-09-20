@@ -391,6 +391,96 @@ pub enum CullAction {
 }
 
 /// What the page draws after a keypress.
+/// Something picked up and not yet put down: a crop being drawn, the spot tool,
+/// a local adjustment waiting to be placed.
+///
+/// These three and not the eyedroppers or the mixer's target, which are armed
+/// the same way. The difference is whether anything is *half-made*. An armed
+/// eyedropper is only what the next click will mean, and carrying it to the next
+/// photograph is a reasonable thing to want. A crop rectangle belongs to the
+/// frame it was drawn on, and the key that moves to another frame leaves it
+/// behind without saying whether it was kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tool {
+    Crop,
+    Spot,
+    Placing,
+}
+
+impl Tool {
+    /// What the page and the refusal call it. No keys: which key puts a tool
+    /// down is the page's to say, for the reason `CullView::said` names none.
+    pub fn name(self) -> &'static str {
+        match self {
+            Tool::Crop => "Crop",
+            Tool::Spot => "Spot removal",
+            Tool::Placing => "The adjustment being placed",
+        }
+    }
+}
+
+impl CullAction {
+    /// Whether this has to wait until the tool in hand is put down.
+    ///
+    /// With a tool in hand the keyboard is the tool's. Lightroom's X flips a
+    /// crop's orientation, so a migrant pressing it here was rejecting the
+    /// photograph and being carried to the next one — a judgement made and the
+    /// evidence removed in one keypress, by somebody who thought they were
+    /// cropping. The rule is the whole rule, rather than "navigation and
+    /// judgements": anything that can change which photograph is on screen or
+    /// what is recorded about it waits, because a rule with exceptions has to
+    /// be remembered and this one only has to be read off the screen.
+    ///
+    /// No wildcard, so a new action has to be put on one side or the other.
+    pub fn waits_for(&self, tool: Tool) -> bool {
+        match self {
+            // The tool's own way in and ways out.
+            CullAction::Crop | CullAction::CropApply | CullAction::CropCancel => tool != Tool::Crop,
+            CullAction::Spot => tool != Tool::Spot,
+            // Leaving for the loupe is how the spot tool is put down. It is not
+            // how a crop is: that would leave without saying kept or discarded.
+            CullAction::Loupe => tool != Tool::Spot,
+            // Reads, and changes to things that are not this photograph.
+            CullAction::CopyEdit
+            | CullAction::SetTarget(_)
+            | CullAction::RenameCollection { .. }
+            | CullAction::NewCollection(_) => false,
+            // Standing still, which is what the shell resolves a view change to.
+            CullAction::SelectBy(0) => false,
+            CullAction::Next
+            | CullAction::Previous
+            | CullAction::SelectNext
+            | CullAction::SelectPrevious
+            | CullAction::SelectBy(_)
+            | CullAction::SelectMarked(_)
+            | CullAction::Rate(_)
+            | CullAction::Pick
+            | CullAction::Reject
+            | CullAction::ClearFlag
+            | CullAction::Colour(_)
+            | CullAction::ClearColour
+            | CullAction::SurveyJudge(_)
+            | CullAction::Undo
+            | CullAction::Mark
+            | CullAction::ClearMarks
+            | CullAction::PasteEdit
+            | CullAction::ShowCollection(_)
+            | CullAction::TargetToggle
+            | CullAction::AddMarked
+            | CullAction::TakeOut
+            | CullAction::EmptyCollection(_)
+            | CullAction::DeleteCollection(_)
+            | CullAction::MoveInCollection(_)
+            | CullAction::SetFilter(_)
+            | CullAction::MakeCopy
+            | CullAction::RemoveCopy
+            | CullAction::Grid
+            | CullAction::Survey
+            | CullAction::Cells(_) => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CullView {
     pub filename: String,
@@ -2430,6 +2520,48 @@ pub(crate) mod tests {
         // be taken back too.
         let quick = named(&library, "Quick Collection").id;
         assert!(library.act(CullAction::DeleteCollection(quick)).is_err());
+    }
+
+    #[test]
+    fn a_tool_in_hand_keeps_the_keyboard() {
+        // The key a Lightroom hand presses to flip a crop, and what it would
+        // have done here: rejected the photograph and moved on.
+        for tool in [Tool::Crop, Tool::Spot, Tool::Placing] {
+            for held in [
+                CullAction::Reject,
+                CullAction::Pick,
+                CullAction::Rate(3),
+                CullAction::Next,
+                CullAction::SelectBy(-1),
+                CullAction::Undo,
+                CullAction::PasteEdit,
+                CullAction::Grid,
+                CullAction::SetFilter(Filter::default()),
+            ] {
+                assert!(held.waits_for(tool), "{held:?} should wait for {tool:?}");
+            }
+            // Nothing about this photograph changes, so nothing has to wait.
+            for free in [
+                CullAction::CopyEdit,
+                CullAction::SetTarget(1),
+                CullAction::SelectBy(0),
+            ] {
+                assert!(!free.waits_for(tool), "{free:?} need not wait for {tool:?}");
+            }
+        }
+
+        // Every tool can be put down, and only by its own exits: a crop left
+        // through the loupe would not have said whether it was kept.
+        assert!(!CullAction::CropApply.waits_for(Tool::Crop));
+        assert!(!CullAction::CropCancel.waits_for(Tool::Crop));
+        assert!(!CullAction::Crop.waits_for(Tool::Crop));
+        assert!(CullAction::Loupe.waits_for(Tool::Crop));
+        assert!(!CullAction::Spot.waits_for(Tool::Spot));
+        assert!(!CullAction::Loupe.waits_for(Tool::Spot));
+        // One tool at a time.
+        assert!(CullAction::Spot.waits_for(Tool::Crop));
+        assert!(CullAction::Crop.waits_for(Tool::Spot));
+        assert!(CullAction::Crop.waits_for(Tool::Placing));
     }
 
     #[test]

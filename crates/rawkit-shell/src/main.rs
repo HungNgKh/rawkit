@@ -857,6 +857,17 @@ fn cull(
     let Some(library) = &state.0 else {
         return Err("no library is open; pass a .rawkit catalog".into());
     };
+    // Here as well as in the page, which checks first and says which keys put
+    // the tool down. The page is where a key arrives, but it is a string nobody
+    // compiles, and a rule that protects a judgement from being made by
+    // accident should not depend on one.
+    if let Some(tool) = tool_in_hand() {
+        if action.waits_for(tool) {
+            return Err(Told::from(
+                format!("{} is in hand; finish or cancel it first", tool.name()).as_str(),
+            ));
+        }
+    }
     // Resolved here rather than in the library, because these are about the
     // *layout* — which view is showing and how many cells fit across it — and
     // the library knows about photographs, not pixels.
@@ -4411,6 +4422,18 @@ struct Survey {
 
 /// Set when the page asks for the rectangle to be taken.
 static CROP_COMMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The tool in hand, if there is one. See [`library::Tool`] for why these three.
+fn tool_in_hand() -> Option<library::Tool> {
+    match mode() {
+        MODE_CROP => Some(library::Tool::Crop),
+        MODE_SPOT => Some(library::Tool::Spot),
+        _ if PLACING_MASK.load(std::sync::atomic::Ordering::Relaxed) => {
+            Some(library::Tool::Placing)
+        }
+        _ => None,
+    }
+}
 
 pub(crate) fn mode_name() -> &'static str {
     match mode() {

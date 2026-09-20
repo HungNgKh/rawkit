@@ -27,6 +27,9 @@ what a contributor would otherwise undo.
 | **I2** | The page is held to the shell's types by a test | `page_contract` scrapes `panel.html` and fails on an action, command or view field the shell does not have. |
 | **I3** | Three levels, told apart by cause, in the shell | *info* fades · *refused* stays until the next thing is said · *failed* gets its own line until dismissed. |
 | **I4** | The shell says what happened; the page says which key | `CullView::said` is a sentence with no key names in it. |
+| **I5** | A tool in hand owns the keyboard | In crop, spot, or while placing an adjustment, keys that judge or move wait — and say so. Held in the page *and* the shell. |
+| **I6** | A pointer gives the keyboard back; a keyboard keeps it | A slider blurs after a drag, not after Tab. Escape is one rung per press. |
+| **I7** | Copying settings is a chord | `Ctrl+Shift+C` / `Ctrl+Shift+V`; bare `S` and `A` say where they went. |
 
 ## I1 — one status line
 
@@ -109,6 +112,68 @@ Auto-advance is **not** shown as a setting yet. It was planned for this slice,
 but a label for a setting that cannot be changed is a lie; it arrives with the
 slice that gives settings somewhere to live.
 
+## I5 — a tool in hand owns the keyboard
+
+Lightroom's X flips a crop's orientation. Here it rejected the photograph and
+moved to the next one: a judgement made and the evidence removed in one
+keypress, by somebody who thought they were cropping. Nothing guarded it — not
+the page, not `CullAction::Pick`.
+
+| What a cull key does while a tool is up | |
+|---|---|
+| Carries on as before | The mode error above. |
+| Is silently ignored | Reads as a broken key. |
+| Puts the tool down, then acts | Two things for one key, and the crop is lost without having been asked about. |
+| **Waits, and says what is in the way and how to leave** | The only one that teaches the exit. |
+
+**Which states count:** crop, the spot tool, an adjustment waiting to be placed —
+the three with something *half-made* in them. Not the eyedroppers or the mixer's
+target, which are armed the same way but are only what the next click will mean;
+carrying one to the next photograph is a reasonable thing to want.
+
+**Which keys wait:** everything that can change which photograph is on screen or
+what is recorded about it. The whole rule rather than "navigation and
+judgements", because a rule with exceptions has to be remembered and this one
+only has to be read off the screen. `CullAction::waits_for` has no wildcard, so
+a new action has to be put on one side or the other.
+
+Held in two places on purpose. The page checks first, because it knows the keys
+and can name the exits (*"Crop is in hand — Enter keeps it, Esc cancels"*). The
+shell checks again in the `cull` handler and names none (I4), because the page
+is a string nobody compiles and a rule that protects a judgement should not
+depend on one. The page holds back a **list of keys that wait**, not everything
+but a list of exceptions: a keyboard has a hundred keys that do nothing here, and
+a tool that complained about Shift on its way to a chord would be noise.
+
+Backspace means *remove the selected thing from where I am*: the selected mark
+in the spot tool, otherwise the frame from the collection being viewed.
+
+## I6 — who keeps the keyboard
+
+A focused control owns its keys — without that, arrows move a slider *and* the
+selection. But a slider keeps focus after the drag that moved it, so after any
+adjustment made with the mouse the arrows nudged Exposure instead of changing
+photograph, P and X did nothing, and there was no focus style to say why.
+
+Blur on `pointerup`, **and only the slider the pointer went down on** — not
+whichever has focus, or releasing a drag on the photograph would take the
+keyboard from a slider somebody had tabbed to. Somebody who tabbed to a slider is
+driving it with the arrows on purpose. `:focus-visible` draws the ring for the
+same split: the engine already knows which of the two just happened.
+
+Escape is a ladder, one rung a press: a focused control → whatever the pointer is
+armed to mean → the tool in hand → the view. It used to blur a text box *and*
+fall through, so Escape out of a rename also cancelled the crop behind it; and
+the range picker was not on the ladder at all.
+
+## I7 — copying settings is a chord
+
+Bare `A` pasted the copied settings onto every selected photograph: the most
+expensive key on the board was also the easiest to hit. Now `Ctrl+Shift+C` and
+`Ctrl+Shift+V`, as Lightroom has them. `S` and `A` do nothing except say where
+they went, for as long as hands remember them — a key that silently stopped
+working is a bug report.
+
 ## If you change this
 
 | If you touch… | …this will tell you |
@@ -118,4 +183,6 @@ slice that gives settings somewhere to live.
 | what undo is given, or how | `the_stack_being_full_does_not_hide_a_new_entry`; the `takes_back` half of `every_change_says…` |
 | the notice slot | `a_failure_is_not_talked_over` |
 | what counts as a failure | `a_refusal_and_a_failure_are_told_apart_by_cause` |
+| which actions a tool holds back, or adding a `CullAction` | `a_tool_in_hand_keeps_the_keyboard`, and `waits_for` will not compile until the new action is placed |
+| which *keys* a tool holds back | nothing automatic — `WAITS` and `inHand()` in the page are checked by hand in the window. Keep them in step with `waits_for`. |
 | anything that writes a message in the page | there must be exactly one writer: `grep -n 'saidLine\.\|failedLine\.' panel.html` shows only `tell` and the dismiss handler |
