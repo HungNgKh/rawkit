@@ -1270,17 +1270,54 @@ impl Library {
     /// What is outstanding among these photographs, in the order given — for
     /// the ones somebody is looking at, which cannot wait for the walk to reach
     /// them. An id the source does not hold is passed over.
+    ///
+    /// These are cells the grid has just failed to show, and that is evidence
+    /// the catalog does not have: **a preview whose file is gone**. Somebody
+    /// clears the previews folder to get the space back, and every row still
+    /// says current — so by the catalog's rule nothing is outstanding, nothing
+    /// would ever be built, and the grid would be placeholders for good with
+    /// nothing anywhere saying why. Here, and only here, the files are looked
+    /// for. Not in the walk: that is three `stat`s a photograph across the whole
+    /// library to find what looking at the grid finds for nothing.
     pub fn outstanding_among(&self, ids: &[i64], renderer: &str) -> Result<Vec<previews::Wanted>> {
         let images: Vec<LibraryImage> = ids
             .iter()
             .filter_map(|id| self.sequence.by_id(*id).cloned())
             .collect();
-        Ok(previews::outstanding_in(
-            &self.catalog,
-            &images,
-            previews::Level::BULK,
-            renderer,
-        )?)
+        let levels = previews::Level::BULK;
+        let mut wanted = previews::outstanding_in(&self.catalog, &images, levels, renderer)?;
+        if let Some(dir) = previews::directory(&self.catalog) {
+            for image in &images {
+                if wanted.iter().any(|w| w.image_id == image.id) {
+                    continue;
+                }
+                let mut missing = Vec::new();
+                for &level in levels {
+                    let gone = previews::lookup(&self.catalog, image.id, level)?
+                        .is_some_and(|preview| !dir.join(&preview.path).exists());
+                    if gone {
+                        missing.push(level);
+                    }
+                }
+                if missing.is_empty() {
+                    continue;
+                }
+                let state = rawkit_catalog::edits::latest(&self.catalog, image.id)?
+                    .map(|(_, state)| state)
+                    .unwrap_or_default();
+                wanted.push(previews::Wanted {
+                    image_id: image.id,
+                    path: image.path.clone(),
+                    filename: image.filename.clone(),
+                    edit_state_hash: state.content_hash(),
+                    state,
+                    missing,
+                });
+            }
+            // Back into the order asked for, which is nearest first.
+            wanted.sort_by_key(|w| ids.iter().position(|id| *id == w.image_id));
+        }
+        Ok(wanted)
     }
 
     /// Record what the builder made. The only way a preview built in the window
@@ -2642,6 +2679,48 @@ pub(crate) mod tests {
         // be taken back too.
         let quick = named(&library, "Quick Collection").id;
         assert!(library.act(CullAction::DeleteCollection(quick)).is_err());
+    }
+
+    #[test]
+    fn a_preview_whose_file_is_gone_is_wanted_again_by_whoever_is_looking_at_it() {
+        let scratch = Scratch::new("previews-gone");
+        let library = library_at(&scratch.0, 2);
+        let (first, second) = (library.id_at(0).unwrap(), library.id_at(1).unwrap());
+        let hash = EditState::default().content_hash();
+        let dir = library.previews_directory().unwrap();
+        for id in [first, second] {
+            let built: Vec<previews::Preview> = previews::Level::BULK
+                .iter()
+                .map(|&level| previews::Preview {
+                    level,
+                    path: previews::relative_path(id, level, &hash),
+                    edit_state_hash: hash.clone(),
+                    renderer: "this-build".into(),
+                    width: 3,
+                    height: 2,
+                    bytes: 6,
+                })
+                .collect();
+            library.record_previews(id, &built).unwrap();
+            // The files too, for the second photograph only.
+            if id == second {
+                for preview in &built {
+                    let file = dir.join(&preview.path);
+                    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                    std::fs::write(file, b"jpeg").unwrap();
+                }
+            }
+        }
+        // By the catalog's rule neither is outstanding: every row is current.
+        let page = library.outstanding_page(0, 64, "this-build").unwrap();
+        assert!(page.wanted.is_empty());
+        // Asked about by the grid, the one with no files is — all three levels.
+        let wanted = library
+            .outstanding_among(&[second, first], "this-build")
+            .unwrap();
+        assert_eq!(wanted.len(), 1);
+        assert_eq!(wanted[0].image_id, first);
+        assert_eq!(wanted[0].missing, previews::Level::BULK.to_vec());
     }
 
     #[test]

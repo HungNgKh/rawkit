@@ -64,6 +64,8 @@ In the scale gate, at 20 000: a page of 64 is **1.4 ms**; recording 8 previews
 **2–7 ms**, which is the connection going from reading to writing and is paid
 once each time the builder wakes — not a per-row price.
 
+| P17 | A preview whose **file** is gone is wanted again — by the grid, not by the walk | Clear the previews folder and every row still says current, so by the catalog's rule nothing is outstanding and the grid would be placeholders for good. The cells the grid has just failed to show are the evidence the catalog lacks, so that is where the files are looked for. The walk does not: three `stat`s a photograph across the library, to find what looking at the grid finds for nothing. The terminal's build has the same blind spot and keeps it for now. |
+
 With 64 cells on screen and the builder working, the grid measures 2.0 ms a
 frame, worst 12 ms: the near list costs nothing that shows.
 
@@ -92,6 +94,7 @@ frame, worst 12 ms: the near list costs nothing that shows.
 | what the queue admits | `a_photograph_asked_for_twice_is_built_once`, `forgetting_the_queue_lets_what_was_started_finish` |
 | the order things are built in | `what_is_on_screen_is_built_before_what_is_not`, `what_was_on_screen_a_scroll_ago_has_no_claim`, `what_is_being_built_is_not_offered_again_by_being_on_screen` |
 | who else holds a photograph the screen asked for | `a_photograph_only_the_screen_asked_for_is_still_built_after_a_scroll` — without it a run never ends |
+| what counts as missing for a cell on screen | `a_preview_whose_file_is_gone_is_wanted_again_by_whoever_is_looking_at_it` |
 | where an on-screen cell's edit is read from | `what_the_screen_read_a_moment_ago_replaces_what_the_walk_read`, `the_pump_asks_about_what_is_on_screen_before_the_walk_gets_there` |
 | what a run says, and how often | `the_run_says_what_it_came_to_once_and_names_a_failure`, `stopping_forgets_what_is_waiting_and_counts_what_was_done` |
 | what Stop and Build do to each other | `the_last_thing_asked_is_what_happens` |
