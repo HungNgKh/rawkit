@@ -276,8 +276,30 @@ pub fn outstanding(
     levels: &[Level],
     renderer: &str,
 ) -> Result<Vec<Wanted>, CatalogError> {
+    let everything = crate::cull::sequence(catalog, &crate::cull::Filter::default())?;
+    outstanding_in(catalog, &everything, levels, renderer)
+}
+
+/// [`outstanding`], asked of some photographs rather than of all of them.
+///
+/// The whole-library walk is a quarter of a second at twenty thousand
+/// photographs. From a terminal that is nothing. In the window it would be run
+/// under the lock every keypress takes, and a quarter of a second is two and a
+/// half keypresses' worth of nothing happening. So the window asks a page at a
+/// time, of the sequence it is already holding — which also spares it the
+/// nineteen milliseconds `sequence` costs, since it never reads one.
+///
+/// The answer is the same one: what is outstanding among these, in the order
+/// they were given. Asking page by page and asking all at once agree, which is
+/// what lets the terminal and the window share the rule for "stale".
+pub fn outstanding_in(
+    catalog: &Catalog,
+    images: &[crate::cull::LibraryImage],
+    levels: &[Level],
+    renderer: &str,
+) -> Result<Vec<Wanted>, CatalogError> {
     let mut wanted = Vec::new();
-    for image in crate::cull::sequence(catalog, &crate::cull::Filter::default())? {
+    for image in images {
         // The edit the photograph currently has — the stored one, or as shot.
         let state = crate::edits::latest(catalog, image.id)?
             .map(|(_, state)| state)
@@ -295,8 +317,8 @@ pub fn outstanding(
         if !missing.is_empty() {
             wanted.push(Wanted {
                 image_id: image.id,
-                path: image.path,
-                filename: image.filename,
+                path: image.path.clone(),
+                filename: image.filename.clone(),
                 state,
                 edit_state_hash: hash,
                 missing,
@@ -486,6 +508,37 @@ mod tests {
         assert!(work.iter().all(|w| w.missing.len() == 3));
         // As shot, because none of them has been edited.
         assert!(work.iter().all(|w| w.state == EditState::default()));
+    }
+
+    #[test]
+    fn asking_a_page_at_a_time_gives_the_answer_asking_all_at_once_does() {
+        let dir = tempdir();
+        let names: Vec<String> = (0..7).map(|n| format!("{n}.ARW")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let catalog = library(&dir, &names);
+        let everything = crate::cull::sequence(&catalog, &crate::cull::Filter::default()).unwrap();
+        // Some current, some not, so a page can be all, none or part outstanding.
+        let hash = EditState::default().content_hash();
+        for image in [&everything[1], &everything[2], &everything[5]] {
+            for level in Level::BULK {
+                let mut preview = sample(&hash);
+                preview.level = *level;
+                record(&catalog, image.id, &preview).unwrap();
+            }
+        }
+
+        let whole = outstanding(&catalog, Level::BULK, BUILD).unwrap();
+        assert_eq!(whole.len(), 4);
+        // Pages of three over seven: a full page, a full page, and a short one.
+        let paged: Vec<Wanted> = everything
+            .chunks(3)
+            .flat_map(|page| outstanding_in(&catalog, page, Level::BULK, BUILD).unwrap())
+            .collect();
+        assert_eq!(paged, whole, "in the same order, and nothing twice");
+        // Nothing asked about is nothing outstanding, not an error.
+        assert!(outstanding_in(&catalog, &[], Level::BULK, BUILD)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

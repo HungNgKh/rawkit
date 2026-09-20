@@ -236,6 +236,10 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
         "{:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
         "", "del whole", "undo", "empty", "undo", "holding 1", "taken 1"
     );
+    println!(
+        "{:>8} {:>9} {:>9} {:>9} {:>9}",
+        "", "page 64", "record 1", "record 8", "record 24"
+    );
 
     let mut worst = Duration::ZERO;
     let mut worst_what = String::new();
@@ -290,6 +294,58 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
         let (left, wanted) = timed(|| {
             previews::outstanding(&catalog, &[Level::Thumb], RENDERER).expect("outstanding")
         });
+
+        // **What the window's preview builder does under the lock a keypress
+        // takes**, which is the opposite of the walk above: it may not ask about
+        // the whole library, so it asks about a page of the sequence it already
+        // holds, once a frame. The page is taken from the middle, and its cost
+        // has to be flat — the same sixty-four lookups whether there are a
+        // thousand photographs behind them or twenty thousand. Dividing the
+        // walk's total by the library's size would have been a guess at this,
+        // and wrong in a known direction: the walk pays for `sequence` too.
+        const PAGE: usize = 64;
+        let page = &rows[n / 2..n / 2 + PAGE];
+        let (paged, _) = timed(|| {
+            previews::outstanding_in(&catalog, page, Level::BULK, RENDERER).expect("a page")
+        });
+
+        // And what it costs to write down what came back. Each `record` is its
+        // own statement and its own commit, and a WAL commit is a fixed cost, so
+        // neither the per-row nor the per-batch figure could be guessed from the
+        // other. One photograph is three levels; the builder records a few
+        // photographs a frame, and how many is decided by these.
+        //
+        // **Read the first column as "the first write after a run of reads",
+        // not as the price of one row.** It comes out dearer than eight — two to
+        // seven milliseconds against a fraction of one — because it is measured
+        // first and pays for the connection going from reading to writing. That
+        // is a real cost the builder pays once each time it wakes, so it is
+        // reported; it is not a per-row figure, and dividing anything by it
+        // would be the order of measurement mistaken for the thing measured.
+        let recorded = |count: usize, from: usize| {
+            let hash = "0".repeat(64);
+            timed(|| {
+                for (at, image) in rows[from..from + count].iter().enumerate() {
+                    let level = Level::BULK[at % Level::BULK.len()];
+                    previews::record(
+                        &catalog,
+                        image.id,
+                        &Preview {
+                            level,
+                            path: previews::relative_path(image.id, level, &hash),
+                            edit_state_hash: hash.clone(),
+                            renderer: RENDERER.into(),
+                            width: 256,
+                            height: 171,
+                            bytes: 9_000,
+                        },
+                    )
+                    .expect("record");
+                }
+            })
+            .0
+        };
+        let (record_1, record_8, record_24) = (recorded(1, 10), recorded(8, 20), recorded(24, 40));
 
         // **These three are on the keystroke path**, which is why they are
         // here. `CullView` is rebuilt after every key a cull presses, and it
@@ -463,6 +519,10 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
             per_holding,
             per_taken
         );
+        println!(
+            "{:>8} {:>9.1?} {:>9.1?} {:>9.1?} {:>9.1?}",
+            "", paged, record_1, record_8, record_24
+        );
         assert!(
             !wanted.is_empty() && wanted.len() < n,
             "the fixture should leave some previews outstanding and not all: {} of {n}",
@@ -484,6 +544,8 @@ fn the_catalog_holds_up_at_the_size_of_a_real_library() {
             ("collection holds", per_holds),
             ("collections holding a frame", per_holding),
             ("when and with what", per_taken),
+            ("a page of what is outstanding", paged),
+            ("recording eight previews", record_8),
             ("whole-library collection", members_whole),
             ("moving one photograph", moved),
             ("moving another", moved_again),
