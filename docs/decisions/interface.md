@@ -208,8 +208,21 @@ tool; an armed eyedropper stayed armed under a crop.
   target. Put down rather than ignored while the other tool is up, because
   "still armed, but not now" is a state nobody can see.
 - **While crop, the spot tool or a placement is in hand, nothing else is picked
-  up** (`hands_free`), in `add_mask`, `select_mask`, `arm_target` and both
-  pickers. I5 held the *keys* back; every one of these has a button as well.
+  up** (`hands_free`), in `add_mask`, `select_mask`, `place_mask`, `arm_target`
+  and both pickers. I5 held the *keys* back; every one of these has a button as
+  well.
+- **A press on the photograph is armed to mean one thing** (`only`). The two
+  eyedroppers and the mixer's target exclude each other, and a placement
+  excludes all three. The page used to do this, in one direction only: arming
+  the white-balance picker put the range picker away and not the reverse, so
+  both could be armed while the badge named one.
+
+**The page asks, then draws what it is told.** `arm`, `pickWb`, `pickRange` and
+`place` used to set their own variable and light their own button before asking,
+so a refusal left a button lit for something never armed. They now call `ask`,
+which invokes and then reads the shell back, on success *and* on refusal. A poll
+that was already on its way when one of them ran describes the moment before;
+`toolEpoch` makes it say nothing about tools.
 
 ## I10 — the exits, always
 

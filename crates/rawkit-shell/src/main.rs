@@ -3027,6 +3027,7 @@ fn arm_target(control: Option<String>) -> Result<u8, String> {
     };
     if armed != 0 {
         hands_free()?;
+        only(Some(Meaning::Target));
     }
     TARGET.store(armed, std::sync::atomic::Ordering::Relaxed);
     if armed == 0 {
@@ -3528,6 +3529,7 @@ fn starting_shape(kind: Option<&str>) -> Result<rawkit_editstate::MaskShape, Str
 #[tauri::command]
 fn add_mask(kind: Option<String>, state: tauri::State<'_, Shared>) -> Result<usize, String> {
     hands_free()?;
+    only(None);
     let shape = starting_shape(kind.as_deref())?;
     let mut session = state.0.lock().expect("session lock");
     let mut masks = session.state().masks.clone();
@@ -3758,12 +3760,22 @@ fn measure_lens() {
 
 /// Whether the next drag on the photograph draws on the selected mask.
 #[tauri::command]
-fn place_mask(armed: bool) -> bool {
+fn place_mask(armed: bool) -> Result<bool, String> {
+    // The one way of picking something up that had no guard. A placement is
+    // itself a tool in hand, so re-arming one that is already armed is let
+    // through; crop and the spot tool are not. It was reachable: the page's
+    // "Redraw" button stays live for a poll's length after crop is entered.
+    if armed && tool_in_hand().is_some_and(|tool| tool != library::Tool::Placing) {
+        hands_free()?;
+    }
+    if armed {
+        only(None);
+    }
     PLACING_MASK.store(armed, std::sync::atomic::Ordering::Relaxed);
     if !armed {
         *MASK_DRAG.lock().expect("mask drag lock") = None;
     }
-    armed
+    Ok(armed)
 }
 
 /// Move one control of one local adjustment.
@@ -4112,6 +4124,7 @@ fn aim_range(camera: [f32; 3], shared: &std::sync::Arc<Mutex<Session>>) -> Resul
 fn pick_range(armed: bool) -> Result<bool, String> {
     if armed {
         hands_free()?;
+        only(Some(Meaning::Range));
     }
     PICKING_RANGE.store(armed, std::sync::atomic::Ordering::Relaxed);
     if !armed {
@@ -4145,6 +4158,7 @@ fn upright() {
 fn pick_white_balance(armed: bool) -> Result<bool, String> {
     if armed {
         hands_free()?;
+        only(Some(Meaning::WhiteBalance));
     }
     PICKING_WB.store(armed, std::sync::atomic::Ordering::Relaxed);
     if !armed {
@@ -4479,6 +4493,39 @@ fn hands_free() -> Result<(), String> {
     }
 }
 
+/// The three things a press on the photograph can be armed to mean, of which
+/// only one may be armed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Meaning {
+    WhiteBalance,
+    Range,
+    Target,
+}
+
+/// Arming one meaning disarms the other two, and `None` disarms all three —
+/// which is what a placement needs, since the drag that places an adjustment is
+/// a fourth thing the same press could mean.
+///
+/// The page did this, in one direction: arming the white-balance picker put the
+/// range picker away, and not the reverse. Both could be armed, the badge named
+/// the first, and the press did whichever the render loop asked about first.
+/// Here rather than there, so it is true however they were armed.
+fn only(keep: Option<Meaning>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if keep != Some(Meaning::WhiteBalance) {
+        PICKING_WB.store(false, Relaxed);
+        *WB_PICK.lock().expect("pick lock") = None;
+    }
+    if keep != Some(Meaning::Range) {
+        PICKING_RANGE.store(false, Relaxed);
+        *RANGE_PICK.lock().expect("range pick lock") = None;
+    }
+    if keep != Some(Meaning::Target) {
+        TARGET.store(0, Relaxed);
+        *TARGET_AIM.lock().expect("aim lock") = None;
+    }
+}
+
 /// One tool at a time: picking up crop or the spot tool puts everything else
 /// down.
 ///
@@ -4491,10 +4538,7 @@ fn hands_free() -> Result<(), String> {
 fn put_down_the_rest() {
     // Putting down is never refused, so there is nothing in these to handle.
     let _ = select_mask(None);
-    let _ = pick_white_balance(false);
-    let _ = pick_range(false);
-    TARGET.store(0, std::sync::atomic::Ordering::Relaxed);
-    *TARGET_AIM.lock().expect("aim lock") = None;
+    only(None);
 }
 
 /// What is in hand, in one word, for the page to show and light its tools from.

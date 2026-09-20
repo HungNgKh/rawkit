@@ -1054,6 +1054,7 @@
   // notices and costs a lock and a serialise.
   let seen = -1;
   setInterval(async () => {
+    const epoch = toolEpoch;
     const s = await invoke("snapshot");
     if (s.generation !== seen) {
       seen = s.generation;
@@ -1074,7 +1075,8 @@
     // nobody can see, which is the same as doing it for no reason.
     // Anything the render loop needed to say — a refused pick, most often.
     if (s.notice) tell(s.notice.level, s.notice.text);
-    followArmed(s.armed);
+    // Not if something was asked for while this was on its way: see `toolEpoch`.
+    if (epoch === toolEpoch) absorbTools(s);
     // Not gated on the generation: selecting a local adjustment does not change
     // the edit, and neither does arming a placement.
     try { showMasks(s); } catch (e) { tell("failed", `the panel broke in masks: ${e && e.message || e}`); }
@@ -1775,16 +1777,32 @@
   // Clicking the arm again disarms, and so does Escape — a mode you cannot see
   // your way out of is worse than no mode.
 
-  let armed = null;
-  const arm = (control) => {
-    if (control !== null && picking) pickWb(false);
-    armed = control;
-    for (const button of document.querySelectorAll(".target")) {
-      button.classList.toggle("armed", button.dataset.control === control);
-    }
-    document.body.classList.toggle("aiming", control !== null || picking);
-    invoke("arm_target", { control }).then(retool).catch(say);
+  // ---- Asking for a tool, and finding out -------------------------------------
+  //
+  // `arm`, `pickWb`, `pickRange` and `place` ask the shell and then draw what it
+  // says. They used to set their own variable and light their own button first,
+  // and ask afterwards — so a refusal ("Crop is in hand") left the button lit
+  // for something that was never armed, until the next poll noticed.
+  //
+  // `toolEpoch` is for the poll that was already on its way when one of them
+  // ran: its answer describes the moment before, and drawing it would put the
+  // button back for a quarter of a second. A poll that started under an older
+  // epoch says nothing about tools.
+  let toolEpoch = 0;
+  const asked = () => {
+    const epoch = ++toolEpoch;
+    return invoke("snapshot").then(s => {
+      if (epoch !== toolEpoch) return;
+      absorbTools(s);
+      // Taken by asking, so it has to be said here or it is lost.
+      if (s.notice) tell(s.notice.level, s.notice.text);
+      retool();
+    }).catch(() => {});
   };
+  const ask = (command, args) => invoke(command, args).catch(say).finally(asked);
+
+  let armed = null;
+  const arm = (control) => ask("arm_target", { control });
 
   for (const button of document.querySelectorAll(".target")) {
     button.addEventListener("click", event => {
@@ -1806,19 +1824,17 @@
   let picking = false;
   /// Whether the next press aims a range mask's band.
   let pickingRange = false;
-  const pickRange = (on) => {
-    pickingRange = on;
-    document.getElementById("mask-pick-range").classList.toggle("armed", on);
-    document.body.classList.toggle("aiming", on || picking || armed !== null);
-    invoke("pick_range", { armed: on }).then(retool).catch(say);
-  };
+  const pickRange = (on) => ask("pick_range", { armed: on });
 
   // What is armed, as the shell has it. Picking up crop or the spot tool puts
   // these down on the shell's side, and the page has to find out: it used to
   // keep its own note of having armed them, and the note outlived the fact.
   // Drawn only — nothing is invoked from here, or the two would chase each other.
   const CONTROLS = [null, "hue", "saturation", "luminance"];
-  const followArmed = (now) => {
+  const absorbTools = (s) => {
+    placing = !!s.placing_mask;
+    document.getElementById("mask-place").classList.toggle("armed", placing);
+    const now = s.armed;
     if (!now) return;
     const target = CONTROLS[now.target] ?? null;
     if (picking === !!now.wb && pickingRange === !!now.range && armed === target) return;
@@ -1832,15 +1848,9 @@
     document.body.classList.toggle("aiming", picking || pickingRange || armed !== null);
   };
 
-  const pickWb = (on) => {
-    // Two eyedroppers, one photograph: arming either puts the other away, so a
-    // press can only ever mean one thing.
-    if (on && pickingRange) pickRange(false);
-    picking = on;
-    dropper.classList.toggle("armed", on);
-    document.body.classList.toggle("aiming", on || armed !== null);
-    invoke("pick_white_balance", { armed: on }).then(retool).catch(say);
-  };
+  // Only one of these can be armed, and the shell sees to it: arming one puts
+  // the others down, whichever button or key it came from.
+  const pickWb = (on) => ask("pick_white_balance", { armed: on });
 
   // Fire and forget, and nothing to keep in step: the answer arrives as a
   // notice and as the two sliders moving, both of which already sync
@@ -1848,8 +1858,7 @@
   const uprightButton = document.getElementById("upright");
   if (uprightButton) uprightButton.onclick = () => invoke("upright").catch(say);
   dropper.addEventListener("click", () => {
-    if (!picking && armed !== null) arm(null);
-    if (!picking) place(false);
+    if (!picking && placing) place(false);
     pickWb(!picking);
   });
 
@@ -1873,17 +1882,13 @@
   let showingMask = false;
 
   const place = (on) => {
-    placing = on;
     if (!on) outlived();
-    document.getElementById("mask-place").classList.toggle("armed", on);
-    document.body.classList.toggle("aiming", on || picking || armed !== null);
-    invoke("place_mask", { armed: on }).then(retool).catch(say);
+    return ask("place_mask", { armed: on });
   };
 
   const showMasks = (s) => {
     const masks = (s.state && s.state.masks) || [];
     selected = s.selected_mask ?? null;
-    placing = !!s.placing_mask;
     part = s.selected_part ?? 0;
     const shape = `${masks.length}:${selected}`;
     if (shape !== shownMasks) {
@@ -1899,7 +1904,6 @@
       document.getElementById("mask-controls").hidden = selected === null;
       document.getElementById("mask-empty").hidden = masks.length > 0;
     }
-    document.getElementById("mask-place").classList.toggle("armed", placing);
     showingMask = !!s.showing_mask;
     document.getElementById("mask-show").classList.toggle("armed", showingMask);
     const mask = selected === null ? null : masks[selected];
@@ -2050,22 +2054,16 @@
   }
 
   const addMask = (kind) => {
-    if (armed !== null) arm(null);
-    if (picking) pickWb(false);
+    // The shell puts the pickers down and arms the placement; this asks, and
+    // then finds out. A range has nowhere to be dragged to — it selects by what
+    // the light is — so it is never placed, and says how it is used instead.
     invoke("add_mask", { kind })
       .then(() => {
-        // A range has nowhere to be dragged to: it selects by what the light is,
-        // so the next press belongs to the photograph and not to the mask.
-        placing = kind !== "range";
-        retool();
-        // How to place one is in the row that says it is being placed, and goes
-        // when the placing does. As a message it stayed — "drag across the
-        // photograph" under a crop, three tools later. A range has no such row,
-        // because it is never placed.
-        if (!placing)
+        if (kind === "range")
           hint("a band on brightness — move From and To, or pick a place to centre it on");
       })
-      .catch(say);
+      .catch(say)
+      .finally(asked);
   };
   // Measuring is a whole-frame demosaic, so the button says so and then stops
   // being pressable. Without that a second click queues a second measurement of
@@ -2136,9 +2134,8 @@
   });
   document.getElementById("mask-pick-range").addEventListener("click", () => {
     if (selected === null || rangeChannel === null) return;
-    if (!pickingRange && armed !== null) arm(null);
+    // How to use it is in the row that says it is armed, and goes when it does.
     pickRange(!pickingRange);
-    if (pickingRange) hint("click the colour or brightness you want the band around");
   });
   document.getElementById("mask-channel").addEventListener("click", () => {
     if (selected === null || rangeChannel === null) return;
@@ -2168,8 +2165,6 @@
   });
   document.getElementById("mask-place").addEventListener("click", () => {
     if (selected === null) return say("nothing selected to redraw");
-    if (!placing && armed !== null) arm(null);
-    if (!placing && picking) pickWb(false);
     place(!placing);
   });
   for (const [id, control] of [
@@ -2663,7 +2658,7 @@
     if (name === "crop" || name === "spot") return act(name);
     if (name === "wb") return pickWb(!picking);
     const lit = (tool === "mask" || tool === "placing") && selectedKind === name;
-    if (lit) return invoke("select_mask", { index: null }).then(retool).catch(say);
+    if (lit) return ask("select_mask", { index: null });
     addMask(name === "linear" ? "gradient" : name);
   };
   document.getElementById("tools").addEventListener("click", event => {
@@ -2724,13 +2719,14 @@
                section: "s-masks", does: [["Cancel", () => place(false)]] },
     wb: { name: "White balance picker", how: "click something neutral · Esc puts it down",
           section: "s-white-balance", does: [["Put down", () => pickWb(false)]] },
-    range: { name: "Range picker", how: "click the tone to centre on · Esc puts it down",
+    range: { name: "Range picker",
+             how: "click the colour or brightness to centre the band on · Esc puts it down",
              section: "s-masks", does: [["Put down", () => pickRange(false)]] },
     target: { name: "Mixer target", how: "drag on a colour in the photograph · Esc puts it down",
               section: null, does: [["Put down", () => arm(null)]] },
-    mask: { name: "Adjustment", how: "drag its handles · O shows what it covers",
+    mask: { name: "Adjustment", how: "drag its handles · O shows what it covers · Esc puts it down",
             section: "s-masks",
-            does: [["Deselect", () => invoke("select_mask", { index: null }).then(retool).catch(say)]] },
+            does: [["Deselect", () => ask("select_mask", { index: null })]] },
   };
   const inhandRow = document.getElementById("inhand");
   let drawnTool = null;
@@ -2869,6 +2865,10 @@
         if (pickingRange) { pickRange(false); break; }
         if (placing) { place(false); break; }
         if (mode === "crop") { act("crop_cancel"); break; }
+        // A selected adjustment is in hand as far as the badge and the pointer
+        // are concerned — a press grabs its handles — so it is a rung too. It
+        // was not, and Escape with GRADIENT 2 lit did nothing anyone could see.
+        if (tool === "mask") { ask("select_mask", { index: null }); break; }
         act("loupe"); break;
       case "e": act("loupe"); break;
       // R for the crop tool, as in Lightroom; the brackets rotate, as in
