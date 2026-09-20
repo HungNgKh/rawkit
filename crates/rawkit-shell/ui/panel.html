@@ -84,6 +84,34 @@
            border-radius: 5px; padding: 4px 11px; font: inherit; cursor: pointer; }
   button:hover { background: #3a3a44; }
   .row { display: flex; gap: 7px; margin-top: 10px; flex-wrap: wrap; }
+  /* The tools, under the histogram where a Lightroom hand looks for them. Lit
+     from what the shell says is in hand, never from having been clicked — the
+     shell puts tools down on its own, and a button still lit for a picker that
+     is no longer armed is a press that does something else. */
+  #tools { display: flex; gap: 4px; margin-top: 8px; }
+  #tools.hidden { display: none; }
+  #tools button { flex: 1 1 0; min-width: 0; padding: 5px 0 4px; font-size: 11px;
+                  line-height: 1.2; color: #c9c9d1; }
+  #tools button kbd { display: block; font: inherit; font-size: 10px; color: #9a9aa2; }
+  #tools button.on { color: #1e1e22; background: #d8bf63; border-color: #d8bf63; }
+  #tools button.on kbd { color: #4a4220; }
+  /* The badge says what is in hand when something is, and then it matters, so
+     then it is lit. 8.9 to 1 on the panel. */
+  #mode.tool { color: #1e1e22; background: #d8bf63; border-color: #d8bf63; }
+
+  /* What is in hand and how to put it down, always, in words and as buttons.
+     It lives in the footer because that is the one part of the column that
+     cannot scroll away, and HTML cannot be drawn over the photograph where the
+     tool actually is. */
+  #inhand { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+            padding-bottom: 7px; margin-bottom: 7px; border-bottom: 1px solid #2c2c34; }
+  #inhand.hidden { display: none; }
+  #inhand .what { color: #d8bf63; font-weight: 600; letter-spacing: .04em;
+                  text-transform: uppercase; font-size: 11px; }
+  #inhand .how { color: #c9c9d1; flex: 1 1 auto; }
+  #inhand .do { display: flex; gap: 6px; }
+  #inhand button { padding: 3px 9px; font-size: 12px; }
+
   /* The status line: the one place the application says what happened, pinned
      under the column so it is on screen whatever has been scrolled to. It used
      to be a line inside the last-but-one section, which meant every refusal was
@@ -244,6 +272,14 @@
   <div id="readout">
     <span class="clip" id="clip-white" title="pixels with a channel at full scale">–</span>
     <span class="clip" id="clip-black" title="pixels with nothing in any channel">–</span>
+  </div>
+  <div id="tools" role="toolbar" aria-label="tools">
+    <button data-tool="crop" title="crop and straighten">Crop<kbd>R</kbd></button>
+    <button data-tool="spot" title="remove spots">Spot<kbd>Q</kbd></button>
+    <button data-tool="linear" title="add a graduated adjustment">Gradient<kbd>L</kbd></button>
+    <button data-tool="radial" title="add a radial adjustment">Radial<kbd>⇧L</kbd></button>
+    <button data-tool="brush" title="add a brushed adjustment">Brush<kbd>B</kbd></button>
+    <button data-tool="wb" title="pick something neutral for the white balance">WB<kbd>W</kbd></button>
   </div>
 </div>
 <div id="cull" class="hidden">
@@ -619,10 +655,13 @@
   </details>
   <details id="s-keys">
     <summary>Keys</summary>
-    <div id="keys">G grid · E loupe · R crop · Q spots · O mask · [ ] rotate · M mark · C compare · ⌃⇧C copy settings · ⌃⇧V paste onto selected · P pick · X reject · 0–5 rate · 6–9 label · F fit · V copy · \ filter · Z undo cull · ⌃Z undo edit · ⌃E export · ⌃⇧E export what is shown · F11 fullscreen</div>
+    <div id="keys">G grid · E loupe · R crop · Q spots · W white balance picker · O mask · [ ] rotate · M mark · C compare · ⌃⇧C copy settings · ⌃⇧V paste onto selected · P pick · X reject · 0–5 rate · 6–9 label · F fit · V copy · \ filter · Z undo cull · ⌃Z undo edit · ⌃E export · ⌃⇧E export what is shown · F11 fullscreen</div>
   </details>
 </main>
 <footer id="status">
+  <div id="inhand" class="hidden">
+    <span class="what"></span><span class="how"></span><span class="do"></span>
+  </div>
   <!-- An alert, so a failure is announced when it happens rather than found. -->
   <div id="failed" class="hidden" role="alert" title="click to dismiss"></div>
   <div id="said" role="status" aria-live="polite">ready</div>
@@ -1035,6 +1074,7 @@
     // nobody can see, which is the same as doing it for no reason.
     // Anything the render loop needed to say — a refused pick, most often.
     if (s.notice) tell(s.notice.level, s.notice.text);
+    followArmed(s.armed);
     // Not gated on the generation: selecting a local adjustment does not change
     // the edit, and neither does arming a placement.
     try { showMasks(s); } catch (e) { tell("failed", `the panel broke in masks: ${e && e.message || e}`); }
@@ -1743,7 +1783,7 @@
       button.classList.toggle("armed", button.dataset.control === control);
     }
     document.body.classList.toggle("aiming", control !== null || picking);
-    invoke("arm_target", { control }).catch(say);
+    invoke("arm_target", { control }).then(retool).catch(say);
   };
 
   for (const button of document.querySelectorAll(".target")) {
@@ -1770,7 +1810,26 @@
     pickingRange = on;
     document.getElementById("mask-pick-range").classList.toggle("armed", on);
     document.body.classList.toggle("aiming", on || picking || armed !== null);
-    invoke("pick_range", { armed: on }).catch(say);
+    invoke("pick_range", { armed: on }).then(retool).catch(say);
+  };
+
+  // What is armed, as the shell has it. Picking up crop or the spot tool puts
+  // these down on the shell's side, and the page has to find out: it used to
+  // keep its own note of having armed them, and the note outlived the fact.
+  // Drawn only — nothing is invoked from here, or the two would chase each other.
+  const CONTROLS = [null, "hue", "saturation", "luminance"];
+  const followArmed = (now) => {
+    if (!now) return;
+    const target = CONTROLS[now.target] ?? null;
+    if (picking === !!now.wb && pickingRange === !!now.range && armed === target) return;
+    picking = !!now.wb;
+    pickingRange = !!now.range;
+    armed = target;
+    dropper.classList.toggle("armed", picking);
+    document.getElementById("mask-pick-range").classList.toggle("armed", pickingRange);
+    for (const button of document.querySelectorAll(".target[data-control]"))
+      button.classList.toggle("armed", button.dataset.control === armed);
+    document.body.classList.toggle("aiming", picking || pickingRange || armed !== null);
   };
 
   const pickWb = (on) => {
@@ -1780,7 +1839,7 @@
     picking = on;
     dropper.classList.toggle("armed", on);
     document.body.classList.toggle("aiming", on || armed !== null);
-    invoke("pick_white_balance", { armed: on }).catch(say);
+    invoke("pick_white_balance", { armed: on }).then(retool).catch(say);
   };
 
   // Fire and forget, and nothing to keep in step: the answer arrives as a
@@ -1818,7 +1877,7 @@
     if (!on) outlived();
     document.getElementById("mask-place").classList.toggle("armed", on);
     document.body.classList.toggle("aiming", on || picking || armed !== null);
-    invoke("place_mask", { armed: on }).catch(say);
+    invoke("place_mask", { armed: on }).then(retool).catch(say);
   };
 
   const showMasks = (s) => {
@@ -1833,7 +1892,8 @@
         const button = document.createElement("button");
         button.textContent = `${i + 1}`;
         button.className = i === selected ? "armed" : "";
-        button.addEventListener("click", () => invoke("select_mask", { index: i }).catch(say));
+        button.addEventListener("click", () =>
+          invoke("select_mask", { index: i }).then(retool).catch(say));
         return button;
       }));
       document.getElementById("mask-controls").hidden = selected === null;
@@ -1843,6 +1903,8 @@
     showingMask = !!s.showing_mask;
     document.getElementById("mask-show").classList.toggle("armed", showingMask);
     const mask = selected === null ? null : masks[selected];
+    selectedKind = mask ? mask.shape.kind : null;
+    drawTool();
     if (mask) {
       // What the adjustment is made of, in the order the shapes are joined —
       // which is the order they were built in, and the order they are applied.
@@ -1964,8 +2026,7 @@
   };
 
   document.getElementById("spot-tool").addEventListener("click", () => {
-    act("spot").then(() =>
-      hint("drag on the photograph to cover a mark; drag a circle to move it"));
+    act("spot");
   });
   document.getElementById("spot-remove").addEventListener("click", () => {
     if (spot === null) return say("nothing selected to remove");
@@ -1996,9 +2057,13 @@
         // A range has nowhere to be dragged to: it selects by what the light is,
         // so the next press belongs to the photograph and not to the mask.
         placing = kind !== "range";
-        hint(placing
-          ? "drag across the photograph to place it"
-          : "a band on brightness — move From and To, or pick a place to centre it on");
+        retool();
+        // How to place one is in the row that says it is being placed, and goes
+        // when the placing does. As a message it stayed — "drag across the
+        // photograph" under a crop, three tools later. A range has no such row,
+        // because it is never placed.
+        if (!placing)
+          hint("a band on brightness — move From and To, or pick a place to centre it on");
       })
       .catch(say);
   };
@@ -2266,7 +2331,7 @@
       `K → ${targetName(view)}${view.in_target ? " ✓" : ""}`;
     drawFilter(view.filter ?? {});
     drawCollections(view);
-    setMode(view.mode);
+    setMode(view.mode, view.tool);
   };
 
   // ---- The filter ----------------------------------------------------------
@@ -2567,10 +2632,9 @@
   // "paste" is not a key; it is the chord's name, so the chord can ask too.
   const WAITS = new Set(["0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
     "p", "x", "u", "m", "c", "k", "z", "v", "g", "e", "enter", "r", "q", "l", "b",
-    "[", "]", "arrowleft", "arrowright", "arrowup", "arrowdown", " ",
+    "w", "[", "]", "arrowleft", "arrowright", "arrowup", "arrowdown", " ",
     "backspace", "delete", "-", "=", "+", "\\", "paste"]);
   const inHand = () => {
-    const mode = document.getElementById("mode").textContent;
     if (mode === "crop")
       return { name: "Crop", exits: "Enter keeps it, Esc cancels", keys: ["enter", "r"] };
     if (mode === "spot")
@@ -2592,6 +2656,23 @@
     return true;
   };
   const MOD = /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘⇧" : "Ctrl+Shift+";
+
+  // The same things the keys do, so there is one behaviour with two ways in. A
+  // lit tool is put down by pressing it again, which is what R and Q already do.
+  const useTool = name => {
+    if (name === "crop" || name === "spot") return act(name);
+    if (name === "wb") return pickWb(!picking);
+    const lit = (tool === "mask" || tool === "placing") && selectedKind === name;
+    if (lit) return invoke("select_mask", { index: null }).then(retool).catch(say);
+    addMask(name === "linear" ? "gradient" : name);
+  };
+  document.getElementById("tools").addEventListener("click", event => {
+    const button = event.target.closest("button");
+    if (!button) return;
+    // The strip is a second way to press a key, so it waits for the same thing.
+    const key = { crop: "r", spot: "q", linear: "l", radial: "l", brush: "b", wb: "w" }[button.dataset.tool];
+    if (!heldBack(key)) useTool(button.dataset.tool);
+  });
 
   // The shell says what happened and whether it can be taken back; which key
   // does that is the page's to say, because the keys are the page's — and this
@@ -2616,9 +2697,100 @@
   // A held arrow key repeats far faster than a RAW decodes. Every press is still
   // sent — the library keeps only the latest request and the render loop reads
   // it once per frame, so this coalesces for the same reason a slider drag does.
-  function setMode(name) {
-    if (document.getElementById("mode").textContent === name) return;
-    document.getElementById("mode").textContent = name;
+  // ---- What is showing, and what is in hand ----------------------------------
+  //
+  // Two questions, and the badge used to answer both with one word: it read
+  // LOUPE while a gradient was live on the photograph, because a gradient is
+  // not a view. `mode` is the view and `tool` is what a press on the photograph
+  // would do, both as the shell reports them. They are variables rather than
+  // something read back off the badge's text, which is how changing what the
+  // badge *says* would have changed what Enter *does*.
+  let mode = "loupe";
+  let tool = "";
+  let selectedKind = null;
+  const KIND = { linear: "gradient", radial: "radial", brush: "brush", range: "range" };
+  // What each tool is called, how it is put down, which section is about it,
+  // and the buttons that do what the keys do. `inHand` below draws the keys a
+  // tool keeps from the same place.
+  const TOOLS = {
+    crop: { name: "Crop", how: "Enter keeps it · Esc cancels", section: "s-geometry",
+            does: [["Done", () => act("crop_apply")], ["Cancel", () => act("crop_cancel")],
+                   ["Reset", () => act("crop_reset")]] },
+    spot: { name: "Spot removal",
+            how: "drag to cover a mark, drag a circle to move it · Esc or Q puts it down",
+            section: "s-spots",
+            does: [["Done", () => act("spot")]] },
+    placing: { name: "Placing", how: "drag across the photograph · Esc cancels",
+               section: "s-masks", does: [["Cancel", () => place(false)]] },
+    wb: { name: "White balance picker", how: "click something neutral · Esc puts it down",
+          section: "s-white-balance", does: [["Put down", () => pickWb(false)]] },
+    range: { name: "Range picker", how: "click the tone to centre on · Esc puts it down",
+             section: "s-masks", does: [["Put down", () => pickRange(false)]] },
+    target: { name: "Mixer target", how: "drag on a colour in the photograph · Esc puts it down",
+              section: null, does: [["Put down", () => arm(null)]] },
+    mask: { name: "Adjustment", how: "drag its handles · O shows what it covers",
+            section: "s-masks",
+            does: [["Deselect", () => invoke("select_mask", { index: null }).then(retool).catch(say)]] },
+  };
+  const inhandRow = document.getElementById("inhand");
+  let drawnTool = null;
+  const drawTool = () => {
+    const kind = KIND[selectedKind] ?? "adjustment";
+    const key = `${mode}|${tool}|${tool === "mask" || tool === "placing" ? `${kind}${selected}` : ""}`;
+    if (key === drawnTool) return;
+    const changedTool = drawnTool === null || drawnTool.split("|")[1] !== tool;
+    drawnTool = key;
+
+    const badge = document.getElementById("mode");
+    // The view and the poll arrive separately, so for a moment the shell can
+    // have said "an adjustment" before the page knows which.
+    const label = tool === "mask" ? (selected === null ? kind : `${kind} ${selected + 1}`)
+      : tool === "placing" ? `placing ${kind}`
+      : tool ? TOOLS[tool].name : mode;
+    badge.textContent = label;
+    badge.classList.toggle("tool", tool !== "");
+
+    const strip = document.getElementById("tools");
+    // No tools in a view of many photographs: there is nothing to use one on.
+    strip.classList.toggle("hidden", mode === "grid" || mode === "survey");
+    for (const button of strip.children) {
+      const name = button.dataset.tool;
+      button.classList.toggle("on", name === tool ||
+        ((tool === "mask" || tool === "placing") && name === selectedKind));
+    }
+
+    const about = TOOLS[tool];
+    inhandRow.classList.toggle("hidden", !about);
+    if (!about) return;
+    inhandRow.querySelector(".what").textContent = label;
+    inhandRow.querySelector(".how").textContent = about.how;
+    inhandRow.querySelector(".do").replaceChildren(...about.does.map(([text, run]) => {
+      const button = document.createElement("button");
+      button.textContent = text;
+      button.addEventListener("click", run);
+      return button;
+    }));
+    // The controls for the thing just picked up, brought to where the eyes are.
+    // Pressing R used to leave the column showing Presets and Collections. Only
+    // when the tool changes: someone who has scrolled away on purpose while it
+    // is up should not be dragged back four times a second.
+    if (changedTool && about.section) {
+      const section = document.getElementById(about.section);
+      section.open = true;
+      section.scrollIntoView({ block: "start", behavior: "smooth" });
+    }
+  };
+  // Ask the shell what is in hand now, after the page has asked for a change to
+  // it. The poll would say the same within a quarter of a second, which is long
+  // enough to watch a badge be wrong.
+  const retool = () => invoke("cull_view").then(show).catch(() => {});
+
+  function setMode(name, inHandNow) {
+    tool = inHandNow ?? "";
+    drawTool();
+    if (mode === name) return;
+    mode = name;
+    drawTool();
     outlived();
     // The grid is laid out from the canvas, so the view controls beside it are
     // about a photograph that is not on screen. Dimmed rather than removed, so
@@ -2683,7 +2855,7 @@
       // In crop the same two keys mean take it and throw it away, which is why
       // crop is a mode rather than a flag.
       case "enter":
-        if (document.getElementById("mode").textContent === "crop") { act("crop_apply"); break; }
+        if (mode === "crop") { act("crop_apply"); break; }
         act("loupe"); break;
       case "escape":
         // A ladder, one rung a press: a control (above), whatever the pointer
@@ -2696,7 +2868,7 @@
         if (picking) { pickWb(false); break; }
         if (pickingRange) { pickRange(false); break; }
         if (placing) { place(false); break; }
-        if (document.getElementById("mode").textContent === "crop") { act("crop_cancel"); break; }
+        if (mode === "crop") { act("crop_cancel"); break; }
         act("loupe"); break;
       case "e": act("loupe"); break;
       // R for the crop tool, as in Lightroom; the brackets rotate, as in
@@ -2704,6 +2876,9 @@
       case "r": act("crop"); break;
       // Q for the spot tool, as in Lightroom.
       case "q": act("spot"); break;
+      // W for the white-balance eyedropper, as in Lightroom. It had a button and
+      // no key, in a section ten down the column.
+      case "w": pickWb(!picking); break;
       // O for the coverage tint, which is the other half of seeing a mask.
       case "o": invoke("show_mask", { on: !showingMask }).catch(say); break;
       case "[": send({ command: "rotate_by", params: -1 }); break;
@@ -2730,8 +2905,7 @@
       // editor has it, and otherwise out of the collection being looked at —
       // never out of the library; the shell refuses that and says why.
       case "backspace": case "delete":
-        if (document.getElementById("mode").textContent === "spot")
-          document.getElementById("spot-remove").click();
+        if (mode === "spot") document.getElementById("spot-remove").click();
         else act("take_out");
         break;
       case "m": act("mark"); break;

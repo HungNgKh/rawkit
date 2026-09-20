@@ -314,6 +314,16 @@ fn snapshot(state: tauri::State<'_, Shared>) -> serde_json::Value {
         // say — and a button that goes on claiming to be armed is worse than
         // one that is a frame behind.
         "mode": mode_name(),
+        "tool": tool_name(),
+        // Armed on the shell's say-so rather than the page's memory of having
+        // asked: the shell puts these down on its own when crop or the spot
+        // tool is picked up, and a button left lit for a picker that is no
+        // longer armed is a press that does something else.
+        "armed": {
+            "wb": PICKING_WB.load(std::sync::atomic::Ordering::Relaxed),
+            "range": PICKING_RANGE.load(std::sync::atomic::Ordering::Relaxed),
+            "target": TARGET.load(std::sync::atomic::Ordering::Relaxed),
+        },
         // Whether this photograph has a lens profile at all. A correction the
         // body cannot make is worth saying out loud rather than offering as a
         // control that refuses every time it is touched.
@@ -929,6 +939,9 @@ fn cull(
             // the session is: it needs the whole frame on screen before it can
             // say where the crop somebody already has sits on it.
             *CROP_DRAG.lock().expect("crop drag lock") = None;
+            if next == MODE_CROP {
+                put_down_the_rest();
+            }
             MODE.store(next, std::sync::atomic::Ordering::Relaxed);
             CullAction::SelectBy(0)
         }
@@ -942,6 +955,9 @@ fn cull(
             };
             *SPOT_DRAG.lock().expect("spot drag lock") = None;
             *SPOT_GRAB.lock().expect("spot grab lock") = None;
+            if next == MODE_SPOT {
+                put_down_the_rest();
+            }
             MODE.store(next, std::sync::atomic::Ordering::Relaxed);
             CullAction::SelectBy(0)
         }
@@ -949,6 +965,16 @@ fn cull(
             // Turning a rectangle into a crop needs the viewport, which lives in
             // the render loop. This only says that it should happen.
             CROP_COMMIT.store(true, std::sync::atomic::Ordering::Relaxed);
+            CullAction::SelectBy(0)
+        }
+        CullAction::CropReset => {
+            // Only inside the tool, where there is a rectangle to put back. The
+            // whole frame, in the fractions of it the rectangle is kept in.
+            if mode() == MODE_CROP {
+                *CROP_DRAG.lock().expect("crop drag lock") = None;
+                *CROP_RECT.lock().expect("crop rect lock") = Some([0.0, 0.0, 1.0, 1.0]);
+                notice("The whole frame again; keep it or cancel");
+            }
             CullAction::SelectBy(0)
         }
         CullAction::CropCancel => {
@@ -2999,6 +3025,9 @@ fn arm_target(control: Option<String>) -> Result<u8, String> {
             ))
         }
     };
+    if armed != 0 {
+        hands_free()?;
+    }
     TARGET.store(armed, std::sync::atomic::Ordering::Relaxed);
     if armed == 0 {
         *TARGET_AIM.lock().expect("aim lock") = None;
@@ -3498,6 +3527,7 @@ fn starting_shape(kind: Option<&str>) -> Result<rawkit_editstate::MaskShape, Str
 
 #[tauri::command]
 fn add_mask(kind: Option<String>, state: tauri::State<'_, Shared>) -> Result<usize, String> {
+    hands_free()?;
     let shape = starting_shape(kind.as_deref())?;
     let mut session = state.0.lock().expect("session lock");
     let mut masks = session.state().masks.clone();
@@ -3652,7 +3682,10 @@ fn remove_mask(index: usize, state: tauri::State<'_, Shared>) -> Result<usize, S
 
 /// Which one the panel is showing.
 #[tauri::command]
-fn select_mask(index: Option<usize>) -> usize {
+fn select_mask(index: Option<usize>) -> Result<usize, String> {
+    if index.is_some() {
+        hands_free()?;
+    }
     let chosen = index.unwrap_or(usize::MAX);
     SELECTED_MASK.store(chosen, std::sync::atomic::Ordering::Relaxed);
     // A different adjustment shows its own first shape. Carrying the part index
@@ -3662,7 +3695,7 @@ fn select_mask(index: Option<usize>) -> usize {
     if index.is_none() {
         PLACING_MASK.store(false, std::sync::atomic::Ordering::Relaxed);
     }
-    chosen
+    Ok(chosen)
 }
 
 /// The brush's width and whether it is erasing.
@@ -4076,12 +4109,15 @@ fn aim_range(camera: [f32; 3], shared: &std::sync::Arc<Mutex<Session>>) -> Resul
 /// than moving two sliders and watching what happens. The band keeps its width
 /// and moves to sit around what was picked.
 #[tauri::command]
-fn pick_range(armed: bool) -> bool {
+fn pick_range(armed: bool) -> Result<bool, String> {
+    if armed {
+        hands_free()?;
+    }
     PICKING_RANGE.store(armed, std::sync::atomic::Ordering::Relaxed);
     if !armed {
         *RANGE_PICK.lock().expect("range pick lock") = None;
     }
-    armed
+    Ok(armed)
 }
 
 /// A request for an upright, awaiting the render loop.
@@ -4106,12 +4142,15 @@ fn upright() {
 
 /// Set the white balance from a patch that ought to be neutral.
 #[tauri::command]
-fn pick_white_balance(armed: bool) -> bool {
+fn pick_white_balance(armed: bool) -> Result<bool, String> {
+    if armed {
+        hands_free()?;
+    }
     PICKING_WB.store(armed, std::sync::atomic::Ordering::Relaxed);
     if !armed {
         *WB_PICK.lock().expect("pick lock") = None;
     }
-    armed
+    Ok(armed)
 }
 
 pub(crate) static CANVAS_CLICK: Mutex<Option<([f64; 2], bool)>> = Mutex::new(None);
@@ -4422,6 +4461,94 @@ struct Survey {
 
 /// Set when the page asks for the rectangle to be taken.
 static CROP_COMMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The other half of one tool at a time: nothing else is picked up while a crop,
+/// the spot tool or a placement is in hand.
+///
+/// The keys are held back by the page and by `cull`, but every one of these has
+/// a button as well, and a button is not a key. Without this, "Add gradient"
+/// pressed mid-crop put a gradient's handles on top of the crop rectangle and
+/// left one press on the photograph meaning two things.
+fn hands_free() -> Result<(), String> {
+    match tool_in_hand() {
+        Some(tool) => Err(format!(
+            "{} is in hand; finish or cancel it first",
+            tool.name()
+        )),
+        None => Ok(()),
+    }
+}
+
+/// One tool at a time: picking up crop or the spot tool puts everything else
+/// down.
+///
+/// They all answer the same press on the photograph, and only one can have it.
+/// The selected adjustment went on drawing its outline and handles through the
+/// spot tool — a gradient's handles over a photograph being retouched, and a
+/// drag that might grab either — and an armed eyedropper stayed armed under a
+/// crop. Put down here rather than ignored while the other tool is up, because
+/// "still armed, but not now" is a state nobody can see.
+fn put_down_the_rest() {
+    // Putting down is never refused, so there is nothing in these to handle.
+    let _ = select_mask(None);
+    let _ = pick_white_balance(false);
+    let _ = pick_range(false);
+    TARGET.store(0, std::sync::atomic::Ordering::Relaxed);
+    *TARGET_AIM.lock().expect("aim lock") = None;
+}
+
+/// What is in hand, in one word, for the page to show and light its tools from.
+///
+/// The most specific thing first: a crop or the spot tool is a mode and owns
+/// the photograph; then whatever the next press is armed to mean; then the
+/// adjustment that is selected, whose handles a press would grab. Empty for
+/// none. The page knows which *kind* of adjustment it is — that is in the edit
+/// — so this only says that one is.
+pub(crate) fn tool_name() -> &'static str {
+    use std::sync::atomic::Ordering::Relaxed;
+    tool_name_of(
+        mode(),
+        PLACING_MASK.load(Relaxed),
+        PICKING_WB.load(Relaxed),
+        PICKING_RANGE.load(Relaxed),
+        TARGET.load(Relaxed) != 0,
+        SELECTED_MASK.load(Relaxed) != usize::MAX,
+    )
+}
+
+/// The order of precedence on its own, away from the statics it is read from —
+/// which are process-wide, so a test that set them would be racing every other
+/// test that does.
+fn tool_name_of(
+    mode: u8,
+    placing: bool,
+    picking_wb: bool,
+    picking_range: bool,
+    targeting: bool,
+    selected: bool,
+) -> &'static str {
+    match mode {
+        MODE_CROP => return "crop",
+        MODE_SPOT => return "spot",
+        // Nothing is in hand in a view of many photographs, whatever was left
+        // armed on the way in.
+        MODE_GRID | MODE_SURVEY => return "",
+        _ => {}
+    }
+    if placing {
+        "placing"
+    } else if picking_wb {
+        "wb"
+    } else if picking_range {
+        "range"
+    } else if targeting {
+        "target"
+    } else if selected {
+        "mask"
+    } else {
+        ""
+    }
+}
 
 /// The tool in hand, if there is one. See [`library::Tool`] for why these three.
 fn tool_in_hand() -> Option<library::Tool> {
@@ -5802,6 +5929,54 @@ mod tests {
     /// The notice slot is one process-wide value, so the tests that use it take
     /// turns rather than reading each other's messages.
     static SAYING: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn the_badge_names_what_a_press_would_do() {
+        let nothing = |mode| tool_name_of(mode, false, false, false, false, false);
+        assert_eq!(nothing(MODE_LOUPE), "");
+        assert_eq!(nothing(MODE_CROP), "crop");
+        assert_eq!(nothing(MODE_SPOT), "spot");
+
+        // The case the badge got wrong: a gradient live on the photograph, and
+        // LOUPE on the badge, because a gradient is not a view.
+        assert_eq!(
+            tool_name_of(MODE_LOUPE, false, false, false, false, true),
+            "mask"
+        );
+        // Being placed outranks merely being selected — it is selected as well,
+        // and what the next drag does is place it.
+        assert_eq!(
+            tool_name_of(MODE_LOUPE, true, false, false, false, true),
+            "placing"
+        );
+        // An armed picker outranks the selected adjustment for the same reason:
+        // the range picker is only ever armed *with* one selected, and the next
+        // press picks rather than grabs a handle.
+        assert_eq!(
+            tool_name_of(MODE_LOUPE, false, false, true, false, true),
+            "range"
+        );
+        assert_eq!(
+            tool_name_of(MODE_LOUPE, false, true, false, false, false),
+            "wb"
+        );
+        assert_eq!(
+            tool_name_of(MODE_LOUPE, false, false, false, true, false),
+            "target"
+        );
+
+        // A mode owns the photograph whatever else was left armed, and a view
+        // of many photographs has no tool at all.
+        assert_eq!(
+            tool_name_of(MODE_CROP, true, true, true, true, true),
+            "crop"
+        );
+        assert_eq!(tool_name_of(MODE_GRID, false, true, false, false, true), "");
+        assert_eq!(
+            tool_name_of(MODE_SURVEY, false, false, false, true, true),
+            ""
+        );
+    }
 
     #[test]
     fn a_failure_is_not_talked_over() {

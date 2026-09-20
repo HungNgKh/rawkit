@@ -29,6 +29,9 @@ what a contributor would otherwise undo.
 | **I4** | The shell says what happened; the page says which key | `CullView::said` is a sentence with no key names in it. |
 | **I5** | A tool in hand owns the keyboard | In crop, spot, or while placing an adjustment, keys that judge or move wait — and say so. Held in the page *and* the shell. |
 | **I6** | A pointer gives the keyboard back; a keyboard keeps it | A slider blurs after a drag, not after Tab. Escape is one rung per press. |
+| **I8** | What is showing and what is in hand are two words | `mode` is the view; `tool` is what a press on the photograph would do. Both come from the shell. |
+| **I9** | One tool at a time, in both directions | Picking up crop or the spot tool puts the rest down; while one is in hand, nothing else is picked up — by key *or* by button. |
+| **I10** | The tool's exits are always on screen | A row in the footer: what is in hand, how to leave it, and buttons that do it. |
 | **I7** | Copying settings is a chord | `Ctrl+Shift+C` / `Ctrl+Shift+V`; bare `S` and `A` say where they went. |
 
 ## I1 — one status line
@@ -174,6 +177,57 @@ expensive key on the board was also the easiest to hit. Now `Ctrl+Shift+C` and
 they went, for as long as hands remember them — a key that silently stopped
 working is a bug report.
 
+## I8 — two words
+
+The badge read LOUPE while a gradient was live on the photograph, because it
+showed the *view* and a gradient is not a view. It was also the variable: four
+places read the badge's text back to decide what Enter, Escape and Backspace do,
+so changing what it says would have changed what they do.
+
+`mode` stays the view (`loupe · grid · survey · crop · spot`). `tool` is one word
+for what a press on the photograph would do — `crop · spot · placing · wb · range
+· target · mask`, or nothing — decided in the shell by `tool_name_of`, most
+specific first: a mode owns the photograph; then whatever the next press is armed
+to mean; then the adjustment whose handles a press would grab. A grid or a survey
+has no tool whatever was left armed on the way in. The page holds both as
+variables and the badge only displays them.
+
+The page used to keep its own note of which pickers it had armed, and the shell
+never said otherwise. Now the snapshot carries `armed`, and the page draws from
+it (`followArmed` — draws only, invokes nothing, or the two would chase each
+other).
+
+## I9 — one tool at a time
+
+Every tool answers the same press on the photograph, and only one can have it.
+The selected adjustment went on drawing its outline and handles through the spot
+tool; an armed eyedropper stayed armed under a crop.
+
+- **Picking up crop or the spot tool puts everything else down**
+  (`put_down_the_rest`): the selected adjustment, both eyedroppers, the mixer's
+  target. Put down rather than ignored while the other tool is up, because
+  "still armed, but not now" is a state nobody can see.
+- **While crop, the spot tool or a placement is in hand, nothing else is picked
+  up** (`hands_free`), in `add_mask`, `select_mask`, `arm_target` and both
+  pickers. I5 held the *keys* back; every one of these has a button as well.
+
+## I10 — the exits, always
+
+| Where a tool says how to leave it | |
+|---|---|
+| Over the photograph, beside the tool | Not possible: HTML cannot be over the canvas on Linux and the GPU draws no text. |
+| In the tool's own section | Scrolls away, and crop had no section. |
+| **A row in the footer** | The one part of the column that cannot scroll. Becomes the tool-options bar under the canvas when the window gains four sides. |
+
+It carries the name, the keys, and buttons for them — crop gets **Done · Cancel ·
+Reset**, which it never had. `CropReset` puts the rectangle back to the whole
+frame *inside* the tool and commits nothing, so Cancel still undoes it.
+
+The tool strip under the histogram is a second way to press the same keys: it
+calls what they call and waits for what they wait for. It is lit from `tool`,
+never from having been clicked. Picking a tool up opens its section and brings it
+to the top — once, when the tool changes, not on every poll.
+
 ## If you change this
 
 | If you touch… | …this will tell you |
@@ -185,4 +239,6 @@ working is a bug report.
 | what counts as a failure | `a_refusal_and_a_failure_are_told_apart_by_cause` |
 | which actions a tool holds back, or adding a `CullAction` | `a_tool_in_hand_keeps_the_keyboard`, and `waits_for` will not compile until the new action is placed |
 | which *keys* a tool holds back | nothing automatic — `WAITS` and `inHand()` in the page are checked by hand in the window. Keep them in step with `waits_for`. |
+| the order of precedence between tools | `the_badge_names_what_a_press_would_do` |
+| a new tool, or a new way to pick one up | add it to `tool_name_of`, to `TOOLS` in the page, and put `hands_free()?` at the top of the command that arms it |
 | anything that writes a message in the page | there must be exactly one writer: `grep -n 'saidLine\.\|failedLine\.' panel.html` shows only `tell` and the dismiss handler |

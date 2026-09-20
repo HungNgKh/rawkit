@@ -327,6 +327,10 @@ pub enum CullAction {
     /// Take the rectangle that was drawn, or throw it away.
     CropApply,
     CropCancel,
+    /// Back to the whole frame, still inside the tool: the rectangle is put
+    /// back where an uncropped photograph has it and nothing is committed, so
+    /// it is undone by cancelling like any other change to the rectangle.
+    CropReset,
     /// Walk a collection instead of the whole library; `None` goes back to all
     /// of it. The filter still applies *within* it — see `Library::read`.
     ShowCollection(Option<i64>),
@@ -435,7 +439,10 @@ impl CullAction {
     pub fn waits_for(&self, tool: Tool) -> bool {
         match self {
             // The tool's own way in and ways out.
-            CullAction::Crop | CullAction::CropApply | CullAction::CropCancel => tool != Tool::Crop,
+            CullAction::Crop
+            | CullAction::CropApply
+            | CullAction::CropCancel
+            | CullAction::CropReset => tool != Tool::Crop,
             CullAction::Spot => tool != Tool::Spot,
             // Leaving for the loupe is how the spot tool is put down. It is not
             // how a crop is: that would leave without saying kept or discarded.
@@ -508,6 +515,11 @@ pub struct CullView {
     /// double-click on a cell opens the loupe — and the page would otherwise go
     /// on claiming the grid was up.
     pub mode: &'static str,
+    /// What is in hand, which is a different question from which view is
+    /// showing and used to be answered by the same badge: it read LOUPE while a
+    /// gradient was live on the photograph, because a gradient is not a view.
+    /// One word from the shell — see `tool_name` — and empty for nothing.
+    pub tool: &'static str,
     /// What is being looked at. Sent back rather than assumed, because the shell
     /// can change it without being asked: a filter that would leave nothing on
     /// screen is turned off, and the controls have to follow.
@@ -1210,7 +1222,10 @@ impl Library {
             // showing, not which photograph. Listed rather than caught by a
             // wildcard so adding a cull action still fails to compile here,
             // which is what has kept this match honest.
-            CullAction::Crop | CullAction::CropApply | CullAction::CropCancel => {}
+            CullAction::Crop
+            | CullAction::CropApply
+            | CullAction::CropCancel
+            | CullAction::CropReset => {}
             CullAction::SetFilter(filter) => self.narrow(filter)?,
             CullAction::ShowCollection(id) => self.show_collection(id)?,
             CullAction::TargetToggle => {
@@ -1724,6 +1739,7 @@ impl Library {
             marked: self.marked().len(),
             is_marked: self.marked.contains(&image.id),
             mode: crate::mode_name(),
+            tool: crate::tool_name(),
             filter: self.sequence.filter().clone(),
             collections: self.collections.clone(),
             viewing: match self.sequence.source() {
@@ -2554,6 +2570,8 @@ pub(crate) mod tests {
         // through the loupe would not have said whether it was kept.
         assert!(!CullAction::CropApply.waits_for(Tool::Crop));
         assert!(!CullAction::CropCancel.waits_for(Tool::Crop));
+        assert!(!CullAction::CropReset.waits_for(Tool::Crop));
+        assert!(CullAction::CropReset.waits_for(Tool::Spot));
         assert!(!CullAction::Crop.waits_for(Tool::Crop));
         assert!(CullAction::Loupe.waits_for(Tool::Crop));
         assert!(!CullAction::Spot.waits_for(Tool::Spot));
