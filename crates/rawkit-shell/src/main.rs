@@ -496,11 +496,7 @@ fn stop_previews() -> Result<(), String> {
 /// having stopped, and the way to try again the photographs that failed.
 #[tauri::command]
 fn build_previews() -> Result<(), String> {
-    if building::restart() {
-        Ok(())
-    } else {
-        Err("no catalog is open, so there are no previews to build".into())
-    }
+    building::restart().map_err(Into::into)
 }
 
 /// Choose a camera profile for the body on screen, and remember it.
@@ -1485,8 +1481,13 @@ fn main() -> Result<()> {
                     }
                     // The one thing that turns "no preview" into a preview, so
                     // the one thing that makes a cell worth asking about again.
+                    // And a cell already holding one is holding the *old* one:
+                    // a photograph is rebuilt because its edit changed, and a
+                    // grid that kept the thumbnail it had would go on showing
+                    // the edit before last until it was scrolled away and back.
                     for id in pumped.recorded {
                         grid.absent.remove(&id);
+                        grid.cells.remove(&id);
                     }
                 }
 

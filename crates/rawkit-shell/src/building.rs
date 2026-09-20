@@ -183,20 +183,43 @@ pub fn stop() -> bool {
     let Some(shared) = RUNNING.get() else {
         return false;
     };
-    let building = shared.progress.lock().expect("progress").is_some();
-    if building {
-        shared.stopped.store(true, Ordering::Relaxed);
-    }
-    building
+    shared.ask(false)
 }
 
-/// Build whatever is outstanding, from the top. `false` with no catalog open.
-pub fn restart() -> bool {
+/// Build whatever is outstanding, from the top. An error, in words, when that
+/// cannot happen — so the command never reports a success nothing will follow.
+pub fn restart() -> Result<(), &'static str> {
     let Some(shared) = RUNNING.get() else {
-        return false;
+        return Err("no catalog is open, so there are no previews to build");
     };
-    shared.restart.store(true, Ordering::Relaxed);
-    true
+    if shared.broken.load(Ordering::Relaxed) {
+        return Err("previews cannot be built in the window on this machine: \
+                    it has no second graphics device to build them on");
+    }
+    shared.ask(true);
+    Ok(())
+}
+
+impl Shared {
+    /// Build, or stop: the two things a person can ask for, settled here and
+    /// not in the pump. Each clears the other, so **the last thing asked is
+    /// what happens**. When the pump did the clearing, a Build and a Stop
+    /// landing inside one frame came out as Build whichever was pressed last.
+    ///
+    /// Stop answers `false` when nothing was being built, and changes nothing.
+    fn ask(&self, build: bool) -> bool {
+        if build {
+            self.stopped.store(false, Ordering::Relaxed);
+            self.restart.store(true, Ordering::Relaxed);
+            return true;
+        }
+        let building = self.progress.lock().expect("progress").is_some();
+        if building {
+            self.restart.store(false, Ordering::Relaxed);
+            self.stopped.store(true, Ordering::Relaxed);
+        }
+        building
+    }
 }
 
 /// Something the pump has to say. Returned rather than said, so that what the
@@ -310,7 +333,6 @@ impl Builder {
             return Pumped::default();
         }
         if self.shared.restart.swap(false, Ordering::Relaxed) {
-            self.shared.stopped.store(false, Ordering::Relaxed);
             self.gave_up.clear();
             self.source = None;
         }
@@ -654,7 +676,7 @@ mod tests {
 
         // Asked from the top, the way "build the previews" asks: nothing is
         // wanting, so nothing is queued and there is nothing to report.
-        builder.shared.restart.store(true, Ordering::Relaxed);
+        builder.shared.ask(true);
         assert_eq!(builder.pump(&library), Pumped::default());
         assert!(take(&builder).is_none());
     }
@@ -694,9 +716,29 @@ mod tests {
         builder.pump(&library);
         assert!(take(&builder).is_none());
         // Until somebody asks by name, which is them saying something changed.
-        builder.shared.restart.store(true, Ordering::Relaxed);
+        builder.shared.ask(true);
         builder.pump(&library);
         assert_eq!(take(&builder).map(|w| w.image_id), Some(first.image_id));
+    }
+
+    #[test]
+    fn the_last_thing_asked_is_what_happens() {
+        let scratch = Scratch::new("building-last-asked");
+        let library = Mutex::new(library_at(&scratch.0, 3));
+        let (mut builder, _worker) = builder("test-build");
+        builder.pump(&library);
+
+        // Build and then Stop, both before the next frame: stopped.
+        assert!(builder.shared.ask(true));
+        assert!(builder.shared.ask(false));
+        builder.pump(&library);
+        assert!(take(&builder).is_none(), "Stop was pressed last");
+
+        // Stop and then Build, the same way: building, from the top.
+        builder.shared.ask(false);
+        builder.shared.ask(true);
+        builder.pump(&library);
+        assert!(take(&builder).is_some(), "Build was pressed last");
     }
 
     #[test]

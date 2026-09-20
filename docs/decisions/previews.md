@@ -37,8 +37,8 @@ terminal command the window never mentioned.
 | P10 | The walk covers everything the source holds, not what the filter shows | A build that followed the view would finish on three picks and leave the shoot black. A change of source restarts the walk; what is built is skipped by the test that found it wanting. |
 | P11 | Failures never stop a run and are said once | Counted, named at the end — the first by name, the rest by number — and not retried until somebody asks for a build by name. |
 | P12 | Persist nothing | Quit mid-build and the next launch walks again; the catalog already knows what is current. |
-| P13 | Stop and Build are commands with no key | They are for the day the machine is needed for something else. Stop without a way back would be a dead end, so both exist. |
-| P14 | The grid keys its cells by photograph and remembers misses | By position, a filter left slot 0 drawing the old slot 0; and four misses nearest the selection could starve every cell that did have a preview. |
+| P13 | Stop and Build are commands with no key, and **the last one asked wins** | They are for the day the machine is needed for something else. Stop without a way back would be a dead end, so both exist. Each clears the other where it is asked, not in the pump — there, two inside one frame came out as Build whichever was last. Build says so, in words, on a machine with no second device. |
+| P14 | The grid keys its cells by photograph and remembers misses | By position, a filter left slot 0 drawing the old slot 0; and four misses nearest the selection could starve every cell that did have a preview. What the pump records is dropped from both the misses and the cells: a photograph is rebuilt because its edit changed, so the thumbnail in hand is the old one. |
 
 ## Measured
 
@@ -88,6 +88,7 @@ once each time the builder wakes — not a per-row price.
 | who records previews, or when `in_flight` is cleared | `a_result_of_any_kind_lets_the_photograph_be_asked_for_again`, `what_the_builder_finishes_reaches_the_catalog_and_is_not_asked_for_again` |
 | what the queue admits | `a_photograph_asked_for_twice_is_built_once`, `forgetting_the_queue_lets_what_was_started_finish` |
 | what a run says, and how often | `the_run_says_what_it_came_to_once_and_names_a_failure`, `stopping_forgets_what_is_waiting_and_counts_what_was_done` |
+| what Stop and Build do to each other | `the_last_thing_asked_is_what_happens` |
 | how the builder is held or woken | `a_held_builder_starts_nothing_and_wakes_when_let_go` — a lost wakeup is a build that stops for good |
 | the rule for "stale" | `asking_a_page_at_a_time_gives_the_answer_asking_all_at_once_does` (catalog) |
 | the page size, or anything under the pump's lock | the scale gate's `page 64` and `record` columns |
