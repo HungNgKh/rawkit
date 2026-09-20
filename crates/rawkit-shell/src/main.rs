@@ -4966,7 +4966,11 @@ fn draw_grid(
     }
 
     let drawn = cells.len();
-    blit.draw_over(gpu, canvas_renderer.canvas(), &cells);
+    // Cleared first, which `draw_over` does not do. It was `draw_over` for a
+    // long time — swept up when the overlays moved to that call — and nothing
+    // showed until the grid got *shorter*: narrow it to the rejects and the one
+    // reject was drawn over a canvas still holding the other nine.
+    blit.draw_grid(gpu, canvas_renderer.canvas(), &cells);
     Ok(drawn)
 }
 
