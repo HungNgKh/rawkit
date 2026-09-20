@@ -135,6 +135,24 @@
   #sheet .key kbd { flex: 0 0 96px; font: inherit; color: #d8bf63; }
   #sheet .key span { color: #c9c9d1; }
 
+  /* The palette: every command, by name. In the column for the reason the sheet
+     is — nothing the page draws can be over the photograph — and at the top of
+     it, because that is where the eyes already are when the hands ask for it. */
+  #palette { position: absolute; inset: 0; z-index: 21; background: #1e1e22;
+             display: flex; flex-direction: column; padding: 12px 16px 0; }
+  #palette.hidden { display: none; }
+  #palette input { flex: 0 0 auto; width: 100%; box-sizing: border-box; font-size: 14px;
+                   padding: 8px 10px; }
+  #palette ol { list-style: none; margin: 10px -16px 0; padding: 0 0 12px; overflow-y: auto;
+                flex: 1 1 auto; }
+  #palette li { display: flex; align-items: baseline; gap: 10px; padding: 6px 16px; cursor: pointer; }
+  #palette li[aria-selected=true] { background: #2c2c36; }
+  #palette li .title { flex: 1 1 auto; color: #e8e8ea; }
+  #palette li .why { color: #e6b866; font-size: 11px; white-space: nowrap; }
+  #palette li kbd { font: inherit; font-size: 12px; color: #d8bf63; white-space: nowrap; }
+  #palette li.cannot .title { color: #9a9aa2; }
+  #palette .none { padding: 10px 16px; color: #9a9aa2; }
+
   /* The tools, under the histogram where a Lightroom hand looks for them. Lit
      from what the shell says is in hand, never from having been clicked — the
      shell puts tools down on its own, and a button still lit for a picker that
@@ -321,9 +339,15 @@
 <div id="workspaces" class="hidden" role="tablist" aria-label="workspace">
   <button data-command="grid" role="tab">Library</button>
   <button data-command="develop" role="tab">Develop</button>
+  <button data-command="palette" aria-label="find a command">⌕</button>
   <button data-command="shortcuts" id="sheet-open" aria-label="keyboard shortcuts">?</button>
 </div>
 <div id="sheet" class="hidden" role="dialog" aria-label="keyboard shortcuts"></div>
+<div id="palette" class="hidden" role="dialog" aria-label="find a command">
+  <input id="palette-box" type="text" placeholder="Find a command…" autocomplete="off"
+         spellcheck="false" role="combobox" aria-controls="palette-list" aria-expanded="true">
+  <ol id="palette-list" role="listbox"></ol>
+</div>
 <div id="bar">
   <canvas id="histogram" title="the developed photograph, in the values a file would carry"></canvas>
   <div id="readout">
@@ -2812,12 +2836,16 @@
                keeps: [] };
     return null;
   };
-  // Whether the tool in hand holds this command back. Says so when it does.
-  const heldBack = command => {
+  // What stands between a command and its being carried out, or null. Asked by
+  // `run`, which acts on the answer, and by the palette, which shows it beside
+  // the command before it is chosen — one function, because the two disagreeing
+  // would be a list that promises what the key then refuses.
+  const obstacle = command => {
     const tool = inHand();
-    if (!tool || !command.waits || tool.keeps.includes(command.id)) return false;
-    tell("refused", `${tool.name} is in hand — ${tool.exits}`);
-    return true;
+    if (tool && command.waits && !tool.keeps.includes(command.id)) return { kind: "tool", tool };
+    if (command.scope === "library" && workspace === "develop") return { kind: "library" };
+    if (command.scope === "develop" && workspace === "library") return { kind: "develop" };
+    return null;
   };
   const MAC = /Mac|iPhone|iPad/.test(navigator.platform);
 
@@ -2960,7 +2988,7 @@
   //          mod is Ctrl, or ⌘ on a Mac. The first is the one shown.
   //   scope  "library" or "develop" — where it means something — or "any".
   //   waits  it can change which photograph is on screen or what is recorded
-  //          about it, so it waits for a tool in hand (`heldBack`).
+  //          about it, so it waits for a tool in hand (`obstacle`).
   //   act    a cull action by the shell's name, with `value`; or `run` for the
   //          rest. `act: "…"` is spelt this way so the contract test can read it.
   const toggleFilter = () => {
@@ -2972,6 +3000,7 @@
     // whatever the pointer is armed to mean, the tool in hand, and then the
     // view — survey and grid step back to the loupe. The armed things come
     // first because they are the most recently picked up.
+    if (!document.getElementById("palette").classList.contains("hidden")) return closePalette();
     if (!document.getElementById("sheet").classList.contains("hidden")) return toggleSheet();
     if (armed !== null) return arm(null);
     if (picking) return pickWb(false);
@@ -3017,7 +3046,13 @@
     { id: "fullscreen", keys: ["f11"], scope: "any", waits: false, group: "Views",
       title: "Full screen", run: () => invoke("toggle_fullscreen").catch(say) },
     { id: "shortcuts", keys: ["?", "f1"], scope: "any", waits: false, group: "Views",
-      title: "This list", run: () => toggleSheet() },
+      title: "Keyboard shortcuts", run: () => toggleSheet() },
+    { id: "palette", keys: ["mod+k"], scope: "any", waits: false, group: "Views",
+      title: "Find a command", run: () => openPalette() },
+    // No key, and none needed: the palette is how a command without one is
+    // reached, which is what lets there be commands that are not worth a key.
+    { id: "actual-size", keys: [], scope: "any", waits: false, group: "Views",
+      title: "Zoom to 1:1", run: () => document.querySelector("[data-absolute]").click() },
 
     // -- moving
     { id: "next", keys: ["arrowright", " "], scope: "any", waits: true, group: "Moving",
@@ -3054,6 +3089,15 @@
     // -- selecting and collecting
     { id: "select", keys: ["m"], scope: "library", waits: true, group: "Collecting",
       title: "Select this photograph, or let it go", act: "mark" },
+    { id: "select-none", keys: ["mod+d"], scope: "library", waits: true, group: "Collecting",
+      title: "Select nothing", act: "clear_marks" },
+    { id: "collection-new", keys: [], scope: "library", waits: false, group: "Collecting",
+      title: "New collection from what is selected",
+      run: () => {
+        const section = document.getElementById("s-collections");
+        section.open = true;
+        document.getElementById("collection-new").click();
+      } },
     { id: "target", keys: ["k"], scope: "any", waits: true, group: "Collecting",
       title: "Into the ★ collection, or back out", act: "target_toggle" },
     { id: "target-selected", keys: ["shift+k"], scope: "any", waits: true, group: "Collecting",
@@ -3097,6 +3141,8 @@
       title: "White balance: pick something neutral", run: () => pickWb(!picking) },
     { id: "overlay", keys: ["o"], scope: "develop", waits: false, group: "Tools",
       title: "Show what the adjustment covers", run: () => invoke("show_mask", { on: !showingMask }).catch(say) },
+    { id: "upright", keys: [], scope: "develop", waits: false, group: "Tools",
+      title: "Level the horizon and the verticals", run: () => invoke("upright").catch(say) },
     { id: "rotate-left", keys: ["["], scope: "any", waits: true, group: "Tools",
       title: "Rotate a quarter turn left", run: () => send({ command: "rotate_by", params: -1 }) },
     { id: "rotate-right", keys: ["]"], scope: "any", waits: true, group: "Tools",
@@ -3161,12 +3207,14 @@
   const run = async id => {
     const command = byId.get(id);
     if (!command) return;
-    if (heldBack(command)) return;
-    if (command.scope === "library" && workspace === "develop") {
+    const blocked = obstacle(command);
+    if (blocked?.kind === "tool")
+      return tell("refused", `${blocked.tool.name} is in hand — ${blocked.tool.exits}`);
+    if (blocked?.kind === "library") {
       return tell("refused",
-        `${spelt(command.keys[0])} is a Library key (${command.title.toLowerCase()}) — G or E goes there`);
+        `${command.title} is the Library's — G or E goes there`);
     }
-    if (command.scope === "develop" && workspace === "library") {
+    if (blocked?.kind === "develop") {
       // Crop and the spot tool are views as far as the shell is concerned, and
       // it opens the photograph for them from anywhere. The rest work on the
       // edit in the session, which from a grid is still the *last* photograph's
@@ -3177,7 +3225,7 @@
         const fromMany = mode === "grid" || mode === "survey";
         await act("develop");
         if (fromMany)
-          return tell("info", `In Develop now — ${spelt(command.keys[0])} again to ${command.title.toLowerCase()}`);
+          return tell("info", `In Develop now — ask again to ${command.title.toLowerCase()}`);
       }
     }
     if (command.act) return act(command.act, command.value);
@@ -3211,7 +3259,8 @@
   // its key as a tooltip — so the key is learnt from the button it replaces.
   for (const element of document.querySelectorAll("[data-command]")) {
     const command = byId.get(element.dataset.command);
-    if (command) element.title = `${command.title} (${spelt(command.keys[0])})`;
+    if (command)
+      element.title = command.keys.length ? `${command.title} (${spelt(command.keys[0])})` : command.title;
   }
   document.addEventListener("click", event => {
     const element = event.target.closest("[data-command]");
@@ -3224,7 +3273,8 @@
     if (!sheet.classList.toggle("hidden")) {
       const groups = new Map();
       for (const command of COMMANDS) {
-        if (command.sheet === null) continue;
+        // The sheet is the keys. A command without one is found in the palette.
+        if (command.sheet === null || !command.keys.length) continue;
         if (!groups.has(command.group)) groups.set(command.group, []);
         groups.get(command.group).push(command);
       }
@@ -3249,6 +3299,129 @@
     }
   };
   sheet.addEventListener("click", toggleSheet);
+
+  // ---- The palette ---------------------------------------------------------------
+  //
+  // The registry again, searched. It runs a command the way a key does —
+  // through `run` — so it is held back by a tool in hand, sent to Develop first,
+  // or refused in the wrong workspace exactly as the key would be. What it adds
+  // is saying so *before* the command is chosen: a row that will not do what it
+  // says carries the reason, because a list of things that silently do nothing
+  // is worse than no list.
+  const palette = document.getElementById("palette");
+  const paletteBox = document.getElementById("palette-box");
+  const paletteList = document.getElementById("palette-list");
+  let found = [];
+  let chosen = 0;
+  // `obstacle`, in three words, for the row.
+  const inTheWay = command => {
+    const blocked = obstacle(command);
+    return !blocked ? null
+      : blocked.kind === "tool" ? `waits for ${blocked.tool.name}`
+      : blocked.kind === "library" ? "Library only" : "opens Develop";
+  };
+  // Every word typed has to be somewhere in the command. Ranked by where: a
+  // title that starts with it, then a word that does, then anywhere at all —
+  // and the key itself counts, so "shift k" finds what Shift+K does.
+  const search = text => {
+    const words = text.toLowerCase().split(/\s+/).filter(Boolean);
+    const scored = [];
+    for (const command of COMMANDS) {
+      // Not the two that only make sense from the keyboard they are on.
+      if (command.id === "escape" || command.id === "palette") continue;
+      const title = command.title.toLowerCase();
+      const rest = `${command.group} ${command.keys.map(spelt).join(" ")} ${command.id}`.toLowerCase();
+      let score = 0;
+      for (const word of words) {
+        if (title.startsWith(word)) score += 4;
+        else if (title.includes(` ${word}`)) score += 3;
+        else if (title.includes(word)) score += 2;
+        else if (rest.includes(word)) score += 1;
+        else { score = -1; break; }
+      }
+      if (score >= 0) scored.push([score, command]);
+    }
+    // Stable, so with nothing typed the list is the registry's own order, which
+    // is already by what people do most.
+    return scored.sort((a, b) => b[0] - a[0]).map(([, command]) => command);
+  };
+  const drawPalette = () => {
+    found = search(paletteBox.value);
+    chosen = Math.min(chosen, Math.max(0, found.length - 1));
+    if (!found.length) {
+      const none = document.createElement("li");
+      none.className = "none";
+      none.textContent = "Nothing is called that.";
+      return paletteList.replaceChildren(none);
+    }
+    paletteList.replaceChildren(...found.map((command, at) => {
+      const row = document.createElement("li");
+      row.setAttribute("role", "option");
+      row.setAttribute("aria-selected", String(at === chosen));
+      row.dataset.at = String(at);
+      const title = document.createElement("span");
+      title.className = "title";
+      title.textContent = command.title;
+      row.append(title);
+      const why = inTheWay(command);
+      if (why) {
+        const note = document.createElement("span");
+        note.className = "why";
+        note.textContent = why;
+        row.append(note);
+        // Going to Develop first is still doing it; the other two are not.
+        row.classList.toggle("cannot", why !== "opens Develop");
+      }
+      if (command.keys.length) {
+        const keys = document.createElement("kbd");
+        keys.textContent = spelt(command.keys[0]);
+        row.append(keys);
+      }
+      return row;
+    }));
+    paletteList.children[chosen]?.scrollIntoView({ block: "nearest" });
+  };
+  const closePalette = () => {
+    palette.classList.add("hidden");
+    // Handed back, or the box would go on owning the keyboard from behind a
+    // panel nobody can see.
+    paletteBox.blur();
+  };
+  const openPalette = () => {
+    sheet.classList.add("hidden");
+    palette.classList.remove("hidden");
+    paletteBox.value = "";
+    chosen = 0;
+    drawPalette();
+    paletteBox.focus();
+  };
+  const choose = at => {
+    const command = found[at];
+    closePalette();
+    if (command) run(command.id);
+  };
+  paletteBox.addEventListener("input", () => { chosen = 0; drawPalette(); });
+  // Its own keys, because a text box owns the keyboard and the handler above
+  // leaves it alone. Stopped here so Escape closes the palette and is not also a
+  // rung of the ladder behind it.
+  paletteBox.addEventListener("keydown", event => {
+    const step = { ArrowDown: 1, ArrowUp: -1 }[event.key];
+    if (step) {
+      chosen = (chosen + step + found.length) % Math.max(1, found.length);
+      drawPalette();
+    } else if (event.key === "Enter") choose(chosen);
+    else if (event.key === "Escape") closePalette();
+    else if (combo(event) === "mod+k") closePalette();
+    else return;
+    event.preventDefault();
+    event.stopPropagation();
+  });
+  paletteList.addEventListener("click", event => {
+    const row = event.target.closest("li[data-at]");
+    if (row) choose(Number(row.dataset.at));
+  });
+  // Clicking away is leaving, as it is for the sheet.
+  palette.addEventListener("click", event => { if (event.target === palette) closePalette(); });
 
   invoke("cull_view").then(show);
 </script>

@@ -35,6 +35,7 @@ what a contributor would otherwise undo.
 | **I11** | Library and Develop are a word the shell owns | `workspace`, beside `mode` and `tool`. The loupe is in both, so it cannot be derived. |
 | **I12** | One registry of commands | Keys, buttons, tooltips and the shortcut sheet are read from `COMMANDS`; a test holds its `waits` to the shell's `waits_for`. |
 | **I13** | The column shows one workspace's controls | Sections carry `library-only` / `develop-only`; the body says which. In the file in the order they display. |
+| **I14** | The palette is the registry, searched | It runs what a key runs, through `run`, and says what is in the way *before* the command is chosen. |
 | **I7** | Copying settings is a chord | `Ctrl+Shift+C` / `Ctrl+Shift+V`; bare `S` and `A` say where they went. |
 
 ## I1 — one status line
@@ -336,6 +337,31 @@ first because everything after it is judged through it; it was eleventh.
 `[hidden] { display: none !important }` — `label { display: flex }` outranked
 the attribute, so every row the page had marked hidden was on screen.
 
+## I14 — the palette
+
+`Ctrl+K`. Every command by name, with its key beside it — so it is also where a
+key is learnt — and the way to reach a command that has no key. That last part
+is what lets there be commands not worth a key: *Zoom to 1:1*, *Level the
+horizon*, *New collection from what is selected*.
+
+It is inside the column, like the sheet, because nothing the page draws can be
+over the photograph on Linux.
+
+A row that will not simply happen says why, in the row: *waits for Crop*,
+*Library only*, *opens Develop*. The reason comes from `obstacle(command)`, the
+same function `run` acts on. The first draft asked the three questions a second
+time for the palette; that is two accounts of one rule, which is what every
+review of this rework has found a bug in.
+
+Search is every typed word found somewhere in the command, ranked by where: the
+start of the title, the start of a word, anywhere in the title, then the group,
+the key and the id — so "shift k" finds what Shift+K does. With nothing typed the
+list is the registry's own order.
+
+The box has its own key handler and stops what it handles: a text box owns the
+keyboard, and Escape must close the palette without also being a rung of the
+ladder behind it.
+
 ## If you change this
 
 | If you touch… | …this will tell you |
@@ -349,6 +375,7 @@ the attribute, so every row the page had marked hidden was on screen.
 | which *keys* a tool holds back | nothing automatic — `WAITS` and `inHand()` in the page are checked by hand in the window. Keep them in step with `waits_for`. |
 | the order of precedence between tools | `the_badge_names_what_a_press_would_do` |
 | a new tool, or a new way to pick one up | add it to `tool_name_of`, to `TOOLS` in the page, and put `hands_free()?` at the top of the command that arms it |
+| why a command would not be carried out | `obstacle` in the page is the only place that decides; `run` and the palette both read it |
 | what a command does, which keys it has, or whether it waits | `page_contract::the_page_and_the_shell_agree_about_what_waits_for_a_tool`, and the registry throws at load on a key bound twice |
 | the shape of a registry entry | the same test — it reads `{ id: `, `act: "…"`, `value: …`, `waits: …` as text |
 | what the view carries per keypress | `the_view_says_where_a_photograph_is_kept`; the `holding 1` and `taken 1` columns of the scale gate |
