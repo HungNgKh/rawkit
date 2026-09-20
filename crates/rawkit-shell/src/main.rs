@@ -136,6 +136,7 @@
 //! is by value rather than by eye. Take several captures a second apart.
 
 #[cfg(target_os = "linux")]
+mod building;
 mod canvas;
 mod library;
 #[cfg(test)]
@@ -466,6 +467,40 @@ fn export_progress() -> Option<serde_json::Value> {
         "filename": exporting.filename,
         "finished": exporting.finished,
     }))
+}
+
+/// How far along the previews are, for the page to draw. `None` when nothing is
+/// being built — which is nearly always, and is why the page draws nothing.
+#[tauri::command]
+fn preview_progress() -> Option<serde_json::Value> {
+    let building = building::progress()?;
+    Some(serde_json::json!({
+        "done": building.done,
+        "total": building.total,
+        "counting": building.counting,
+        "filename": building.filename,
+    }))
+}
+
+/// Stop building previews. What is half made is finished; nothing else starts.
+#[tauri::command]
+fn stop_previews() -> Result<(), String> {
+    if building::stop() {
+        Ok(())
+    } else {
+        Err("no previews are being built".into())
+    }
+}
+
+/// Build whatever previews are outstanding, from the top — the way back from
+/// having stopped, and the way to try again the photographs that failed.
+#[tauri::command]
+fn build_previews() -> Result<(), String> {
+    if building::restart() {
+        Ok(())
+    } else {
+        Err("no catalog is open, so there are no previews to build".into())
+    }
 }
 
 /// Choose a camera profile for the body on screen, and remember it.
@@ -1158,6 +1193,9 @@ fn main() -> Result<()> {
             histogram,
             export,
             export_progress,
+            preview_progress,
+            stop_previews,
+            build_previews,
             choose_profile,
             clear_profile,
             presets,
@@ -1331,6 +1369,7 @@ fn main() -> Result<()> {
             let white = blit.upload(&gpu, &[255, 255, 255, 255], 1, 1)?;
             let mut grid = Grid {
                 cells: std::collections::HashMap::new(),
+                absent: std::collections::HashSet::new(),
                 scroll: 0.0,
             };
             let mut showing = Showing {
@@ -1423,8 +1462,33 @@ fn main() -> Result<()> {
             #[cfg(target_os = "linux")]
             let resizing = window_handle.clone();
 
+            // The previews nobody has built yet, built behind whatever is going
+            // on. Started here rather than on the first frame so the walk through
+            // the library is under way before the grid first asks for a cell.
+            let mut building = library
+                .as_ref()
+                .and_then(|library| library.lock().expect("library lock").previews_directory())
+                .map(building::Builder::spawn);
+
             let mut tick = move || -> Result<()> {
                 let started = std::time::Instant::now();
+
+                // Before anything that can return early: the grid does, below,
+                // and the grid is where somebody is sitting while this matters.
+                if let (Some(library), Some(building)) = (&navigating, &mut building) {
+                    let pumped = building.pump(library);
+                    for said in pumped.said {
+                        match said {
+                            building::Said::Info(text) => notice(text),
+                            building::Said::Failed(text) => failure(text),
+                        }
+                    }
+                    // The one thing that turns "no preview" into a preview, so
+                    // the one thing that makes a cell worth asking about again.
+                    for id in pumped.recorded {
+                        grid.absent.remove(&id);
+                    }
+                }
 
                 // A resize the window manager has already performed, applied
                 // between frames because that is the only moment a swapchain can
@@ -1464,6 +1528,13 @@ fn main() -> Result<()> {
                 // each other.
                 if in_grid() {
                     if let Some(library) = &navigating {
+                        // Nothing moves an edit from here, and this returns
+                        // before the place that would otherwise say so: leave
+                        // the loupe mid-drag and the builder would stay held
+                        // for as long as the grid was up.
+                        if let Some(building) = &building {
+                            building.hold(false);
+                        }
                         let drawn = draw_grid(
                             &gpu,
                             &blit,
@@ -1690,6 +1761,11 @@ fn main() -> Result<()> {
                         // reason the coarse pass is allowed to be soft.
                         if !moving {
                             session.set_haste(false);
+                        }
+                        // The same fact, told to the preview builder: while an
+                        // edit is moving the GPU is for the edit.
+                        if let Some(building) = &building {
+                            building.hold(moving);
                         }
                         session.level() != session.viewport().level(session.max_level())
                     };
@@ -4689,10 +4765,24 @@ pub(crate) fn mode_name() -> &'static str {
 
 /// The grid's own state: what is on the GPU, and where the view is.
 struct Grid {
-    /// Uploaded thumbnails, keyed by position in the sequence. Not an LRU by
-    /// time but by distance from the view, which for a grid is the same thing
-    /// and needs no bookkeeping.
-    cells: std::collections::HashMap<usize, rawkit_engine::PreviewImage>,
+    /// Uploaded thumbnails, keyed by photograph. Not an LRU by time but by
+    /// distance from the view, which for a grid is the same thing and needs no
+    /// bookkeeping.
+    ///
+    /// By photograph and not by position, which is what it used to be. A filter
+    /// renumbers what is showing, and nothing told this: narrow the grid to the
+    /// picks and slot 0 went on drawing whatever had been in slot 0 before.
+    cells: std::collections::HashMap<i64, rawkit_engine::PreviewImage>,
+    /// Photographs the catalog had no preview for when last asked.
+    ///
+    /// Without this, every frame asks again about every empty cell it can see —
+    /// two statements each, and at the smallest cell size that is a thousand
+    /// cells. And the four loads a frame is allowed went to the four cells
+    /// nearest the selection whether or not they had anything to load, so in a
+    /// library half built, the half that *was* built could sit behind four
+    /// misses and never arrive. A photograph leaves here when the builder
+    /// records its previews, which is the only thing that changes the answer.
+    absent: std::collections::HashSet<i64>,
     /// Vertical offset in canvas pixels.
     scroll: f64,
 }
@@ -4704,6 +4794,14 @@ struct Grid {
 /// Spreading them over frames turns a sixty-millisecond stall into cells that
 /// appear over the next half second, which is what a placeholder is for.
 const LOADS_PER_FRAME: usize = 4;
+
+/// How many cells one frame may ask about and find nothing for.
+///
+/// Its own number because a miss is not a load: two lookups and no file, no
+/// JPEG, no upload. Bounded all the same — it is under the library's lock, and
+/// a grid of a thousand empty cells should take a few frames to find that out
+/// rather than one long one.
+const MISSES_PER_FRAME: usize = 32;
 
 /// What the canvas can currently draw for the photograph on screen.
 ///
@@ -4853,30 +4951,53 @@ fn draw_grid(
 
     // Load a bounded number per frame, nearest to the selection first, so what
     // you are looking at fills in before what you are not.
-    let mut wanted: Vec<usize> = shown[from.min(count)..to.min(count)]
+    //
+    // Which photograph is in each slot, read once for the frame: the view, and
+    // four rows either side of it, which is how far a cell is worth keeping.
+    let (near_from, near_to) = (
+        from.saturating_sub(columns * 4).min(count),
+        (to + columns * 4).min(count),
+    );
+    let nearby: Vec<(usize, i64)> = {
+        let library = library.lock().expect("library lock");
+        shown[near_from..near_to]
+            .iter()
+            .filter_map(|&index| Some((index, library.id_at(index)?)))
+            .collect()
+    };
+    let id_of: std::collections::HashMap<usize, i64> = nearby.iter().copied().collect();
+    let mut wanted: Vec<(usize, i64)> = shown[from.min(count)..to.min(count)]
         .iter()
-        .copied()
-        .filter(|i| !grid.cells.contains_key(i))
+        .filter_map(|index| Some((*index, *id_of.get(index)?)))
+        .filter(|(_, id)| !grid.cells.contains_key(id) && !grid.absent.contains(id))
         .collect();
-    wanted.sort_by_key(|i| i.abs_diff(selected));
+    wanted.sort_by_key(|(index, _)| index.abs_diff(selected));
     let needed = cell.round() as u32;
-    for index in wanted.into_iter().take(LOADS_PER_FRAME) {
+    let (mut loaded, mut missed) = (0, 0);
+    for (index, id) in wanted {
+        if loaded == LOADS_PER_FRAME || missed == MISSES_PER_FRAME {
+            break;
+        }
         let decoded = library
             .lock()
             .expect("library lock")
             .preview_at(index, needed, None)?;
-        if let Some(decoded) = decoded {
-            let image = blit.upload(gpu, &decoded.rgba, decoded.width, decoded.height)?;
-            grid.cells.insert(index, image);
+        match decoded {
+            Some(decoded) => {
+                let image = blit.upload(gpu, &decoded.rgba, decoded.width, decoded.height)?;
+                grid.cells.insert(id, image);
+                loaded += 1;
+            }
+            None => {
+                grid.absent.insert(id);
+                missed += 1;
+            }
         }
     }
     // Anything far outside the view is not coming back soon.
-    let keep: std::collections::HashSet<usize> = shown
-        [from.saturating_sub(columns * 4).min(count)..(to + columns * 4).min(count)]
-        .iter()
-        .copied()
-        .collect();
-    grid.cells.retain(|index, _| keep.contains(index));
+    let keep: std::collections::HashSet<i64> = nearby.iter().map(|(_, id)| *id).collect();
+    grid.cells.retain(|id, _| keep.contains(id));
+    grid.absent.retain(|id| keep.contains(id));
 
     let mut cells = Vec::new();
     for (slot, &index) in shown
@@ -4892,8 +5013,9 @@ fn draw_grid(
         // moved through it invisibly. Drawn like any other cell below, so its
         // flag, its label and the selection's edge all show, and a cull can be
         // read off a grid that has not finished arriving.
-        let waiting = !grid.cells.contains_key(&index);
-        let image = grid.cells.get(&index).unwrap_or(blank);
+        let held = id_of.get(&index).and_then(|id| grid.cells.get(id));
+        let waiting = held.is_none();
+        let image = held.unwrap_or(blank);
         let row = slot / columns;
         let column = slot % columns;
         // Fit the photograph inside the slot, keeping its shape. A placeholder

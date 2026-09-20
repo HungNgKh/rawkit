@@ -196,6 +196,16 @@ impl Sequence {
             .map(|place| &self.rows[*place as usize])
     }
 
+    /// Every photograph the source holds, whatever the filter shows of them.
+    ///
+    /// What the preview builder walks. A filter narrows what somebody is looking
+    /// at, not what the library is: a build that followed the view would finish
+    /// "everything" on a view of three picks and leave the rest of the shoot
+    /// black for whoever clears the filter.
+    pub fn everything(&self) -> &[LibraryImage] {
+        &self.rows
+    }
+
     /// Which slot a photograph is showing in, if it is showing.
     pub fn position_of(&self, id: i64) -> Option<usize> {
         let place = self.place.get(&id)?;

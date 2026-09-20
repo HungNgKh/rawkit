@@ -212,3 +212,6 @@ is worse than none, for the reason a stale comment is.
 - [`docs/decisions/interface.md`](docs/decisions/interface.md) — the status line
   and its three levels, the test that holds the page to the shell's types, and
   the constraints every interface slice lives under.
+- [`docs/decisions/previews.md`](docs/decisions/previews.md) — previews that
+  build themselves in the window: which thread touches the catalog (one), what
+  the second GPU device costs a slider drag, and what is not built yet.

@@ -13,7 +13,11 @@
 //! nobody had run `rawkit catalog --previews` on was a black rectangle. Here,
 //! both front ends reach one implementation: [`build`] for a whole library from
 //! the terminal, which can still be interrupted and resumed by running it again
-//! — the catalog knows what is already current.
+//! — the catalog knows what is already current — and [`one`] for the window,
+//! which asks for a photograph at a time because what it wants next changes
+//! while it is working. `build` hands its workers a list fixed up front, and a
+//! list fixed up front is exactly what a person scrolling somewhere else makes
+//! wrong.
 //!
 //! # Rendering from the pyramid, not from the full frame
 //!
@@ -124,17 +128,7 @@ pub fn build(
                 let Some(wanted) = outstanding.get(index) else {
                     break;
                 };
-                let built = one(
-                    gpu,
-                    renderer,
-                    dir,
-                    Path::new(&wanted.path),
-                    wanted.image_id,
-                    &wanted.state,
-                    &wanted.edit_state_hash,
-                    &wanted.missing,
-                    stamp,
-                );
+                let built = one(gpu, renderer, dir, wanted, stamp);
                 // A closed channel means this thread's work is no longer wanted.
                 if sender.send((index, built)).is_err() {
                     break;
@@ -167,19 +161,27 @@ pub fn build(
 
 /// Render one photograph's previews, largest first so the smaller ones are made
 /// by downsampling what is already in hand rather than by rendering again.
-#[allow(clippy::too_many_arguments)]
-fn one(
+///
+/// Writes the files and **records nothing**: what comes back is for whoever
+/// owns the catalog to record. That is the rule [`build`] keeps by receiving on
+/// the thread that called it, and the one the window keeps by recording on its
+/// render loop — one connection, one writer, and no `SQLITE_BUSY` to handle
+/// because nothing else ever asks.
+pub fn one(
     gpu: &Gpu,
     renderer: &Renderer,
     dir: &Path,
-    raw_path: &Path,
-    image_id: i64,
-    state: &EditState,
-    edit_state_hash: &str,
-    levels: &[Level],
+    wanted: &previews::Wanted,
     // Which build is writing these, from `rawkit_engine::renderer_version`.
     stamp: &str,
 ) -> Result<Vec<Preview>> {
+    let raw_path = Path::new(&wanted.path);
+    let (image_id, state, edit_state_hash, levels): (i64, &EditState, &str, &[Level]) = (
+        wanted.image_id,
+        &wanted.state,
+        &wanted.edit_state_hash,
+        &wanted.missing,
+    );
     // Where a build's time actually goes. Set `RAWKIT_TIME_PREVIEWS=1` before
     // optimising anything here — the tile work taught this project that the
     // obvious suspect and the measured one are rarely the same.
@@ -195,6 +197,14 @@ fn one(
         }
     };
 
+    // Asked first and in so many words, because this is the failure a person
+    // will actually meet — a card not plugged in — and the decoder's account of
+    // it is "io error: Input/output error", which names nothing they can fix.
+    anyhow::ensure!(
+        raw_path.exists(),
+        "{} is not there: moved, renamed, or on a drive that is not plugged in",
+        raw_path.display()
+    );
     let raw = rawkit_decode::decode_file(raw_path)
         .with_context(|| format!("decoding {}", raw_path.display()))?;
     let phase = BayerPhase::from_cfa(raw.cfa)
@@ -252,8 +262,8 @@ fn one(
     // The developed size, which a crop makes different from the reduced frame's.
     let mut source = (developed.pixels, developed.width, developed.height);
     let mut built = Vec::new();
-    for wanted in order {
-        let edge = wanted.longest_edge().unwrap_or(source.1.max(source.2));
+    for size in order {
+        let edge = size.longest_edge().unwrap_or(source.1.max(source.2));
         let (scaled, w, h) = resample(&source.0, source.1, source.2, edge);
         lap("resample", &mut clock);
         let bytes = rawkit_export::encode(
@@ -265,7 +275,7 @@ fn one(
             },
         )?;
 
-        let relative = previews::relative_path(image_id, wanted, edit_state_hash);
+        let relative = previews::relative_path(image_id, size, edit_state_hash);
         let file = dir.join(&relative);
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)
@@ -275,7 +285,7 @@ fn one(
         lap("encode+write", &mut clock);
 
         built.push(Preview {
-            level: wanted,
+            level: size,
             path: relative,
             edit_state_hash: edit_state_hash.to_string(),
             // Stamped as it is written, from the build doing the writing. Read

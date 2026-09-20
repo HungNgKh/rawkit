@@ -1651,7 +1651,20 @@
     // finishes: an export that ends by the readout disappearing tells you
     // nothing about whether it worked.
     const job = await invoke("export_progress");
-    exportLine.classList.toggle("hidden", !job);
+    // Previews share the line, and give way to an export that is running:
+    // somebody asked for the export and is waiting on it, and nobody asked for
+    // these. An export that has *finished* gives way to them in turn — its
+    // result has been read by the time anything else has something to say.
+    const building = job && !job.finished ? null : await invoke("preview_progress");
+    exportLine.classList.toggle("hidden", !job && !building);
+    if (building) {
+      // "of at least" while the library is still being gone through: the total
+      // is still climbing, and a number that climbs is not yet the total.
+      exportLine.textContent =
+        `building previews · ${building.done} of ${building.counting ? "at least " : ""}${building.total}` +
+        (building.filename ? ` · ${building.filename}` : "");
+      return;
+    }
     if (!job) return;
     exportLine.textContent = job.finished
       ? job.finished
@@ -3170,6 +3183,13 @@
       title: "Export this photograph", run: () => invoke("export", { scope: "current" }).catch(say) },
     { id: "export-shown", keys: ["mod+shift+e"], scope: "any", waits: false, group: "The edit",
       title: "Export everything the filter shows", run: () => invoke("export", { scope: "shown" }).catch(say) },
+
+    // -- previews. No keys: they build themselves, and these are for the day
+    // somebody needs the machine for something else.
+    { id: "previews-stop", keys: [], scope: "any", waits: false, group: "Views",
+      title: "Stop building previews", run: () => invoke("stop_previews").catch(say) },
+    { id: "previews-build", keys: [], scope: "any", waits: false, group: "Views",
+      title: "Build the previews that are missing", run: () => invoke("build_previews").catch(say) },
   ];
   // Where two keys went, said for as long as hands remember them. Not commands:
   // there is nothing to run, and nothing to list.

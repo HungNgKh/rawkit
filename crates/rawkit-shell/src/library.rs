@@ -569,6 +569,15 @@ pub struct CullView {
     pub in_library: usize,
 }
 
+/// One page of [`Library::outstanding_page`].
+pub struct OutstandingPage {
+    pub wanted: Vec<previews::Wanted>,
+    /// Where the next page starts.
+    pub next: usize,
+    /// Whether that was the last of them.
+    pub finished: bool,
+}
+
 /// An open catalog and where we are in it.
 pub struct Library {
     catalog: Catalog,
@@ -1210,6 +1219,63 @@ impl Library {
             width,
             height,
         }))
+    }
+
+    /// Which photograph is showing in a slot.
+    pub fn id_at(&self, index: usize) -> Option<i64> {
+        self.sequence.get(index).map(|image| image.id)
+    }
+
+    /// Where the photographs on show come from: the library, or a collection.
+    pub fn source(&self) -> Source {
+        self.sequence.source()
+    }
+
+    /// Where this catalog keeps its previews. `None` for one held in memory.
+    pub fn previews_directory(&self) -> Option<std::path::PathBuf> {
+        previews::directory(&self.catalog)
+    }
+
+    /// What is outstanding among one page of the photographs, for the builder.
+    ///
+    /// A page, because this runs under the lock every keypress takes and the
+    /// whole walk is a quarter of a second at twenty thousand. Measured in the
+    /// scale gate: a page of 64 is 1.4 ms and does not grow with the library.
+    ///
+    /// Walks everything the source holds rather than what the filter shows. A
+    /// position in one source means nothing in another, so whoever keeps the
+    /// cursor asks [`Library::source`] under the same lock and throws the
+    /// cursor away when the answer changes.
+    pub fn outstanding_page(
+        &self,
+        from: usize,
+        count: usize,
+        renderer: &str,
+    ) -> Result<OutstandingPage> {
+        let everything = self.sequence.everything();
+        let from = from.min(everything.len());
+        let next = (from + count).min(everything.len());
+        Ok(OutstandingPage {
+            wanted: previews::outstanding_in(
+                &self.catalog,
+                &everything[from..next],
+                previews::Level::BULK,
+                renderer,
+            )?,
+            next,
+            finished: next == everything.len(),
+        })
+    }
+
+    /// Record what the builder made. The only way a preview built in the window
+    /// reaches the catalog, and called from the render loop alone — the builder
+    /// has no connection, which is what makes `SQLITE_BUSY` somebody else's
+    /// problem: there is nobody else.
+    pub fn record_previews(&self, image_id: i64, built: &[previews::Preview]) -> Result<()> {
+        for preview in built {
+            previews::record(&self.catalog, image_id, preview)?;
+        }
+        Ok(())
     }
 
     pub fn current(&self) -> &LibraryImage {
