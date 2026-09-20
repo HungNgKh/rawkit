@@ -1470,6 +1470,7 @@ fn main() -> Result<()> {
                             &mut canvas_renderer,
                             library,
                             &mut grid,
+                            &white,
                             surface_size,
                         )?;
                         // A grid draws nothing over the photograph, so the
@@ -4749,6 +4750,7 @@ fn draw_grid(
     canvas_renderer: &mut session_canvas::CanvasRenderer,
     library: &Mutex<Library>,
     grid: &mut Grid,
+    blank: &rawkit_engine::PreviewImage,
     surface: [u32; 2],
 ) -> Result<usize> {
     canvas_renderer.fit_surface(gpu, surface);
@@ -4883,13 +4885,24 @@ fn draw_grid(
         .take(to.min(count))
         .skip(from.min(count))
     {
-        let Some(image) = grid.cells.get(&index) else {
-            continue;
-        };
+        // A photograph with no preview yet is still a photograph in the library,
+        // and it gets its place: a flat slot the shape of a frame. It used to be
+        // skipped, so a catalog nobody had built previews for was a black
+        // rectangle with nothing to say it held anything — and the selection
+        // moved through it invisibly. Drawn like any other cell below, so its
+        // flag, its label and the selection's edge all show, and a cull can be
+        // read off a grid that has not finished arriving.
+        let waiting = !grid.cells.contains_key(&index);
+        let image = grid.cells.get(&index).unwrap_or(blank);
         let row = slot / columns;
         let column = slot % columns;
-        // Fit the photograph inside the slot, keeping its shape.
-        let (iw, ih) = (image.width as f64, image.height as f64);
+        // Fit the photograph inside the slot, keeping its shape. A placeholder
+        // has none of its own, so it takes the slot's.
+        let (iw, ih) = if waiting {
+            (cell, slot_h)
+        } else {
+            (image.width as f64, image.height as f64)
+        };
         let scale = (cell / iw).min(slot_h / ih);
         let (w, h) = (iw * scale, ih * scale);
         let slot_x = gap / 2.0 + column as f64 * pitch_x;
@@ -4902,6 +4915,16 @@ fn draw_grid(
             .pop()
             .unwrap_or((None, None));
         let tint = match flag {
+            // The placeholder is a white texel, so its tint is its colour: a
+            // grey a step above the surround, and neutral, because it sits
+            // beside photographs being judged for colour. A rejected one is
+            // dimmed by the same third a rejected photograph is.
+            //
+            // In linear light, like every tint here: 0.025 is about #2b2b2b on
+            // screen. The first attempt wrote 0.11 meaning "a dark grey" and got
+            // a mid one, which is a slot brighter than most photographs in it.
+            Some(rawkit_catalog::cull::Flag::Reject) if waiting => [0.008, 0.008, 0.008],
+            _ if waiting => [0.025, 0.025, 0.025],
             // A third the brightness. The shape of a cull becomes visible
             // without reading anything, which is the whole point of a grid.
             Some(rawkit_catalog::cull::Flag::Reject) => [0.33, 0.33, 0.33],
