@@ -726,7 +726,10 @@ impl Library {
         let saved = rawkit_catalog::edits::save(&self.catalog, image, state, source)?;
         // `None` is an edit identical to the one already stored: nothing about
         // the photograph changed, so nothing about its previews did.
-        if saved.is_some() {
+        // Once each: with no builder to take the list — a machine with no
+        // second device, a catalog held in memory — it is never emptied, and
+        // this keeps it to the photographs edited rather than the edits made.
+        if saved.is_some() && !self.dirtied.contains(&image) {
             self.dirtied.push(image);
         }
         Ok(saved)
@@ -739,6 +742,16 @@ impl Library {
             .map(|(_, state)| state)
             .unwrap_or_default()
             .content_hash())
+    }
+
+    /// Whether the catalog still has this photograph. A virtual copy can be
+    /// deleted while the window is open, and something that was working on it
+    /// in the meantime needs to be able to find that out.
+    pub fn has_image(&self, image: i64) -> bool {
+        self.catalog
+            .connection()
+            .query_row("SELECT 1 FROM images WHERE id = ?1", [image], |_| Ok(()))
+            .is_ok()
     }
 
     /// The photographs whose edit has changed since this was last asked.

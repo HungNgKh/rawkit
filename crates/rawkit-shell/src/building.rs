@@ -541,6 +541,14 @@ impl Builder {
         {
             let mut library = library.lock().expect("library lock");
             for built in arrived {
+                // Deleted while it was being built — a virtual copy can be. Not
+                // a failure: recording it would be refused by the foreign key,
+                // and the person would be told in red, with a database's
+                // wording, about a photograph they removed on purpose.
+                if !library.has_image(built.image_id) {
+                    self.found = self.found.saturating_sub(1);
+                    continue;
+                }
                 // Rendered from an edit the photograph has since moved on from.
                 // Asked of the catalog rather than inferred from who saved
                 // what: it is one lookup a photograph, and it is right even
@@ -1310,6 +1318,33 @@ mod tests {
         let pumped = builder.pump(&library, &[]);
         assert_eq!(pumped.recorded, vec![taken.image_id]);
         assert_eq!(pumped.said, vec![]);
+    }
+
+    #[test]
+    fn a_photograph_deleted_while_it_was_being_built_is_nobodys_failure() {
+        let scratch = Scratch::new("building-deleted");
+        let library = Mutex::new(library_at(&scratch.0, 2));
+        let (mut builder, worker) = builder("test-build");
+        builder.pump(&library, &[]);
+        let (first, second) = (take(&builder).unwrap(), take(&builder).unwrap());
+
+        // What deleting a virtual copy does, by the cascades the schema has.
+        library
+            .lock()
+            .unwrap()
+            .catalog()
+            .connection()
+            .execute("DELETE FROM images WHERE id = ?1", [first.image_id])
+            .unwrap();
+        worker.send(rendered(&first, "test-build")).unwrap();
+        let pumped = builder.pump(&library, &[]);
+        assert_eq!(pumped, Pumped::default(), "nothing recorded, nothing said");
+
+        worker.send(rendered(&second, "test-build")).unwrap();
+        assert_eq!(
+            builder.pump(&library, &[]).said,
+            vec![Said::Info("Previews built for 1 photograph".into())]
+        );
     }
 
     #[test]
