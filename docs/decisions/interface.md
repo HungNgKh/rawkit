@@ -294,6 +294,16 @@ button cannot do what its key would have refused.
   scrapes every entry and holds its `waits` to `CullAction::waits_for`, which
   closes the gap S2 recorded as "kept in step by hand". It fails on a Reject
   that does not wait — the bug S2 was for.
+- **A chord belongs to a text box while one is being typed in.** The old handler
+  took every Ctrl chord before it looked at focus, so Ctrl+Z in a rename box
+  undid the *edit* and suppressed the box's own undo. A slider is not a text
+  box, and the chords still work with one focused.
+- **Enter opens a photograph from a grid or a survey, and is nothing otherwise.**
+  It used to send `loupe` whatever was showing — harmless while the loupe was
+  the only place to be, and with two workspaces a way of being thrown out of
+  Develop by Enter.
+- The Shift fallback is for bare keys only: Ctrl+Shift+S must not become Ctrl+S
+  because nothing is on the first.
 - A key bound twice throws at load. The second would simply never run, and
   nobody finds that by pressing it.
 - Shift on a key that does not use it is still the key (Shift+X rejects, as it

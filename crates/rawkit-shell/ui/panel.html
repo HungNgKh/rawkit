@@ -2806,7 +2806,7 @@
                // Leaving for the loupe with the rest: the shell lets it through
                // as this tool's way out, and a command it would accept must not
                // be refused here on its behalf.
-               keeps: ["spot", "loupe", "confirm", "remove"] };
+               keeps: ["spot", "loupe", "remove"] };
     if (placing)
       return { name: "An adjustment", exits: "drag on the photograph to place it, or Esc",
                keeps: [] };
@@ -2999,7 +2999,13 @@
       title: "Survey the selected photographs side by side", act: "survey" },
     { id: "confirm", keys: ["enter"], scope: "any", waits: true, group: "Views",
       title: "Open the photograph; in Crop, keep the crop",
-      run: () => act(mode === "crop" ? "crop_apply" : "loupe") },
+      // From many photographs to one, and nothing otherwise. It used to send
+      // `loupe` whatever was showing — harmless when the loupe was the only
+      // place to be, and now a way of being thrown out of Develop by Enter.
+      run: () => {
+        if (mode === "crop") return act("crop_apply");
+        if (mode === "grid" || mode === "survey") return act("loupe");
+      } },
     { id: "escape", keys: ["escape"], scope: "any", waits: false, group: "Views",
       title: "Put down whatever is in hand; then back to one photograph", run: escape },
     { id: "cells-smaller", keys: ["-"], scope: "library", waits: true, group: "Views",
@@ -3194,7 +3200,9 @@
 
     // Shift on a key that does not use it is still the key: Shift+X rejects, as
     // it always did, and Caps Lock changes nothing.
-    const command = byKey.get(key) ?? byKey.get(key.replace("shift+", ""));
+    // Bare keys only. A chord is not loosened: Ctrl+Shift+S must not become
+    // Ctrl+S because nothing is on the first.
+    const command = byKey.get(key) ?? (chord ? undefined : byKey.get(key.replace("shift+", "")));
     if (command) return run(command.id), event.preventDefault();
     if (MOVED[key]) return tell("refused", MOVED[key].replace("⌃⇧", MAC ? "⌘⇧" : "Ctrl+Shift+")), event.preventDefault();
   });
