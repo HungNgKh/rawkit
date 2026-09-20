@@ -3234,6 +3234,11 @@
 
   document.addEventListener("keydown", event => {
     if (event.altKey) return;
+    // While the palette is up the keyboard is its box's, however focus got away
+    // from it. Handed back rather than acted on: a key must not reach a
+    // photograph that a panel is covering.
+    if (!palette.classList.contains("hidden") && event.target !== paletteBox)
+      return paletteBox.focus(), event.preventDefault();
     const key = combo(event);
     // A focused control owns its own keys. Without this, arrows move the slider
     // *and* the selection, and a digit rates the photograph while you are
@@ -3270,6 +3275,8 @@
   // The sheet, drawn from the registry when it is asked for.
   const sheet = document.getElementById("sheet");
   const toggleSheet = () => {
+    // One panel over the column at a time, from whichever side it is asked.
+    palette.classList.add("hidden");
     if (!sheet.classList.toggle("hidden")) {
       const groups = new Map();
       for (const command of COMMANDS) {
@@ -3410,6 +3417,9 @@
       chosen = (chosen + step + found.length) % Math.max(1, found.length);
       drawPalette();
     } else if (event.key === "Enter") choose(chosen);
+    // Tab has nowhere to go: everything else is behind the panel, and focus
+    // sent there would be on a button nobody can see.
+    else if (event.key === "Tab") { /* stays in the box */ }
     else if (event.key === "Escape") closePalette();
     else if (combo(event) === "mod+k") closePalette();
     else return;
@@ -3422,6 +3432,12 @@
   });
   // Clicking away is leaving, as it is for the sheet.
   palette.addEventListener("click", event => { if (event.target === palette) closePalette(); });
+  // A press anywhere in the palette but the box would take focus from the box —
+  // and then P, typed to find "pick", would pick the photograph behind a panel
+  // that is covering it. The press still clicks; it just does not move focus.
+  palette.addEventListener("mousedown", event => {
+    if (event.target !== paletteBox) event.preventDefault();
+  });
 
   invoke("cull_view").then(show);
 </script>
