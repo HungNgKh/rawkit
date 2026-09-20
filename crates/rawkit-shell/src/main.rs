@@ -1368,6 +1368,7 @@ fn main() -> Result<()> {
                 absent: std::collections::HashSet::new(),
                 wanting: Vec::new(),
                 scroll: 0.0,
+                followed: None,
             };
             let mut showing = Showing {
                 path: raw.clone(),
@@ -4795,6 +4796,12 @@ struct Grid {
     wanting: Vec<i64>,
     /// Vertical offset in canvas pixels.
     scroll: f64,
+    /// The selection, column count, canvas height and number of cells the view
+    /// last moved to keep in sight. The view follows a *change* in these, not
+    /// their value. The count is there for a filter and for the survey: both
+    /// lay out a different set, and coming back from either has to find the
+    /// selection again even when nothing else about it has changed.
+    followed: Option<(usize, usize, u32, usize)>,
 }
 
 /// How many thumbnails to load in one frame.
@@ -4943,14 +4950,24 @@ fn draw_grid(
     // Follow the selection rather than making the user chase it. Only ever by
     // the minimum needed, so a selection already on screen does not move the
     // view at all.
-    let at = shown.iter().position(|i| *i == selected).unwrap_or(0);
-    let selected_row = (at / columns) as f64;
-    let top = selected_row * pitch_y;
-    let bottom = top + pitch_y;
-    if top < grid.scroll {
-        grid.scroll = top;
-    } else if bottom > grid.scroll + surface[1] as f64 {
-        grid.scroll = bottom - surface[1] as f64;
+    //
+    // And only when there is something to follow: the selection moved, or the
+    // layout did under it. This ran every frame once, which made the wheel a
+    // leash — it could turn the view exactly as far as kept the selected row
+    // on screen and was pulled back the next frame, so with the selection on
+    // the last row, scrolling up did nothing at all.
+    let following = (selected, columns, surface[1], count);
+    if grid.followed != Some(following) {
+        grid.followed = Some(following);
+        let at = shown.iter().position(|i| *i == selected).unwrap_or(0);
+        let selected_row = (at / columns) as f64;
+        let top = selected_row * pitch_y;
+        let bottom = top + pitch_y;
+        if top < grid.scroll {
+            grid.scroll = top;
+        } else if bottom > grid.scroll + surface[1] as f64 {
+            grid.scroll = bottom - surface[1] as f64;
+        }
     }
     let furthest = (rows as f64 * pitch_y - surface[1] as f64).max(0.0);
     grid.scroll = grid.scroll.clamp(0.0, furthest);
