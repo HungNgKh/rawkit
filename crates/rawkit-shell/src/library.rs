@@ -2518,7 +2518,31 @@ pub(crate) mod tests {
                 l.act(CullAction::SetFilter(Filter::default())).unwrap();
                 l.act(CullAction::SetFilter(narrowing.clone())).unwrap();
             });
+            // What the grid asks every frame at its smallest cells: a thousand
+            // photographs' marks, under the lock a keypress also wants. It has
+            // a frame to spend, not a keypress, so it is held to its own limit.
+            library
+                .act(CullAction::SetFilter(Filter::default()))
+                .unwrap();
+            let page: Vec<usize> = (n / 2..n / 2 + 1_000).collect();
+            let facts = median(&mut library, &mut |l| {
+                l.cell_facts(&page).unwrap();
+            });
+            assert!(
+                facts < std::time::Duration::from_millis(8),
+                "a page of marks at {n} took {facts:.1?}, which is half a frame"
+            );
+            // Everything showing, selected, and the view that follows it.
+            let all = median(&mut library, &mut |l| {
+                l.act(CullAction::SelectAll).unwrap();
+            });
+            println!("{n:>8} a page of marks {facts:>9.1?}, select all {all:>9.1?}");
+            library.act(CullAction::ClearMarks).unwrap();
+            library
+                .act(CullAction::SetFilter(narrowing.clone()))
+                .unwrap();
             for (what, took) in [
+                ("select all", all),
                 ("next", next),
                 ("view", view),
                 ("pick under a filter", pick),

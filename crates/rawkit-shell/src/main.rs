@@ -5828,11 +5828,20 @@ fn draw_grid(
                 selected = index;
                 let mut library = library.lock().expect("library lock");
                 match (click.extend, click.toggle) {
+                    // In a survey both are a plain click. A range there would
+                    // pull in every photograph *between* two of the frames
+                    // being compared, which are not on screen and were never
+                    // asked about; and letting one go would take it out of the
+                    // comparison with nothing to bring it back, where the
+                    // survey's own keys judge it and can be undone.
+                    _ if survey => library.select(index),
                     (true, _) => library.select_to(index),
-                    (false, true) => library.toggle_at(index),
-                    (false, false) => library.select(index),
+                    (_, true) => library.toggle_at(index),
+                    _ => library.select(index),
                 }
-                if click.double {
+                // Held keys mean "I am still choosing", so the second press of
+                // a fast pair is another choice and not a request to open.
+                if click.double && !click.extend && !click.toggle {
                     library.reopen();
                     MODE.store(MODE_LOUPE, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -5946,7 +5955,19 @@ fn draw_grid(
         .skip(from.min(count))
         .collect();
     let indices: Vec<usize> = showing.iter().map(|(_, index)| *index).collect();
-    let facts = library.lock().expect("library lock").cell_facts(&indices)?;
+    // A catalog that cannot be read for a moment costs the marks, not the
+    // window: an error out of a frame ends the render loop. Said once.
+    let facts = library
+        .lock()
+        .expect("library lock")
+        .cell_facts(&indices)
+        .unwrap_or_else(|why| {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                complain(&why);
+            }
+            vec![library::CellFacts::default(); indices.len()]
+        });
 
     // Marks are sized with the cell, and drawn once per size: a tenth of the
     // cell, no smaller than ten pixels — below that a star is a smudge — and no

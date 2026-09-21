@@ -754,9 +754,25 @@ which is not what a file manager does. Here a selection is built deliberately,
 with a key, often over minutes; a click to look at something should not be able
 to throw it away.
 
+**In a survey both are a plain click.** A survey lays out only the selected
+photographs, but a range is measured over the whole sequence: Shift-click between
+two compared frames would select every photograph between them in the library and
+the comparison of five would become one of five hundred. Ctrl-click would take a
+frame out of the comparison with nothing to bring it back, where the survey's own
+keys judge a frame and can be undone. Found in review, before anybody met it.
+
+**A double-click with Shift or Ctrl held does not open.** Held keys mean "still
+choosing"; two quick Ctrl-clicks are two choices.
+
 The selection is a list and a set (`Selected`): the list keeps the order a
 survey and an export show things in, and the set answers "is this one?" for a
 thousand cells sixty times a second without walking twenty thousand ids.
+
+What a cell carries is asked once a frame for the page, under the lock a keypress
+also wants. Measured at twenty thousand photographs on the development machine:
+0.6 ms for a thousand cells, 1.3 ms to select all. If the catalog cannot answer,
+the frame is drawn without marks and the failure is said once — an error out of a
+frame ends the render loop, and marks are not worth the window.
 
 ## If you change this
 
@@ -792,6 +808,8 @@ thousand cells sixty times a second without walking twenty thousand ids.
 | what a mark looks like | `rawkit_engine::glyphs` tests — lit at ten pixels, a dark opaque rim, nothing at the corners; and `a_mark_is_laid_over_a_thumbnail_and_the_thumbnail_shows_through_its_holes` on a GPU |
 | what Shift-click and Ctrl-click select | `a_range_is_what_can_be_seen_between_its_two_ends`, `a_range_across_a_filter_takes_what_is_showing_and_nothing_hidden` |
 | what a cell is told about its photograph | `everything_showing_can_be_selected_at_once_and_a_cell_knows_it` — in the order asked, and one query |
+| what a page of marks or "select all" costs | the `a page of marks` line of `a_cull_stays_instant_at_the_size_of_a_real_library` — held to half a frame, not to a keypress |
+| what a modified click does in a survey, or a modified double-click anywhere | nothing automatic. By hand: Shift-click and Ctrl-click a survey frame (the survey keeps its frames), Ctrl-double-click a cell (the grid stays) |
 | the order a cell's layers are drawn in | nothing automatic. Grounds, photographs, marks: a ground drawn after a photograph covers it |
 | what a launch opens | `what_is_named_is_what_opens`, `with_nothing_named_the_last_catalog_comes_back`, `a_catalog_that_was_closed_stays_closed`, `the_test_pattern_has_to_be_asked_for` |
 | the recent list | `the_last_one_opened_comes_first_and_is_listed_once`, `only_so_many_are_kept`, `a_bare_launch_reopens_the_last_one_only_if_it_is_there`, `a_list_that_cannot_be_read_is_an_empty_one` |
