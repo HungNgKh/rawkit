@@ -40,11 +40,24 @@ pub struct Remembered {
     pub maximised: bool,
 }
 
-fn path(app: &tauri::AppHandle) -> Option<PathBuf> {
+/// Where this machine's settings live, made if it is not there.
+///
+/// `RAWKIT_CONFIG_DIR` moves it. For a portable install — and for every test
+/// of the window, which would otherwise write its scratch catalogs into the
+/// list of recent ones somebody's real launch reads, and reopen one of them
+/// for that somebody the next morning.
+pub fn config_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
     use tauri::Manager;
-    let dir = app.path().app_config_dir().ok()?;
+    let dir = match std::env::var_os("RAWKIT_CONFIG_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => app.path().app_config_dir().ok()?,
+    };
     std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join("window.json"))
+    Some(dir)
+}
+
+fn path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    Some(config_dir(app)?.join("window.json"))
 }
 
 /// What was saved last time, if any of it can be read.

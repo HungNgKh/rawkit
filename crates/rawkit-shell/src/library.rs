@@ -87,6 +87,7 @@ impl Loaded {
                 )
             }
             Some(path) => {
+                there(path)?;
                 let raw = rawkit_decode::decode_file(path)
                     .with_context(|| format!("decoding {}", path.display()))?;
                 let phase = BayerPhase::from_cfa(raw.cfa).ok_or_else(|| {
@@ -141,6 +142,31 @@ impl Loaded {
         };
         loaded.levels = Pyramid::build(&loaded.frame(), tile).into_levels();
         Ok(loaded)
+    }
+
+    /// A flat dark frame, standing in for a photograph that could not be read.
+    ///
+    /// Something has to be on the canvas — the session, the renderer and every
+    /// command are built round there being a frame — and the alternative was
+    /// the error leaving through the render loop, which ends it: the window
+    /// froze on whatever was last drawn, because one file on a card that had
+    /// been pulled out could not be opened. Dark and featureless on purpose. It
+    /// must not look like a photograph, and the status line says what it is.
+    pub fn stand_in(tile: u32) -> Self {
+        let (width, height) = (1536u32, 1024u32);
+        let mut loaded = Self {
+            mosaic: vec![0.004; (width * height) as usize],
+            levels: Vec::new(),
+            size: [width, height],
+            phase: BayerPhase::Rggb,
+            wb: [1.0, 1.0, 1.0],
+            profile: CameraProfile::from_color_matrix(rawkit_engine::profile::IDENTITY),
+            camera: None,
+            orientation: rawkit_editstate::Orientation::AsShot,
+            distortion: None,
+        };
+        loaded.levels = Pyramid::build(&loaded.frame(), tile).into_levels();
+        loaded
     }
 
     /// Which body took this photograph.
@@ -661,21 +687,43 @@ pub struct Library {
     recorded: u64,
 }
 
+/// Refuse a file that is not there, in words a person can act on.
+///
+/// Asked before the decoder is, because what the decoder says about a missing
+/// file is "io error: Input/output error" — and this is the failure people
+/// will actually meet: a card that is not plugged in.
+fn there(path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        path.exists(),
+        "{} is not there: moved, renamed, or on a drive that is not plugged in",
+        path.display()
+    );
+    Ok(())
+}
+
 /// How many judgements can be taken back. Enough to cover a mis-keyed run
 /// through a burst, short enough to stay a keypress rather than a browser.
 const UNDO_DEPTH: usize = 64;
 
 impl Library {
     /// Open a catalog and stand at the first photograph in it.
+    #[cfg(test)]
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_or_empty(path)?
+            .ok_or_else(|| anyhow!("{} has no photographs in it", path.display()))
+    }
+
+    /// Open a catalog, or `None` for one with no photographs in it.
+    ///
+    /// Not an error, because a catalog somebody has just made is exactly that,
+    /// and a window that refused to open it would be refusing the first thing a
+    /// new person does. But not a `Library` either: a sequence is never empty,
+    /// and every view here is built on there being a photograph to show.
+    pub fn open_or_empty(path: &Path) -> Result<Option<Self>> {
         let catalog = Catalog::open(path)?;
-        let sequence =
-            Sequence::read(&catalog, Source::Library, Filter::default())?.ok_or_else(|| {
-                anyhow!(
-                    "{} has no images; run `rawkit catalog <path> --scan <folder>` first",
-                    path.display()
-                )
-            })?;
+        let Some(sequence) = Sequence::read(&catalog, Source::Library, Filter::default())? else {
+            return Ok(None);
+        };
         eprintln!(
             "library    : {} · {} image(s)",
             path.display(),
@@ -684,7 +732,7 @@ impl Library {
         let listed = collections::all(&catalog)?;
         let target = collections::target(&catalog)?;
         let tally = cull::tally(&catalog)?;
-        Ok(Self {
+        Ok(Some(Self {
             catalog,
             sequence,
             index: 0,
@@ -701,7 +749,7 @@ impl Library {
             recorded: 0,
             request: None,
             marked: Vec::new(),
-        })
+        }))
     }
 
     pub fn catalog(&self) -> &Catalog {
@@ -778,6 +826,7 @@ impl Library {
     /// set up for a frame whose pixels are going to come from a preview.
     pub fn size_of_current(&self) -> Result<([u32; 2], rawkit_editstate::Orientation)> {
         let path = &self.current().path;
+        there(Path::new(path))?;
         let meta = rawkit_decode::read_metadata(Path::new(path))
             .with_context(|| format!("reading {path}"))?;
         // The orientation travels with the size because the two are one answer:

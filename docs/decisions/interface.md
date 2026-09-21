@@ -37,6 +37,13 @@ what a contributor would otherwise undo.
 | **I13** | The column shows one workspace's controls | Sections carry `library-only` / `develop-only`; the body says which. In the file in the order they display. |
 | **I14** | The palette is the registry, searched | It runs what a key runs, through `run`, and says what is in the way *before* the command is chosen. |
 | **I7** | Copying settings is a chord | `Ctrl+Shift+C` / `Ctrl+Shift+V`; bare `S` and `A` say where they went. |
+| **I15** | Nothing open is a welcome screen | The canvas is hidden and the page covers the window: Open, New, one photograph, the recent catalogs. The synthetic mosaic is `--test-pattern`. |
+| **I16** | Opening something else is a relaunch | One process, one catalog. A new process cannot show the last catalog's collections, target or undo stack, because it never had them. |
+| **I17** | A bare launch reopens the last catalog; closing one stays closed | `recent.json` beside `window.json`. Closing is a relaunch with `--welcome`, or the relaunch would reopen what was just closed. |
+| **I18** | Nothing a person can meet may fail the launch or end the render loop | A catalog that will not open is the welcome screen and a sentence. A photograph that cannot be read is a flat stand-in and a sentence. |
+| **I19** | Every way out goes through the render loop | It owns the saver. Closing the window used to lose an edit made in the last 800 ms; now close, open and relaunch all flush first. |
+| **I20** | What the shell says has a command of its own | `take_notice`. It rode on `snapshot`, which five places read and two of them said. |
+| **I21** | New never replaces a catalog, and only `--new` makes one | The picker's "replace?" is a question about a file. Without `--new`, a path that is not there is refused, not created. |
 
 ## I1 — one status line
 
@@ -362,6 +369,120 @@ The box has its own key handler and stops what it handles: a text box owns the
 keyboard, and Escape must close the palette without also being a rung of the
 ladder behind it.
 
+## I15 — nothing open is a welcome screen
+
+A bare launch used to show a synthetic pink mosaic with a live histogram, live
+sliders and no words: every control worked, on a photograph that did not exist,
+and nothing said how to reach one that did (F01, the designer's first
+severity-4 finding). Now it shows what can be done: open a catalog, make one,
+open one photograph, or pick from the catalogs this machine has opened.
+
+On Linux the canvas is an X window *over* the page, so the page cannot be seen
+while it is mapped. With nothing open it is unmapped (`canvas::hide`) and the
+render loop draws nothing. Everything else is built as usual, over a stand-in
+frame — the session, the state the commands ask for — because thirty commands
+take that state and a window with none of it managed would turn each of them
+into a way to crash. The page asks `entrance` once, and while it says
+`welcome`, `run` lets through only registry entries marked `welcome: true`.
+
+An open catalog with no photographs in it is the same screen with a different
+headline. Until import is built (S8) it says how to fill it from a terminal,
+which is a tax on a stranger and is stated rather than hidden.
+
+The mosaic is `--test-pattern`. It is a developer's tool and is spelt like one.
+
+## I16 — opening something else is a relaunch
+
+**Weighed against:** switching in place. It would be seamless, and it is what
+the plan first assumed.
+
+A catalog is not one value in this shell. It is the library, the saver, the
+session, the preview builder and its thread, the grid's textures, and some
+thirty statics: the mode, the workspace, the tool in hand, the undo stack, the
+notice slot, the export in progress, the builder's `OnceLock`. Switching in
+place means finding and resetting every one, and **the failure is silent** — a
+collection list, a target or a tally from the catalog before, drawn over the
+catalog after. The plan's own acceptance test for this slice was "switch twice;
+nothing from the first leaks into the second". A new process passes that by
+construction, and keeps passing it as statics are added by people who have
+never read this.
+
+Lightroom Classic relaunches to switch catalogs, for the same reason.
+
+It costs about a second, and a window that closes and reopens where it was
+(`window.json` is written first). It is refused while an export is running: the
+export is a thread of this process, and leaving would end it part-way through a
+folder with nothing to say which files were written.
+
+**Not done:** a drop on the canvas. On Linux the canvas is its own window and
+takes no drops, so a drop lands only on the panel, or anywhere on the welcome
+screen. A dropped folder is refused in words until S8.
+
+## I17 — what a bare launch opens
+
+`start_for(arguments, last)` is a pure function and is tested as one. Anything
+named wins; with nothing named the last catalog comes back, if it is still
+there; `--welcome` overrides that, and is how "close" is spelt — without it the
+relaunch finds the catalog just closed at the top of the recent list and opens
+it again. Only the *last* catalog is ever reopened: falling back to the one
+before would open something nobody left, without saying why.
+
+A recent catalog that has gone stays on the list, struck through, with a
+`forget` beside it. It may be on a drive that is not plugged in, and a list
+that quietly dropped it would be one more thing to wonder about.
+
+`RAWKIT_CONFIG_DIR` moves both files. For a portable install, and for every
+test of the window — which would otherwise write scratch catalogs into the list
+somebody's real launch reads, and reopen one for them the next morning.
+
+## I18 — nothing a person can meet may fail the launch, or end the render loop
+
+Tauri panics when its `setup` hook returns an error, and the render loop ends
+when a frame does. Both were reachable by the ordinary world: a catalog on a
+card that is not plugged in did the first, and walking onto one missing file in
+the loupe did the second — the window froze on the frame before it.
+
+So: a catalog that will not open is the welcome screen with the reason on it. A
+photograph that cannot be read is `Loaded::stand_in` — flat, dark, and
+deliberately nothing like a photograph — with the reason on the status line,
+and the next photograph opens normally. In the navigation block of `tick`, the
+header read, the preview lookup and the texture upload no longer use `?`.
+
+A missing file says it is not there, in those words, before the decoder is
+asked: what the decoder says is "io error: Input/output error".
+
+## I19 — every way out goes through the render loop
+
+`LEAVING` is a request the render loop acts on at the top of its next frame:
+flush the saver, write the window's geometry, start the next process if there
+is one, exit. The saver lives there, and an edit made in the last 800 ms is
+still in its settle timer.
+
+Closing the window is one of those ways out, which it was not before: the close
+is held for a frame (`prevent_close`) and the loop exits the process. That is
+only safe while the loop is alive — `TICKING` — because a window held open for
+a loop that has died could never be closed.
+
+## I20 — what the shell says has a command of its own
+
+`NOTICE` is taken when read, so it must only be read by something that says it.
+It used to be a field of `snapshot`, and five places on the page ask for a
+snapshot: two said the notice, three took it and dropped it — one of them as
+the page loads. Anything said during `setup` was gone before there was a status
+line to put it on, which is exactly when "that catalog could not be opened" is
+said. `take_notice` is asked for by `hear()` and by nothing else.
+
+On the welcome screen the status line is under the welcome, so `tell` writes
+its sentence in both places.
+
+## I21 — New never replaces a catalog
+
+The save dialog asks "replace?" about a *file*, and a person who answers yes to
+that has not agreed to lose a library. An existing path is left alone, and the
+sentence says to open it instead. Separately, SQLite opens-or-creates: a
+mistyped catalog name on the command line used to leave an empty file as its
+only reply. Now only `--new` — which only New passes — may create one.
+
 ## If you change this
 
 | If you touch… | …this will tell you |
@@ -379,4 +500,10 @@ ladder behind it.
 | what a command does, which keys it has, or whether it waits | `page_contract::the_page_and_the_shell_agree_about_what_waits_for_a_tool`, and the registry throws at load on a key bound twice |
 | the shape of a registry entry | the same test — it reads `{ id: `, `act: "…"`, `value: …`, `waits: …` as text |
 | what the view carries per keypress | `the_view_says_where_a_photograph_is_kept`; the `holding 1` and `taken 1` columns of the scale gate |
+| what a launch opens | `what_is_named_is_what_opens`, `with_nothing_named_the_last_catalog_comes_back`, `a_catalog_that_was_closed_stays_closed`, `the_test_pattern_has_to_be_asked_for` |
+| the recent list | `the_last_one_opened_comes_first_and_is_listed_once`, `only_so_many_are_kept`, `a_bare_launch_reopens_the_last_one_only_if_it_is_there`, `a_list_that_cannot_be_read_is_an_empty_one` |
+| anything in `setup`, or in the navigation block of `tick` | nothing automatic. **No `?` on anything a missing file, a bad catalog or a corrupt preview can reach.** Check by hand with `target/scratch`-style catalogs whose files have been renamed |
+| who reads the notice | `grep -n 'take_notice' panel.html` shows only `hear` |
+| a new command that should work with nothing open | mark it `welcome: true` in the registry, or the welcome screen drops it |
+| a new static that holds something about the open catalog | nothing to do — that is what I16 buys. Do not add a "reset" path |
 | anything that writes a message in the page | there must be exactly one writer: `grep -n 'saidLine\.\|failedLine\.' panel.html` shows only `tell` and the dismiss handler |

@@ -142,6 +142,7 @@ mod library;
 #[cfg(test)]
 mod page_contract;
 mod pointer;
+mod recent;
 mod sequence;
 mod session_canvas;
 mod window_state;
@@ -344,9 +345,6 @@ fn snapshot(state: tauri::State<'_, Shared>) -> serde_json::Value {
         // said, not what anyone decided. It is here so the panel can *say* why
         // a photograph opened turned — a reason the user cannot see is
         // indistinguishable from a bug.
-        // A one-shot line from the render loop, which has no command to return
-        // a refusal through.
-        "notice": NOTICE.lock().expect("notice lock").take(),
         // What the panel is actually being given. Polled rather than pushed
         // because the window can narrow without the page doing anything, and a
         // stylesheet that has not heard draws a column wider than the canvas
@@ -1096,10 +1094,284 @@ fn cull_view(state: tauri::State<'_, Shelf>) -> Option<CullView> {
 /// failure this must not have is silence. An unknown flag is refused rather than
 /// taken for a filename, so `--porfile x.dcp` says so instead of trying to
 /// decode a RAW called `--porfile`.
-fn parse_arguments(
-    args: impl Iterator<Item = String>,
-) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
-    let (mut target, mut profile) = (None, None);
+/// Whether the window is showing the welcome screen: nothing is open.
+///
+/// The canvas is hidden and the render loop draws nothing, so the page — which
+/// on Linux sits *under* the canvas's own window — can be seen to say so.
+static WELCOME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A catalog that opened and had nothing in it, for the welcome screen to name.
+static EMPTY_CATALOG: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Where this machine's settings are. Found once, in `setup`, which is the
+/// only place with an application to ask.
+static CONFIG_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// A way out of this process that the render loop has been asked to take.
+///
+/// # Why opening a catalog is a relaunch
+///
+/// Lightroom Classic does the same, and for the reason that applies here. A
+/// catalog is not one value in this shell: it is the library, the saver, the
+/// session, the preview builder and its thread, the grid's textures, and some
+/// thirty statics — the mode, the workspace, the tool in hand, the undo stack,
+/// the notice slot, the export in progress. Switching in place means finding
+/// and resetting every one, and the failure is silent: a collection list, a
+/// target or a tally from the catalog before, shown over the catalog after.
+/// A new process cannot leak what it never had. It costs about a second and a
+/// window that closes and reopens where it was.
+///
+/// # Why the render loop does it
+///
+/// It owns the saver. An edit made in the last 800 ms is still in the settle
+/// timer, and leaving without `flush` loses it — which closing the window used
+/// to do, every time, until this was the way out for that too.
+static LEAVING: Mutex<Option<Leaving>> = Mutex::new(None);
+
+#[derive(Debug)]
+enum Leaving {
+    Quit,
+    /// Start again with these arguments.
+    For(Vec<std::ffi::OsString>),
+}
+
+/// Whether the render loop is alive to act on [`LEAVING`]. If it has died, a
+/// close must close: holding the window open for a loop that will never come
+/// would make it unclosable.
+static TICKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// Open the catalog a launch was pointed at. `None` is one with no photographs.
+fn open_catalog(path: &Path, create: bool) -> Result<Option<Library>> {
+    if !create && !path.is_file() {
+        return Err(anyhow!(
+            "it is not there: moved, renamed, or on a drive that is not plugged in"
+        ));
+    }
+    Library::open_or_empty(path)
+}
+
+/// Ask the render loop to start again on something else.
+///
+/// Refused while an export is running: it is on a thread of this process, and
+/// leaving would end it part-way through a folder with nothing to say which
+/// files were written.
+fn leave_for(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
+    let exporting = EXPORTING
+        .lock()
+        .expect("export lock")
+        .as_ref()
+        .is_some_and(|export| export.finished.is_none());
+    if exporting {
+        return Err("an export is still running, and opening something else would end it".into());
+    }
+    *LEAVING.lock().expect("leaving lock") = Some(Leaving::For(arguments));
+    Ok(())
+}
+
+/// Open whatever this path is: a catalog, a photograph — or neither.
+fn leave_for_path(path: &Path) -> Result<(), String> {
+    let raw = path.extension().is_some_and(|extension| {
+        rawkit_catalog::scan::EXTENSIONS
+            .iter()
+            .any(|known| extension.eq_ignore_ascii_case(known))
+    });
+    if path.is_dir() {
+        // Said plainly rather than ignored. Adding a folder is the next thing
+        // the window learns, and until it has, a drop that did nothing would
+        // read as a drop that was not noticed.
+        return Err(format!(
+            "{} is a folder, and adding a folder of photographs is not in the window yet",
+            path.display()
+        ));
+    }
+    if !is_catalog(path) && !raw {
+        return Err(format!(
+            "{} is neither a catalog nor a photograph this can read",
+            path.display()
+        ));
+    }
+    if !path.is_file() {
+        return Err(format!(
+            "{} is not there: moved, renamed, or on a drive that is not plugged in",
+            path.display()
+        ));
+    }
+    leave_for(vec![path.as_os_str().to_owned()])
+}
+
+/// Whatever the shell has to say that no command returned: taken, so it is said
+/// once.
+///
+/// Its own command, where it used to ride on `snapshot`. Five places on the page
+/// ask for a snapshot and two of them read this; the other three took it and
+/// dropped it — and one of those runs as the page loads, so anything said
+/// during `setup` ("that catalog could not be opened") was gone before there
+/// was a status line to put it on.
+#[tauri::command]
+fn take_notice() -> Option<Told> {
+    NOTICE.lock().expect("notice lock").take()
+}
+
+/// What the page needs to know before it draws anything: whether there is
+/// anything open, and what could be.
+#[tauri::command]
+fn entrance() -> serde_json::Value {
+    let recent: Vec<serde_json::Value> = CONFIG_DIR
+        .get()
+        .and_then(|dir| dir.as_deref())
+        .map(recent::all)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|recent| {
+            serde_json::json!({
+                "path": recent.path,
+                "name": recent.path.file_name().map(|n| n.to_string_lossy().into_owned()),
+                "folder": recent.path.parent().map(|p| p.display().to_string()),
+                "photographs": recent.photographs,
+                "opened_at": recent.opened_at,
+                "there": recent.path.is_file(),
+            })
+        })
+        .collect();
+    let empty = EMPTY_CATALOG.lock().expect("entrance lock").clone();
+    serde_json::json!({
+        "welcome": WELCOME.load(std::sync::atomic::Ordering::Relaxed),
+        "empty": empty.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()),
+        "empty_path": empty,
+        "recent": recent,
+        "now": now(),
+    })
+}
+
+/// Pick a catalog and open it.
+#[tauri::command]
+fn open_catalog_dialog(app: tauri::AppHandle) {
+    use tauri_plugin_dialog::DialogExt;
+    app.dialog()
+        .file()
+        .add_filter("rawkit catalog", &["rawkit"])
+        .pick_file(|chosen| {
+            let Some(path) = chosen.and_then(|p| p.into_path().ok()) else {
+                return; // Cancelled, which is an answer and not an error.
+            };
+            if let Err(why) = leave_for_path(&path) {
+                tell(Told::from(why.as_str()));
+            }
+        });
+}
+
+/// Pick a photograph and open it on its own, with no catalog.
+#[tauri::command]
+fn open_photograph_dialog(app: tauri::AppHandle) {
+    use tauri_plugin_dialog::DialogExt;
+    app.dialog()
+        .file()
+        .add_filter("RAW photograph", rawkit_catalog::scan::EXTENSIONS)
+        .pick_file(|chosen| {
+            let Some(path) = chosen.and_then(|p| p.into_path().ok()) else {
+                return;
+            };
+            if let Err(why) = leave_for_path(&path) {
+                tell(Told::from(why.as_str()));
+            }
+        });
+}
+
+/// Name a new catalog, make it, and open it.
+#[tauri::command]
+fn new_catalog_dialog(app: tauri::AppHandle) {
+    use tauri_plugin_dialog::DialogExt;
+    app.dialog()
+        .file()
+        .add_filter("rawkit catalog", &["rawkit"])
+        .set_file_name("Photographs.rawkit")
+        .save_file(|chosen| {
+            let Some(mut path) = chosen.and_then(|p| p.into_path().ok()) else {
+                return;
+            };
+            if !is_catalog(&path) {
+                path.set_extension("rawkit");
+            }
+            // Some pickers add the filter's extension to a name that already
+            // has it. `Shoot.rawkit.rawkit` is nobody's intention.
+            while let Some(stem) = path.file_stem().map(PathBuf::from) {
+                if !is_catalog(&stem) {
+                    break;
+                }
+                path.set_file_name(stem);
+            }
+            // The picker will have asked "replace?" and been told yes. Not
+            // here: what is being replaced is somebody's library, the question
+            // was a generic one about a file, and no answer to it should be
+            // able to cost a catalog. Open it instead, and say which happened.
+            if path.exists() {
+                tell(Told::from(
+                    format!(
+                        "{} already exists, so it has been left alone. Open it instead",
+                        path.display()
+                    )
+                    .as_str(),
+                ));
+                return;
+            }
+            let arguments = vec!["--new".into(), path.into_os_string()];
+            if let Err(why) = leave_for(arguments) {
+                tell(Told::from(why.as_str()));
+            }
+        });
+}
+
+/// Open one from the list of recent catalogs.
+#[tauri::command]
+fn open_recent(path: PathBuf) -> Result<(), String> {
+    leave_for_path(&path)
+}
+
+/// Take a catalog that is no longer there off the list.
+#[tauri::command]
+fn forget_recent(path: PathBuf) {
+    if let Some(dir) = CONFIG_DIR.get().and_then(|dir| dir.as_deref()) {
+        recent::forget(dir, &path);
+    }
+}
+
+/// Close what is open and go back to the welcome screen.
+#[tauri::command]
+fn close_catalog() -> Result<(), String> {
+    if WELCOME.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("nothing is open".into());
+    }
+    leave_for(vec!["--welcome".into()])
+}
+
+/// What the command line asked for.
+#[derive(Debug, Default, PartialEq)]
+struct Arguments {
+    /// A `.rawkit` catalog, or a photograph.
+    target: Option<PathBuf>,
+    profile: Option<PathBuf>,
+    /// Open on the welcome screen whatever was open last. How "close this
+    /// catalog" is spelt, since closing one is a launch without one.
+    welcome: bool,
+    /// The catalog named may be made if it is not there. Without this a path
+    /// that does not exist is refused: SQLite opens-or-creates, and a mistyped
+    /// name used to leave an empty catalog behind as its only reply.
+    new: bool,
+    /// The synthetic mosaic, for looking at the renderer with no file to hand.
+    /// It used to be what a bare launch showed — a pink test card with live
+    /// sliders and not a word of explanation — which is a developer's tool
+    /// standing where a stranger's first screen should be.
+    test_pattern: bool,
+}
+
+fn parse_arguments(args: impl Iterator<Item = String>) -> Result<Arguments> {
+    let mut parsed = Arguments::default();
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1107,19 +1379,54 @@ fn parse_arguments(
                 let next = args
                     .next()
                     .ok_or_else(|| anyhow!("--profile needs the path of a .dcp file"))?;
-                profile = Some(PathBuf::from(next));
+                parsed.profile = Some(PathBuf::from(next));
             }
             _ if arg.starts_with("--profile=") => {
-                profile = Some(PathBuf::from(&arg["--profile=".len()..]));
+                parsed.profile = Some(PathBuf::from(&arg["--profile=".len()..]));
             }
+            "--welcome" => parsed.welcome = true,
+            "--new" => parsed.new = true,
+            "--test-pattern" => parsed.test_pattern = true,
             _ if arg.starts_with('-') && arg != "-" => {
                 return Err(anyhow!("unknown option {arg}"));
             }
-            _ if target.is_none() => target = Some(PathBuf::from(arg)),
+            _ if parsed.target.is_none() => parsed.target = Some(PathBuf::from(arg)),
             _ => return Err(anyhow!("only one photograph can be opened at a time")),
         }
     }
-    Ok((target, profile))
+    Ok(parsed)
+}
+
+/// What a launch opens.
+#[derive(Debug, PartialEq)]
+enum Start {
+    Catalog { path: PathBuf, create: bool },
+    Photograph(PathBuf),
+    TestPattern,
+    Welcome,
+}
+
+/// Decide it, from what was asked for and what was open last.
+///
+/// Anything named wins. With nothing named, the last catalog comes back —
+/// a session continues where it stopped — unless the welcome screen was asked
+/// for, which is how closing a catalog stays closed across the relaunch.
+fn start_for(arguments: &Arguments, last: Option<PathBuf>) -> Start {
+    if arguments.test_pattern {
+        return Start::TestPattern;
+    }
+    match &arguments.target {
+        Some(path) if is_catalog(path) => Start::Catalog {
+            path: path.clone(),
+            create: arguments.new,
+        },
+        Some(path) => Start::Photograph(path.clone()),
+        None if arguments.welcome => Start::Welcome,
+        None => last.map_or(Start::Welcome, |path| Start::Catalog {
+            path,
+            create: false,
+        }),
+    }
 }
 
 fn main() -> Result<()> {
@@ -1149,16 +1456,17 @@ fn main() -> Result<()> {
     // because a directly-opened RAW had no way to reach one: the picker wanted a
     // catalog to write the choice into, so the commonest way to use this program
     // was also the only way that could not be colour-managed.
-    let (target, profile) = match parse_arguments(std::env::args().skip(1)) {
-        Ok(pair) => pair,
+    let arguments = match parse_arguments(std::env::args().skip(1)) {
+        Ok(arguments) => arguments,
         Err(e) => {
             eprintln!(
-                "usage      : rawkit-shell [--profile <file.dcp>] [<file.ARW>|<file.rawkit>]"
+                "usage      : rawkit-shell [--profile <file.dcp>] [--welcome | --test-pattern] \
+                 [[--new] <file.rawkit> | <file.ARW>]"
             );
             return Err(e);
         }
     };
-    if let Some(path) = &profile {
+    if let Some(path) = &arguments.profile {
         // Read now rather than at the first render, so a mistyped path is an
         // error at the moment it was made and not a photograph that quietly
         // looks wrong an hour later.
@@ -1184,6 +1492,14 @@ fn main() -> Result<()> {
             histogram,
             export,
             export_progress,
+            take_notice,
+            entrance,
+            open_catalog_dialog,
+            open_photograph_dialog,
+            new_catalog_dialog,
+            open_recent,
+            forget_recent,
+            close_catalog,
             preview_progress,
             stop_previews,
             build_previews,
@@ -1283,8 +1599,26 @@ fn main() -> Result<()> {
                     // The last chance: a window manager sends this before it
                     // takes the window away, and `Drop` will not run for a
                     // process that is killed.
-                    tauri::WindowEvent::CloseRequested { .. } => {
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
                         remember_window(&app_handle, &remembering, true);
+                        // Held for one frame, so the render loop can write the
+                        // edit that is still in its settle timer. See `LEAVING`.
+                        if TICKING.load(std::sync::atomic::Ordering::Relaxed) {
+                            api.prevent_close();
+                            *LEAVING.lock().expect("leaving lock") = Some(Leaving::Quit);
+                        }
+                        return;
+                    }
+                    // Dropped on the window. On Linux that means on the panel,
+                    // or anywhere on the welcome screen: the canvas is a window
+                    // of its own and takes no drops. The first thing dropped is
+                    // the thing opened; one window shows one.
+                    tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
+                        if let Some(path) = paths.first() {
+                            if let Err(why) = leave_for_path(path) {
+                                tell(Told::from(why.as_str()));
+                            }
+                        }
                         return;
                     }
                     _ => return,
@@ -1295,15 +1629,40 @@ fn main() -> Result<()> {
             // A library, if that is what was passed. The catalog is what makes
             // an edit outlive the process, so it is opened before the image it
             // describes rather than bolted on after.
-            let library = match target.as_deref().filter(|p| is_catalog(p)) {
-                Some(path) => Some(Arc::new(Mutex::new(Library::open(path)?))),
-                None => None,
-            };
-            let raw = match &library {
-                Some(library) => Some(PathBuf::from(
-                    &library.lock().expect("library lock").current().path,
-                )),
-                None => target.clone().filter(|p| !is_catalog(p)),
+            //
+            // Nothing below may fail the launch. This hook returning an error is
+            // a panic inside Tauri and a window that never appears, and what
+            // used to return one was the ordinary world: a catalog on a card
+            // that is not plugged in, a photograph that has moved. Each of
+            // those now opens the welcome screen and says what happened.
+            let settings = window_state::config_dir(app.handle());
+            let _ = CONFIG_DIR.set(settings.clone());
+            let start = start_for(&arguments, settings.as_deref().and_then(recent::last));
+            eprintln!("start      : {start:?}");
+            let (library, raw) = match &start {
+                Start::Catalog { path, create } => match open_catalog(path, *create) {
+                    Ok(Some(library)) => {
+                        if let Some(settings) = &settings {
+                            recent::note(settings, path, library.count(), now());
+                        }
+                        let first = PathBuf::from(&library.current().path);
+                        (Some(Arc::new(Mutex::new(library))), Some(first))
+                    }
+                    // Open, and nothing in it: a catalog somebody has just made.
+                    Ok(None) => {
+                        if let Some(settings) = &settings {
+                            recent::note(settings, path, 0, now());
+                        }
+                        *EMPTY_CATALOG.lock().expect("entrance lock") = Some(path.clone());
+                        (None, None)
+                    }
+                    Err(why) => {
+                        failure(format!("{} could not be opened: {why:#}", path.display()));
+                        (None, None)
+                    }
+                },
+                Start::Photograph(path) => (None, Some(path.clone())),
+                Start::TestPattern | Start::Welcome => (None, None),
             };
             // A catalog opens in the Library, which is where a session with one
             // starts: choosing, before changing.
@@ -1312,7 +1671,28 @@ fn main() -> Result<()> {
             }
             app.manage(Shelf(library.clone()));
 
-            let mut loaded = Loaded::open(raw.as_deref(), DEFAULT_TILE)?;
+            // A photograph that cannot be read. In a catalog it is one frame
+            // among many, so the catalog opens and that frame is a flat stand-in
+            // with the reason on the status line; on its own it was the whole
+            // of what was asked for, so the answer is the welcome screen.
+            let (mut loaded, raw) = match raw {
+                None if start == Start::TestPattern => (Loaded::open(None, DEFAULT_TILE)?, None),
+                None => (Loaded::stand_in(DEFAULT_TILE), None),
+                Some(path) => match Loaded::open(Some(&path), DEFAULT_TILE) {
+                    Ok(loaded) => (loaded, Some(path)),
+                    Err(why) => {
+                        failure(format!("{why:#}"));
+                        (
+                            Loaded::stand_in(DEFAULT_TILE),
+                            library.is_some().then_some(path),
+                        )
+                    }
+                },
+            };
+            // Nothing to show is the welcome screen: no catalog, and no
+            // photograph that opened.
+            let welcome = library.is_none() && raw.is_none() && start != Start::TestPattern;
+            WELCOME.store(welcome, std::sync::atomic::Ordering::Relaxed);
             *LENS_PROFILE.lock().expect("lens profile lock") = loaded.distortion;
             *PROFILE_NAME.lock().expect("profile lock") =
                 apply_profile(library.as_ref(), &mut loaded);
@@ -1463,8 +1843,39 @@ fn main() -> Result<()> {
                 .and_then(|library| library.lock().expect("library lock").previews_directory())
                 .map(building::Builder::spawn);
 
+            let (leaving_app, leaving_window) = (app.handle().clone(), window_handle.clone());
+            // Nothing is open, so there is nothing to draw and the page has the
+            // window. Only the native canvas needs telling: it is the one
+            // arrangement where the canvas is *over* the page.
+            #[cfg(target_os = "linux")]
+            if welcome && route == Route::NativeChild {
+                canvas::hide();
+            }
+
             let mut tick = move || -> Result<()> {
                 let started = std::time::Instant::now();
+
+                // First, because it is the last thing this process does.
+                let leaving = LEAVING.lock().expect("leaving lock").take();
+                if let Some(leaving) = leaving {
+                    saver.flush();
+                    remember_window(&leaving_app, &leaving_window, true);
+                    if let Leaving::For(arguments) = &leaving {
+                        let again = std::env::current_exe()
+                            .and_then(|exe| std::process::Command::new(exe).args(arguments).spawn());
+                        if let Err(why) = again {
+                            // Still here, and saying so: the alternative is a
+                            // window that closes and nothing that opens.
+                            failure(format!("That could not be opened, because rawkit could not be started again: {why}"));
+                            return Ok(());
+                        }
+                    }
+                    leaving_app.exit(0);
+                    return Ok(());
+                }
+                if welcome {
+                    return Ok(());
+                }
 
                 // Before anything that can return early: the grid does, below,
                 // and the grid is where somebody is sitting while this matters.
@@ -1607,8 +2018,20 @@ fn main() -> Result<()> {
                     let library = navigating.as_ref().expect("a request implies a library");
                     // A header parse, so the viewport can be set up for a
                     // photograph nothing has decoded.
-                    let (size, orientation) =
-                        library.lock().expect("library lock").size_of_current()?;
+                    //
+                    // Or cannot be, and then the frame is a stand-in and the
+                    // status line says why. Nothing in this block may leave
+                    // through `?`: an error out of a frame ends the render
+                    // loop, and the window freezes on the photograph before.
+                    let header = library.lock().expect("library lock").size_of_current();
+                    let (size, orientation, mut stand_in) = match header {
+                        Ok((size, orientation)) => (size, orientation, None),
+                        Err(why) => {
+                            failure(format!("{why:#}"));
+                            let stand_in = Loaded::stand_in(DEFAULT_TILE);
+                            (stand_in.size, stand_in.orientation, Some(stand_in))
+                        }
+                    };
 
                     let mut session = shared.lock().expect("session lock");
                     if (size, orientation) != (showing.size, showing.orientation) {
@@ -1640,16 +2063,28 @@ fn main() -> Result<()> {
 
                     let needed = needed_pixels(&session, size);
                     let hash = session.state().content_hash();
-                    let found = library
-                        .lock()
-                        .expect("library lock")
-                        .preview_for(needed, &hash)?;
-                    showing.preview = match found {
-                        Some(decoded) => {
-                            Some(blit.upload(&gpu, &decoded.rgba, decoded.width, decoded.height)?)
-                        }
-                        None => None,
+                    // A preview that cannot be read is no preview: the decode
+                    // below is the answer to that, as it is to there being none.
+                    let found = match &stand_in {
+                        Some(_) => None,
+                        None => library
+                            .lock()
+                            .expect("library lock")
+                            .preview_for(needed, &hash)
+                            .unwrap_or_else(|why| {
+                                complain(&why);
+                                None
+                            }),
                     };
+                    showing.preview = found.and_then(|decoded| {
+                        blit.upload(&gpu, &decoded.rgba, decoded.width, decoded.height)
+                            .map_err(|why| complain(&why.into()))
+                            .ok()
+                    });
+                    if let Some(stand_in) = stand_in.take() {
+                        canvas_renderer.reload(&gpu, &stand_in.frame());
+                        showing.raw = Some(stand_in);
+                    }
                     eprintln!(
                         "open       : {} in {:.0} ms",
                         if showing.preview.is_some() {
@@ -1708,7 +2143,17 @@ fn main() -> Result<()> {
                 };
                 if !covered && showing.raw.is_none() {
                     let decoding = std::time::Instant::now();
-                    let mut next = Loaded::open(showing.path.as_deref(), DEFAULT_TILE)?;
+                    // A photograph that cannot be read is a thing to say, not a
+                    // reason to stop drawing. The `?` that stood here ended the
+                    // render loop: walk onto one file from a card that had been
+                    // pulled out and the window froze on the frame before it.
+                    let mut next = match Loaded::open(showing.path.as_deref(), DEFAULT_TILE) {
+                        Ok(next) => next,
+                        Err(why) => {
+                            failure(format!("{why:#}"));
+                            Loaded::stand_in(DEFAULT_TILE)
+                        }
+                    };
                     // Before the reload, not after: the profile decides how big
                     // the table buffer is, and `reload` is what allocates it.
                     *PROFILE_NAME.lock().expect("profile lock") =
@@ -2628,10 +3073,12 @@ fn main() -> Result<()> {
                     Ok(()) => gtk::glib::ControlFlow::Continue,
                     Err(e) => {
                         eprintln!("paint: {e}");
+                        TICKING.store(false, std::sync::atomic::Ordering::Relaxed);
                         gtk::glib::ControlFlow::Break
                     }
                 },
             );
+            TICKING.store(true, std::sync::atomic::Ordering::Relaxed);
             // Elsewhere there is no equivalent constraint and no GTK loop to
             // hook, so a thread it is — until each platform's canvas arrives
             // with its own idea of when a frame should happen.
@@ -2639,6 +3086,7 @@ fn main() -> Result<()> {
             std::thread::spawn(move || loop {
                 if let Err(e) = tick() {
                     eprintln!("paint: {e}");
+                    TICKING.store(false, std::sync::atomic::Ordering::Relaxed);
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(16));
@@ -7550,10 +7998,10 @@ mod radial_tests {
 
 #[cfg(test)]
 mod argument_tests {
-    use super::parse_arguments;
+    use super::{parse_arguments, start_for, Arguments, Start};
     use std::path::PathBuf;
 
-    fn parse(args: &[&str]) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
+    fn parse(args: &[&str]) -> Result<Arguments, String> {
         parse_arguments(args.iter().map(|s| s.to_string())).map_err(|e| e.to_string())
     }
 
@@ -7566,23 +8014,22 @@ mod argument_tests {
             vec!["--profile", "p.dcp", "a.ARW"],
             vec!["--profile=p.dcp", "a.ARW"],
         ] {
-            let (target, profile) = parse(&args).expect("should parse");
-            assert_eq!(target, Some(PathBuf::from("a.ARW")), "{args:?}");
-            assert_eq!(profile, Some(PathBuf::from("p.dcp")), "{args:?}");
+            let parsed = parse(&args).expect("should parse");
+            assert_eq!(parsed.target, Some(PathBuf::from("a.ARW")), "{args:?}");
+            assert_eq!(parsed.profile, Some(PathBuf::from("p.dcp")), "{args:?}");
         }
     }
 
     #[test]
     fn either_may_be_left_out() {
-        assert_eq!(parse(&[]).unwrap(), (None, None));
+        assert_eq!(parse(&[]).unwrap(), Arguments::default());
         assert_eq!(
-            parse(&["a.ARW"]).unwrap(),
-            (Some(PathBuf::from("a.ARW")), None)
+            parse(&["a.ARW"]).unwrap().target,
+            Some(PathBuf::from("a.ARW"))
         );
-        assert_eq!(
-            parse(&["--profile", "p.dcp"]).unwrap(),
-            (None, Some(PathBuf::from("p.dcp")))
-        );
+        let only_profile = parse(&["--profile", "p.dcp"]).unwrap();
+        assert_eq!(only_profile.target, None);
+        assert_eq!(only_profile.profile, Some(PathBuf::from("p.dcp")));
     }
 
     #[test]
@@ -7598,5 +8045,67 @@ mod argument_tests {
 
         let e = parse(&["a.ARW", "b.ARW"]).expect_err("should refuse");
         assert!(e.contains("one photograph"), "said: {e}");
+    }
+
+    fn start(args: &[&str], last: Option<&str>) -> Start {
+        start_for(&parse(args).unwrap(), last.map(PathBuf::from))
+    }
+
+    #[test]
+    fn what_is_named_is_what_opens() {
+        let last = Some("last.rawkit");
+        assert_eq!(
+            start(&["shoot.rawkit"], last),
+            Start::Catalog {
+                path: "shoot.rawkit".into(),
+                create: false
+            }
+        );
+        // Whatever the case of the extension: it is a filename, on three
+        // operating systems.
+        assert!(matches!(
+            start(&["SHOOT.RAWKIT"], last),
+            Start::Catalog { .. }
+        ));
+        assert_eq!(start(&["a.ARW"], last), Start::Photograph("a.ARW".into()));
+        // Only `--new` may make a catalog that is not there. Without it a
+        // mistyped name is refused, where it used to leave an empty file.
+        assert_eq!(
+            start(&["--new", "fresh.rawkit"], last),
+            Start::Catalog {
+                path: "fresh.rawkit".into(),
+                create: true
+            }
+        );
+    }
+
+    #[test]
+    fn with_nothing_named_the_last_catalog_comes_back() {
+        assert_eq!(
+            start(&[], Some("last.rawkit")),
+            Start::Catalog {
+                path: "last.rawkit".into(),
+                create: false
+            }
+        );
+        // A first run, or a last catalog that has gone.
+        assert_eq!(start(&[], None), Start::Welcome);
+    }
+
+    #[test]
+    fn a_catalog_that_was_closed_stays_closed() {
+        // Closing is a relaunch with `--welcome`. Without the flag the relaunch
+        // would find the catalog just closed at the top of the recent list and
+        // open it again, and "close" would be a second's flicker.
+        assert_eq!(start(&["--welcome"], Some("last.rawkit")), Start::Welcome);
+    }
+
+    #[test]
+    fn the_test_pattern_has_to_be_asked_for() {
+        assert_eq!(
+            start(&["--test-pattern"], Some("last.rawkit")),
+            Start::TestPattern
+        );
+        assert_ne!(start(&[], None), Start::TestPattern);
     }
 }

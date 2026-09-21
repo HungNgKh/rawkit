@@ -233,6 +233,20 @@ fn place(child: &gdk::Window, panel: &std::sync::atomic::AtomicI32, width: i32, 
     child.move_resize(0, 0, (width - panel).max(1), height.max(1));
 }
 
+/// Take the canvas off the screen, for a window with nothing to show in it.
+///
+/// The canvas is an X window *over* the page, so while it is mapped the page
+/// beneath it cannot be seen — and with nothing open, the page is where the
+/// welcome is. Never shown again in this process: opening something is a
+/// relaunch, and the new process maps its own.
+pub fn hide() {
+    CHILD.with(|slot| {
+        if let Some(child) = slot.borrow().as_ref() {
+            child.hide();
+        }
+    });
+}
+
 /// Re-place the canvas after the divider has moved, with the window unchanged.
 ///
 /// Must be called on the GTK main thread; on Linux the render loop runs there,
