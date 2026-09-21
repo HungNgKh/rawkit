@@ -39,10 +39,19 @@ fn vs(@builtin(vertex_index) index: u32) -> VsOut {
 // and went through the transfer function with the photograph; doing it here
 // keeps them looking exactly as they did, which is what makes moving them out
 // of the canvas a change in structure and not in appearance.
+struct Surround {
+    colour: vec4<f32>,
+}
+@group(0) @binding(5) var<uniform> surround: Surround;
+
 fn composited(uv: vec2<f32>) -> vec3<f32> {
     let photograph = textureSample(canvas, canvas_sampler, uv);
     let over = textureSample(overlay, canvas_sampler, uv);
-    return photograph.rgb * (1.0 - over.a) + over.rgb;
+    // Where the canvas holds no photograph its alpha is zero, and the surround
+    // shows. Mixed rather than chosen, so the photograph's edge is filtered
+    // against the surround and not against black.
+    let base = mix(surround.colour.rgb, photograph.rgb, photograph.a);
+    return base * (1.0 - over.a) + over.rgb;
 }
 
 /// For an `-Srgb` target format, where the hardware encodes on write.

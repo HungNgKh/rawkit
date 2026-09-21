@@ -114,7 +114,8 @@ fn straighten(@builtin(global_invocation_id) gid: vec3<u32>) {
     // stops where the rotation runs off the sensor — which looks like a bug in
     // the straighten and is really a missing boundary.
     if (any(straight < vec2<f32>(0.0)) || any(straight > params.photograph)) {
-        textureStore(canvas, gid.xy, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        // Transparent: the presenter puts the chosen surround here.
+        textureStore(canvas, gid.xy, vec4<f32>(0.0, 0.0, 0.0, 0.0));
         return;
     }
     let homogeneous = vec3<f32>(
@@ -127,7 +128,7 @@ fn straighten(@builtin(global_invocation_id) gid: vec3<u32>) {
     // a behaviour -- but a divide by nothing must not become a texture read at
     // whatever coordinate that produces.
     if (abs(homogeneous.z) < 1e-6) {
-        textureStore(canvas, gid.xy, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        textureStore(canvas, gid.xy, vec4<f32>(0.0, 0.0, 0.0, 0.0));
         return;
     }
     var placed = homogeneous.xy / homogeneous.z;

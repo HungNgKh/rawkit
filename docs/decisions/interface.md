@@ -66,6 +66,7 @@ what a contributor would otherwise undo.
 | **I42** | Everything the library does can be undone, and redone | Copies made and removed, presets and snapshots deleted join the stack; redo is "undo the undo" — every record has an inverse. |
 | **I43** | Act, then offer Undo — no "sure?" | Deleting a preset, snapshot, collection or copy is one click, and the sentence that says so carries an Undo button. |
 | **I44** | A History list, kept per photograph for the sitting | Every step named, the one in force marked, the undone ones still listed; a change made while away is a step of its own. |
+| **I45** | The surround is a choice, and neutral | Dark `#1a1a1a` by default; grey, mid grey, white and black from the palette. Drawn by the presenter in linear light, remembered with the window. |
 | **I21** | New never replaces a catalog, and only `--new` makes one | The picker's "replace?" is a question about a file. Without `--new`, a path that is not there is refused, not created. |
 
 ## I1 — one status line
@@ -986,6 +987,22 @@ or an undo of one — that change is a step of its own, "Changed in Library", so
 paste can be taken back from either workspace. Not across a relaunch: the catalog
 keeps every version, and this is only the sitting's path through them.
 
+## I45 — what is round the photograph
+
+Q6: the letterbox was the renderer's black, and the only choice there was. Now the
+canvas is transparent wherever it holds no photograph — a fresh canvas, the
+straighten pass's background, the loupe preview beyond its edge — and the
+**presenter** fills it with the chosen surround, mixed by alpha so the
+photograph's edge is filtered against the surround and not against black. In
+linear light, before the display transform, so a mid grey chosen to judge
+exposure against is that grey on this monitor.
+
+Five, all neutral: dark (`#1a1a1a`, a step below the chrome, the default), grey
+(`#3a3a3a`), mid grey (`#777`), white and black. From the palette ("round the
+photograph"), no key: it is set once per room, not per photograph. Remembered in
+`window.json` with the rest of this machine's preferences, not in the catalog.
+The grid and the strip draw their own grounds and are unchanged.
+
 ## If you change this
 
 | If you touch… | …this will tell you |
@@ -1032,6 +1049,7 @@ keeps every version, and this is only the sitting's path through them.
 | what undo and redo do to the library | `what_undo_takes_back_redo_puts_back_and_undo_takes_back_again`, `a_removed_copy_comes_back_where_it_was_and_goes_again`, `a_deleted_preset_or_snapshot_is_one_undo_away`; in the catalog `a_removed_copy_comes_back_with_everything_it_had` and its refusal |
 | what a step of the edit history is | `the_history_names_its_steps_and_knows_where_it_is`, `a_let_go_ends_the_step_so_two_drags_are_two_undos`, `a_kept_history_comes_back_and_a_change_made_elsewhere_is_a_step` |
 | a new session command | give it words in `STEP_WORDS` in the page, or it shows in History under its own name |
+| what is round the photograph | `where_the_canvas_holds_no_photograph_the_surround_shows` (engine, GPU). Anything that writes the canvas outside the photograph must write alpha 0 |
 | how the window is divided | `frame::tests` — the four sides, the left panel giving way first, a hidden panel's width going to the photograph, the physical canvas meeting the bars at a fractional scale, and where a pointer lands |
 | a bar's height or a panel's width in the page | nothing automatic: the page must take it from `--top`, `--left`, `--panel`, `--bottom`, never a number of its own. Check by pixel: the page's border ends on the pixel before the canvas starts, on all four sides |
 | where an overlay lives | the welcome and import screens are top-level; the sheet, palette and export panel are in `#chrome` and call `needRight()` |

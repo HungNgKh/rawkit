@@ -98,11 +98,13 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(region.inner.rgb * a, a);
     }
 
-    // Outside the photograph is black, not the edge pixel smeared outwards.
+    // Outside the photograph is nothing, not the edge pixel smeared outwards.
     // Clamping would paint a border of stretched sky wherever the image does not
-    // fill the view, which reads as part of the picture.
+    // fill the view, which reads as part of the picture. Transparent, so the
+    // presenter shows the chosen surround there; only the loupe's preview,
+    // which is placed larger than its cell, ever reaches this.
     if (cell.x < 0.0 || cell.y < 0.0 || cell.x > 1.0 || cell.y > 1.0) {
-        return vec4<f32>(0.0, 0.0, 0.0, a);
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
     return vec4<f32>(
         textureSample(image, image_sampler, cell).rgb * region.tint.rgb * a,

@@ -1855,6 +1855,7 @@ fn main() -> Result<()> {
             set_panel_width,
             frame,
             show_panels,
+            set_surround,
             folders,
             toggle_fullscreen,
             arm_target,
@@ -1891,13 +1892,20 @@ fn main() -> Result<()> {
             // is created — otherwise the first frame is drawn at the default
             // width and the window visibly settles a moment after it opens.
             let saved = window_state::load(&app.handle().clone());
-            if let Some(saved) = saved {
+            if let Some(saved) = &saved {
                 PANEL_NOW.store(
                     saved.panel.clamp(frame::PANEL_MIN, frame::PANEL_MAX) as i32,
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 frame::want(!saved.left_hidden, !saved.right_hidden);
                 frame::want_strip(!saved.strip_hidden);
+                if let Some(at) = saved
+                    .surround
+                    .as_deref()
+                    .and_then(|name| SURROUNDS.iter().position(|(n, _, _)| *n == name))
+                {
+                    SURROUND.store(at, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             let (gpu, surface, layout, window_handle) = build_window(app, route, saved)?;
             eprintln!(
@@ -2356,6 +2364,13 @@ fn main() -> Result<()> {
                         height: surface_size[1],
                     });
                     canvas_renderer.invalidate();
+                }
+
+                // The surround, when it has been changed. Read by the presenter
+                // for every view, so told once rather than per frame.
+                let chosen = SURROUND.load(std::sync::atomic::Ordering::Relaxed);
+                if SURROUND_TOLD.swap(chosen, std::sync::atomic::Ordering::Relaxed) != chosen {
+                    canvas_renderer.presenter().set_surround(&gpu, surround().2);
                 }
 
                 // Before the grid's early return. It sat after it, so an export
@@ -3794,7 +3809,7 @@ fn remember_window(app: &tauri::AppHandle, window: &tauri::Window, force: bool) 
     let panel = PANEL_NOW.load(Ordering::Relaxed) as f64;
     let shown = frame::wanted(0);
     let shown = (shown.left, shown.right, frame::strip_wanted());
-    if let Some(state) = window_state::of(window, panel, shown) {
+    if let Some(state) = window_state::of(window, panel, shown, surround().0) {
         window_state::save(app, state);
     }
 }
@@ -3868,7 +3883,7 @@ fn build_window(
     route: Route,
     saved: Option<window_state::Remembered>,
 ) -> Result<(Gpu, wgpu::Surface<'static>, Layout, tauri::Window)> {
-    let (width, height) = saved.map_or(WINDOW, |s| (s.width, s.height));
+    let (width, height) = saved.as_ref().map_or(WINDOW, |s| (s.width, s.height));
     match route {
         Route::Cutout => {
             // The real interface, told to leave the canvas area unpainted. The
@@ -5275,6 +5290,49 @@ fn pick_white_balance(armed: bool) -> Result<bool, String> {
 }
 
 pub(crate) static CANVAS_CLICK: Mutex<Option<Click>> = Mutex::new(None);
+
+/// What can be round the photograph: a name for the settings file, words for
+/// the status line, and the colour in linear light. Q6: dark by default, with a
+/// mid grey and white for judging a print's exposure against a page, and black
+/// for whoever wants it. All neutral — R = G = B — because the eye adapts to
+/// what surrounds a photograph, and a tinted surround is a tinted judgement.
+const SURROUNDS: [(&str, &str, [f32; 3]); 5] = [
+    (
+        "dark",
+        "dark grey",
+        rawkit_engine::present::DEFAULT_SURROUND,
+    ),
+    ("grey", "grey", [0.0423, 0.0423, 0.0423]),
+    ("mid", "mid grey", [0.1845, 0.1845, 0.1845]),
+    ("white", "white", [1.0, 1.0, 1.0]),
+    ("black", "black", [0.0, 0.0, 0.0]),
+];
+
+/// Which of [`SURROUNDS`] is chosen, and whether the presenter has been told.
+static SURROUND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SURROUND_TOLD: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+fn surround() -> (&'static str, &'static str, [f32; 3]) {
+    SURROUNDS[SURROUND.load(std::sync::atomic::Ordering::Relaxed) % SURROUNDS.len()]
+}
+
+/// Change what is round the photograph: to the one named, or to the next.
+/// Answers with its words, for the status line.
+#[tauri::command]
+fn set_surround(window: tauri::Window, name: Option<String>) -> Result<String, String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let at = match name {
+        Some(name) => SURROUNDS
+            .iter()
+            .position(|(n, _, _)| *n == name)
+            .ok_or_else(|| format!("there is no surround called {name:?}"))?,
+        None => (SURROUND.load(Relaxed) + 1) % SURROUNDS.len(),
+    };
+    SURROUND.store(at, Relaxed);
+    remember_window(&window.app_handle().clone(), &window, false);
+    Ok(SURROUNDS[at].1.to_string())
+}
 
 /// Where the pointer last was over the canvas, in canvas pixels, whether or not
 /// a button was down. What a zoom to 1:1 holds still. Only GTK reports a pointer

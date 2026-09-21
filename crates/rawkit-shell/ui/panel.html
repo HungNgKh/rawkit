@@ -3934,6 +3934,10 @@
     // reach would take the panel away from anybody who drives it that way.
     { id: "filmstrip", keys: ["f6"], scope: "any", waits: false, group: "Views",
       title: "Show or hide the filmstrip", run: () => panels("strip") },
+    { id: "surround", keys: [], scope: "any", waits: false, group: "Views",
+      title: "Change what is round the photograph: dark, grey, mid grey, white, black",
+      run: () => invoke("set_surround", { name: null })
+        .then(words => tell("info", `Round the photograph: ${words}`)).catch(say) },
     { id: "panel-left", keys: ["f7"], scope: "any", waits: false, group: "Views",
       title: "Show or hide the left panel", run: () => panels("left") },
     { id: "panel-right", keys: ["f8"], scope: "any", waits: false, group: "Views",

@@ -417,6 +417,54 @@ fn blank_target(gpu: &Gpu, format: wgpu::TextureFormat) -> wgpu::Texture {
 
 #[test]
 #[ignore = "requires a GPU adapter"]
+fn where_the_canvas_holds_no_photograph_the_surround_shows() {
+    // Q6: a fresh canvas is transparent, and what fills it is the surround the
+    // person chose — a letterbox that could only be black was the complaint.
+    // The photograph itself must not move when the surround does.
+    let gpu = match Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_) => return,
+    };
+    let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+    let presenter = Presenter::new(&gpu, format);
+    let renderer = Renderer::new(&gpu);
+    let target = blank_target(&gpu, format);
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let first = |pixels: Vec<u8>| [pixels[0], pixels[1], pixels[2]];
+
+    let empty = renderer.create_canvas(&gpu, SIZE, SIZE);
+    presenter
+        .draw_into(&gpu, &empty, None, &view, [0, 0, SIZE, SIZE])
+        .unwrap();
+    assert_eq!(
+        first(read_back(&gpu, &target)),
+        [26, 26, 26],
+        "the default is #1a1a1a"
+    );
+
+    presenter.set_surround(&gpu, [0.1845, 0.1845, 0.1845]);
+    presenter
+        .draw_into(&gpu, &empty, None, &view, [0, 0, SIZE, SIZE])
+        .unwrap();
+    assert_eq!(
+        first(read_back(&gpu, &target)),
+        [119, 119, 119],
+        "mid grey is #777"
+    );
+
+    let photograph = grey_canvas(&gpu, &renderer);
+    presenter
+        .draw_into(&gpu, &photograph, None, &view, [0, 0, SIZE, SIZE])
+        .unwrap();
+    assert_eq!(
+        first(read_back(&gpu, &target)),
+        [188, 188, 188],
+        "an opaque photograph is untouched"
+    );
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
 fn the_overlay_is_composited_over_the_photograph_and_only_where_it_is() {
     // The seam the overlay layer created: everything an interface draws now
     // lives in a second texture, and this pass is the only thing that puts the

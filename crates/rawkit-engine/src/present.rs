@@ -47,6 +47,20 @@ fn half_from_f32(value: f32) -> u16 {
 /// Built once per target format. The format matters because an `-Srgb` target
 /// encodes on write and a plain one does not, and the difference is a whole
 /// transfer function.
+/// The surround until somebody chooses another: `#1a1a1a`, a step below the
+/// chrome's `#1f1f1f`, in linear light. Dark, because the eye adapts to what is
+/// round a photograph and a bright surround makes every frame look darker than
+/// it is; not black, so a black photograph still has an edge.
+pub const DEFAULT_SURROUND: [f32; 3] = [0.0103, 0.0103, 0.0103];
+
+fn f32_bytes(values: &[f32; 4]) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    for (at, value) in values.iter().enumerate() {
+        bytes[at * 4..at * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
 pub struct Presenter {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
@@ -58,6 +72,12 @@ pub struct Presenter {
     /// dummy texel is cheaper than a second pipeline layout.
     lut: wgpu::TextureView,
     lut_sampler: wgpu::Sampler,
+    /// What shows where the canvas has no photograph — the letterbox round a
+    /// fitted frame, the dark beyond a straightened one. Linear RGB in a
+    /// uniform, so it passes through the same output transform the photograph
+    /// does: a grey chosen to judge exposure against is that grey on this
+    /// monitor, not a number the page painted.
+    surround: wgpu::Buffer,
     /// One transparent texel, for presenting with no overlay.
     ///
     /// A bind group cannot have holes, and the same trick the display LUT
@@ -152,6 +172,16 @@ impl Presenter {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
                         count: None,
                     },
@@ -295,7 +325,24 @@ impl Presenter {
             &[0, 0, 0, 0],
         );
 
+        let surround = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("surround"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        gpu.queue.write_buffer(
+            &surround,
+            0,
+            &f32_bytes(&[
+                DEFAULT_SURROUND[0],
+                DEFAULT_SURROUND[1],
+                DEFAULT_SURROUND[2],
+                1.0,
+            ]),
+        );
         Self {
+            surround,
             pipeline,
             layout,
             sampler,
@@ -303,6 +350,15 @@ impl Presenter {
             lut_sampler,
             empty: empty.create_view(&wgpu::TextureViewDescriptor::default()),
         }
+    }
+
+    /// What shows where there is no photograph, in linear RGB.
+    pub fn set_surround(&self, gpu: &Gpu, linear: [f32; 3]) {
+        gpu.queue.write_buffer(
+            &self.surround,
+            0,
+            &f32_bytes(&[linear[0], linear[1], linear[2], 1.0]),
+        );
     }
 
     /// Draw `canvas` into `target`, filling it.
@@ -381,6 +437,10 @@ impl Presenter {
                     resource: wgpu::BindingResource::TextureView(
                         overlay.map_or(&self.empty, |o| o.view()),
                     ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.surround.as_entire_binding(),
                 },
             ],
         });

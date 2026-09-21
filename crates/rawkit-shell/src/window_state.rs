@@ -24,7 +24,7 @@ use std::path::PathBuf;
 /// and it is the wrong one: the number would mean something different the next
 /// time the desktop's scale factor changed, and the window would open a quarter
 /// of the way across the screen from where it was left.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Remembered {
     pub width: f64,
     pub height: f64,
@@ -47,6 +47,10 @@ pub struct Remembered {
     /// The filmstrip, F6.
     #[serde(default)]
     pub strip_hidden: bool,
+    /// What shows round the photograph, by name. A preference of this machine's
+    /// screen and room, like the rest of this file, and not of the catalog.
+    #[serde(default)]
+    pub surround: Option<String>,
 }
 
 /// Where this machine's settings live, made if it is not there.
@@ -94,7 +98,12 @@ pub fn save(app: &tauri::AppHandle, state: Remembered) {
 /// saving it would reopen a window the size of the display and not fullscreen —
 /// which is neither state the user was in. Keeping the previous value is the
 /// better answer, and it costs a `None`.
-pub fn of(window: &tauri::Window, panel: f64, shown: (bool, bool, bool)) -> Option<Remembered> {
+pub fn of(
+    window: &tauri::Window,
+    panel: f64,
+    shown: (bool, bool, bool),
+    surround: &str,
+) -> Option<Remembered> {
     if window.is_fullscreen().unwrap_or(false) {
         return None;
     }
@@ -111,5 +120,6 @@ pub fn of(window: &tauri::Window, panel: f64, shown: (bool, bool, bool)) -> Opti
         left_hidden: !shown.0,
         right_hidden: !shown.1,
         strip_hidden: !shown.2,
+        surround: Some(surround.to_string()),
     })
 }
