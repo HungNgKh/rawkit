@@ -1,7 +1,7 @@
 # Adding photographs
 
 **Status:** in progress · **Started:** 2026-09-21 ·
-**Code:** `rawkit-catalog::scan`, and the window's import on top of it
+**Code:** `rawkit-catalog::scan`, `rawkit-shell::importing`, `rawkit_deliver::file_metadata`
 
 How photographs get into a catalog: from the terminal (`rawkit catalog --scan`,
 `rawkit ingest`) and, from S8 of the interface work, from the window.
@@ -21,6 +21,10 @@ How photographs get into a catalog: from the terminal (`rawkit catalog --scan`,
 | A1 | A volume's root **widens**; it is never re-pointed at the folder being scanned | Adding a second folder on a drive used to lose the first. |
 | A2 | "Missing" is decided for the folder that was scanned, not for the volume | A scan says nothing about folders it did not look in. |
 | A3 | A scan can be watched, stopped, and tried without being kept | `scan_watched`: progress, `Cancelled`, `dry_run`. One code path for the count before and the scan after. |
+| A4 | The window adds **in place**, and only that, for now | Nothing is copied, moved or renamed. Copying from a card is a different promise and later work. |
+| A5 | Count first, then ask, on a button that says the number | The count is a dry run of the scan that follows. |
+| A6 | The import has its own connection, and the window stands still for it | One transaction of a dozen seconds cannot sit under the keypress lock; and with no `busy_timeout`, nothing else may write while it runs. |
+| A7 | An import ends in a relaunch | The library in the process is the one from before. Interface decision I16. |
 
 ## A1 — the root widens
 
@@ -90,6 +94,69 @@ from the code that will run when they do. With `no_metadata` it reads no files.
 `scan_on` is `scan_watched` that is never stopped and always kept, so the
 terminal and the tests are unchanged.
 
+## A4 — in place
+
+The owner's decision (Q5 of the interface plan): add-in-place for the beta,
+because it is the half of "import" that can be trusted with a stranger's
+library. The sheet says so in one line that never changes: *They stay where
+they are. Nothing is copied, moved or renamed.*
+
+With no catalog open there is nowhere to add to, and the command says that
+*before* it opens a folder picker. A new catalog opens to a screen whose first
+action is to add a folder; a folder dropped on the window is added.
+
+## A5 — count, then ask
+
+`Stage::Counted { fresh, already, unreadable }`, from a dry run with a reader
+that reads no files — names and sizes are enough to count. The button reads
+"Add 1 268 photographs". Folders that could not be listed are counted on the
+sheet, because a number that is short with no reason given looks like a scan
+that missed things. A folder with nothing new in it never reaches the question:
+the status line says everything is already here, and the sheet closes.
+
+## A6 — its own connection, and a window that stands still
+
+A scan is one transaction and, at twenty thousand photographs, about twelve
+seconds. Under the library's mutex that is every keypress blocked for twelve
+seconds. So it runs on a thread with a connection of its own — and then the
+constraint from the preview work applies in the other direction: **there is no
+`busy_timeout`**, so while that transaction holds the write lock, a write from
+the window does not wait, it fails.
+
+So there are none. The render loop flushes the pending edit, then does nothing
+until the import ends — no saver, no preview pump — and the page's sheet covers
+the window and takes the keyboard. On Linux the canvas is unmapped for the
+duration, because the sheet is the page's and the canvas is over the page.
+An import is refused while an export is running, for the reason a relaunch is.
+
+One connection for both halves, held across the question between them: closing
+a catalog writes a rolling backup, and an import should cost the rotation one
+backup, not two.
+
+**Weighed against:** scanning through the library's own connection, in slices,
+between frames. It keeps one writer by construction, but the scan is one
+transaction *because* a half-added folder is worse than none, and slicing it
+either gives that up or holds a transaction open across frames with the
+window's own writes landing inside it.
+
+## A7 — and then a relaunch
+
+`--added <n>` is how the next process knows to say "Added 1 268 photographs" —
+a relaunch cannot carry a sentence any other way — and to open on the grid,
+which is what "here is what arrived" looks like. The previews then build
+themselves, what is on screen first.
+
+## Not built, and known
+
+- **Copy from a card** (`rawkit ingest` from the window): destination, date
+  folders, duplicate skip, verification. The plan's second half of S8.
+- **Choosing what to add.** The designer's sheet has a grid of thumbnails with a
+  tick on each. This adds the folder or does not.
+- **Stopping is per file.** A header read on a slow card is the longest a Stop
+  can take to be heard.
+- **The count holds the write lock** for as long as it takes — about a second
+  at twenty thousand. Nothing in the window writes meanwhile, by A6.
+
 ## If you change this
 
 | Changing… | …is guarded by |
@@ -99,4 +166,8 @@ terminal and the tests are unchanged.
 | how folder rows are re-spelled | `a_subfolder_named_like_the_folder_above_it_survives_the_root_moving_up` — and its check that no folder is left without a parent |
 | what a scan may call missing | `a_file_missing_from_one_folder_is_not_every_other_folders_problem` |
 | finding a library that moved | `a_library_that_has_moved_is_found_where_it_went` |
+| the import's stages, and that nothing is kept until somebody says so | `it_counts_asks_and_then_adds`, `saying_no_keeps_nothing`, `stopped_part_way_it_keeps_nothing` |
+| what happens when there is nothing new | `a_folder_already_in_the_catalog_is_nothing_to_add` — nobody is asked a question with one answer |
+| a failure on the sheet | `a_folder_that_is_not_there_is_a_failure_that_stays_until_read` |
+| anything the render loop does while `IMPORTING` | nothing automatic. **It must write nothing to the catalog.** Read the block in `tick` |
 | stopping or trying a scan | `a_scan_that_is_stopped_keeps_nothing_and_says_how_far_it_got`, `a_dry_run_counts_and_keeps_nothing` |

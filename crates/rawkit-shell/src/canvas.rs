@@ -237,12 +237,21 @@ fn place(child: &gdk::Window, panel: &std::sync::atomic::AtomicI32, width: i32, 
 ///
 /// The canvas is an X window *over* the page, so while it is mapped the page
 /// beneath it cannot be seen — and with nothing open, the page is where the
-/// welcome is. Never shown again in this process: opening something is a
-/// relaunch, and the new process maps its own.
+/// welcome is. The import's sheet needs the window the same way, and gives it
+/// back with [`show`] if it ends without a relaunch.
 pub fn hide() {
     CHILD.with(|slot| {
         if let Some(child) = slot.borrow().as_ref() {
             child.hide();
+        }
+    });
+}
+
+/// Put the canvas back, after something that needed the whole window has gone.
+pub fn show() {
+    CHILD.with(|slot| {
+        if let Some(child) = slot.borrow().as_ref() {
+            child.show();
         }
     });
 }

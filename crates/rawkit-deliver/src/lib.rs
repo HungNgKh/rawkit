@@ -44,6 +44,27 @@
 
 pub mod previews;
 
+/// What a scan records about a file, read from its header.
+///
+/// The catalog takes its reader as a parameter so that it need not depend on
+/// the decoder; this is the one place the two are joined, and it is here
+/// because both front ends scan — the terminal always has, and the window's
+/// import does now. A translation small enough to read in full.
+///
+/// A failure is `None`, not an error: an `.ARW` that will not parse is a row
+/// with empty camera columns, never a scan that stops halfway through a library.
+pub fn file_metadata(path: &std::path::Path) -> Option<rawkit_catalog::scan::FileMetadata> {
+    let found = rawkit_decode::read_metadata(path).ok()?;
+    Some(rawkit_catalog::scan::FileMetadata {
+        captured_at: found.captured_at,
+        camera_make: Some(found.camera.make).filter(|s| !s.is_empty()),
+        camera_model: Some(found.camera.model).filter(|s| !s.is_empty()),
+        camera_serial: found.camera.serial,
+        shutter_count: found.shutter_count.map(i64::from),
+        lens: found.lens,
+    })
+}
+
 use anyhow::{bail, Context, Result};
 use rawkit_catalog::cull::{self, Filter, Flagged};
 use rawkit_catalog::db::Catalog;

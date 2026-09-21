@@ -386,8 +386,8 @@ into a way to crash. The page asks `entrance` once, and while it says
 `welcome`, `run` lets through only registry entries marked `welcome: true`.
 
 An open catalog with no photographs in it is the same screen with a different
-headline. Until import is built (S8) it says how to fill it from a terminal,
-which is a tax on a stranger and is stated rather than hidden.
+headline and a first action of its own: add a folder
+(`docs/decisions/import.md`).
 
 The mosaic is `--test-pattern`. It is a developer's tool and is spelt like one.
 
@@ -416,7 +416,7 @@ folder with nothing to say which files were written.
 
 **Not done:** a drop on the canvas. On Linux the canvas is its own window and
 takes no drops, so a drop lands only on the panel, or anywhere on the welcome
-screen. A dropped folder is refused in words until S8.
+screen. A dropped folder is photographs to add, not something to open.
 
 ## I17 — what a bare launch opens
 

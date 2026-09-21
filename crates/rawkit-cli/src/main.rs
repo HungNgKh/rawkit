@@ -320,7 +320,7 @@ fn main() -> Result<()> {
                 &mut catalog,
                 &from,
                 &into,
-                file_metadata,
+                rawkit_deliver::file_metadata,
                 |done, total, name| {
                     if !name.is_empty() && name != last {
                         eprint!("\rcopying    : {done}/{total} {name}   ");
@@ -398,7 +398,8 @@ fn main() -> Result<()> {
                 None => println!("backups    : none"),
             }
             if let Some(root) = scan {
-                let report = rawkit_catalog::scan::scan(&mut catalog, &root, file_metadata)?;
+                let report =
+                    rawkit_catalog::scan::scan(&mut catalog, &root, rawkit_deliver::file_metadata)?;
                 println!(
                     "scanned    : {} added, {} updated, {} unchanged, {} now missing",
                     report.added, report.updated, report.unchanged, report.missing
@@ -582,28 +583,6 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// The seam between the catalog and the decoder.
-///
-/// `rawkit-catalog` deliberately does not depend on `rawkit-decode`, so that the
-/// library layer stays free of LibRaw and its CDDL obligations. It takes a
-/// reader instead, and this is the one place the two are joined — a translation
-/// small enough to read in full, which is the point of putting it here rather
-/// than giving the catalog a dependency it would only use for six columns.
-///
-/// A failure is `None`, not an error: an `.ARW` that will not parse is a row
-/// with empty camera columns, never a scan that stops halfway through a library.
-fn file_metadata(path: &std::path::Path) -> Option<rawkit_catalog::scan::FileMetadata> {
-    let found = rawkit_decode::read_metadata(path).ok()?;
-    Some(rawkit_catalog::scan::FileMetadata {
-        captured_at: found.captured_at,
-        camera_make: Some(found.camera.make).filter(|s| !s.is_empty()),
-        camera_model: Some(found.camera.model).filter(|s| !s.is_empty()),
-        camera_serial: found.camera.serial,
-        shutter_count: found.shutter_count.map(i64::from),
-        lens: found.lens,
-    })
 }
 
 /// Sizes in the units a person reads, because "17179869184" is not a size.

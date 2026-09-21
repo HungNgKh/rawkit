@@ -138,6 +138,7 @@
 #[cfg(target_os = "linux")]
 mod building;
 mod canvas;
+mod importing;
 mod library;
 #[cfg(test)]
 mod page_contract;
@@ -1187,14 +1188,9 @@ fn leave_for_path(path: &Path) -> Result<(), String> {
             .iter()
             .any(|known| extension.eq_ignore_ascii_case(known))
     });
+    // A folder is photographs to add, not something to open.
     if path.is_dir() {
-        // Said plainly rather than ignored. Adding a folder is the next thing
-        // the window learns, and until it has, a drop that did nothing would
-        // read as a drop that was not noticed.
-        return Err(format!(
-            "{} is a folder, and adding a folder of photographs is not in the window yet",
-            path.display()
-        ));
+        return begin_import(path);
     }
     if !is_catalog(path) && !raw {
         return Err(format!(
@@ -1356,6 +1352,172 @@ fn close_catalog() -> Result<(), String> {
     leave_for(vec!["--welcome".into()])
 }
 
+/// The catalog this process has open — with photographs in it or without.
+static OPEN_CATALOG: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// A folder somebody has asked to add, waiting for the render loop to start
+/// the import: it flushes the pending edit first, and then stands still.
+static PENDING_IMPORT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// The import this process is running, if it is. See [`importing`].
+static IMPORT: Mutex<Option<importing::Running>> = Mutex::new(None);
+
+/// Whether the render loop is standing still for an import. It writes nothing
+/// to the catalog while this is set, which is what lets the import's own
+/// connection hold the write lock for as long as a scan takes.
+static IMPORTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask for a folder of photographs to be added to the open catalog.
+fn begin_import(folder: &Path) -> Result<(), String> {
+    if OPEN_CATALOG.get().and_then(|open| open.as_ref()).is_none() {
+        return Err(
+            "there is no catalog open to add them to — open one, or make a new one, first".into(),
+        );
+    }
+    if !folder.is_dir() {
+        return Err(format!("{} is not a folder", folder.display()));
+    }
+    let exporting = EXPORTING
+        .lock()
+        .expect("export lock")
+        .as_ref()
+        .is_some_and(|export| export.finished.is_none());
+    if exporting {
+        return Err("an export is still running; add the folder when it has finished".into());
+    }
+    if IMPORT.lock().expect("import lock").is_some() {
+        return Err("a folder is already being added".into());
+    }
+    *PENDING_IMPORT.lock().expect("import lock") = Some(folder.to_path_buf());
+    Ok(())
+}
+
+/// Start the import's thread. Called by the render loop, once it has flushed.
+fn start_import(folder: PathBuf) {
+    let Some(catalog) = OPEN_CATALOG.get().and_then(|open| open.clone()) else {
+        return;
+    };
+    let shared = Arc::new(importing::Shared::default());
+    let (decide, decided) = std::sync::mpsc::channel();
+    *IMPORT.lock().expect("import lock") = Some(importing::Running {
+        shared: shared.clone(),
+        decide,
+        folder: folder.clone(),
+    });
+    std::thread::spawn(move || {
+        let outcome = importing::run(
+            &shared,
+            &catalog,
+            &folder,
+            rawkit_catalog::VolumeId::resolve,
+            rawkit_deliver::file_metadata,
+            &decided,
+        );
+        let name = importing::name_of(&folder);
+        eprintln!("import     : {name}: {outcome:?}");
+        match outcome {
+            importing::Outcome::Added(added) => {
+                // The library in this process is the one from before. What an
+                // import produces is a catalog worth opening, so open it.
+                let again = vec![
+                    "--added".into(),
+                    added.to_string().into(),
+                    catalog.into_os_string(),
+                ];
+                match leave_for(again) {
+                    Ok(()) => shared.opening(added),
+                    Err(why) => shared.fail(format!(
+                        "{added} photographs were added, but the catalog could not be reopened \
+                         to show them: {why}"
+                    )),
+                }
+                return;
+            }
+            importing::Outcome::Nothing => {
+                notice(format!(
+                    "Nothing to add: every photograph in {name} is already in this catalog"
+                ));
+            }
+            importing::Outcome::Cancelled => notice("Nothing was added"),
+            // The sheet is showing why, and stays until it is dismissed.
+            importing::Outcome::Failed => return,
+        }
+        *IMPORT.lock().expect("import lock") = None;
+    });
+}
+
+/// Pick a folder of photographs and add it to the open catalog.
+#[tauri::command]
+fn add_folder_dialog(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_dialog::DialogExt;
+    // Asked before the picker, not after: choosing a folder and *then* being
+    // told there is nowhere to put it is the wrong order to learn that in.
+    if OPEN_CATALOG.get().and_then(|open| open.as_ref()).is_none() {
+        return Err(
+            "there is no catalog open to add them to — open one, or make a new one, first".into(),
+        );
+    }
+    app.dialog().file().pick_folder(|chosen| {
+        let Some(folder) = chosen.and_then(|p| p.into_path().ok()) else {
+            return;
+        };
+        if let Err(why) = begin_import(&folder) {
+            tell(Told::from(why.as_str()));
+        }
+    });
+    Ok(())
+}
+
+/// Where the import is, for the page to draw. `None` when there is none.
+#[tauri::command]
+fn import_progress() -> Option<serde_json::Value> {
+    let import = IMPORT.lock().expect("import lock");
+    let running = import.as_ref()?;
+    Some(serde_json::json!({
+        "folder": running.folder.display().to_string(),
+        "name": importing::name_of(&running.folder),
+        "at": running.shared.stage(),
+    }))
+}
+
+/// Go on and add what was counted.
+#[tauri::command]
+fn confirm_import() -> Result<(), String> {
+    let import = IMPORT.lock().expect("import lock");
+    let running = import.as_ref().ok_or("nothing is waiting to be added")?;
+    if !matches!(
+        running.shared.stage(),
+        Some(importing::Stage::Counted { .. })
+    ) {
+        return Err("nothing is waiting to be added".into());
+    }
+    running
+        .decide
+        .send(true)
+        .map_err(|_| "the import has already ended".to_string())
+}
+
+/// Stop the import, wherever it has got to. Nothing is kept unless it had
+/// finished: a scan is one transaction.
+#[tauri::command]
+fn cancel_import() {
+    let mut import = IMPORT.lock().expect("import lock");
+    let Some(running) = import.as_ref() else {
+        return;
+    };
+    match running.shared.stage() {
+        Some(importing::Stage::Counted { .. }) => {
+            let _ = running.decide.send(false);
+        }
+        Some(importing::Stage::Failed { .. }) | None => *import = None,
+        // Already in the catalog, and the relaunch is on its way.
+        Some(importing::Stage::Opening { .. }) => {}
+        Some(importing::Stage::Counting { .. } | importing::Stage::Adding { .. }) => {
+            running.shared.stop();
+        }
+    }
+}
+
 /// What the command line asked for.
 #[derive(Debug, Default, PartialEq)]
 struct Arguments {
@@ -1369,6 +1531,9 @@ struct Arguments {
     /// that does not exist is refused: SQLite opens-or-creates, and a mistyped
     /// name used to leave an empty catalog behind as its only reply.
     new: bool,
+    /// How many photographs the import that started this process added, for it
+    /// to say so. A relaunch cannot carry a sentence across any other way.
+    added: Option<usize>,
     /// The synthetic mosaic, for looking at the renderer with no file to hand.
     /// It used to be what a bare launch showed — a pink test card with live
     /// sliders and not a word of explanation — which is a developer's tool
@@ -1391,6 +1556,9 @@ fn parse_arguments(args: impl Iterator<Item = String>) -> Result<Arguments> {
                 parsed.profile = Some(PathBuf::from(&arg["--profile=".len()..]));
             }
             "--welcome" => parsed.welcome = true,
+            "--added" => {
+                parsed.added = args.next().and_then(|n| n.parse().ok());
+            }
             "--new" => parsed.new = true,
             "--test-pattern" => parsed.test_pattern = true,
             _ if arg.starts_with('-') && arg != "-" => {
@@ -1500,6 +1668,10 @@ fn main() -> Result<()> {
             export_progress,
             take_notice,
             entrance,
+            add_folder_dialog,
+            import_progress,
+            confirm_import,
+            cancel_import,
             open_catalog_dialog,
             open_photograph_dialog,
             new_catalog_dialog,
@@ -1651,9 +1823,17 @@ fn main() -> Result<()> {
             let _ = CONFIG_DIR.set(settings.clone());
             let start = start_for(&arguments, settings.as_deref().and_then(recent::last));
             eprintln!("start      : {start:?}");
+            let mut opened = None;
             let (library, raw) = match &start {
                 Start::Catalog { path, create } => match open_catalog(path, *create) {
                     Ok(Some(library)) => {
+                        opened = Some(path.clone());
+                        if let Some(added) = arguments.added {
+                            notice(match added {
+                                1 => "Added 1 photograph".to_string(),
+                                n => format!("Added {n} photographs"),
+                            });
+                        }
                         if let Some(settings) = &settings {
                             recent::note(settings, path, library.count(), now());
                         }
@@ -1662,6 +1842,7 @@ fn main() -> Result<()> {
                     }
                     // Open, and nothing in it: a catalog somebody has just made.
                     Ok(None) => {
+                        opened = Some(path.clone());
                         if let Some(settings) = &settings {
                             recent::note(settings, path, 0, now());
                         }
@@ -1676,10 +1857,19 @@ fn main() -> Result<()> {
                 Start::Photograph(path) => (None, Some(path.clone())),
                 Start::TestPattern | Start::Welcome => (None, None),
             };
+            // Absolute, because it is handed to the next process, which need
+            // not start where this one did.
+            let _ = OPEN_CATALOG
+                .set(opened.map(|path| std::path::absolute(&path).unwrap_or(path)));
             // A catalog opens in the Library, which is where a session with one
             // starts: choosing, before changing.
             if library.is_some() {
                 enter(LIBRARY);
+                // Straight from adding photographs: show all of them, not the
+                // first one. The grid is what "here is what arrived" looks like.
+                if arguments.added.is_some() {
+                    MODE.store(MODE_GRID, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             app.manage(Shelf(library.clone()));
 
@@ -1905,6 +2095,33 @@ fn main() -> Result<()> {
                     }
                     leaving_app.exit(0);
                     return Ok(());
+                }
+                // A folder to add. The edit in hand goes to the catalog first,
+                // because from here until the import ends this loop writes
+                // nothing: the import's own connection holds the write lock,
+                // and SQLite here does not wait for a lock, it fails.
+                let adding = PENDING_IMPORT.lock().expect("import lock").take();
+                if let Some(folder) = adding {
+                    saver.flush();
+                    IMPORTING.store(true, std::sync::atomic::Ordering::Relaxed);
+                    // The sheet is the page's, and on Linux the canvas is over
+                    // the page.
+                    #[cfg(target_os = "linux")]
+                    if route == Route::NativeChild {
+                        canvas::hide();
+                    }
+                    start_import(folder);
+                }
+                if IMPORTING.load(std::sync::atomic::Ordering::Relaxed) {
+                    if IMPORT.lock().expect("import lock").is_some() {
+                        return Ok(());
+                    }
+                    // Over without a relaunch: nothing to add, or stopped.
+                    IMPORTING.store(false, std::sync::atomic::Ordering::Relaxed);
+                    #[cfg(target_os = "linux")]
+                    if route == Route::NativeChild && !welcome {
+                        canvas::show();
+                    }
                 }
                 if welcome {
                     return Ok(());
