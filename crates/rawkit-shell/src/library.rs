@@ -913,6 +913,26 @@ impl Library {
     /// the only way for the two to stay in step is for one of them to be
     /// derived. Marked frames the filter excludes are absent here and still
     /// marked: narrowing the view is not a decision about the comparison.
+    /// The selected photographs that are showing, by id, in the order they
+    /// show. The ones the filter is hiding are left out, because the count the
+    /// page gives for "selected" leaves them out: what is exported is what was
+    /// counted, and what was counted is what can be seen.
+    pub fn selected_ids(&self) -> Vec<i64> {
+        self.marked()
+            .into_iter()
+            .filter_map(|position| self.id_at(position))
+            .collect()
+    }
+
+    /// Every photograph the window is showing, in the order it shows them —
+    /// the library or a collection, through the filter.
+    pub fn shown_ids(&self) -> Vec<i64> {
+        self.sequence
+            .slice(0, self.sequence.len())
+            .map(|image| image.id)
+            .collect()
+    }
+
     pub fn marked(&self) -> Vec<usize> {
         let mut positions: Vec<usize> = self
             .marked
@@ -929,12 +949,6 @@ impl Library {
     /// Where a photograph sits in the sequence, if the filter admits it.
     fn position_of(&self, id: i64) -> Option<usize> {
         self.sequence.position_of(id)
-    }
-
-    /// Which part of the library is on screen — what an export of "what is
-    /// shown" is an export of.
-    pub fn filter(&self) -> &Filter {
-        self.sequence.filter()
     }
 
     /// A second interpretation of the photograph under the cursor.
@@ -2837,6 +2851,40 @@ pub(crate) mod tests {
         assert_eq!(wanted.len(), 1);
         assert_eq!(wanted[0].image_id, first);
         assert_eq!(wanted[0].missing, previews::Level::BULK.to_vec());
+    }
+
+    #[test]
+    fn what_an_export_is_given_is_what_the_window_is_showing() {
+        // "Shown" used to be sent as the filter alone. That was the whole truth
+        // until collections existed; after that it exported the filtered
+        // *library* while the window was showing a collection.
+        let dir = Scratch::new("export-shown");
+        let mut library = library_at(&dir.0, 5);
+        let everything = library.shown_ids();
+        assert_eq!(everything.len(), 5);
+
+        // Two of them into a collection, and the collection opened.
+        library.act(CullAction::Mark).unwrap();
+        library.act(CullAction::SelectNext).unwrap();
+        library.act(CullAction::SelectNext).unwrap();
+        library.act(CullAction::Mark).unwrap();
+        assert_eq!(library.selected_ids(), vec![everything[0], everything[2]]);
+        let view = library
+            .act(CullAction::NewCollection("Portfolio".into()))
+            .unwrap();
+        let made = view
+            .collections
+            .iter()
+            .find(|c| c.name == "Portfolio")
+            .unwrap()
+            .id;
+        library.act(CullAction::ShowCollection(Some(made))).unwrap();
+        assert_eq!(library.shown_ids(), vec![everything[0], everything[2]]);
+
+        // And what is counted as selected is what can be seen to be.
+        let view = library.view().unwrap();
+        assert_eq!(view.marked, library.selected_ids().len());
+        assert_eq!(view.total, library.shown_ids().len());
     }
 
     #[test]

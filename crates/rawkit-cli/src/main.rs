@@ -534,6 +534,8 @@ fn main() -> Result<()> {
                         last = done;
                         eprint!("\rexporting  : {done}/{total} {name:<40}");
                     }
+                    // Nothing stops an export from the terminal but Ctrl+C.
+                    true
                 },
             )?;
             if report.written + report.skipped > 0 {

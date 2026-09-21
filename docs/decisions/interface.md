@@ -43,6 +43,9 @@ what a contributor would otherwise undo.
 | **I18** | Nothing a person can meet may fail the launch or end the render loop | A catalog that will not open is the welcome screen and a sentence. A photograph that cannot be read is a flat stand-in and a sentence. |
 | **I19** | Every way out goes through the render loop | It owns the saver. Closing the window used to lose an edit made in the last 800 ms; now close, open and relaunch all flush first. |
 | **I20** | What the shell says has a command of its own | `take_notice`. It rode on `snapshot`, which five places read and two of them said. |
+| **I22** | Export is a panel in the column, with a button | What, how, to where — and only what the writer can do. `Ctrl+Shift+E` opens it; `Ctrl+E` exports again with the last settings. |
+| **I23** | What is exported is what was counted | "Selected" and "shown" are sent as lists of photographs, in the order shown — not as a filter, which cannot describe a collection. |
+| **I24** | Export settings belong to the machine | `export.json` beside `window.json`: the last settings and the named ones. A destination folder is a fact about this computer. |
 | **I21** | New never replaces a catalog, and only `--new` makes one | The picker's "replace?" is a question about a file. Without `--new`, a path that is not there is refused, not created. |
 
 ## I1 — one status line
@@ -495,6 +498,62 @@ sentence says to open it instead. Separately, SQLite opens-or-creates: a
 mistyped catalog name on the command line used to leave an empty file as its
 only reply. Now only `--new` — which only New passes — may create one.
 
+## I22 — export is a panel, with a button
+
+Export was two chords nobody could discover and no choices at all: a full-size
+JPEG at quality 92, of this photograph or of "what the filter shows" (F11). The
+writer underneath has always taken more, and the terminal has always offered it.
+
+The panel is in the column, not over the window. On Linux nothing of the page's
+can be drawn over the photograph — and here that is also right, because the
+photographs stay in view while somebody decides how big to make them. **What**:
+selected, shown, or this photograph, each with its count, and the button says
+the number. **How**: format, JPEG quality, full size or a long edge, sharpening
+for the output, and whether a file that is already there is left or replaced.
+**To**: a folder. One photograph goes into a folder like any other set; the
+save-as dialog it used to get was a second way to answer "where", with its own
+overwrite rule.
+
+**Only what the writer does.** No colour space, no naming pattern, no "add a
+number": `rawkit_deliver::Delivery` has none of them, and a control for
+something that cannot happen is worse than its absence. When the writer grows
+one, the panel grows a row.
+
+`Ctrl+Shift+E` opens the panel and `Ctrl+E` exports again with the last
+settings — the designer's assignment, and the reverse of what the two chords
+did before. Again means the same *how*, of what is meant now: if the last
+export was of a selection and nothing is selected today, it is of what is shown.
+
+An export can be stopped, between photographs: what is being written is
+finished, because half a JPEG is worse than one more. `write`'s progress
+callback answers whether to go on. The line at the end says how many were
+never started. Every photograph that was not written is listed in the panel
+with its reason; the status line has room for the first.
+
+Found building it: **an export asked for from the grid did not start** until
+somebody opened a photograph. The block that starts one sat after the grid's
+early return in the render loop. The grid is where a set of photographs is
+chosen.
+
+## I23 — what is exported is what was counted
+
+`Selection::Images(ids)`, gathered in the order given. "Shown" used to be sent
+as the filter alone, with a comment explaining that an interface which can show
+a set it will not deliver is the mismatch being avoided. That was the whole
+truth until collections existed; after that, exporting what was shown while
+looking at a collection exported the filtered *library*. A collection is a list
+in an order a person chose, and no filter describes it.
+
+"Selected" is the selected photographs that are showing. The ones a filter is
+hiding are left out because the count on the panel leaves them out.
+
+## I24 — export settings belong to the machine
+
+Not the catalog. A destination folder is a fact about this computer, and a
+catalog carried to another should not arrive with presets pointing at folders
+that are not there. It also keeps the schema out of it. A preset does not hold
+a scope: "web, 2048" is how, and which photographs is asked every time.
+
 ## If you change this
 
 | If you touch… | …this will tell you |
@@ -513,6 +572,10 @@ only reply. Now only `--new` — which only New passes — may create one.
 | the shape of a registry entry | the same test — it reads `{ id: `, `act: "…"`, `value: …`, `waits: …` as text |
 | what the view carries per keypress | `the_view_says_where_a_photograph_is_kept`; the `holding 1` and `taken 1` columns of the scale gate |
 | what is written while a stand-in is showing | `a_photograph_that_could_not_be_read_is_not_edited_by_accident` |
+| what the panel can ask for | `every_format_the_panel_offers_is_one_the_writer_has`, `what_cannot_be_carried_out_is_refused_in_words`, `the_defaults_lose_nothing_nobody_asked_to_lose` |
+| what "selected" and "shown" mean to an export | `what_an_export_is_given_is_what_the_window_is_showing` (shell), `a_list_is_gathered_in_the_order_it_was_given` (deliver) |
+| where export settings are kept | `the_last_settings_and_the_presets_come_back`, `a_file_somebody_edited_badly_is_a_first_run` |
+| anything in `tick` that must happen in the grid too | it goes **before** the `in_grid()` early return. The pump, the import and the export all do |
 | what a launch opens | `what_is_named_is_what_opens`, `with_nothing_named_the_last_catalog_comes_back`, `a_catalog_that_was_closed_stays_closed`, `the_test_pattern_has_to_be_asked_for` |
 | the recent list | `the_last_one_opened_comes_first_and_is_listed_once`, `only_so_many_are_kept`, `a_bare_launch_reopens_the_last_one_only_if_it_is_there`, `a_list_that_cannot_be_read_is_an_empty_one` |
 | anything in `setup`, or in the navigation block of `tick` | nothing automatic. **No `?` on anything a missing file, a bad catalog or a corrupt preview can reach.** Check by hand with `target/scratch`-style catalogs whose files have been renamed |

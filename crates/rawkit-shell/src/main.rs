@@ -138,6 +138,7 @@
 #[cfg(target_os = "linux")]
 mod building;
 mod canvas;
+mod exporting;
 mod importing;
 mod library;
 #[cfg(test)]
@@ -388,70 +389,116 @@ fn histogram(seen: Option<u64>) -> Option<serde_json::Value> {
     }))
 }
 
-/// Choose where an export goes, and leave it for the render loop to start.
-///
-/// Returns as soon as the dialog is open. The picker's own callback is what
-/// records the destination, so nothing here waits on a person — a command that
-/// blocked until someone had finished browsing their disk would hold a Tauri
-/// thread for as long as they took.
+/// What the export panel opens showing: the settings last used on this
+/// machine, and the named ones.
 #[tauri::command]
-fn export(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, Shelf>,
-    scope: String,
-) -> Result<(), String> {
-    use tauri_plugin_dialog::DialogExt;
+fn export_panel() -> exporting::Kept {
+    CONFIG_DIR
+        .get()
+        .and_then(|dir| dir.as_deref())
+        .map(exporting::kept)
+        .unwrap_or_default()
+}
 
+/// Open a folder picker for the export's destination. Returns as soon as it is
+/// open — a command that waited for somebody to finish browsing their disk
+/// would hold a Tauri thread for as long as they took — and the page collects
+/// the answer with [`take_export_folder`].
+#[tauri::command]
+fn pick_export_folder(app: tauri::AppHandle) {
+    use tauri_plugin_dialog::DialogExt;
+    app.dialog().file().pick_folder(|chosen| {
+        if let Some(folder) = chosen.and_then(|p| p.into_path().ok()) {
+            *PICKED_FOLDER.lock().expect("export lock") = Some(folder);
+        }
+    });
+}
+
+/// The folder the picker came back with, once.
+#[tauri::command]
+fn take_export_folder() -> Option<PathBuf> {
+    PICKED_FOLDER.lock().expect("export lock").take()
+}
+
+/// Export, as the panel describes it. Leaves the work for the render loop to
+/// start — see [`PENDING_EXPORT`] — and returns.
+#[tauri::command]
+fn export_with(
+    state: tauri::State<'_, Shelf>,
+    settings: exporting::Settings,
+) -> Result<(), String> {
     let Some(library) = state.0.clone() else {
         return Err("no catalog is open, so there is nothing to export".into());
     };
-    let (selection, name) = {
+    if IMPORTING.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("a folder is being added; export when it has finished".into());
+    }
+    let running = EXPORTING
+        .lock()
+        .expect("export lock")
+        .as_ref()
+        .is_some_and(|export| export.finished.is_none());
+    if running {
+        return Err("an export is already running".into());
+    }
+    let (delivery, folder) = settings.delivery(EXPORT_JOBS)?;
+    let selection = {
         let library = library.lock().expect("library lock");
-        match scope.as_str() {
-            "current" => {
-                let current = library.current();
-                let stem = std::path::Path::new(&current.filename)
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| current.filename.clone());
-                (
-                    rawkit_deliver::Selection::Image(current.id),
-                    Some(format!("{stem}.jpg")),
-                )
+        match settings.scope {
+            exporting::Scope::Current => rawkit_deliver::Selection::Image(library.current().id),
+            // As lists, not as the filter. A filter alone was the whole truth
+            // until collections existed; after that, "shown" exported the
+            // filtered *library* while the window showed a collection.
+            exporting::Scope::Shown => rawkit_deliver::Selection::Images(library.shown_ids()),
+            exporting::Scope::Selected => {
+                let ids = library.selected_ids();
+                if ids.is_empty() {
+                    return Err("nothing is selected, so there is nothing to export".into());
+                }
+                rawkit_deliver::Selection::Images(ids)
             }
-            // Whatever the library is currently showing — which with no filter
-            // set is the whole of it, and with one set is exactly the frames on
-            // screen. Not the marked set: marking is the transient "these ones"
-            // gesture that compare and paste already use, while a filter is what
-            // the window is *about*, and an interface that can show you a set it
-            // will not deliver is the mismatch this replaced.
-            "shown" => (
-                rawkit_deliver::Selection::Matching(library.filter().clone()),
-                None,
-            ),
-            other => return Err(format!("{other} is not something to export")),
         }
     };
-
-    // One photograph is saved as a file the user names; a set goes into a folder.
-    // The picker's own kind is what decides which, so the two cannot disagree.
-    let one_file = name.is_some();
-    let leave = move |chosen: Option<tauri_plugin_dialog::FilePath>| {
-        let Some(path) = chosen.and_then(|p| p.into_path().ok()) else {
-            return; // Cancelled, which is an answer and not an error.
-        };
-        let destination = if one_file {
-            rawkit_deliver::Destination::File(path)
-        } else {
-            rawkit_deliver::Destination::Folder(path)
-        };
-        *PENDING_EXPORT.lock().expect("export lock") = Some((selection, destination));
-    };
-    let dialog = app.dialog().clone();
-    match name {
-        Some(filename) => dialog.file().set_file_name(filename).save_file(leave),
-        None => dialog.file().pick_folder(leave),
+    if let Some(dir) = CONFIG_DIR.get().and_then(|dir| dir.as_deref()) {
+        exporting::remember(dir, &settings);
     }
+    *PENDING_EXPORT.lock().expect("export lock") = Some((
+        selection,
+        rawkit_deliver::Destination::Folder(folder),
+        delivery,
+    ));
+    Ok(())
+}
+
+/// Keep these settings under a name.
+#[tauri::command]
+fn save_export_preset(name: String, settings: exporting::Settings) -> Result<(), String> {
+    let dir = CONFIG_DIR
+        .get()
+        .and_then(|dir| dir.as_deref())
+        .ok_or("there is nowhere on this machine to keep a preset")?;
+    exporting::save_preset(dir, &name, &settings)
+}
+
+#[tauri::command]
+fn forget_export_preset(name: String) {
+    if let Some(dir) = CONFIG_DIR.get().and_then(|dir| dir.as_deref()) {
+        exporting::forget_preset(dir, &name);
+    }
+}
+
+/// Stop the export after the photographs being written now.
+#[tauri::command]
+fn cancel_export() -> Result<(), String> {
+    let running = EXPORTING
+        .lock()
+        .expect("export lock")
+        .as_ref()
+        .is_some_and(|export| export.finished.is_none());
+    if !running {
+        return Err("no export is running".into());
+    }
+    EXPORT_STOP.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -465,6 +512,9 @@ fn export_progress() -> Option<serde_json::Value> {
         "total": exporting.total,
         "filename": exporting.filename,
         "finished": exporting.finished,
+        // Every photograph that was not written, and why: the status line has
+        // room for the first, and the panel lists the rest.
+        "failed": exporting.failed,
     }))
 }
 
@@ -1688,8 +1738,14 @@ fn main() -> Result<()> {
             cull_view,
             canvas_pointer,
             histogram,
-            export,
             export_progress,
+            export_panel,
+            pick_export_folder,
+            take_export_folder,
+            export_with,
+            save_export_preset,
+            forget_export_preset,
+            cancel_export,
             take_notice,
             entrance,
             add_folder_dialog,
@@ -2208,6 +2264,28 @@ fn main() -> Result<()> {
                     canvas_renderer.invalidate();
                 }
 
+                // Before the grid's early return. It sat after it, so an export
+                // asked for from the grid — where a set of photographs is most
+                // naturally chosen — did not start until somebody opened one.
+                //
+                // A destination the picker has already collected. Gathered here
+                // rather than in the command, because this is the thread that
+                // owns the saver: `flush` puts the edit you were making a moment
+                // ago into the catalog before anything reads it back out.
+                let chosen = PENDING_EXPORT.lock().expect("export lock").take();
+                if let Some((selection, destination, delivery)) = chosen {
+                    saver.flush();
+                    if let Err(e) =
+                        begin_export(exporting_from.as_ref(), selection, destination, delivery)
+                    {
+                        eprintln!("export     : {e:#}");
+                        // Said where refusals are said. It used to be left in
+                        // the job line as "export failed", where it stayed for
+                        // the rest of the session looking like a result.
+                        complain(&e);
+                    }
+                }
+
                 // The grid draws from the same cache the loupe does and touches
                 // nothing else: no decode, no session, no viewport. Returning
                 // here is what keeps the two views from having to know about
@@ -2384,24 +2462,6 @@ fn main() -> Result<()> {
                         canvas_renderer.invalidate();
                         // The histogram describes colour, so it is stale too.
                         *SCOPE.lock().expect("histogram lock") = None;
-                    }
-                }
-
-                // A destination the picker has already collected. Gathered here
-                // rather than in the command, because this is the thread that
-                // owns the saver: `flush` puts the edit you were making a moment
-                // ago into the catalog before anything reads it back out.
-                let chosen = PENDING_EXPORT.lock().expect("export lock").take();
-                if let Some((selection, destination)) = chosen {
-                    saver.flush();
-                    if let Err(e) = begin_export(exporting_from.as_ref(), selection, destination) {
-                        eprintln!("export     : {e:#}");
-                        *EXPORTING.lock().expect("export lock") = Some(Exporting {
-                            done: 0,
-                            total: 0,
-                            filename: String::new(),
-                            finished: Some(format!("export failed: {e}")),
-                        });
                     }
                 }
 
@@ -3384,6 +3444,7 @@ fn begin_export(
     library: Option<&Arc<Mutex<Library>>>,
     selection: rawkit_deliver::Selection,
     destination: rawkit_deliver::Destination,
+    delivery: rawkit_deliver::Delivery,
 ) -> Result<()> {
     let library = library.ok_or_else(|| anyhow::anyhow!("no catalog is open"))?;
     let chosen = {
@@ -3393,18 +3454,14 @@ fn begin_export(
     };
 
     let total = chosen.len();
+    EXPORT_STOP.store(false, std::sync::atomic::Ordering::Relaxed);
     *EXPORTING.lock().expect("export lock") = Some(Exporting {
         done: 0,
         total,
         filename: String::new(),
+        failed: Vec::new(),
         finished: None,
     });
-
-    // A file the user named through a save dialog has already been asked about,
-    // and answering that question twice — once in the dialog, once by silently
-    // skipping — would make the second answer a lie. Into a folder, an existing
-    // file is skipped and counted, because nothing asked.
-    let overwrite = matches!(destination, rawkit_deliver::Destination::File(_));
     let where_to = match &destination {
         rawkit_deliver::Destination::File(path) => path.display().to_string(),
         rawkit_deliver::Destination::Folder(dir) => dir.display().to_string(),
@@ -3412,33 +3469,22 @@ fn begin_export(
 
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        // Full resolution, always. An export is a delivery, and the pyramid's
-        // averaging softens the edge of a blown highlight — acceptable in
-        // something you look at, not in something you send.
-        let outcome = rawkit_deliver::write(
-            &chosen,
-            &destination,
-            rawkit_deliver::Delivery {
-                max_dim: 0,
-                // Nothing was resized, so there is nothing for output
-                // sharpening to restore. The window has no control for it yet,
-                // nor for the file format; when it grows them, they belong
-                // beside the size, not beside the edit.
-                sharpening: rawkit_deliver::OutputSharpening::None,
-                overwrite,
-                jobs: EXPORT_JOBS,
-                ..Default::default()
-            },
-            |done, total, filename| {
+        // Level 0 whatever size was asked for: an export is a delivery, and the
+        // pyramid's averaging softens the edge of a blown highlight —
+        // acceptable in something you look at, not in something you send. The
+        // writer scales down from there.
+        let outcome =
+            rawkit_deliver::write(&chosen, &destination, delivery, |done, total, filename| {
                 *EXPORTING.lock().expect("export lock") = Some(Exporting {
                     done,
                     total,
                     filename: filename.to_string(),
+                    failed: Vec::new(),
                     finished: None,
                 });
-            },
-        );
-        let finished = match outcome {
+                !EXPORT_STOP.load(std::sync::atomic::Ordering::Relaxed)
+            });
+        let (finished, failed) = match outcome {
             Ok(report) => {
                 // No path in the readout. It is the longest part of the line
                 // and the least useful — the user chose it a moment ago — and
@@ -3455,13 +3501,17 @@ fn begin_export(
                 if report.skipped > 0 {
                     line += &format!(" · {} already there", report.skipped);
                 }
+                if report.not_started > 0 {
+                    line += &format!(" · stopped with {} to go", report.not_started);
+                }
                 if !report.failed.is_empty() {
                     line += &format!(" · {} failed", report.failed.len());
                     // Which, and why, where it will be read. "1 failed" beside a
                     // folder with nothing new in it is a question; the answer
                     // was being given to a terminal. The first is named and the
                     // rest counted, because the cause is nearly always shared —
-                    // a folder that cannot be written fails every file the same way.
+                    // a folder that cannot be written fails every file the same
+                    // way. Every one of them is listed in the export panel.
                     let (name, why) = &report.failed[0];
                     failure(match report.failed.len() {
                         1 => format!("{name} was not exported: {why}"),
@@ -3471,11 +3521,11 @@ fn begin_export(
                         eprintln!("export     : {name}: {why}");
                     }
                 }
-                line
+                (line, report.failed)
             }
             Err(e) => {
                 failure(format!("The export did not run: {e:#}"));
-                format!("export failed: {e}")
+                (format!("export failed: {e}"), Vec::new())
             }
         };
         eprintln!("export     : {finished}");
@@ -3485,6 +3535,7 @@ fn begin_export(
             done,
             total,
             filename: String::new(),
+            failed,
             finished: Some(finished),
         });
     });
@@ -5289,8 +5340,21 @@ fn apply_profile(library: Option<&Arc<Mutex<Library>>>, loaded: &mut Loaded) -> 
 /// export that read the catalog without flushing first would deliver the
 /// photograph as it was *before* the last thing you did to it — which looks
 /// like the export ignoring your edit, and is really a race with a debounce.
-static PENDING_EXPORT: Mutex<Option<(rawkit_deliver::Selection, rawkit_deliver::Destination)>> =
-    Mutex::new(None);
+#[allow(clippy::type_complexity)]
+static PENDING_EXPORT: Mutex<
+    Option<(
+        rawkit_deliver::Selection,
+        rawkit_deliver::Destination,
+        rawkit_deliver::Delivery,
+    )>,
+> = Mutex::new(None);
+
+/// A destination folder the picker came back with, for the page to collect.
+static PICKED_FOLDER: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Somebody said stop. Read by the export's progress callback, which is where
+/// the writer asks whether to go on.
+static EXPORT_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// How far along an export is, for the page to show. `None` between exports.
 static EXPORTING: Mutex<Option<Exporting>> = Mutex::new(None);
@@ -5299,6 +5363,8 @@ struct Exporting {
     done: usize,
     total: usize,
     filename: String,
+    /// Name and reason, for each photograph that was not written.
+    failed: Vec<(String, String)>,
     /// Set once, when there is nothing left to do. Kept rather than cleared so
     /// the result stays on screen — an export that finished by the readout
     /// simply vanishing tells you nothing about whether it worked.

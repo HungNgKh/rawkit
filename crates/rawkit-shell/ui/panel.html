@@ -135,6 +135,43 @@
   #sheet .key kbd { flex: 0 0 96px; font: inherit; color: #d8bf63; }
   #sheet .key span { color: #c9c9d1; }
 
+  /* Export. In the column and not over the window, for the reason the sheet is:
+     on Linux nothing of the page's can be drawn over the photograph — and here
+     that is also right, because the photographs stay in view while somebody
+     decides how big to make them. */
+  #export { position: absolute; inset: 0; z-index: 22; background: #1e1e22; overflow-y: auto;
+            padding: 14px 16px 24px; }
+  #export.hidden { display: none; }
+  #export header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; }
+  #export h2 { font-size: 15px; font-weight: 600; margin: 0; color: #f0f0f2; }
+  #export h3 { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: #9a9aa2;
+               margin: 16px 0 6px; font-weight: 600; }
+  #export .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  #export .row > span { flex: 0 0 92px; color: #b4b4bc; }
+  #export .row select, #export .row input[type=number] { flex: 1 1 auto; min-width: 0; }
+  #export select, #export input[type=number] { background: #141418; color: inherit; font: inherit;
+            border: 1px solid #36363e; border-radius: 4px; padding: 4px 6px; }
+  #export input[type=number] { max-width: 84px; }
+  /* Size, its number and its unit on one line: the select gives way. */
+  #export .row #export-size { flex: 1 1 0; }
+  #export .row #export-edge { flex: 0 0 68px; }
+  #export label.what { display: flex; gap: 8px; align-items: baseline; padding: 3px 0; cursor: pointer; }
+  #export label.what.none { color: #8a8a92; cursor: default; }
+  #export label.what b { font-weight: 600; font-variant-numeric: tabular-nums; }
+  #export #export-folder { flex: 1 1 auto; min-width: 0; color: #e8e8ea; overflow-wrap: anywhere; }
+  #export #export-folder.unset { color: #e6b866; }
+  #export .buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px; }
+  #export button.primary { background: #d8bf63; border-color: #d8bf63; color: #1b1b1f; font-weight: 600; }
+  #export button.primary:disabled { background: #3a382c; border-color: #3a382c; color: #8a8a92; cursor: default; }
+  #export .hint { color: #8a8a92; font-size: 12px; margin: 2px 0 0 100px; }
+  #export #export-last { color: #c9c9d1; margin: 0; overflow-wrap: anywhere; }
+  #export #export-failed { list-style: none; margin: 6px 0 0; padding: 0; color: #ff8a80; font-size: 12px; }
+  #export #export-failed li { padding: 2px 0; overflow-wrap: anywhere; }
+  #export #export-failed li b { color: #ffb4ad; font-weight: 600; }
+  #job { display: flex; gap: 8px; align-items: baseline; }
+  #job #job-text { flex: 1 1 auto; min-width: 0; }
+  #job button { flex: 0 0 auto; font: inherit; font-size: 11px; padding: 0 6px; }
+
   /* The palette: every command, by name. In the column for the reason the sheet
      is — nothing the page draws can be over the photograph — and at the top of
      it, because that is where the eyes already are when the hands ask for it. */
@@ -398,6 +435,7 @@
 <div id="workspaces" class="hidden" role="tablist" aria-label="workspace">
   <button data-command="grid" role="tab">Library</button>
   <button data-command="develop" role="tab">Develop</button>
+  <button data-command="export">Export…</button>
   <button data-command="palette" aria-label="find a command">⌕</button>
   <button data-command="shortcuts" id="sheet-open" aria-label="keyboard shortcuts">?</button>
 </div>
@@ -438,6 +476,56 @@
     <button id="import-go" class="primary" hidden></button>
   </div>
  </div>
+</div>
+<div id="export" class="hidden" role="dialog" aria-labelledby="export-title">
+  <header><h2 id="export-title">Export</h2><button id="export-close" aria-label="close">✕</button></header>
+  <h3>What</h3>
+  <label class="what"><input type="radio" name="export-scope" value="selected"><span><b id="export-n-selected">0</b> selected</span></label>
+  <label class="what"><input type="radio" name="export-scope" value="shown"><span><b id="export-n-shown">0</b> <span id="export-shown-as">shown</span></span></label>
+  <label class="what"><input type="radio" name="export-scope" value="current"><span>This photograph</span></label>
+  <h3>How</h3>
+  <div class="row"><span>Preset</span>
+    <select id="export-preset" aria-label="preset"></select>
+    <button id="export-preset-forget" title="Forget this preset" hidden>forget</button></div>
+  <div class="row"><span>Format</span>
+    <select id="export-format" aria-label="format">
+      <option value="jpeg">JPEG</option>
+      <option value="png8">PNG, 8 bits</option>
+      <option value="png16">PNG, 16 bits</option>
+      <option value="tiff16">TIFF, 16 bits</option>
+    </select></div>
+  <div class="row" id="export-quality-row"><span>Quality</span>
+    <input id="export-quality" type="number" min="1" max="100" step="1" aria-label="JPEG quality, 1 to 100"></div>
+  <div class="row"><span>Size</span>
+    <select id="export-size" aria-label="size">
+      <option value="full">Full size</option>
+      <option value="edge">Long edge</option>
+    </select>
+    <input id="export-edge" type="number" min="64" step="1" aria-label="long edge in pixels" hidden><span id="export-px" hidden style="flex:0 0 auto">px</span></div>
+  <div class="row"><span>Sharpen</span>
+    <select id="export-sharpen" aria-label="sharpening for the output">
+      <option value="none">Not for output</option>
+      <option value="low">Low</option>
+      <option value="standard">Standard</option>
+      <option value="high">High</option>
+    </select></div>
+  <p class="hint" id="export-sharpen-hint">Over and above the sharpening in the edit. For a file made smaller.</p>
+  <div class="row"><span>If it exists</span>
+    <select id="export-exists" aria-label="if a file is already there">
+      <option value="leave">Leave it, and say so</option>
+      <option value="replace">Replace it</option>
+    </select></div>
+  <h3>To</h3>
+  <div class="row"><span id="export-folder" class="unset">No folder chosen</span><button id="export-choose">Choose…</button></div>
+  <h3>Keep these settings</h3>
+  <div class="row"><input id="export-preset-name" type="text" placeholder="Name these settings" aria-label="preset name">
+    <button id="export-preset-save">Save</button></div>
+  <div class="buttons"><button id="export-cancel">Cancel</button><button id="export-go" class="primary">Export</button></div>
+  <div id="export-result" hidden>
+    <h3>Last export</h3>
+    <p id="export-last"></p>
+    <ol id="export-failed"></ol>
+  </div>
 </div>
 <div id="sheet" class="hidden" role="dialog" aria-label="keyboard shortcuts"></div>
 <div id="palette" class="hidden" role="dialog" aria-label="find a command">
@@ -861,7 +949,7 @@
     <span id="chosen"></span>
     <span id="aim"></span>
   </div>
-  <div id="job" class="hidden"></div>
+  <div id="job" class="hidden"><span id="job-text"></span><button id="job-stop" hidden>Stop</button></div>
 </footer>
 </div>
 
@@ -877,6 +965,9 @@
   let atWelcome = null;
   /// Whether a folder is being added. The sheet has the window and the keys.
   let importing = false;
+  /// What the shell last said about the photograph and the library, for the
+  /// things that count from it rather than draw it.
+  let latestView = null;
 
   // ---- Saying what happened --------------------------------------------------
   //
@@ -1749,6 +1840,8 @@
   drawCurve();
 
   const exportLine = document.getElementById("job");
+  const jobStop = document.getElementById("job-stop");
+  jobStop.addEventListener("click", () => invoke("cancel_export").catch(say));
   /// The generation the histogram on screen was drawn at; `null` asks for it
   /// again whatever it is, which is how a column that changed width gets a
   /// redraw rather than a stretched copy of the old one.
@@ -1771,16 +1864,20 @@
     // result has been read by the time anything else has something to say.
     const building = job && !job.finished ? null : await invoke("preview_progress");
     exportLine.classList.toggle("hidden", !job && !building);
+    heardOfExport(job);
+    const jobText = document.getElementById("job-text");
+    const running = !!job && !job.finished;
+    jobStop.hidden = !running;
     if (building) {
       // "of at least" while the library is still being gone through: the total
       // is still climbing, and a number that climbs is not yet the total.
-      exportLine.textContent =
+      jobText.textContent =
         `building previews · ${building.done} of ${building.counting ? "at least " : ""}${building.total}` +
         (building.filename ? ` · ${building.filename}` : "");
       return;
     }
     if (!job) return;
-    exportLine.textContent = job.finished
+    jobText.textContent = job.finished
       ? job.finished
       : `exporting ${job.done}/${job.total}` + (job.filename ? ` · ${job.filename}` : "");
   }, 100);
@@ -2615,6 +2712,7 @@
 
   const show = view => {
     if (!view) return;
+    latestView = view;
     strip.classList.remove("hidden");
     document.getElementById("frame").textContent = view.filename;
     // Two rows can carry the same filename, and the copy name is the only thing
@@ -3128,6 +3226,7 @@
     // first because they are the most recently picked up.
     if (!document.getElementById("palette").classList.contains("hidden")) return closePalette();
     if (!document.getElementById("sheet").classList.contains("hidden")) return toggleSheet();
+    if (!document.getElementById("export").classList.contains("hidden")) return closeExport();
     if (armed !== null) return arm(null);
     if (picking) return pickWb(false);
     if (pickingRange) return pickRange(false);
@@ -3292,10 +3391,12 @@
       title: "Paste them onto everything selected", act: "paste_edit" },
     // The picker decides the rest: a name for one photograph, a folder for a
     // set, so the two cannot be asked for the wrong thing.
-    { id: "export", keys: ["mod+e"], scope: "any", waits: false, group: "The edit",
-      title: "Export this photograph", run: () => invoke("export", { scope: "current" }).catch(say) },
-    { id: "export-shown", keys: ["mod+shift+e"], scope: "any", waits: false, group: "The edit",
-      title: "Export everything the filter shows", run: () => invoke("export", { scope: "shown" }).catch(say) },
+    { id: "export", keys: ["mod+shift+e"], scope: "any", waits: false, group: "The edit",
+      title: "Export…", run: () => openExport() },
+    { id: "export-again", keys: ["mod+e"], scope: "any", waits: false, group: "The edit",
+      title: "Export again, with the last settings", run: () => exportAgain() },
+    { id: "export-stop", keys: [], scope: "any", waits: false, group: "The edit",
+      title: "Stop the export", run: () => invoke("cancel_export").catch(say) },
 
     // -- the way in, and out. `welcome` marks the ones that work with nothing
     // open, which is all the welcome screen lets through.
@@ -3498,6 +3599,173 @@
     if (e.welcome) drawWelcome(e);
   });
   enter().catch(say);
+
+  // ---- Export ------------------------------------------------------------------
+  //
+  // It was two chords and no choices. The writer underneath has always taken a
+  // format, a size, sharpening and what to do about a file that is there, and
+  // this offers those and nothing it does not do: no colour space, no naming
+  // pattern. A control for something that cannot happen is worse than none.
+  const exportPanel = document.getElementById("export");
+  const exportGo = document.getElementById("export-go");
+  const exportField = id => document.getElementById(`export-${id}`);
+  /// What was last used and what has been named, as the shell keeps them.
+  let exportKept = { last: null, presets: [] };
+  let exportFolder = null;
+  const exportScope = () => exportPanel.querySelector("input[name=export-scope]:checked")?.value ?? "shown";
+  const exportCounts = () => ({
+    selected: latestView?.marked ?? 0,
+    shown: latestView?.total ?? 0,
+    current: latestView ? 1 : 0,
+  });
+  /// The form as the shell wants it.
+  const exportSettings = () => ({
+    scope: exportScope(),
+    format: exportField("format").value,
+    quality: Number(exportField("quality").value) || 92,
+    long_edge: exportField("size").value === "edge" ? Number(exportField("edge").value) || 0 : 0,
+    sharpening: exportField("sharpen").value,
+    replace: exportField("exists").value === "replace",
+    folder: exportFolder,
+  });
+  const drawExport = () => {
+    const counts = exportCounts();
+    exportField("n-selected").textContent = counts.selected.toLocaleString();
+    exportField("n-shown").textContent = counts.shown.toLocaleString();
+    // "Shown" is the library or a collection, through the filter. Said, so
+    // that a filter somebody forgot is on is on the panel and not a surprise
+    // in the folder.
+    const narrowed = latestView && (latestView.filter?.flagged || latestView.filter?.min_rating
+      || latestView.filter?.colour || latestView.viewing !== null);
+    exportField("shown-as").textContent = narrowed ? "shown, as filtered" : "shown — everything";
+    const none = exportPanel.querySelector("input[value=selected]");
+    none.disabled = counts.selected === 0;
+    none.closest("label").classList.toggle("none", counts.selected === 0);
+    if (none.disabled && none.checked) exportPanel.querySelector("input[value=shown]").checked = true;
+
+    const jpeg = exportField("format").value === "jpeg";
+    exportField("quality-row").hidden = !jpeg;
+    const edge = exportField("size").value === "edge";
+    exportField("edge").hidden = !edge;
+    exportField("px").hidden = !edge;
+    exportField("sharpen-hint").hidden = exportField("sharpen").value === "none";
+
+    const folder = exportField("folder");
+    folder.textContent = exportFolder ?? "No folder chosen";
+    folder.classList.toggle("unset", !exportFolder);
+    const n = counts[exportScope()];
+    exportGo.textContent = n === 1 ? "Export 1 photograph" : `Export ${n.toLocaleString()} photographs`;
+    exportGo.disabled = n === 0 || !exportFolder;
+    exportGo.title = !exportFolder ? "Choose a folder first" : "";
+    exportField("preset-forget").hidden = !exportField("preset").value;
+  };
+  /// Put settings into the form. The scope is left alone unless asked for:
+  /// a preset says how, and which photographs is asked every time.
+  const fillExport = (settings, withScope) => {
+    if (withScope) {
+      const radio = exportPanel.querySelector(`input[value=${settings.scope}]`);
+      if (radio) radio.checked = true;
+    }
+    exportField("format").value = settings.format;
+    exportField("quality").value = settings.quality;
+    exportField("size").value = settings.long_edge ? "edge" : "full";
+    exportField("edge").value = settings.long_edge || 2048;
+    exportField("sharpen").value = settings.sharpening;
+    exportField("exists").value = settings.replace ? "replace" : "leave";
+    exportFolder = settings.folder ?? exportFolder;
+  };
+  const listExportPresets = chosen => {
+    const select = exportField("preset");
+    select.replaceChildren(new Option("As last time", ""));
+    for (const preset of exportKept.presets) select.append(new Option(preset.name, preset.name));
+    select.value = chosen ?? "";
+  };
+  const EXPORT_DEFAULTS = { scope: "shown", format: "jpeg", quality: 92, long_edge: 0,
+                            sharpening: "none", replace: false, folder: null };
+  const openExport = async () => {
+    palette.classList.add("hidden");
+    document.getElementById("sheet").classList.add("hidden");
+    exportKept = await invoke("export_panel");
+    listExportPresets();
+    fillExport(exportKept.last ?? EXPORT_DEFAULTS, false);
+    // What somebody has just selected is what they most likely mean; with
+    // nothing selected, what is on screen.
+    const wanted = exportCounts().selected > 0 ? "selected" : "shown";
+    exportPanel.querySelector(`input[value=${wanted}]`).checked = true;
+    drawExport();
+    exportPanel.classList.remove("hidden");
+    exportGo.focus();
+  };
+  const closeExport = () => exportPanel.classList.add("hidden");
+  const startExport = settings => invoke("export_with", { settings }).then(closeExport).catch(say);
+  const exportAgain = async () => {
+    const kept = await invoke("export_panel");
+    // Nothing to do again: the first export is made in the panel.
+    if (!kept.last?.folder) return openExport();
+    // The same *how*, of what is meant now — not of whatever was selected the
+    // last time, which may be nothing at all today.
+    const scope = kept.last.scope === "selected" && exportCounts().selected === 0 ? "shown" : kept.last.scope;
+    startExport({ ...kept.last, scope });
+  };
+  exportPanel.addEventListener("change", event => {
+    if (event.target === exportField("preset")) {
+      const preset = exportKept.presets.find(p => p.name === event.target.value);
+      fillExport(preset ? preset.settings : (exportKept.last ?? EXPORT_DEFAULTS), false);
+      if (preset) exportField("preset-name").value = preset.name;
+    }
+    drawExport();
+  });
+  exportPanel.addEventListener("input", drawExport);
+  exportGo.addEventListener("click", () => startExport(exportSettings()));
+  exportField("cancel").addEventListener("click", closeExport);
+  exportField("close").addEventListener("click", closeExport);
+  exportField("choose").addEventListener("click", () => invoke("pick_export_folder").catch(say));
+  exportField("preset-save").addEventListener("click", async () => {
+    const name = exportField("preset-name").value.trim();
+    try {
+      await invoke("save_export_preset", { name, settings: exportSettings() });
+      exportKept = await invoke("export_panel");
+      listExportPresets(exportKept.presets.find(p => p.name.toLowerCase() === name.toLowerCase())?.name);
+      drawExport();
+      tell("info", `Saved the export settings as ${name}`);
+    } catch (e) { say(e); }
+  });
+  exportField("preset-name").addEventListener("keydown", e => { if (e.key === "Enter") exportField("preset-save").click(); });
+  exportField("preset-forget").addEventListener("click", async () => {
+    const name = exportField("preset").value;
+    if (!name) return;
+    await invoke("forget_export_preset", { name }).catch(say);
+    exportKept = await invoke("export_panel");
+    listExportPresets();
+    drawExport();
+  });
+  /// The job poll's news about the export, for the panel: what it came to, and
+  /// every photograph that was not written — the status line has room for one.
+  let exportHeard = "";
+  const heardOfExport = job => {
+    const told = JSON.stringify([job?.finished ?? null, job?.failed ?? []]);
+    if (told === exportHeard) return;
+    exportHeard = told;
+    exportField("result").hidden = !job?.finished;
+    if (!job?.finished) return;
+    exportField("last").textContent = job.finished;
+    const list = exportField("failed");
+    list.replaceChildren();
+    for (const [name, why] of job.failed ?? []) {
+      const item = document.createElement("li");
+      const bold = document.createElement("b");
+      bold.textContent = name;
+      item.append(bold, ` — ${why}`);
+      list.append(item);
+    }
+  };
+  // The folder picker answers on its own time; while the panel is up, ask.
+  setInterval(async () => {
+    if (exportPanel.classList.contains("hidden")) return;
+    const folder = await invoke("take_export_folder").catch(() => null);
+    if (folder) exportFolder = folder;
+    drawExport();
+  }, 200);
 
   // ---- Adding a folder ----------------------------------------------------------
   //

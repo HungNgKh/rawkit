@@ -99,6 +99,16 @@ pub enum Selection {
     /// a judgement, and an export of *this frame* must not depend on how it was
     /// judged.
     Image(i64),
+    /// These photographs, in this order.
+    ///
+    /// For the two things a window can show that no filter describes: the
+    /// frames somebody has selected, and a collection — which is a list in an
+    /// order a person chose. "What is shown" used to be sent as the filter
+    /// alone, which was the whole truth until collections existed; after that
+    /// it exported the filtered *library* while the window was showing a
+    /// collection, the very mismatch this type's first variant was written to
+    /// prevent.
+    Images(Vec<i64>),
 }
 
 impl Selection {
@@ -124,6 +134,8 @@ pub struct ExportReport {
     pub skipped: usize,
     pub bytes: u64,
     pub failed: Vec<(String, String)>,
+    /// How many were never started, because whoever was watching said stop.
+    pub not_started: usize,
 }
 
 /// One photograph and the edit it is to be rendered with.
@@ -179,6 +191,17 @@ pub fn gather(catalog: &Catalog, selection: Selection) -> Result<Vec<Chosen>> {
             .into_iter()
             .filter(|image| image.id == *id)
             .collect(),
+        // Through the same read as the others — so a photograph whose file has
+        // gone missing is left out here as it is everywhere — and then put in
+        // the order asked for. An id the catalog no longer has is passed over.
+        Selection::Images(ids) => {
+            let mut found: std::collections::HashMap<i64, cull::LibraryImage> =
+                cull::sequence(catalog, &Filter::default())?
+                    .into_iter()
+                    .map(|image| (image.id, image))
+                    .collect();
+            ids.iter().filter_map(|id| found.remove(id)).collect()
+        }
     };
     for image in images {
         // The edit as it stands, or as shot for a photograph nobody has touched.
@@ -262,11 +285,15 @@ impl Default for Delivery {
 }
 
 /// Render and write what [`gather`] chose. Touches no catalog.
+///
+/// `progress` hears about each photograph as it finishes and answers whether to
+/// go on. `false` stops the run *between* photographs: what is being written is
+/// finished — half a JPEG is worse than one more — and nothing else is started.
 pub fn write(
     chosen: &[Chosen],
     to: &Destination,
     delivery: Delivery,
-    mut progress: impl FnMut(usize, usize, &str),
+    mut progress: impl FnMut(usize, usize, &str) -> bool,
 ) -> Result<ExportReport> {
     if let (Destination::File(path), false) = (to, chosen.len() == 1) {
         bail!(
@@ -287,14 +314,19 @@ pub fn write(
     // photographs are independent, the catalog is read before any of them start,
     // and results come back on a channel so one thread does the reporting.
     let next = std::sync::atomic::AtomicUsize::new(0);
+    let stopped = std::sync::atomic::AtomicBool::new(false);
     let (sender, receiver) = std::sync::mpsc::channel();
     let workers = delivery.jobs.max(1).min(chosen.len());
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let sender = sender.clone();
-            let (next, chosen, gpu, renderer) = (&next, &chosen, &gpu, &renderer);
+            let (next, stopped, chosen, gpu, renderer) =
+                (&next, &stopped, &chosen, &gpu, &renderer);
             scope.spawn(move || loop {
+                if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(Chosen {
                     image,
@@ -335,9 +367,13 @@ pub fn write(
         }
         drop(sender);
 
+        let mut finished = 0;
         for (done, (index, outcome)) in receiver.into_iter().enumerate() {
             let image = &chosen[index].image;
-            progress(done, chosen.len(), &image.filename);
+            finished = done + 1;
+            if !progress(done, chosen.len(), &image.filename) {
+                stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             match outcome {
                 Ok(Some(bytes)) => {
                     report.written += 1;
@@ -353,9 +389,10 @@ pub fn write(
                     .push((image.filename.clone(), format!("{e:#}"))),
             }
         }
+        report.not_started = chosen.len() - finished;
     });
 
-    progress(chosen.len(), chosen.len(), "");
+    progress(chosen.len() - report.not_started, chosen.len(), "");
     Ok(report)
 }
 
@@ -365,7 +402,7 @@ pub fn export(
     selection: Selection,
     to: &Path,
     delivery: Delivery,
-    progress: impl FnMut(usize, usize, &str),
+    progress: impl FnMut(usize, usize, &str) -> bool,
 ) -> Result<ExportReport> {
     let chosen = gather(catalog, selection)?;
     write(
@@ -386,6 +423,14 @@ fn one(
     delivery: Delivery,
     destination: &Path,
 ) -> Result<u64> {
+    // Asked first and in so many words: this is the failure a person will meet
+    // — a card not plugged in — and the decoder's account of it is "io error:
+    // Input/output error", which names nothing anyone can fix.
+    anyhow::ensure!(
+        raw_path.exists(),
+        "{} is not there: moved, renamed, or on a drive that is not plugged in",
+        raw_path.display()
+    );
     let raw = rawkit_decode::decode_file(raw_path)
         .with_context(|| format!("decoding {}", raw_path.display()))?;
     let phase = BayerPhase::from_cfa(raw.cfa)
@@ -484,7 +529,7 @@ mod tests {
             &chosen,
             &Destination::File(std::path::PathBuf::from("/nowhere/one.jpg")),
             Delivery::default(),
-            |_, _, _| {},
+            |_, _, _| true,
         )
         .expect_err("two photographs asked to become one file");
         assert!(
@@ -513,6 +558,44 @@ mod tests {
         // photograph into the previews directory is refused the same way.
         assert!(check_destination(&catalog, &Destination::File(previews.join("one.jpg"))).is_err());
         assert!(check_destination(&catalog, &Destination::File(dir.join("one.jpg"))).is_ok());
+
+        drop(catalog);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_list_is_gathered_in_the_order_it_was_given() {
+        // A collection is a list in an order a person chose, and a selection is
+        // made in whatever order it was made. Neither is the library's order,
+        // which is the order everything else here is read in.
+        let dir = std::env::temp_dir().join(format!("rawkit-gather-{}", std::process::id()));
+        let photos = dir.join("photos");
+        std::fs::create_dir_all(&photos).unwrap();
+        for name in ["a.ARW", "b.ARW", "c.ARW"] {
+            std::fs::write(photos.join(name), b"raw").unwrap();
+        }
+        let mut catalog = Catalog::open(&dir.join("lib.rawkit")).unwrap();
+        rawkit_catalog::scan::scan_on(
+            &mut catalog,
+            &photos,
+            rawkit_catalog::VolumeId::Uuid("test-volume".into()),
+            rawkit_catalog::scan::no_metadata,
+        )
+        .unwrap();
+        let library = cull::sequence(&catalog, &Filter::default()).unwrap();
+        let id = |name: &str| library.iter().find(|i| i.filename == name).unwrap().id;
+
+        let chosen = gather(
+            &catalog,
+            Selection::Images(vec![id("c.ARW"), 9_999, id("a.ARW")]),
+        )
+        .unwrap();
+        let names: Vec<&str> = chosen.iter().map(|c| c.image.filename.as_str()).collect();
+        assert_eq!(
+            names,
+            ["c.ARW", "a.ARW"],
+            "in order, and the stranger passed over"
+        );
 
         drop(catalog);
         let _ = std::fs::remove_dir_all(&dir);
