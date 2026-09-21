@@ -248,7 +248,39 @@ pub const MAX_RATING: u8 = 5;
 /// order total rather than host-dependent — and it is worth naming now that
 /// something depends on it.
 pub fn sequence(catalog: &Catalog, filter: &Filter) -> Result<Vec<LibraryImage>, CatalogError> {
+    read(catalog, filter, None)
+}
+
+/// [`sequence`], for one folder and every folder under it.
+///
+/// Under it as well, because a shoot is often a folder of folders — a card per
+/// day, a subfolder per camera — and choosing the shoot should show the shoot.
+/// Same order as the whole library, so a photograph has the same neighbours in
+/// its folder as in everything.
+pub fn sequence_in(
+    catalog: &Catalog,
+    folder: i64,
+    filter: &Filter,
+) -> Result<Vec<LibraryImage>, CatalogError> {
+    read(catalog, filter, Some(folder))
+}
+
+fn read(
+    catalog: &Catalog,
+    filter: &Filter,
+    folder: Option<i64>,
+) -> Result<Vec<LibraryImage>, CatalogError> {
     let (narrowed, values) = narrowing(filter);
+    // An integer, formatted into the text: `narrowing` binds its values by
+    // position, and a bound parameter here would have to be counted into them.
+    let within = folder.map_or(String::new(), |id| {
+        format!(
+            " AND f.folder_id IN (WITH RECURSIVE under(id) AS (
+                   SELECT {id} UNION ALL
+                   SELECT d.id FROM folders d JOIN under ON d.parent_id = under.id)
+                 SELECT id FROM under)"
+        )
+    });
     let mut statement = catalog.connection().prepare(&format!(
         "SELECT i.id,
                 v.last_mount_path || '/' || d.relative_path || '/' || f.filename,
@@ -259,7 +291,7 @@ pub fn sequence(catalog: &Catalog, filter: &Filter) -> Result<Vec<LibraryImage>,
            JOIN files f ON f.id = i.file_id
            JOIN folders d ON d.id = f.folder_id
            JOIN volumes v ON v.id = d.volume_id
-          WHERE f.missing = 0{narrowed}
+          WHERE f.missing = 0{within}{narrowed}
           ORDER BY f.captured_at IS NULL, f.captured_at, f.filename, i.id"
     ))?;
     let rows = statement

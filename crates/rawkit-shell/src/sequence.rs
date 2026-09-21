@@ -62,6 +62,8 @@ pub enum Source {
     Library,
     /// One collection, in the order somebody put it in.
     Collection(i64),
+    /// One folder and every folder under it, in the order it was shot.
+    Folder(i64),
 }
 
 /// What happened when a photograph was taken out of what is shown.
@@ -101,6 +103,7 @@ impl Sequence {
         let rows = match source {
             Source::Library => cull::sequence(catalog, &everything)?,
             Source::Collection(id) => collections::members(catalog, id, &everything)?,
+            Source::Folder(id) => cull::sequence_in(catalog, id, &everything)?,
         };
         let place = rows
             .iter()
@@ -271,6 +274,7 @@ impl Sequence {
         let truth: Vec<i64> = match self.source {
             Source::Library => cull::sequence(catalog, &self.filter)?,
             Source::Collection(id) => collections::members(catalog, id, &self.filter)?,
+            Source::Folder(id) => cull::sequence_in(catalog, id, &self.filter)?,
         }
         .iter()
         .map(|image| image.id)

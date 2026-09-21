@@ -439,6 +439,27 @@
   #orientation { color: var(--text-tertiary); margin: 7px 0; }
   #orientation .why { color: var(--text-tertiary); }
 
+  /* Places to look: the whole catalog, a folder, a collection. One row shape,
+     so that "where am I" reads the same whichever kind it is. */
+  #s-catalog { padding: 10px 0 8px; border-bottom: 1px solid var(--ground-raised); }
+  #left button.place { display: flex; align-items: baseline; gap: 8px; width: 100%; text-align: left;
+                       background: none; border: 1px solid transparent; border-radius: 4px;
+                       padding: 3px 6px; min-width: 0; }
+  #left button.place:hover { background: var(--ground-raised); }
+  #left button.place.on { background: var(--ground-hover); border-color: var(--focus); }
+  #left button.place .name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+                             white-space: nowrap; }
+  #left .count { margin-left: auto; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
+  .tree { list-style: none; margin: 0 0 4px; padding: 0; }
+  .tree li { display: flex; align-items: center; gap: 2px; }
+  .tree .twisty { flex: 0 0 18px; padding: 0; border: 0; background: none; color: var(--text-tertiary);
+                  line-height: 22px; }
+  .tree .twisty:empty { visibility: hidden; }
+  #left .saved button.pick { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+  #left .saved button.pick .name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  #collection-search { width: 100%; box-sizing: border-box; margin: 2px 0 4px; }
+  #left details > summary { padding-top: 12px; padding-bottom: 8px; }
+
   /* Presets and snapshots. A saved thing is a row: its name, wide and clickable,
      and a remove that stays out of the way until it is wanted. */
   .saved { list-style: none; margin: 8px 0 0; padding: 0; }
@@ -516,19 +537,29 @@
   /* The filter row. Chips rather than a menu, because what is being looked at
      has to be readable without opening anything — a narrowed library that does
      not say so is a library with photographs missing from it. */
-  #filter { display: flex; align-items: center; gap: 12px; min-width: 0; }
-  #filter.narrowed { color: var(--attention); }
-  #filter button { font: inherit; font-size: 12px; line-height: 1.5;
-                   background: none; color: var(--text-tertiary); border: 1px solid var(--border-subtle);
-                   border-radius: 3px; padding: 0 6px; cursor: pointer; }
-  #filter button:hover { color: var(--text-secondary); border-color: var(--border-control); }
-  #filter button.on { color: var(--ground-well); background: var(--attention); border-color: var(--attention); }
+  #filter { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  #filter .named { color: var(--text-tertiary); font-size: 12px; margin-left: 6px; }
+  /* 26 pixels tall and never narrower than 24: WCAG 2.5.8's minimum, and at
+     4K the old 15-pixel star chips were a hunt. */
+  #filter button { font: inherit; font-size: 12px; min-height: 26px; min-width: 26px; box-sizing: border-box;
+                   background: var(--ground-raised); color: var(--text-secondary);
+                   border: 1px solid var(--border-subtle); border-radius: 4px; padding: 0 9px; cursor: pointer; }
+  #filter button:hover { color: var(--text-primary); border-color: var(--border-control); }
+  #filter button.on { color: var(--on-attention); background: var(--attention); border-color: var(--attention); }
   #filter .set { display: flex; gap: 3px; }
-  #filter .dot { width: 13px; padding: 0; text-align: center; }
+  #filter .segmented { gap: 0; }
+  #filter .segmented button { border-radius: 0; margin-left: -1px; }
+  #filter .segmented button:first-child { border-radius: 4px 0 0 4px; margin-left: 0; }
+  #filter .segmented button:last-child { border-radius: 0 4px 4px 0; }
+  #filter .segmented button.on { position: relative; }
+  #filter-stars button { padding: 0; font-size: 14px; }
+  #filter-stars button.on { color: var(--attention); background: var(--ground-raised); border-color: var(--attention); }
+  #filter .dot { padding: 0; font-size: 14px; }
   /* The label chips carry their own colour, so "on" cannot borrow the shared
      yellow without saying the wrong thing. */
-  #filter .dot.on { background: currentColor; border-color: currentColor; }
-  #filter-stars button { letter-spacing: 0; padding: 0 3px; }
+  #filter .dot.on { background: var(--ground-hover); border-color: currentColor; box-shadow: inset 0 0 0 1px currentColor; }
+  #filter #filter-off { color: var(--on-attention); background: var(--attention); border-color: var(--attention);
+                        font-weight: 600; margin-left: auto; }
 </style>
 
 <!-- Over the whole window, and so outside every region of the frame: the right
@@ -611,19 +642,27 @@
        so picking up a tool does not move the photograph under it. -->
   <div class="row2">
     <div id="filter" class="library-only" title="what the arrows walk through, and what ⌃⇧E exports">
-      <span class="set" id="filter-flags">
-        <button data-flag="">all</button>
-        <button data-flag="pick">picks</button>
-        <button data-flag="reject">rejects</button>
-        <button data-flag="unflagged">undecided</button>
+      <!-- One of four, so it is drawn as one control with four parts: chips
+           side by side read as toggles that could all be on at once. -->
+      <span class="set segmented" id="filter-flags" role="radiogroup" aria-label="flag">
+        <button data-flag="" role="radio">All</button>
+        <button data-flag="pick" role="radio">Picks</button>
+        <button data-flag="reject" role="radio">Rejects</button>
+        <button data-flag="unflagged" role="radio">Undecided</button>
       </span>
-      <span class="set" id="filter-stars" title="at least this many stars"></span>
+      <span class="named">Rating ≥</span>
+      <span class="set" id="filter-stars" title="at least this many stars; the lit one again for any"></span>
+      <span class="named">Label</span>
       <span class="set" id="filter-colours"></span>
       <!-- One chip, for the collection being viewed, because it answers the
            question the rest of this line does — what the arrows walk through.
            Pressing it goes back to the whole library. Choosing a collection is in
            the panel on the left: a chip each stopped being readable at about eight. -->
       <span class="set" id="filter-collections"></span>
+      <!-- Says the filter is on, and is how to turn it off. The row's colour
+           alone was the only sign before, and a narrowed library that does not
+           say so is a library with photographs missing from it. -->
+      <button id="filter-off" hidden title="show everything again (\ puts this filter back)">Filter on ✕</button>
     </div>
     <div id="inhand" class="develop-only hidden">
       <span class="what"></span><span class="how"></span><span class="do"></span>
@@ -635,13 +674,24 @@
 
 <!-- Where to go: on the left, where navigation always is. -->
 <aside id="left" aria-label="navigation">
+  <section id="s-catalog" class="library-only">
+    <button class="place" id="source-all" title="every photograph in the catalog">All photographs<span class="count" id="source-all-count"></span></button>
+  </section>
+  <details id="s-folders" class="library-only" open>
+    <summary>Folders</summary>
+    <ul class="tree" id="folder-list"></ul>
+  </details>
   <details id="s-collections" class="library-only" open>
     <summary>Collections</summary>
     <!-- A list rather than chips: a name, a count, and the three things done
-         to a collection, in a shape that still reads with a hundred of them. -->
+         to a collection, in a shape that still reads with a hundred of them.
+         The search keeps a match's parents, so a nested one is still found
+         where it lives. -->
+    <input id="collection-search" type="search" placeholder="Find a collection" aria-label="find a collection" autocomplete="off" spellcheck="false">
     <ul class="saved" id="collection-list"></ul>
+    <p class="empty" id="collection-none" hidden>No collection is called that.</p>
     <p class="empty">★ is where K sends a photograph.</p>
-    <div class="row"><button id="collection-new">New from selection…</button></div>
+    <div class="row"><button id="collection-new">New from the selected…</button></div>
     <div class="form hidden" id="collection-form">
       <div class="row">
         <input id="collection-name" type="text" placeholder="Name this collection" maxlength="60">
@@ -3094,7 +3144,8 @@
     // Where the arrows walk: the whole catalog, or one collection of it.
     const viewing = (view.collections ?? []).find(c => c.id === view.viewing);
     document.getElementById("source").textContent =
-      viewing ? (viewing.is_quick ? "Quick Collection" : viewing.name) : "All photographs";
+      viewing ? (viewing.is_quick ? "Quick Collection" : viewing.name)
+      : view.folder != null ? (folderName(view.folder) ?? "A folder") : "All photographs";
     document.getElementById("frame").textContent = view.filename;
     // Two rows can carry the same filename, and the copy name is the only thing
     // that tells them apart — in the readout, and in the name of anything
@@ -3129,6 +3180,8 @@
       `K → ${targetName(view)}${view.in_target ? " ✓" : ""}`;
     drawFilter(view.filter ?? {});
     drawCollections(view);
+    drawFolders(view);
+    drawAll(view);
     setWorkspace(view.workspace);
     drawInfo(view);
     setMode(view.mode, view.tool);
@@ -3179,6 +3232,9 @@
     };
     const on = narrowing(filter);
     document.getElementById("filter").classList.toggle("narrowed", on);
+    document.getElementById("filter-off").hidden = !on;
+    for (const button of document.querySelectorAll("#filter-flags button"))
+      button.setAttribute("aria-checked", String((button.dataset.flag || null) === filter.flagged));
     if (on) remembered = { ...filter };
     for (const button of document.querySelectorAll("#filter-flags button"))
       button.classList.toggle("on", (button.dataset.flag || null) === filter.flagged);
@@ -3246,13 +3302,18 @@
     const count = document.createElement("span");
     count.className = "count";
     count.textContent = String(collection.count);
-    pick.append(collection.name, count);
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = collection.name;
+    pick.append(name, count);
+    // Pressing the one being walked through does nothing: going back is "All
+    // photographs", which says so. It used to leave, a toggle nobody could see.
     pick.title = view.viewing === collection.id
-      ? "back to the whole library"
+      ? "being walked through"
       : collection.count ? "walk through these" : "nothing in it yet";
     pick.addEventListener("click", () => {
       pick.blur();
-      act("show_collection", view.viewing === collection.id ? null : collection.id);
+      if (view.viewing !== collection.id) act("show_collection", collection.id);
     });
 
     li.append(aim, pick);
@@ -3312,8 +3373,20 @@
     return li;
   };
   const drawCollections = view => {
-    const shown = view.collections ?? [];
-    const signature = `${view.viewing}|` +
+    const all = view.collections ?? [];
+    const wanted = collectionSearch.value.trim().toLowerCase();
+    let shown = all;
+    if (wanted) {
+      const byId = new Map(all.map(c => [c.id, c]));
+      const keep = new Set();
+      for (const c of all) {
+        if (!c.name.toLowerCase().includes(wanted) && !(c.is_quick && "quick collection".includes(wanted))) continue;
+        for (let at = c; at && !keep.has(at.id); at = byId.get(at.parent_id)) keep.add(at.id);
+      }
+      shown = all.filter(c => keep.has(c.id));
+    }
+    document.getElementById("collection-none").hidden = !wanted || shown.length > 0;
+    const signature = `${wanted}|${view.viewing}|` +
       shown.map(c => `${c.id}:${c.parent_id}:${c.name}:${c.count}:${c.is_target}`).join(",");
     if (signature === collectionsDrawn) return;
     collectionsDrawn = signature;
@@ -3331,6 +3404,114 @@
     }
   };
 
+  // ---- Folders ------------------------------------------------------------------
+  //
+  // Asked for, not carried in every view: the tree only changes when photographs
+  // are added or copies made or removed, and each of those changes how many
+  // photographs the library holds — so that number is when to ask again.
+  const folderList = document.getElementById("folder-list");
+  let folderRows = [];
+  let foldersAskedAt = null;
+  let foldersDrawn = "";
+  /// Folders somebody has closed. Open is the default, down to the second
+  /// level: a shoot's days are what most people choose between, and a year of
+  /// shoots is a long list if every one of them starts open.
+  const folded = new Set();
+  let foldedByDefault = null;
+  const folderName = id => folderRows.find(f => f.id === id)?.name;
+  const drawFolders = view => {
+    if (view.in_library !== foldersAskedAt) {
+      foldersAskedAt = view.in_library;
+      invoke("folders").then(rows => {
+        folderRows = rows;
+        foldersDrawn = "";
+        if (foldedByDefault === null) {
+          foldedByDefault = true;
+          const depthOf = new Map();
+          for (const f of rows) depthOf.set(f.id, f.parent_id == null ? 0 : (depthOf.get(f.parent_id) ?? 0) + 1);
+          for (const f of rows) if (depthOf.get(f.id) >= 1 && rows.some(c => c.parent_id === f.id)) folded.add(f.id);
+        }
+        drawFolders(latestView ?? view);
+        show(latestView ?? view);
+      }).catch(say);
+    }
+    const signature = `${view.folder}|${folderRows.length}|${[...folded].join(",")}`;
+    if (signature === foldersDrawn) return;
+    foldersDrawn = signature;
+    const under = new Map();
+    for (const f of folderRows) {
+      const key = f.parent_id ?? 0;
+      if (!under.has(key)) under.set(key, []);
+      under.get(key).push(f);
+    }
+    for (const list of under.values()) list.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    const rows = [];
+    const walk = (key, depth) => {
+      for (const f of under.get(key) ?? []) {
+        const li = document.createElement("li");
+        li.style.paddingLeft = `${12 * depth}px`;
+        const twisty = document.createElement("button");
+        twisty.className = "twisty";
+        const opens = under.has(f.id);
+        if (opens) {
+          twisty.textContent = folded.has(f.id) ? "▸" : "▾";
+          twisty.setAttribute("aria-label", folded.has(f.id) ? `open ${f.name}` : `close ${f.name}`);
+          twisty.addEventListener("click", () => {
+            twisty.blur();
+            if (!folded.delete(f.id)) folded.add(f.id);
+            drawFolders(latestView);
+          });
+        } else {
+          twisty.tabIndex = -1;
+        }
+        const place = document.createElement("button");
+        place.className = "place";
+        place.classList.toggle("on", view.folder === f.id);
+        place.title = f.own === f.total ? f.path : `${f.path} — ${f.own} here, ${f.total} with the folders in it`;
+        const name = document.createElement("span");
+        name.className = "name";
+        name.textContent = f.name;
+        const count = document.createElement("span");
+        count.className = "count";
+        count.textContent = String(f.total);
+        place.append(name, count);
+        place.addEventListener("click", () => { place.blur(); act("show_folder", f.id); });
+        li.append(twisty, place);
+        rows.push(li);
+        if (opens && !folded.has(f.id)) walk(f.id, depth + 1);
+      }
+    };
+    walk(0, 0);
+    folderList.replaceChildren(...rows);
+  };
+  const allButton = document.getElementById("source-all");
+  allButton.addEventListener("click", () => {
+    allButton.blur();
+    const view = latestView;
+    if (view?.viewing != null) act("show_collection", null);
+    else if (view?.folder != null) act("show_folder", null);
+  });
+  const drawAll = view => {
+    allButton.classList.toggle("on", view.viewing == null && view.folder == null);
+    document.getElementById("source-all-count").textContent = String(view.in_library ?? "");
+  };
+
+  // The search box over the collections: a match keeps its parents, so a nested
+  // collection is found where it lives rather than floating free of its tree.
+  const collectionSearch = document.getElementById("collection-search");
+  collectionSearch.addEventListener("input", () => {
+    collectionsDrawn = "";
+    if (latestView) drawCollections(latestView);
+  });
+  // Escape in the box empties it first, and only then gives the keyboard back.
+  collectionSearch.addEventListener("keydown", event => {
+    if (event.key === "Escape" && collectionSearch.value) {
+      collectionSearch.value = "";
+      collectionSearch.dispatchEvent(new Event("input"));
+      event.stopPropagation();
+    }
+  });
+
   document.getElementById("filter").addEventListener("click", event => {
     const button = event.target.closest("button");
     if (!button) return;
@@ -3338,7 +3519,8 @@
     // and a chip that kept focus would eat the next P or X — the keys somebody
     // narrowed the library in order to press.
     button.blur();
-    if (button.dataset.flag !== undefined) narrow({ flagged: button.dataset.flag || null });
+    if (button.id === "filter-off") act("set_filter", { flagged: null, min_rating: null, colour: null });
+    else if (button.dataset.flag !== undefined) narrow({ flagged: button.dataset.flag || null });
     // Clicking the star already filtered at clears it, which is the only way
     // back to "any rating" that does not need a sixth chip meaning "none".
     else if (button.dataset.stars) {

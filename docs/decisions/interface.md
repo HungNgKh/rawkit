@@ -58,6 +58,9 @@ what a contributor would otherwise undo.
 | **I34** | The window is divided by the shell, and the page draws at its numbers | Top bar, left panel, right panel, status bar: four insets in `frame.rs`. The Linux canvas is placed from them and the page is handed them. |
 | **I35** | The tool-options bar is a permanent row, not one that appears with a tool | Picking up crop must not move the photograph under the handles. The row holds the filter in Library. |
 | **I36** | Panels hide with F7 and F8, not Tab | Tab moves the keyboard through the controls; taking it would take the panel from anybody who drives it that way. |
+| **I37** | A folder is a place to look, as a collection is | Choosing one shows it *and every folder under it*, in the library's order, with the filter still applying. "All photographs" is how back, for both. |
+| **I38** | The filter bar is controls, not chips | 26 px targets; the flag choice is one segmented radio; "Filter on ✕" says it is on and turns it off. |
+| **I39** | Collections can be searched, and a second click does nothing | A match keeps its parents. Clicking the collection being walked used to leave it — a toggle nobody could see. |
 | **I21** | New never replaces a catalog, and only `--new` makes one | The picker's "replace?" is a question about a file. Without `--new`, a path that is not there is refused, not created. |
 
 ## I1 — one status line
@@ -824,6 +827,43 @@ from anyone driving it that way. F7 and F8 are Lightroom's own keys for the left
 and right panels; "hide both" is in the palette without a key. What is hidden is
 remembered with the window.
 
+## I37 — folders
+
+The left panel in Library is "All photographs", the folder tree, then the
+collections. A folder carries two counts: its own photographs and those of every
+folder under it, and the second is the one shown, because choosing a folder shows
+everything under it — a shoot is often a folder of folders, and a parent with
+nothing of its own must not read as empty. Photographs, not files: a virtual copy
+counts. Missing files are not counted, and a folder with nothing left to show is
+not offered, because choosing it could only be refused.
+
+The tree is asked for (`folders`), not carried in every view: it changes only when
+photographs are added or copies made or removed, and each of those changes the
+library's size, which is when the page asks again. Folders open to the second
+level; deeper ones start closed.
+
+A folder is a `Source` like a collection, so the filter applies within it and the
+oracle checks it after every action in the tests. At most one of `viewing` and
+`folder` is set in the view.
+
+## I38 — the filter bar
+
+F16. The chips were 11 px text in 18 px boxes and the star chips 15 px wide. Now
+every control is at least 26 by 26. The flag choice is exclusive, so it is drawn
+as one segmented control with `role=radio`, not four toggles side by side. The
+star and label groups are named. When anything narrows the library, a **Filter
+on ✕** button appears: it is the sign and the off switch, and `\` still puts the
+last filter back. Text search is not here, because the catalog cannot search
+text yet.
+
+## I39 — the collection list
+
+A search box above the list; a match keeps its parents, so a nested collection is
+found where it lives. Escape in the box empties it before giving the keyboard
+back. Clicking the collection already being walked does nothing — "All
+photographs" says what going back is. "New from selection…" is "New from the
+selected…", the word the rest of the window uses since S11.
+
 ## If you change this
 
 | If you touch… | …this will tell you |
@@ -865,6 +905,7 @@ remembered with the window.
 | the recent list | `the_last_one_opened_comes_first_and_is_listed_once`, `only_so_many_are_kept`, `a_bare_launch_reopens_the_last_one_only_if_it_is_there`, `a_list_that_cannot_be_read_is_an_empty_one` |
 | anything in `setup`, or in the navigation block of `tick` | nothing automatic. **No `?` on anything a missing file, a bad catalog or a corrupt preview can reach.** Check by hand with `target/scratch`-style catalogs whose files have been renamed |
 | who reads the notice | `grep -n 'take_notice' panel.html` shows only `hear` |
+| what a folder counts, or what choosing one shows | `folders::tests` in the catalog (own and total, under it too, missing files, virtual copies) and `a_folder_is_a_place_to_look_and_the_filter_still_applies_in_it` |
 | how the window is divided | `frame::tests` — the four sides, the left panel giving way first, a hidden panel's width going to the photograph, the physical canvas meeting the bars at a fractional scale, and where a pointer lands |
 | a bar's height or a panel's width in the page | nothing automatic: the page must take it from `--top`, `--left`, `--panel`, `--bottom`, never a number of its own. Check by pixel: the page's border ends on the pixel before the canvas starts, on all four sides |
 | where an overlay lives | the welcome and import screens are top-level; the sheet, palette and export panel are in `#chrome` and call `needRight()` |

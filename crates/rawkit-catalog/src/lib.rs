@@ -32,6 +32,7 @@ pub mod copies;
 pub mod cull;
 pub mod db;
 pub mod edits;
+pub mod folders;
 pub mod ingest;
 pub mod path;
 pub mod presets;

@@ -1213,6 +1213,24 @@ fn cull(
         })
 }
 
+/// The folders photographs are in, with counts, for the left panel.
+///
+/// Asked for by the page, not carried in every view: the tree changes only when
+/// photographs are added or copies made or removed, and the page asks again
+/// when the library's size says one of those happened. Nothing open is an
+/// empty tree rather than an error — the welcome screen has no left panel.
+#[tauri::command]
+fn folders(state: tauri::State<'_, Shelf>) -> Result<Vec<rawkit_catalog::folders::Folder>, String> {
+    let Some(library) = state.0.as_ref() else {
+        return Ok(Vec::new());
+    };
+    library
+        .lock()
+        .expect("library lock")
+        .folders()
+        .map_err(|e| e.to_string())
+}
+
 /// The status line as it stands, for a page that has just loaded.
 #[tauri::command]
 fn cull_view(state: tauri::State<'_, Shelf>) -> Option<CullView> {
@@ -1851,6 +1869,7 @@ fn main() -> Result<()> {
             set_panel_width,
             frame,
             show_panels,
+            folders,
             toggle_fullscreen,
             arm_target,
             pick_white_balance,

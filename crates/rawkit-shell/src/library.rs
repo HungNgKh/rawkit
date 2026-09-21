@@ -362,6 +362,10 @@ pub enum CullAction {
     /// Walk a collection instead of the whole library; `None` goes back to all
     /// of it. The filter still applies *within* it — see `Library::read`.
     ShowCollection(Option<i64>),
+    /// Walk one folder and everything under it; `None` goes back to all of the
+    /// library. A folder is a place to look, as a collection is, so choosing
+    /// one leaves any collection and the filter still applies within it.
+    ShowFolder(Option<i64>),
     /// Put this frame in the target collection, or take it out. The same key
     /// either way, like [`CullAction::Mark`]: a toggle is what a one-key gesture
     /// on a single frame can honestly be.
@@ -504,6 +508,7 @@ impl CullAction {
             | CullAction::SelectAll
             | CullAction::PasteEdit
             | CullAction::ShowCollection(_)
+            | CullAction::ShowFolder(_)
             | CullAction::TargetToggle
             | CullAction::AddMarked
             | CullAction::TakeOut
@@ -573,6 +578,9 @@ pub struct CullView {
     pub collections: Vec<Collection>,
     /// Which one is being walked through, and `None` for the whole library.
     pub viewing: Option<i64>,
+    /// Which folder is being walked through, if one is. At most one of this and
+    /// `viewing` is set: a folder and a collection are both places to look.
+    pub folder: Option<i64>,
     /// Whether this frame is in the target collection, so the key that toggles
     /// it can say which way it will go.
     pub in_target: bool,
@@ -1231,7 +1239,21 @@ impl Library {
     /// the library exactly where it was. This used to write `viewing`, read, and
     /// put `viewing` back by hand on each of three ways out.
     pub fn show_collection(&mut self, id: Option<i64>) -> Result<()> {
-        let source = id.map_or(Source::Library, Source::Collection);
+        self.show(
+            id.map_or(Source::Library, Source::Collection),
+            "that collection is empty",
+        )
+    }
+
+    /// Walk one folder and everything under it, or the whole library again.
+    pub fn show_folder(&mut self, id: Option<i64>) -> Result<()> {
+        self.show(
+            id.map_or(Source::Library, Source::Folder),
+            "nothing in that folder can be shown",
+        )
+    }
+
+    fn show(&mut self, source: Source, empty: &str) -> Result<()> {
         let filter = self.sequence.filter().clone();
         let next = match Sequence::read(&self.catalog, source, filter.clone())? {
             Some(next) => Some(next),
@@ -1243,7 +1265,7 @@ impl Library {
             }
             None => None,
         };
-        let next = next.ok_or_else(|| anyhow!("that collection is empty"))?;
+        let next = next.ok_or_else(|| anyhow!("{empty}"))?;
         // Stay on the same photograph when it is in both views, which is what
         // switching to a collection the current frame is already in should do.
         let standing = self.current().id;
@@ -1377,6 +1399,11 @@ impl Library {
 
     /// What a grid reports after a click, for the page: the clicks happen on
     /// the canvas and no command carries the sentence back.
+    /// The folder tree, with counts. See [`rawkit_catalog::folders`].
+    pub fn folders(&self) -> Result<Vec<rawkit_catalog::folders::Folder>> {
+        Ok(rawkit_catalog::folders::tree(&self.catalog)?)
+    }
+
     pub fn take_said(&mut self) -> Option<String> {
         self.said.take()
     }
@@ -1628,6 +1655,7 @@ impl Library {
             | CullAction::CropReset => {}
             CullAction::SetFilter(filter) => self.narrow(filter)?,
             CullAction::ShowCollection(id) => self.show_collection(id)?,
+            CullAction::ShowFolder(id) => self.show_folder(id)?,
             CullAction::TargetToggle => {
                 let (target, id) = (self.target, self.current().id);
                 let (frame, into) = (self.name_of(id), self.collection_name(target));
@@ -2154,7 +2182,11 @@ impl Library {
             collections: self.collections.clone(),
             viewing: match self.sequence.source() {
                 Source::Collection(id) => Some(id),
-                Source::Library => None,
+                Source::Library | Source::Folder(_) => None,
+            },
+            folder: match self.sequence.source() {
+                Source::Folder(id) => Some(id),
+                Source::Library | Source::Collection(_) => None,
             },
             // An indexed point lookup, 4 µs and flat at twenty thousand — the
             // one collection question that really is about this frame, and so
@@ -2565,6 +2597,61 @@ pub(crate) mod tests {
             worst.1,
             worst.0
         );
+    }
+
+    #[test]
+    fn a_folder_is_a_place_to_look_and_the_filter_still_applies_in_it() {
+        // Two days of a shoot, three photographs each, in folders of their own.
+        let dir = Scratch::new("folder-source");
+        let photos = dir.0.join("photos");
+        for i in 0..6 {
+            let day = photos.join(if i < 3 { "day1" } else { "day2" });
+            std::fs::create_dir_all(&day).unwrap();
+            std::fs::write(day.join(format!("DSC{i:05}.ARW")), b"raw").unwrap();
+        }
+        let mut catalog = Catalog::open(&dir.0.join("library.rawkit")).unwrap();
+        rawkit_catalog::scan::scan_on(
+            &mut catalog,
+            &photos,
+            rawkit_catalog::VolumeId::Uuid("test-volume".into()),
+            |path: &Path| {
+                let name = path.file_stem()?.to_string_lossy().into_owned();
+                let index: i64 = name.trim_start_matches("DSC").parse().ok()?;
+                Some(FileMetadata {
+                    captured_at: Some(1_000 + index),
+                    ..FileMetadata::default()
+                })
+            },
+        )
+        .unwrap();
+        drop(catalog);
+        let mut library = Library::open(&dir.0.join("library.rawkit")).unwrap();
+
+        let folders = library.folders().unwrap();
+        let day2 = folders.iter().find(|f| f.name == "day2").unwrap().id;
+        let photos_root = folders.iter().find(|f| f.name == "photos").unwrap();
+        assert_eq!(photos_root.total, 6);
+
+        let view = library.act(CullAction::ShowFolder(Some(day2))).unwrap();
+        assert_eq!(
+            (view.folder, view.viewing, view.total),
+            (Some(day2), None, 3)
+        );
+        assert_eq!(view.filename, "DSC00003.ARW");
+
+        // Picking one and narrowing to picks narrows the folder, not the library.
+        library.act(CullAction::Pick).unwrap();
+        let view = library
+            .act(CullAction::SetFilter(Filter::flagged(Flagged::Pick)))
+            .unwrap();
+        assert_eq!(
+            (view.folder, view.total, view.in_library),
+            (Some(day2), 1, 6)
+        );
+
+        // And back to everything, still narrowed.
+        let view = library.act(CullAction::ShowFolder(None)).unwrap();
+        assert_eq!((view.folder, view.total), (None, 1));
     }
 
     #[test]
