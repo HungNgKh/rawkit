@@ -46,6 +46,12 @@ what a contributor would otherwise undo.
 | **I22** | Export is a panel in the column, with a button | What, how, to where — and only what the writer can do. `Ctrl+Shift+E` opens it; `Ctrl+E` exports again with the last settings. |
 | **I23** | What is exported is what was counted | "Selected" and "shown" are sent as lists of photographs, in the order shown — not as a filter, which cannot describe a collection. |
 | **I24** | Export settings belong to the machine | `export.json` beside `window.json`: the last settings and the named ones. A destination folder is a fact about this computer. |
+| **I25** | One slider, still an `<input type=range>` underneath | The pointer is taken over whole; the keyboard and the accessibility stay native. |
+| **I26** | Photographic units, for display only | `+0.19 EV`, `+37`, `5500 K`, `+1.5°`. The wire, the edit and the catalog stay in the engine's. |
+| **I27** | What "changed" means comes from the shell | `edit_defaults` run through the page's own `sync`; `touched` parts in the snapshot. Never the markup's `value=`. |
+| **I28** | Looking is not changing | `Session::set_compare`: before/after and a section's eye redraw the canvas and touch nothing — not the edit, the history, or the generation the autosave watches. |
+| **I29** | A key may belong to two commands only if one is the Library's and one is Develop's | `\` is the filter in the Library and before/after in Develop. |
+| **I30** | The chrome is neutral, and said once | Colour tokens on `:root`; R = G = B in every grey. 11 px is retired. |
 | **I21** | New never replaces a catalog, and only `--new` makes one | The picker's "replace?" is a question about a file. Without `--new`, a path that is not there is refused, not created. |
 
 ## I1 — one status line
@@ -569,6 +575,115 @@ catalog carried to another should not arrive with presets pointing at folders
 that are not there. It also keeps the schema out of it. A preset does not hold
 a scope: "web, 2048" is how, and which photographs is asked every time.
 
+## I25 — one slider
+
+F14: the native range input has no way back to a default, no typing a number,
+no fine movement, a click on the rail throws the value to wherever the click
+was, and it is orange in one engine and blue in another.
+
+**Weighed against:** the designer's `div` rail with `role="slider"`. Rejected
+for what it costs to get right — keyboard, ARIA values, forced-colours, three
+engines — when the native element already is a slider to a keyboard and a
+screen reader. What is replaced is what it does badly:
+
+- **The pointer is taken over whole.** `pointerdown` is cancelled, which stops
+  the native drag, the native jump, and the focus a click used to leave behind
+  (F07). A drag moves the value by how far the pointer *moved*, not to where it
+  is — which is what lets **Shift** make the same movement count a quarter.
+  A press on the rail moves a tenth of the range towards it: a stray click
+  cannot throw Exposure to +4.
+- **Double-click** the slider or its name: back to the default, one undo step.
+  Delete does the same for a slider reached with Tab; Shift+arrow is ten steps.
+- **Click the number** to type one, in the units shown. Enter commits, Escape
+  cancels, the arrows step. Out of range is clamped, not refused: "200" into a
+  control that stops at 100 means all the way. The number is inside the
+  slider's `<label>`, so the click is `preventDefault`ed or the label hands the
+  focus straight to the slider and the entry closes before a key is pressed.
+- **The fill starts where nothing is** — the middle, for a control that goes
+  both ways — and a `•` in the margin marks one that has been changed.
+
+Drawn with `-webkit-` pseudo-elements, which is all three webviews. One drag is
+still one undo step: the session coalesces on the command, and this sends the
+same commands the native input did.
+
+## I26 — photographic units, for display only
+
+The owner's Q8. −1…1 is shown as −100…+100 and 0…1 as 0…100, exposure in EV,
+temperature in K, angles in degrees; radii and the perspective three keep the
+engine's number, because it *is* their unit. One rule (`unitOf`) applied where
+a readout is written — a document-level `input` listener that runs after each
+control's own handler, and `setSlider` — rather than fifty format functions
+changed one by one. Words win over numbers: "as shot" is not a temperature.
+
+## I27 — what "changed" means comes from the shell
+
+The markup has a `value=` on every slider, and it would have been the obvious
+default. It is a second list of defaults, and two lists are two chances for one
+to be wrong: a slider whose markup said 0 and whose `EditState::default()` said
+0.4 would show a dot on every untouched photograph and "reset" to the wrong
+place. So the page asks for `edit_defaults`, runs it through the same `sync`
+that fills the sliders in, and keeps each slider's value as its default. The
+dot on a section's heading is `touched` in the snapshot — `Part::is_touched`,
+which also covers the things that are not sliders: the curve, the wheels, the
+masks.
+
+## I28 — looking is not changing
+
+`Session::set_compare(Some(Compare::Before | Compare::Without(part)))`. The
+render job is drawn from `shown_state()`; every tile is forgotten, because
+every tile shows the other rendering; and **the generation does not move**,
+because it is what the autosave watches and looking at a photograph the way it
+was is not a change to it. Nothing enters the history.
+
+*Before* clears every part and keeps the orientation, the crop and the lens
+corrections: a comparison that jumps compares the edges and not the picture.
+With nothing done to the frame it is exactly `EditState::default()`, which is
+the slice's acceptance test and a unit test.
+
+A **part** is nearly a preset's group and not quite. Exposure and clarity share
+a field and are two things to a person — "tone" and "presence" — and an eye on
+Tone that also took the clarity away would compare against a picture nobody
+asked to see. Geometry is not a part, for the reason before keeps it.
+
+The first edit ends a comparison, or the slider moves and the picture does not.
+So does opening another photograph. Escape ends one: it is a rung of the
+ladder, above the tools.
+
+The eye is held, not toggled, from a pointer; from the keyboard there is no
+holding, so Space looks and Space again stops. Double-clicking a heading's dot
+puts that part back to nothing through `SetEditState`, which is one undo step
+where a run of slider commands would be one per control.
+
+## I29 — one key, two workspaces
+
+The registry refuses a key bound twice, because the second command would
+simply never run. `\` needs to be two things — the filter in the Library and
+before/after in Develop, which is Lightroom's split and so already in migrants'
+hands. The rule is now exactly as wide as that: two commands may share a key
+if one is scoped `library` and the other `develop`, and `commandFor(key)` takes
+the one where you are.
+
+Found the hard way. The registry threw while the page loaded, which stops
+everything after it, silently — there is no console. Every command still
+worked, because the key handler is registered earlier; what was missing was
+everything defined later. A `window` `error` listener now puts a load failure on
+the status line with its line number.
+
+## I30 — the chrome is neutral
+
+F20, F21 and the owner's Q6. Every grey was blue-shifted — `#1e1e22`,
+`#9a9aa2`: blue above red and green in each — and a tool for judging colour
+cannot put a tint in the surround the eye adapts to. The palette is now tokens
+on `:root`, R = G = B throughout, with the designer's contrast figures: three
+text steps that clear AA on all three grounds, control boundaries at 3:1.
+Colour means something — a flag, a fault, the focus, a tool in hand — and is
+used in small areas. The slider's fill is grey on purpose. 11 px is retired;
+12 is the smallest type. The grid's ground lost its blue too.
+
+**Not done:** the letterbox round the photograph in the loupe is still the
+renderer's black, and Q6's choice of surround (black, dark, mid-grey, white)
+is not built. `-moz-` slider styling is minimal: no webview here is Gecko.
+
 ## If you change this
 
 | If you touch… | …this will tell you |
@@ -592,6 +707,14 @@ a scope: "web, 2048" is how, and which photographs is asked every time.
 | what each file in a batch is called | `two_photographs_with_one_name_become_two_files`, `a_copy_and_its_original_do_not_write_the_same_file` |
 | where export settings are kept | `the_last_settings_and_the_presets_come_back`, `a_file_somebody_edited_badly_is_a_first_run` |
 | anything in `tick` that must happen in the grid too | it goes **before** the `in_grid()` early return. The pump, the import and the export all do |
+| what a slider does to a pointer, a key or a typed number | nothing automatic. By hand, in the window: double-click, type 50 and 250, a rail click, Shift-drag against a plain drag (a quarter as far) |
+| how a value is shown | `unitOf` is the only place; `setSlider` and the `input` listener are the only writers |
+| what a slider's default is | `learnDefaults` in the first poll. Never `value=` in the markup |
+| what comparing may touch | `comparing_changes_what_is_drawn_and_nothing_else`, `the_first_edit_ends_the_comparison` |
+| what "before" is | `before_is_the_photograph_as_it_opened_with_the_frame_it_has_now` — exactly a default edit when the frame is untouched |
+| what a part covers | `a_part_is_what_a_person_thinks_of_as_one_thing`. A new field of the edit belongs to a `Part`, or before/after will not clear it |
+| two commands on one key | the registry throws at load unless the scopes are `library` and `develop`; a load failure is on the status line |
+| a colour in the stylesheet | it is a token, or it is data (a band swatch, a label colour, a histogram channel) |
 | what a launch opens | `what_is_named_is_what_opens`, `with_nothing_named_the_last_catalog_comes_back`, `a_catalog_that_was_closed_stays_closed`, `the_test_pattern_has_to_be_asked_for` |
 | the recent list | `the_last_one_opened_comes_first_and_is_listed_once`, `only_so_many_are_kept`, `a_bare_launch_reopens_the_last_one_only_if_it_is_there`, `a_list_that_cannot_be_read_is_an_empty_one` |
 | anything in `setup`, or in the navigation block of `tick` | nothing automatic. **No `?` on anything a missing file, a bad catalog or a corrupt preview can reach.** Check by hand with `target/scratch`-style catalogs whose files have been renamed |

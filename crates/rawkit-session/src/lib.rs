@@ -85,6 +85,99 @@ pub const TEMPERATURE_RANGE_K: std::ops::RangeInclusive<f32> = 1000.0..=50_000.0
 /// photograph accumulates in one sitting, and a drag is one of them.
 const MAX_STEPS: usize = 200;
 
+/// A part of the edit a person can look at the photograph without, and put
+/// back to nothing.
+///
+/// Nearly the groups a preset is made of ([`rawkit_editstate::Group`]), and not
+/// quite, which is why this exists. A group is a field of the edit; a part is
+/// what somebody thinks of as one thing. Exposure and clarity share a field and
+/// are two things: one is "the tone", the other sits with saturation under
+/// "presence", and an eye on the Tone section that also took the clarity away
+/// would be comparing against a picture nobody asked to see.
+///
+/// Geometry is not a part. Looking at a photograph without its crop moves the
+/// frame, and a comparison that jumps compares nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Part {
+    WhiteBalance,
+    Tone,
+    Presence,
+    Curve,
+    Mixer,
+    Grading,
+    Detail,
+    Masks,
+    Spots,
+    Effects,
+    Calibration,
+}
+
+impl Part {
+    pub const ALL: [Part; 11] = [
+        Part::WhiteBalance,
+        Part::Tone,
+        Part::Presence,
+        Part::Curve,
+        Part::Mixer,
+        Part::Grading,
+        Part::Detail,
+        Part::Masks,
+        Part::Spots,
+        Part::Effects,
+        Part::Calibration,
+    ];
+
+    /// Put this part of an edit back to what a photograph opens with.
+    pub fn clear(self, state: &mut EditState) {
+        use rawkit_editstate::Group;
+        let plain = EditState::default();
+        match self {
+            Part::WhiteBalance => state.adopt(&plain, &[Group::WhiteBalance]),
+            Part::Tone => {
+                // The six that are the tone, leaving the three that share the
+                // field and are not.
+                let presence = (state.tone.clarity, state.tone.texture, state.tone.dehaze);
+                state.tone = plain.tone;
+                (state.tone.clarity, state.tone.texture, state.tone.dehaze) = presence;
+            }
+            Part::Presence => {
+                state.tone.clarity = plain.tone.clarity;
+                state.tone.texture = plain.tone.texture;
+                state.tone.dehaze = plain.tone.dehaze;
+                state.adopt(&plain, &[Group::Colour]);
+            }
+            Part::Curve => state.adopt(&plain, &[Group::Curve]),
+            Part::Mixer => state.adopt(&plain, &[Group::Hsl]),
+            Part::Grading => state.adopt(&plain, &[Group::Grade]),
+            Part::Detail => state.adopt(&plain, &[Group::Detail]),
+            Part::Masks => state.adopt(&plain, &[Group::Masks]),
+            Part::Spots => state.spots.clear(),
+            Part::Effects => state.adopt(&plain, &[Group::Effects]),
+            Part::Calibration => state.adopt(&plain, &[Group::Calibration]),
+        }
+    }
+
+    /// Whether this part of an edit is anything but what a photograph opens
+    /// with — what the dot on a section's heading says.
+    pub fn is_touched(self, state: &EditState) -> bool {
+        let mut cleared = state.clone();
+        self.clear(&mut cleared);
+        cleared != *state
+    }
+}
+
+/// What the canvas shows in place of the edit. See [`Session::set_compare`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Compare {
+    /// As it opened, framed as it is now: every [`Part`] cleared, and the
+    /// orientation, the crop and the lens corrections kept — so the frame does
+    /// not jump, and what is compared is the picture and not its edges.
+    Before,
+    Without(Part),
+}
+
 /// What the user asked for. The only way to change a [`Session`].
 ///
 /// One variant per thing the UI can do, rather than a generic patch, for the
@@ -607,6 +700,13 @@ pub struct Session {
     ///
     /// Without it a crop could only ever shrink.
     cropping: bool,
+    /// What the canvas is showing *instead of* the edit, while somebody looks.
+    ///
+    /// A fact about the view, like `cropping`: [`state`](Self::state) is
+    /// untouched, nothing is saved, nothing enters the history, and the
+    /// generation does not move — it is what the autosave watches, and looking
+    /// at a photograph the way it was is not a change to it.
+    compare: Option<Compare>,
     haste: bool,
     /// The control that opened the step now on top of `past`, so a run of the
     /// same one collapses into it. `None` means the next edit starts a new step
@@ -647,6 +747,7 @@ impl Session {
             fitted: false,
             haste: false,
             cropping: false,
+            compare: None,
             recorded,
             developed,
             tile,
@@ -805,6 +906,41 @@ impl Session {
         self.cropping
     }
 
+    /// Show the photograph without some or all of the edit, or stop doing so.
+    /// `true` if that changed what is on the canvas.
+    ///
+    /// Every tile is forgotten, because every tile shows the other rendering.
+    /// The generation stays where it is; see the field.
+    pub fn set_compare(&mut self, compare: Option<Compare>) -> bool {
+        if self.compare == compare {
+            return false;
+        }
+        self.compare = compare;
+        self.rendered.clear();
+        true
+    }
+
+    /// What the canvas is showing in place of the edit, if anything.
+    pub fn compare(&self) -> Option<Compare> {
+        self.compare
+    }
+
+    /// The edit as it is being *drawn*: the real one, less whatever is being
+    /// compared away. Never stored and never sent anywhere but the renderer.
+    pub fn shown_state(&self) -> EditState {
+        let mut shown = self.state.clone();
+        match self.compare {
+            None => {}
+            Some(Compare::Before) => {
+                for part in Part::ALL {
+                    part.clear(&mut shown);
+                }
+            }
+            Some(Compare::Without(part)) => part.clear(&mut shown),
+        }
+        shown
+    }
+
     /// Apply one command. Never blocks and never renders.
     ///
     /// # What counts as one undo step
@@ -834,6 +970,12 @@ impl Session {
         let before = self.state.clone();
 
         let event = self.dispatch(command);
+        // An edit made while looking at "before" would be made blind: the
+        // slider moves and the picture does not. So the first change ends the
+        // comparison, and what is on the canvas is what is being changed.
+        if matches!(event, Event::EditChanged { .. }) {
+            self.set_compare(None);
+        }
 
         // Only a change earns a step. A refused command left the state alone, so
         // recording one would put a point in the history that undo could return
@@ -862,6 +1004,8 @@ impl Session {
         self.past.clear();
         self.future.clear();
         self.step = None;
+        // A comparison belongs to the photograph it was asked of.
+        self.compare = None;
         self.edit_changed()
     }
 
@@ -1230,7 +1374,7 @@ impl Session {
 
         RenderJob {
             generation: self.generation,
-            state: self.state.clone(),
+            state: self.shown_state(),
             tiles,
         }
     }
@@ -1537,6 +1681,124 @@ mod tests {
             height: 1000,
         });
         s
+    }
+
+    /// Every tile on screen drawn, so that "is there work" means "did
+    /// something change".
+    fn settle(s: &mut Session) {
+        let job = s.pending_work();
+        for tile in job.tiles {
+            s.tile_rendered(tile, job.generation);
+        }
+        assert!(s.pending_work().is_empty());
+    }
+
+    #[test]
+    fn comparing_changes_what_is_drawn_and_nothing_else() {
+        let mut s = session();
+        s.apply(Command::SetExposure(1.5));
+        settle(&mut s);
+        let (generation, edit) = (s.generation(), s.state().clone());
+
+        assert!(s.set_compare(Some(Compare::Before)));
+        assert!(!s.set_compare(Some(Compare::Before)), "asked twice is once");
+        let job = s.pending_work();
+        assert!(!job.is_empty(), "every tile shows the other rendering");
+        assert_eq!(
+            job.state.tone.exposure_ev, 0.0,
+            "and is drawn without the edit"
+        );
+        // Looking is not changing: nothing for the autosave to write, nothing
+        // in the history, and the edit is where it was.
+        assert_eq!(s.generation(), generation);
+        assert_eq!(*s.state(), edit);
+
+        settle(&mut s);
+        assert!(s.set_compare(None));
+        assert_eq!(s.pending_work().state.tone.exposure_ev, 1.5);
+        assert_eq!(s.generation(), generation);
+        // One step of history, and it is the exposure.
+        s.apply(Command::Undo);
+        assert_eq!(s.state().tone.exposure_ev, 0.0);
+    }
+
+    #[test]
+    fn before_is_the_photograph_as_it_opened_with_the_frame_it_has_now() {
+        let mut s = session();
+        s.apply(Command::SetExposure(-1.0));
+        s.apply(Command::SetClarity(0.4));
+        s.apply(Command::SetSaturation(0.3));
+        // With nothing done to the frame, before is exactly a default edit —
+        // pixel for pixel what a photograph nobody has touched renders as.
+        s.set_compare(Some(Compare::Before));
+        assert_eq!(s.shown_state(), EditState::default());
+
+        // Turned and straightened, it keeps both: a comparison that jumps
+        // compares the edges and not the picture.
+        s.set_compare(None);
+        s.apply(Command::RotateBy(1));
+        s.apply(Command::SetStraighten(2.0));
+        s.set_compare(Some(Compare::Before));
+        let before = s.shown_state();
+        assert_eq!(before.orientation, s.state().orientation);
+        assert_eq!(before.crop, s.state().crop);
+        assert_eq!(before.tone, EditState::default().tone);
+        assert_eq!(before.colour, EditState::default().colour);
+    }
+
+    #[test]
+    fn the_first_edit_ends_the_comparison() {
+        // Or the slider moves and the picture does not.
+        let mut s = session();
+        s.apply(Command::SetExposure(1.0));
+        s.set_compare(Some(Compare::Without(Part::Tone)));
+        s.apply(Command::SetContrast(0.2));
+        assert_eq!(s.compare(), None);
+        assert_eq!(s.pending_work().state.tone.exposure_ev, 1.0);
+
+        // A refused command changed nothing, so it ends nothing.
+        s.set_compare(Some(Compare::Before));
+        s.apply(Command::SetExposure(f32::NAN));
+        assert_eq!(s.compare(), Some(Compare::Before));
+
+        // And a comparison belongs to the photograph it was asked of.
+        s.load(EditState::default());
+        assert_eq!(s.compare(), None);
+    }
+
+    #[test]
+    fn a_part_is_what_a_person_thinks_of_as_one_thing() {
+        let mut edit = EditState::default();
+        edit.tone.exposure_ev = 1.0;
+        edit.tone.clarity = 0.5;
+        edit.colour.saturation = 0.25;
+
+        // Exposure and clarity share a field and are two things.
+        let mut without_tone = edit.clone();
+        Part::Tone.clear(&mut without_tone);
+        assert_eq!(without_tone.tone.exposure_ev, 0.0);
+        assert_eq!(
+            without_tone.tone.clarity, 0.5,
+            "clarity is presence, not tone"
+        );
+
+        let mut without_presence = edit.clone();
+        Part::Presence.clear(&mut without_presence);
+        assert_eq!(without_presence.tone.clarity, 0.0);
+        assert_eq!(without_presence.colour.saturation, 0.0);
+        assert_eq!(without_presence.tone.exposure_ev, 1.0);
+
+        assert!(Part::Tone.is_touched(&edit));
+        assert!(Part::Presence.is_touched(&edit));
+        assert!(!Part::Curve.is_touched(&edit));
+        for part in Part::ALL {
+            let mut cleared = edit.clone();
+            part.clear(&mut cleared);
+            assert!(
+                !part.is_touched(&cleared),
+                "{part:?} cleared is {part:?} untouched"
+            );
+        }
     }
 
     #[test]

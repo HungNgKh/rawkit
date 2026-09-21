@@ -296,6 +296,16 @@ fn snapshot(state: tauri::State<'_, Shared>) -> serde_json::Value {
         "viewport": session.viewport(),
         "image": session.image_size(),
         "generation": session.generation(),
+        // What the canvas is showing in place of the edit — "before", or the
+        // edit without one part of it — so the page can say so. A photograph
+        // that looks wrong with nothing saying why is a bug report.
+        "compare": session.compare(),
+        // The parts of the edit that are anything but what a photograph opens
+        // with: the dot on a section's heading.
+        "touched": rawkit_session::Part::ALL
+            .into_iter()
+            .filter(|part| part.is_touched(session.state()))
+            .collect::<Vec<_>>(),
         // Which local adjustment the panel is showing, and whether the next
         // drag on the photograph redraws it. Neither is part of the *edit* —
         // they are where the hands are, not what the picture is — so they live
@@ -500,6 +510,42 @@ fn cancel_export() -> Result<(), String> {
     }
     EXPORT_STOP.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
+}
+
+/// The edit a photograph opens with — what "changed" is measured against and
+/// what double-clicking a slider goes back to. Asked of the type that defines
+/// it, because the page's markup also has a default in it for every slider,
+/// and two lists of defaults are two chances for one of them to be wrong.
+#[tauri::command]
+fn edit_defaults() -> EditState {
+    EditState::default()
+}
+
+/// Show the photograph without the edit, or without one part of it — or, with
+/// nothing, as it is. Looking, not changing: see `Session::set_compare`.
+#[tauri::command]
+fn compare(
+    state: tauri::State<'_, Shared>,
+    with: Option<rawkit_session::Compare>,
+) -> Result<(), String> {
+    // One photograph, at a size it can be looked at. Over a grid there is
+    // nothing on the canvas this would change, and saying nothing would make
+    // the key look broken.
+    if with.is_some() && matches!(mode(), MODE_GRID | MODE_SURVEY) {
+        return Err("open one photograph to compare it with how it was".into());
+    }
+    state.0.lock().expect("session lock").set_compare(with);
+    Ok(())
+}
+
+/// Put one part of the edit back to what a photograph opens with. One step of
+/// undo, which a run of slider commands — one per control — would not be.
+#[tauri::command]
+fn reset_part(state: tauri::State<'_, Shared>, part: rawkit_session::Part) -> Event {
+    let mut session = state.0.lock().expect("session lock");
+    let mut edit = session.state().clone();
+    part.clear(&mut edit);
+    session.apply(Command::SetEditState(Box::new(edit)))
 }
 
 /// How far along the export is, for the page to draw.
@@ -1739,6 +1785,9 @@ fn main() -> Result<()> {
             canvas_pointer,
             histogram,
             export_progress,
+            edit_defaults,
+            compare,
+            reset_part,
             export_panel,
             pick_export_folder,
             take_export_folder,

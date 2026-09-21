@@ -451,12 +451,14 @@ impl PreviewBlit {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         // The background between cells. Dark rather than black so
-                        // a black photograph still has an edge.
+                        // a black photograph still has an edge — and neutral:
+                        // it had more blue in it than red or green, and what
+                        // surrounds a photograph is what the eye adapts to.
                         load: if clear {
                             wgpu::LoadOp::Clear(wgpu::Color {
                                 r: 0.012,
                                 g: 0.012,
-                                b: 0.014,
+                                b: 0.012,
                                 a: 1.0,
                             })
                         } else {

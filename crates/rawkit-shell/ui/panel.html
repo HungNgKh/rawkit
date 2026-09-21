@@ -2,16 +2,49 @@
 <meta charset="utf-8">
 <title>rawkit</title>
 <style>
-  :root { color-scheme: dark; }
-  html, body { margin: 0; height: 100%; background: #1e1e22; color: #e8e8ea;
-               font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+  /* One palette, and it is neutral: R = G = B in every grey. The chrome used to
+     be blue-shifted throughout (#1e1e22, #9a9aa2 — blue above red and green in
+     each), and a tool for judging colour cannot put a tint in the surround the
+     eye adapts to. Colour here means something — a flag, a fault, the focus, a
+     tool in hand — and is used in small areas only.
+
+     The text steps clear WCAG AA on all three grounds; nothing that carries
+     information goes below --text-tertiary, and --text-disabled is for the
+     disabled alone. Control boundaries clear the 3:1 that 1.4.11 asks for. */
+  :root {
+    color-scheme: dark;
+    --ground-panel: #1f1f1f;
+    --ground-raised: #2a2a2a;
+    --ground-hover: #333333;
+    --ground-well: #151515;
+    --text-primary: #ebebeb;
+    --text-secondary: #b0b0b0;
+    --text-tertiary: #969696;
+    --text-disabled: #6a6a6a;
+    --border-control: #767676;
+    --border-subtle: #333333;
+    --track-fill: #a8a8a8;
+    --track-rail: #4a4a4a;
+    --focus: #6ea8ff;
+    --pick: #4fc3d0;
+    --danger: #f0857a;
+    --attention: #e6c35c;
+    --on-attention: #151515;
+    --ok: #7fcf8a;
+    --info: #7fb0f0;
+  }
+  /* An application, not a document: Ctrl+A should not paint every label blue.
+     Text fields select as they always do. */
+  body { user-select: none; -webkit-user-select: none; }
+  html, body { margin: 0; height: 100%; background: var(--ground-panel); color: var(--text-primary);
+               font: 13px/18px system-ui, sans-serif; font-variant-numeric: tabular-nums; overflow: hidden; }
   /* Under a transparent cutout the page covers the whole window and the GPU
      surface is behind it, so everything outside the chrome has to paint nothing
      at all — an opaque pixel there is a pixel of photograph nobody can see.
      Route 3 gives the canvas its own window and never sets this, which is why
      it is a class rather than the default. */
   body.cutout { background: transparent; }
-  body.cutout #chrome { background: #1e1e22; }
+  body.cutout #chrome { background: var(--ground-panel); }
 
   /* A column on the right rather than a strip across the top. A landscape
      photograph is limited by its short edge and a strip takes from exactly
@@ -21,8 +54,8 @@
      disagreement is a strip of photograph behind the panel or a strip of
      desktop beside it. */
   #chrome { position: fixed; top: 0; right: 0; bottom: 0; width: var(--panel, 360px);
-            display: flex; flex-direction: column; background: #1e1e22;
-            border-left: 1px solid #2c2c34; }
+            display: flex; flex-direction: column; background: var(--ground-panel);
+            border-left: 1px solid var(--ground-raised); }
 
   /* The divider: eight pixels of grab area over a one-pixel line, because a
      one-pixel target is a target you hunt for.
@@ -34,7 +67,7 @@
              cursor: col-resize; z-index: 10; }
   #divider:hover::after, #divider.dragging::after {
     content: ""; position: absolute; top: 0; bottom: 0; left: 0; width: 1px;
-    background: #5a5a68; }
+    background: var(--border-control); }
   /* While dragging, the pointer owns the whole page: without this the cursor
      flickers to a text caret every time it crosses a label. */
   body.dividing { cursor: col-resize; user-select: none; }
@@ -50,14 +83,14 @@
      already knows which of the two just happened. There was no focus style at
      all, which is how a slider could hold the keyboard with nothing to show it.
      6.0 to 1 against the panel. */
-  :focus-visible { outline: 2px solid #7c8cff; outline-offset: 2px; border-radius: 3px; }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 3px; }
   input[type=range]:focus-visible { outline-offset: 4px; }
 
   /* `hidden` means hidden. `label { display: flex }` further down outranks the
      attribute's own rule, so a row marked hidden was on screen all along. */
   [hidden] { display: none !important; }
 
-  details { border-bottom: 1px solid #26262e; }
+  details { border-bottom: 1px solid var(--ground-raised); }
   details:last-child { border-bottom: 0; }
   summary { font-size: 13px; font-weight: 600; letter-spacing: .02em;
             padding: 10px 0 10px 16px; cursor: pointer; position: relative;
@@ -67,26 +100,66 @@
      WebKitGTK, WKWebView and WebView2 — three platforms showing three shapes
      for the same control is exactly the kind of thing nobody notices until a
      screenshot from someone else's machine looks wrong. */
-  summary::before { content: "▸"; position: absolute; left: 0; color: #7d7d87;
+  summary::before { content: "▸"; position: absolute; left: 0; color: var(--text-tertiary);
                     transition: transform .12s ease; display: inline-block; }
   details[open] > summary::before { transform: rotate(90deg); }
-  summary:hover { color: #ffffff; }
+  summary:hover { color: var(--text-primary); }
   details > *:last-child { margin-bottom: 12px; }
 
   label { display: flex; align-items: center; gap: 10px; margin: 7px 0; }
   /* 72 rather than the strip's 58: a column has the room, and at 58 both
      noise-reduction labels wrapped onto two lines and pushed their sliders out
      of alignment with everything above them. */
-  label span:first-child { width: 72px; color: #9a9aa2; flex-shrink: 0; }
+  label span:first-child { width: 72px; color: var(--text-tertiary); flex-shrink: 0; }
   /* `min-width: 0` because a range input has an intrinsic minimum of its own,
      and without it flex refuses to shrink one — which pushed the readout out of
      the column and over the label beside it. */
   input[type=range] { flex: 1; min-width: 0; }
+  /* One slider, drawn here rather than by three browser engines. Neutral: the
+     native one is orange in one engine and blue in another, and either is the
+     most saturated thing beside the photograph. A 4 px rail and a 14 px thumb
+     inside a 24 px target. The fill runs from where the control's zero is —
+     the middle, for one that goes both ways — so how far and which way a
+     setting is from nothing can be read without reading the number. */
+  input[type=range] { -webkit-appearance: none; appearance: none; background: transparent; height: 24px;
+                      margin: 0; cursor: pointer; touch-action: none; --lo: 0; --hi: 0; }
+  input[type=range]::-webkit-slider-runnable-track { height: 4px; border-radius: 2px;
+    background: linear-gradient(to right,
+      var(--track-rail) calc(7px + (100% - 14px) * var(--lo)),
+      var(--track-fill) calc(7px + (100% - 14px) * var(--lo)),
+      var(--track-fill) calc(7px + (100% - 14px) * var(--hi)),
+      var(--track-rail) calc(7px + (100% - 14px) * var(--hi))); }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 14px; height: 14px;
+    border-radius: 50%; background: var(--track-fill); border: 1px solid var(--ground-panel); margin-top: -5px; }
+  input[type=range]::-moz-range-track { height: 4px; border-radius: 2px; background: var(--track-rail); }
+  input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; border: 1px solid var(--ground-panel);
+    background: var(--track-fill); }
+  input[type=range]:disabled { opacity: .4; cursor: default; }
+  /* Changed from what a photograph opens with. Hung in the margin so that a
+     row does not shift sideways when it appears. */
+  label { position: relative; }
+  label.modified > span:first-child::before { content: "•"; position: absolute; left: -10px;
+                                               color: var(--text-primary); }
+  label > output { cursor: text; white-space: nowrap; flex: 0 0 62px; }
+  label > output:hover { color: var(--text-primary); text-decoration: underline dotted; }
+  label > input.entry { flex: 0 0 auto; width: 58px; text-align: right; padding: 1px 4px; font: inherit; }
+  /* A section's heading: a dot when anything in it is changed, and an eye to
+     look at the photograph without it. */
+  summary .dot { color: var(--text-primary); margin-left: 6px; cursor: pointer; visibility: hidden; }
+  summary .dot.on { visibility: visible; }
+  summary .eye { margin-left: auto; font: inherit; font-size: 12px; font-weight: 400; padding: 0 6px; min-height: 0;
+                 color: var(--text-tertiary); background: none; border: 1px solid transparent; visibility: hidden; }
+  summary .eye.on { visibility: visible; }
+  summary .eye:hover { color: var(--text-primary); border-color: var(--border-control); }
+  summary .eye.held { color: var(--on-attention); background: var(--attention); }
+  #comparing { color: var(--on-attention); background: var(--attention); border-radius: 3px; padding: 2px 6px;
+               margin-top: 4px; font-weight: 600; }
+  #comparing.hidden { display: none; }
   output { width: 44px; text-align: right; font-variant-numeric: tabular-nums;
            flex-shrink: 0; }
-  button { background: #303038; color: inherit; border: 1px solid #45454f;
+  button { background: var(--ground-raised); color: inherit; border: 1px solid var(--border-control);
            border-radius: 5px; padding: 4px 11px; font: inherit; cursor: pointer; }
-  button:hover { background: #3a3a44; }
+  button:hover { background: var(--border-subtle); }
   .row { display: flex; gap: 7px; margin-top: 10px; flex-wrap: wrap; }
   /* Two workspaces in one column. The Library's controls and Develop's are all
      in the page all the time, and the body says which set is showing — so a
@@ -98,143 +171,143 @@
   #workspaces.hidden { display: none; }
   #workspaces button[role=tab] { flex: 1 1 0; font-weight: 600; letter-spacing: .02em; }
   #workspaces button[role=tab][aria-selected=true] {
-    color: #1e1e22; background: #e8e8ea; border-color: #e8e8ea; }
+    color: var(--ground-panel); background: var(--text-primary); border-color: var(--text-primary); }
   #zoom { margin-left: auto; display: flex; gap: 3px; }
-  #zoom button { padding: 1px 7px; font-size: 11px; }
+  #zoom button { padding: 1px 7px; font-size: 12px; }
 
   /* The judgement, as controls. */
-  #s-info { padding: 12px 0 6px; border-bottom: 1px solid #26262e; }
+  #s-info { padding: 12px 0 6px; border-bottom: 1px solid var(--ground-raised); }
   #s-info .judge { gap: 5px; margin: 0 0 8px; }
   #s-info .judge button { flex: 1 1 0; min-width: 0; padding: 7px 0; }
-  #s-info .judge button.on { color: #1e1e22; background: #e8e8ea; border-color: #e8e8ea; }
-  #info-flag button[data-command=pick].on { background: #6fc27a; border-color: #6fc27a; }
-  #info-flag button[data-command=reject].on { background: #e0705f; border-color: #e0705f; }
+  #s-info .judge button.on { color: var(--ground-panel); background: var(--text-primary); border-color: var(--text-primary); }
+  #info-flag button[data-command=pick].on { background: var(--ok); border-color: var(--ok); }
+  #info-flag button[data-command=reject].on { background: var(--danger); border-color: var(--danger); }
   #info-stars button { font-size: 15px; letter-spacing: 0; }
   #info-labels button i { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
                           vertical-align: -1px; }
   #info-facts { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; margin: 10px 0 4px;
                 font-size: 12px; }
-  #info-facts dt { color: #9a9aa2; }
-  #info-facts dd { margin: 0; color: #e8e8ea; overflow-wrap: anywhere; }
+  #info-facts dt { color: var(--text-tertiary); }
+  #info-facts dd { margin: 0; color: var(--text-primary); overflow-wrap: anywhere; }
 
   /* One of the mixer's three at a time. */
   #mixer-tabs { gap: 4px; margin-bottom: 6px; }
   #mixer-tabs button { flex: 1 1 0; }
-  #mixer-tabs button[aria-selected=true] { color: #1e1e22; background: #e8e8ea; border-color: #e8e8ea; }
+  #mixer-tabs button[aria-selected=true] { color: var(--ground-panel); background: var(--text-primary); border-color: var(--text-primary); }
   #mixer-bands label.hidden { display: none; }
 
   /* The shortcut sheet. Inside the column because that is all the page has: it
      cannot be drawn over the photograph. It covers the column while it is up. */
-  #sheet { position: absolute; inset: 0; z-index: 20; background: #1e1e22; overflow-y: auto;
+  #sheet { position: absolute; inset: 0; z-index: 20; background: var(--ground-panel); overflow-y: auto;
            padding: 14px 16px 24px; }
   #sheet.hidden { display: none; }
-  #sheet h2 { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: #9a9aa2;
+  #sheet h2 { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-tertiary);
               margin: 16px 0 6px; font-weight: 600; }
   #sheet h2:first-child { margin-top: 0; }
   #sheet .key { display: flex; gap: 10px; align-items: baseline; padding: 2px 0; font-size: 12px; }
-  #sheet .key kbd { flex: 0 0 96px; font: inherit; color: #d8bf63; }
-  #sheet .key span { color: #c9c9d1; }
+  #sheet .key kbd { flex: 0 0 96px; font: inherit; color: var(--attention); }
+  #sheet .key span { color: var(--text-secondary); }
 
   /* Export. In the column and not over the window, for the reason the sheet is:
      on Linux nothing of the page's can be drawn over the photograph — and here
      that is also right, because the photographs stay in view while somebody
      decides how big to make them. */
-  #export { position: absolute; inset: 0; z-index: 22; background: #1e1e22; overflow-y: auto;
+  #export { position: absolute; inset: 0; z-index: 22; background: var(--ground-panel); overflow-y: auto;
             padding: 14px 16px 24px; }
   #export.hidden { display: none; }
   #export header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; }
-  #export h2 { font-size: 15px; font-weight: 600; margin: 0; color: #f0f0f2; }
-  #export h3 { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: #9a9aa2;
+  #export h2 { font-size: 15px; font-weight: 600; margin: 0; color: var(--text-primary); }
+  #export h3 { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-tertiary);
                margin: 16px 0 6px; font-weight: 600; }
   #export .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
-  #export .row > span { flex: 0 0 92px; color: #b4b4bc; }
+  #export .row > span { flex: 0 0 92px; color: var(--text-secondary); }
   #export .row select, #export .row input[type=number] { flex: 1 1 auto; min-width: 0; }
-  #export select, #export input[type=number] { background: #141418; color: inherit; font: inherit;
-            border: 1px solid #36363e; border-radius: 4px; padding: 4px 6px; }
+  #export select, #export input[type=number] { background: var(--ground-well); color: inherit; font: inherit;
+            border: 1px solid var(--border-subtle); border-radius: 4px; padding: 4px 6px; }
   #export input[type=number] { max-width: 84px; }
   /* Size, its number and its unit on one line: the select gives way. */
   #export .row #export-size { flex: 1 1 0; }
   #export .row #export-edge { flex: 0 0 68px; }
   #export label.what { display: flex; gap: 8px; align-items: baseline; padding: 3px 0; cursor: pointer; }
-  #export label.what.none { color: #8a8a92; cursor: default; }
+  #export label.what.none { color: var(--text-tertiary); cursor: default; }
   #export label.what b { font-weight: 600; font-variant-numeric: tabular-nums; }
-  #export #export-folder { flex: 1 1 auto; min-width: 0; color: #e8e8ea; overflow-wrap: anywhere; }
-  #export #export-folder.unset { color: #e6b866; }
+  #export #export-folder { flex: 1 1 auto; min-width: 0; color: var(--text-primary); overflow-wrap: anywhere; }
+  #export #export-folder.unset { color: var(--attention); }
   #export .buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px; }
-  #export button.primary { background: #d8bf63; border-color: #d8bf63; color: #1b1b1f; font-weight: 600; }
-  #export button.primary:disabled { background: #3a382c; border-color: #3a382c; color: #8a8a92; cursor: default; }
-  #export .hint { color: #8a8a92; font-size: 12px; margin: 2px 0 0 100px; }
-  #export #export-last { color: #c9c9d1; margin: 0; overflow-wrap: anywhere; }
-  #export #export-failed { list-style: none; margin: 6px 0 0; padding: 0; color: #ff8a80; font-size: 12px; }
+  #export button.primary { background: var(--attention); border-color: var(--attention); color: var(--on-attention); font-weight: 600; }
+  #export button.primary:disabled { background: var(--ground-raised); border-color: var(--ground-raised); color: var(--text-tertiary); cursor: default; }
+  #export .hint { color: var(--text-tertiary); font-size: 12px; margin: 2px 0 0 100px; }
+  #export #export-last { color: var(--text-secondary); margin: 0; overflow-wrap: anywhere; }
+  #export #export-failed { list-style: none; margin: 6px 0 0; padding: 0; color: var(--danger); font-size: 12px; }
   #export #export-failed li { padding: 2px 0; overflow-wrap: anywhere; }
-  #export #export-failed li b { color: #ffb4ad; font-weight: 600; }
+  #export #export-failed li b { color: var(--danger); font-weight: 600; }
   #job { display: flex; gap: 8px; align-items: baseline; }
   #job #job-text { flex: 1 1 auto; min-width: 0; }
-  #job button { flex: 0 0 auto; font: inherit; font-size: 11px; padding: 0 6px; }
+  #job button { flex: 0 0 auto; font: inherit; font-size: 12px; padding: 0 6px; }
 
   /* The palette: every command, by name. In the column for the reason the sheet
      is — nothing the page draws can be over the photograph — and at the top of
      it, because that is where the eyes already are when the hands ask for it. */
   /* The way in. Over the whole window, not just the column: with nothing open
      there is no photograph for the rest of the window to be. */
-  #welcome { position: fixed; inset: 0; z-index: 40; background: #1e1e22; overflow-y: auto;
+  #welcome { position: fixed; inset: 0; z-index: 40; background: var(--ground-panel); overflow-y: auto;
              padding: 11vh 24px 32px; box-sizing: border-box; }
   #welcome.hidden { display: none; }
   #welcome .inner { max-width: 860px; margin: 0 auto; }
-  #welcome .mark { font-size: 12px; letter-spacing: .14em; text-transform: uppercase; color: #9a9aa2; }
-  #welcome h1 { font-size: 24px; font-weight: 500; margin: 10px 0 6px; color: #f0f0f2; }
-  #welcome .lede { color: #b4b4bc; margin: 0 0 26px; font-size: 14px; max-width: 640px; }
-  #welcome .lede code { font: 12px ui-monospace, monospace; color: #d8d8de; user-select: all; }
+  #welcome .mark { font-size: 12px; letter-spacing: .14em; text-transform: uppercase; color: var(--text-tertiary); }
+  #welcome h1 { font-size: 24px; font-weight: 500; margin: 10px 0 6px; color: var(--text-primary); }
+  #welcome .lede { color: var(--text-secondary); margin: 0 0 26px; font-size: 14px; max-width: 640px; }
+  #welcome .lede code { font: 12px ui-monospace, monospace; color: var(--text-secondary); user-select: all; }
   #welcome .ways { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
   #welcome .ways button { text-align: left; padding: 16px 16px 14px; border-radius: 8px; cursor: pointer;
-                          background: #26262c; border: 1px solid #36363e; color: #e8e8ea; font: inherit; }
-  #welcome .ways button:hover, #welcome .ways button:focus-visible { background: #2e2e36; border-color: #55555f; }
+                          background: var(--ground-raised); border: 1px solid var(--border-subtle); color: var(--text-primary); font: inherit; }
+  #welcome .ways button:hover, #welcome .ways button:focus-visible { background: var(--ground-hover); border-color: var(--border-control); }
   #welcome .ways b { display: block; font-size: 15px; font-weight: 500; margin-bottom: 4px; }
-  #welcome .ways span { display: block; color: #9a9aa2; font-size: 12px; }
-  #welcome .ways kbd { display: block; margin-top: 10px; font: inherit; font-size: 12px; color: #d8bf63; }
-  #welcome h2 { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: #9a9aa2;
+  #welcome .ways span { display: block; color: var(--text-tertiary); font-size: 12px; }
+  #welcome .ways kbd { display: block; margin-top: 10px; font: inherit; font-size: 12px; color: var(--attention); }
+  #welcome h2 { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-tertiary);
                 margin: 34px 0 8px; font-weight: 600; }
   #welcome ol { list-style: none; margin: 0; padding: 0; }
   #welcome li { display: grid; grid-template-columns: minmax(180px, 2fr) 1fr 3fr 1fr auto; gap: 14px;
                 align-items: baseline; padding: 8px 10px; margin: 0 -10px; border-radius: 6px; cursor: pointer; }
-  #welcome li:hover, #welcome li:focus-visible { background: #26262c; outline: none; }
-  #welcome li .name { color: #f0f0f2; }
-  #welcome li .count, #welcome li .when { color: #b4b4bc; white-space: nowrap; }
-  #welcome li .folder { color: #8a8a92; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #welcome li.gone .name { color: #8a8a92; text-decoration: line-through; }
-  #welcome li.gone .when { color: #e6b866; }
-  #welcome li button { font: inherit; font-size: 11px; background: none; border: 0; color: #9a9aa2;
+  #welcome li:hover, #welcome li:focus-visible { background: var(--ground-raised); outline: none; }
+  #welcome li .name { color: var(--text-primary); }
+  #welcome li .count, #welcome li .when { color: var(--text-secondary); white-space: nowrap; }
+  #welcome li .folder { color: var(--text-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #welcome li.gone .name { color: var(--text-tertiary); text-decoration: line-through; }
+  #welcome li.gone .when { color: var(--attention); }
+  #welcome li button { font: inherit; font-size: 12px; background: none; border: 0; color: var(--text-tertiary);
                        cursor: pointer; padding: 0; }
-  #welcome li button:hover { color: #e8e8ea; text-decoration: underline; }
-  #welcome .drop { margin-top: 30px; color: #9a9aa2; }
-  #welcome .promise { margin-top: 6px; color: #8a8a92; }
+  #welcome li button:hover { color: var(--text-primary); text-decoration: underline; }
+  #welcome .drop { margin-top: 30px; color: var(--text-tertiary); }
+  #welcome .promise { margin-top: 6px; color: var(--text-tertiary); }
   /* Above the ways in, not below them: what it most often says is why the last
      thing tried did not open, and that is read before trying the next. */
-  #welcome #welcome-said { margin: -12px 0 14px; min-height: 1.4em; color: #c9c9d1; }
-  #welcome #welcome-said.refused { color: #e6b866; }
-  #welcome #welcome-said.failed { color: #ff8a80; }
+  #welcome #welcome-said { margin: -12px 0 14px; min-height: 1.4em; color: var(--text-secondary); }
+  #welcome #welcome-said.refused { color: var(--attention); }
+  #welcome #welcome-said.failed { color: var(--danger); }
   /* Adding a folder. Over the whole window, and over the welcome: while it is
      up the shell is standing still, and nothing under it should look usable. */
-  #import { position: fixed; inset: 0; z-index: 50; background: #1e1e22; overflow-y: auto;
+  #import { position: fixed; inset: 0; z-index: 50; background: var(--ground-panel); overflow-y: auto;
             padding: 16vh 24px 32px; box-sizing: border-box; }
   #import.hidden { display: none; }
   #import .inner { max-width: 640px; margin: 0 auto; }
-  #import .mark { font-size: 12px; letter-spacing: .14em; text-transform: uppercase; color: #9a9aa2; }
-  #import h1 { font-size: 22px; font-weight: 500; margin: 10px 0 4px; color: #f0f0f2; overflow-wrap: anywhere; }
-  #import .from { color: #8a8a92; margin: 0 0 26px; overflow-wrap: anywhere; }
-  #import .what { font-size: 15px; color: #e8e8ea; margin: 0 0 6px; min-height: 1.4em; }
-  #import .also { color: #b4b4bc; margin: 0 0 6px; min-height: 1.4em; overflow-wrap: anywhere; }
-  #import .also.failed { color: #ff8a80; }
-  #import progress { width: 100%; height: 6px; margin: 14px 0 0; accent-color: #d8bf63; }
-  #import .promise { color: #8a8a92; margin: 22px 0 0; }
+  #import .mark { font-size: 12px; letter-spacing: .14em; text-transform: uppercase; color: var(--text-tertiary); }
+  #import h1 { font-size: 22px; font-weight: 500; margin: 10px 0 4px; color: var(--text-primary); overflow-wrap: anywhere; }
+  #import .from { color: var(--text-tertiary); margin: 0 0 26px; overflow-wrap: anywhere; }
+  #import .what { font-size: 15px; color: var(--text-primary); margin: 0 0 6px; min-height: 1.4em; }
+  #import .also { color: var(--text-secondary); margin: 0 0 6px; min-height: 1.4em; overflow-wrap: anywhere; }
+  #import .also.failed { color: var(--danger); }
+  #import progress { width: 100%; height: 6px; margin: 14px 0 0; accent-color: var(--attention); }
+  #import .promise { color: var(--text-tertiary); margin: 22px 0 0; }
   #import .buttons { display: flex; gap: 10px; justify-content: flex-end; margin-top: 28px; }
   #import .buttons button { font: inherit; padding: 8px 16px; border-radius: 6px; cursor: pointer;
-                            background: #26262c; border: 1px solid #36363e; color: #e8e8ea; }
-  #import .buttons button.primary { background: #d8bf63; border-color: #d8bf63; color: #1b1b1f; font-weight: 600; }
+                            background: var(--ground-raised); border: 1px solid var(--border-subtle); color: var(--text-primary); }
+  #import .buttons button.primary { background: var(--attention); border-color: var(--attention); color: var(--on-attention); font-weight: 600; }
   #import .buttons button:hover { filter: brightness(1.12); }
   #welcome .ways.one { grid-template-columns: 1fr; margin-bottom: 12px; }
-  #welcome .ways button.primary { border-color: #d8bf63; }
-  #palette { position: absolute; inset: 0; z-index: 21; background: #1e1e22;
+  #welcome .ways button.primary { border-color: var(--attention); }
+  #palette { position: absolute; inset: 0; z-index: 21; background: var(--ground-panel);
              display: flex; flex-direction: column; padding: 12px 16px 0; }
   #palette.hidden { display: none; }
   #palette input { flex: 0 0 auto; width: 100%; box-sizing: border-box; font-size: 14px;
@@ -242,12 +315,12 @@
   #palette ol { list-style: none; margin: 10px -16px 0; padding: 0 0 12px; overflow-y: auto;
                 flex: 1 1 auto; }
   #palette li { display: flex; align-items: baseline; gap: 10px; padding: 6px 16px; cursor: pointer; }
-  #palette li[aria-selected=true] { background: #2c2c36; }
-  #palette li .title { flex: 1 1 auto; color: #e8e8ea; }
-  #palette li .why { color: #e6b866; font-size: 11px; white-space: nowrap; }
-  #palette li kbd { font: inherit; font-size: 12px; color: #d8bf63; white-space: nowrap; }
-  #palette li.cannot .title { color: #9a9aa2; }
-  #palette .none { padding: 10px 16px; color: #9a9aa2; }
+  #palette li[aria-selected=true] { background: var(--ground-hover); }
+  #palette li .title { flex: 1 1 auto; color: var(--text-primary); }
+  #palette li .why { color: var(--attention); font-size: 12px; white-space: nowrap; }
+  #palette li kbd { font: inherit; font-size: 12px; color: var(--attention); white-space: nowrap; }
+  #palette li.cannot .title { color: var(--text-tertiary); }
+  #palette .none { padding: 10px 16px; color: var(--text-tertiary); }
 
   /* The tools, under the histogram where a Lightroom hand looks for them. Lit
      from what the shell says is in hand, never from having been clicked — the
@@ -255,25 +328,25 @@
      is no longer armed is a press that does something else. */
   #tools { display: flex; gap: 4px; margin-top: 8px; }
   #tools.hidden { display: none; }
-  #tools button { flex: 1 1 0; min-width: 0; padding: 5px 0 4px; font-size: 11px;
-                  line-height: 1.2; color: #c9c9d1; }
-  #tools button kbd { display: block; font: inherit; font-size: 10px; color: #9a9aa2; }
-  #tools button.on { color: #1e1e22; background: #d8bf63; border-color: #d8bf63; }
-  #tools button.on kbd { color: #4a4220; }
+  #tools button { flex: 1 1 0; min-width: 0; padding: 5px 0 4px; font-size: 12px;
+                  line-height: 1.2; color: var(--text-secondary); }
+  #tools button kbd { display: block; font: inherit; font-size: 12px; color: var(--text-tertiary); }
+  #tools button.on { color: var(--ground-panel); background: var(--attention); border-color: var(--attention); }
+  #tools button.on kbd { color: var(--on-attention); }
   /* The badge says what is in hand when something is, and then it matters, so
      then it is lit. 8.9 to 1 on the panel. */
-  #mode.tool { color: #1e1e22; background: #d8bf63; border-color: #d8bf63; }
+  #mode.tool { color: var(--ground-panel); background: var(--attention); border-color: var(--attention); }
 
   /* What is in hand and how to put it down, always, in words and as buttons.
      It lives in the footer because that is the one part of the column that
      cannot scroll away, and HTML cannot be drawn over the photograph where the
      tool actually is. */
   #inhand { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
-            padding-bottom: 7px; margin-bottom: 7px; border-bottom: 1px solid #2c2c34; }
+            padding-bottom: 7px; margin-bottom: 7px; border-bottom: 1px solid var(--ground-raised); }
   #inhand.hidden { display: none; }
-  #inhand .what { color: #d8bf63; font-weight: 600; letter-spacing: .04em;
-                  text-transform: uppercase; font-size: 11px; }
-  #inhand .how { color: #c9c9d1; flex: 1 1 auto; }
+  #inhand .what { color: var(--attention); font-weight: 600; letter-spacing: .04em;
+                  text-transform: uppercase; font-size: 12px; }
+  #inhand .how { color: var(--text-secondary); flex: 1 1 auto; }
   #inhand .do { display: flex; gap: 6px; }
   #inhand button { padding: 3px 9px; font-size: 12px; }
 
@@ -285,18 +358,18 @@
      news for a moment. What was refused stays until the next thing is said. What
      failed gets a line of its own and stays until it is dismissed — an edit that
      did not reach the catalog must not be replaced by "Picked" a second later.
-     Colours are checked against the #1e1e22 ground: 10.4, 5.9, 8.6 and 6.6 to 1. */
-  #status { flex-shrink: 0; border-top: 1px solid #2c2c34; padding: 8px 16px 9px;
+     Colours are checked against the var(--ground-panel) ground: 10.4, 5.9, 8.6 and 6.6 to 1. */
+  #status { flex-shrink: 0; border-top: 1px solid var(--ground-raised); padding: 8px 16px 9px;
             font-size: 12px; line-height: 1.45; }
-  #said { color: #c9c9d1; min-height: 1.45em; overflow-wrap: anywhere;
+  #said { color: var(--text-secondary); min-height: 1.45em; overflow-wrap: anywhere;
           transition: color .6s ease; }
-  #said.old { color: #9a9aa2; }
-  #said.refused { color: #e6b866; }
-  #failed { color: #ff9384; overflow-wrap: anywhere; cursor: pointer;
-            padding-bottom: 6px; margin-bottom: 6px; border-bottom: 1px solid #2c2c34; }
-  #failed::after { content: "  dismiss"; color: #9a9aa2; }
+  #said.old { color: var(--text-tertiary); }
+  #said.refused { color: var(--attention); }
+  #failed { color: var(--danger); overflow-wrap: anywhere; cursor: pointer;
+            padding-bottom: 6px; margin-bottom: 6px; border-bottom: 1px solid var(--ground-raised); }
+  #failed::after { content: "  dismiss"; color: var(--text-tertiary); }
   #failed.hidden, #job.hidden { display: none; }
-  #standing { display: flex; gap: 10px; color: #9a9aa2; margin-top: 2px;
+  #standing { display: flex; gap: 10px; color: var(--text-tertiary); margin-top: 2px;
               font-variant-numeric: tabular-nums; white-space: nowrap; }
   #standing > span { overflow: hidden; text-overflow: ellipsis; }
   /* Nothing selected is nothing to say, and an empty span would still claim its
@@ -305,10 +378,10 @@
   #aim { flex: 0 1 auto; min-width: 0; }
   /* A row to itself. Sharing one with the standing facts in a 330-pixel column
      ellipsised all three — "2 sele…  K → q…  exported 0 file(s), 0.0 MB in 2.3s…". */
-  #job { color: #c9c9d1; margin-top: 2px; overflow-wrap: anywhere;
+  #job { color: var(--text-secondary); margin-top: 2px; overflow-wrap: anywhere;
          font-variant-numeric: tabular-nums; }
-  #keys { color: #7d7d87; font-size: 11px; line-height: 1.7; }
-  .reading { color: #7d7d87; font-size: 11px; margin-top: 8px;
+  #keys { color: var(--text-tertiary); font-size: 12px; line-height: 1.7; }
+  .reading { color: var(--text-tertiary); font-size: 12px; margin-top: 8px;
              font-variant-numeric: tabular-nums; }
   /* `touch-action: none` so a drag on the curve is a drag and not the column
      deciding to scroll underneath it. */
@@ -316,19 +389,19 @@
   .wheel-group { width: 92px; text-align: center; }
   .wheel-group canvas { width: 92px; height: 92px; display: block; cursor: crosshair;
                         touch-action: none; border-radius: 50%; }
-  .wheel-group span { display: block; font-size: 11px; color: #9a9aa2; margin: 5px 0 2px; }
+  .wheel-group span { display: block; font-size: 12px; color: var(--text-tertiary); margin: 5px 0 2px; }
   /* Full width of its own group, so the slider reads as belonging to the wheel
      above it rather than to the row of them. */
   .wheel-group input[type=range] { width: 92px; }
   #curve { width: 100%; aspect-ratio: 1; margin: 8px 0 2px; border-radius: 3px;
-           background: #141418; display: block; cursor: crosshair;
+           background: var(--ground-well); display: block; cursor: crosshair;
            touch-action: none; }
   /* The profile's own name, which can be long and is not ours to shorten. */
-  #profile-name { color: #9a9aa2; overflow-wrap: anywhere; margin: 7px 0; }
+  #profile-name { color: var(--text-tertiary); overflow-wrap: anywhere; margin: 7px 0; }
   /* Which way up the frame is, and where that came from. Muted like the profile
      name because it is a readout rather than a control. */
-  #orientation { color: #9a9aa2; margin: 7px 0; }
-  #orientation .why { color: #6d6d76; }
+  #orientation { color: var(--text-tertiary); margin: 7px 0; }
+  #orientation .why { color: var(--text-tertiary); }
 
   /* Presets and snapshots. A saved thing is a row: its name, wide and clickable,
      and a remove that stays out of the way until it is wanted. */
@@ -336,50 +409,50 @@
   .saved li { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
   .saved button.pick { flex: 1; text-align: left; overflow: hidden;
                        text-overflow: ellipsis; white-space: nowrap; }
-  .saved button.drop { color: #8e8e98; padding: 4px 8px; flex-shrink: 0; }
-  .saved button.drop.sure { color: #e0705f; border-color: #6a3a3a; }
+  .saved button.drop { color: var(--text-tertiary); padding: 4px 8px; flex-shrink: 0; }
+  .saved button.drop.sure { color: var(--danger); border-color: var(--danger); }
   /* A collection's row carries two more things than a preset's: which one K is
      aimed at, and how many photographs it holds. The count is tabular so a
      column of them reads as a column. */
-  .saved button.aim { color: #6d6d76; padding: 4px 7px; flex-shrink: 0; }
-  .saved button.aim.on { color: #d8bf63; border-color: #6a5f33; }
-  .saved button.pick.on { border-color: #7c8cff; }
-  .saved button.pick .count { color: #8e8e98; font-variant-numeric: tabular-nums;
+  .saved button.aim { color: var(--text-tertiary); padding: 4px 7px; flex-shrink: 0; }
+  .saved button.aim.on { color: var(--attention); border-color: var(--attention); }
+  .saved button.pick.on { border-color: var(--focus); }
+  .saved button.pick .count { color: var(--text-tertiary); font-variant-numeric: tabular-nums;
                               margin-left: 6px; }
-  .empty { color: #7d7d87; margin: 8px 0 0; }
+  .empty { color: var(--text-tertiary); margin: 8px 0 0; }
   .empty.hidden, .form.hidden { display: none; }
-  input[type=text] { flex: 1; min-width: 0; background: #141418; color: inherit;
-                     border: 1px solid #45454f; border-radius: 5px;
+  input[type=text] { flex: 1; min-width: 0; background: var(--ground-well); color: inherit;
+                     border: 1px solid var(--border-control); border-radius: 5px;
                      padding: 4px 8px; font: inherit; }
   /* Two columns, because seven tick boxes down a 360px panel is a lot of
      scrolling to answer one question about a look. */
   .groups { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px;
             margin-top: 10px; }
   .groups label { margin: 3px 0; gap: 6px; font-size: 12px; }
-  .groups label span { color: #e8e8ea; }
+  .groups label span { color: var(--text-primary); }
 
   /* The histogram sits at the top of the column, above everything it describes.
      Fixed height, so a long export line or a wrapping status block can never
      take its space. */
-  #bar { padding: 12px 16px 10px; border-bottom: 1px solid #2c2c34;
+  #bar { padding: 12px 16px 10px; border-bottom: 1px solid var(--ground-raised);
          font-variant-numeric: tabular-nums; flex-shrink: 0; }
   #histogram { width: 100%; height: 84px; border-radius: 3px;
-               background: #141418; display: block; }
+               background: var(--ground-well); display: block; }
   #readout { display: flex; align-items: baseline; gap: 14px; margin-top: 7px; }
   /* The targeted-adjustment button, on the right of its section heading. A
      summary is a flex row for this reason alone. */
   summary { display: flex; align-items: center; }
   .target { margin-left: auto; padding: 0 7px; line-height: 1.5;
-            color: #8e8e98; background: transparent; border-color: transparent; }
+            color: var(--text-tertiary); background: transparent; border-color: transparent; }
   /* The eyedropper sits in a row of ordinary buttons rather than on a heading,
      so it keeps a button's shape and only borrows the armed state. */
   #pick-wb { margin-left: 0; padding: 4px 11px; color: inherit;
-             background: #303038; border-color: #45454f; }
+             background: var(--ground-raised); border-color: var(--border-control); }
   /* After the rule above, and by id, because `.target.armed` loses to `#pick-wb`
      on specificity — which showed up as a button that armed and did not say so. */
-  #pick-wb.armed { color: #1e1e22; background: #d8bf63; border-color: #d8bf63; }
-  .target:hover { color: #e8e8ea; background: #303038; border-color: #45454f; }
-  .target.armed { color: #1e1e22; background: #d8bf63; border-color: #d8bf63; }
+  #pick-wb.armed { color: var(--ground-panel); background: var(--attention); border-color: var(--attention); }
+  .target:hover { color: var(--text-primary); background: var(--ground-raised); border-color: var(--border-control); }
+  .target.armed { color: var(--ground-panel); background: var(--attention); border-color: var(--attention); }
   /* While something is armed the photograph is a target, not a hand. */
   body.aiming { cursor: crosshair; }
 
@@ -388,40 +461,40 @@
      are much slower to scan than eight colours. */
   .swatch { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
             margin-right: 7px; vertical-align: baseline; }
-  .clip { font-size: 11px; color: #56565e; }
-  .clip.lit#clip-white { color: #e0705f; }
-  .clip.lit#clip-black { color: #6f9ade; }
+  .clip { font-size: 12px; color: var(--text-disabled); }
+  .clip.lit#clip-white { color: var(--danger); }
+  .clip.lit#clip-black { color: var(--info); }
 
   /* The culling readout, stacked rather than strung along a bar. In a column
      there is no room for a row, and there is no need for one either. */
-  #cull { padding: 10px 16px; border-bottom: 1px solid #2c2c34;
+  #cull { padding: 10px 16px; border-bottom: 1px solid var(--ground-raised);
           font-variant-numeric: tabular-nums; flex-shrink: 0; }
   #cull.hidden { display: none; }
   #cull .line { display: flex; align-items: baseline; gap: 10px; }
   #cull .line + .line { margin-top: 5px; }
   #frame { font-weight: 600; overflow: hidden; text-overflow: ellipsis;
            white-space: nowrap; }
-  #position, #counts { color: #7d7d87; font-size: 11px; }
+  #position, #counts { color: var(--text-tertiary); font-size: 12px; }
   #counts { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #stars { letter-spacing: 2px; color: #d8bf63; margin-left: auto; flex-shrink: 0; }
-  #mode { color: #8e8e98; text-transform: uppercase; letter-spacing: .08em; font-size: 11px;
-          border: 1px solid #3a3a44; border-radius: 3px; padding: 1px 6px; flex-shrink: 0; }
-  #copy { color: #17171b; background: #7d8ec2; border-radius: 3px;
-          padding: 0 5px; font-size: 11px; flex-shrink: 0; }
+  #stars { letter-spacing: 2px; color: var(--attention); margin-left: auto; flex-shrink: 0; }
+  #mode { color: var(--text-tertiary); text-transform: uppercase; letter-spacing: .08em; font-size: 12px;
+          border: 1px solid var(--border-subtle); border-radius: 3px; padding: 1px 6px; flex-shrink: 0; }
+  #copy { color: var(--ground-well); background: var(--info); border-radius: 3px;
+          padding: 0 5px; font-size: 12px; flex-shrink: 0; }
   #copy.hidden { display: none; }
-  #flag.pick { color: #6fc27a; }
-  #flag.reject { color: #e0705f; }
+  #flag.pick { color: var(--ok); }
+  #flag.reject { color: var(--danger); }
 
   /* The filter row. Chips rather than a menu, because what is being looked at
      has to be readable without opening anything — a narrowed library that does
      not say so is a library with photographs missing from it. */
   #filter { flex-wrap: wrap; gap: 6px; }
-  #filter.narrowed { color: #d8bf63; }
-  #filter button { font: inherit; font-size: 11px; line-height: 1.5;
-                   background: none; color: #7d7d87; border: 1px solid #3a3a44;
+  #filter.narrowed { color: var(--attention); }
+  #filter button { font: inherit; font-size: 12px; line-height: 1.5;
+                   background: none; color: var(--text-tertiary); border: 1px solid var(--border-subtle);
                    border-radius: 3px; padding: 0 6px; cursor: pointer; }
-  #filter button:hover { color: #c8c8d0; border-color: #55555f; }
-  #filter button.on { color: #17171b; background: #d8bf63; border-color: #d8bf63; }
+  #filter button:hover { color: var(--text-secondary); border-color: var(--border-control); }
+  #filter button.on { color: var(--ground-well); background: var(--attention); border-color: var(--attention); }
   #filter .set { display: flex; gap: 3px; }
   #filter .dot { width: 13px; padding: 0; text-align: center; }
   /* The label chips carry their own colour, so "on" cannot borrow the shared
@@ -482,7 +555,7 @@
   <h3>What</h3>
   <label class="what"><input type="radio" name="export-scope" value="selected"><span><b id="export-n-selected">0</b> selected</span></label>
   <label class="what"><input type="radio" name="export-scope" value="shown"><span><b id="export-n-shown">0</b> <span id="export-shown-as">shown</span></span></label>
-  <label class="what"><input type="radio" name="export-scope" value="current"><span>This photograph <span id="export-this" style="color:#8a8a92"></span></span></label>
+  <label class="what"><input type="radio" name="export-scope" value="current"><span>This photograph <span id="export-this" style="color:#969696"></span></span></label>
   <h3>How</h3>
   <div class="row"><span>Preset</span>
     <select id="export-preset" aria-label="preset"></select>
@@ -949,6 +1022,7 @@
     <span id="chosen"></span>
     <span id="aim"></span>
   </div>
+  <div id="comparing" class="hidden" role="status"></div>
   <div id="job" class="hidden"><span id="job-text"></span><button id="job-stop" hidden>Stop</button></div>
 </footer>
 </div>
@@ -1025,6 +1099,9 @@
   // Whatever the shell has to say that no command returned. Asked for by name:
   // it is taken when read, so it must only be read by something that says it.
   const hear = () => invoke("take_notice").then(told => { if (told) tell(told.level, told.text); }).catch(() => {});
+  // A throw while the page is loading stops everything after it, silently —
+  // there is no console to watch. Whatever it was, say so.
+  window.addEventListener("error", e => tell("failed", `the panel broke loading: ${e.message} (line ${e.lineno})`));
   // How to use the thing just picked up. Not an event, so it never outranks one.
   const hint = text => tell("info", text);
 
@@ -1044,7 +1121,7 @@
     ["orange", "Orange", "#c8813a"],
     ["yellow", "Yellow", "#c2bb3d"],
     ["green", "Green", "#4aa84a"],
-    ["aqua", "Aqua", "#3fb3b8"],
+    ["aqua", "Aqua", "#4fc3d0"],
     ["blue", "Blue", "#4a72c8"],
     ["purple", "Purple", "#8a5ac8"],
     ["magenta", "Magenta", "#c04a9e"],
@@ -1256,6 +1333,189 @@
   }
   document.addEventListener("pointerup", () => (dragging = null));
 
+  // ---- One slider ---------------------------------------------------------------
+  //
+  // Still an `<input type=range>` underneath, which is what makes it a slider to
+  // a keyboard and to a screen reader for nothing. What is replaced is what the
+  // native one does badly: a click on the rail throws the value to wherever the
+  // click was, there is no fine movement, no way back to the default, no typing
+  // a number, and the number shown is the engine's (0.37) not a photographer's
+  // (+37).
+  const signed = (n, places = 0) => `${n > 0 ? "+" : ""}${n.toFixed(places)}`.replace(/^[+-]?0(\.0+)?$/, m => m.replace(/[+-]/, ""));
+  /// How a control's value is shown and typed. Display only: the wire, the edit
+  /// and the catalog stay in the engine's units (decision Q8).
+  const UNITS = {
+    // Stops, to a hundredth: what the word "exposure" means to anybody.
+    ev: { show: v => `${signed(v, 2)} EV`, read: t => parseFloat(t) },
+    // −1…1 as −100…+100, and 0…1 as 0…100: what hands know from every other editor.
+    hundred: { show: v => signed(Math.round(v * 100)), read: t => parseFloat(t) / 100 },
+    percent: { show: v => `${Math.round(v * 100)}`, read: t => parseFloat(t) / 100 },
+    kelvin: { show: v => `${Math.round(v)} K`, read: t => parseFloat(t) },
+    degrees: { show: v => `${signed(v, 1)}°`, read: t => parseFloat(t) },
+    whole: { show: v => signed(Math.round(v)), read: t => parseFloat(t) },
+  };
+  const unitOf = input => {
+    const [min, max] = [parseFloat(input.min), parseFloat(input.max)];
+    if (input.id === "exposure" || input.id === "mask-exposure") return UNITS.ev;
+    if (input.id === "temperature") return UNITS.kelvin;
+    if (input.id === "straighten") return UNITS.degrees;
+    if (input.id === "tint") return UNITS.whole;
+    if (min === -1 && max === 1) return UNITS.hundred;
+    if (min === 0 && max === 1) return UNITS.percent;
+    return null; // Radii, sizes, the perspective three: the engine's number is the unit.
+  };
+  const places = input => (String(input.step).split(".")[1] ?? "").length;
+  const showValue = (input, value) => {
+    const unit = unitOf(input);
+    return unit ? unit.show(Number(value)) : Number(value).toFixed(places(input));
+  };
+  /// What the control goes back to. From the shell's own default edit, run
+  /// through the same `sync` that fills the sliders in — see `learnDefaults`.
+  const defaultOf = input => parseFloat(input.dataset.default ?? input.getAttribute("value") ?? "0");
+  const snap = (input, value) => {
+    const [min, max, step] = [parseFloat(input.min), parseFloat(input.max), parseFloat(input.step) || 0.01];
+    const stepped = min + Math.round((value - min) / step) * step;
+    return Math.min(max, Math.max(min, Number(stepped.toFixed(6))));
+  };
+  /// Redraw what is derived from a slider's value: its fill, and whether it has
+  /// been changed. Not the number — whoever set the value knows what to call it
+  /// ("as shot" is not a temperature), and says so through `setSlider`.
+  const paint = input => {
+    const [min, max, value] = [parseFloat(input.min), parseFloat(input.max), parseFloat(input.value)];
+    const at = (value - min) / (max - min);
+    // Where nothing is: the middle for a control that goes both ways.
+    const zero = min < 0 && max > 0 ? -min / (max - min) : 0;
+    input.style.setProperty("--lo", Math.min(at, zero));
+    input.style.setProperty("--hi", Math.max(at, zero));
+    const label = input.closest("label");
+    if (label && input.id !== "temperature")
+      label.classList.toggle("modified", Math.abs(value - defaultOf(input)) > 1e-6);
+  };
+  /// Set a slider as if a person had: the value, and the `input` event that the
+  /// control's own handler is listening for, which is what sends the command.
+  const put = (input, value) => {
+    input.value = snap(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+  const reset = input => {
+    // The temperature's default is not a number: it is whatever the camera said.
+    if (input.id === "temperature") return document.getElementById("as-shot").click();
+    put(input, defaultOf(input));
+  };
+  // After the control's own handler, which wrote the engine's number: the
+  // photographer's, and the fill.
+  document.addEventListener("input", event => {
+    const input = event.target.closest?.("input[type=range]");
+    if (!input) return;
+    paint(input);
+    const readout = document.getElementById(`${input.id}-value`);
+    if (readout) readout.textContent = showValue(input, input.value);
+  });
+
+  // The pointer. Taken over whole: cancelling `pointerdown` is what stops the
+  // native drag, and with it the native jump-to-the-click and the focus that a
+  // click used to leave behind (F07).
+  let held = null;
+  document.addEventListener("pointerdown", event => {
+    const input = event.target.closest?.("input[type=range]");
+    if (!input || input.disabled || event.button !== 0) return;
+    event.preventDefault();
+    const box = input.getBoundingClientRect();
+    const [min, max] = [parseFloat(input.min), parseFloat(input.max)];
+    const travel = Math.max(box.width - 14, 1);
+    const thumb = box.left + 7 + travel * (parseFloat(input.value) - min) / (max - min);
+    if (Math.abs(event.clientX - thumb) > 12) {
+      // On the rail: a tenth of the way towards the click, not to it. A stray
+      // click should not be able to throw Exposure to +4.
+      const towards = Math.sign(event.clientX - thumb);
+      return put(input, parseFloat(input.value) + towards * (max - min) / 10);
+    }
+    held = { input, x: event.clientX, exact: parseFloat(input.value), perPixel: (max - min) / travel };
+    input.setPointerCapture(event.pointerId);
+  }, true);
+  document.addEventListener("pointermove", event => {
+    if (!held) return;
+    // By how far the pointer moved, not by where it is — which is what lets
+    // Shift make the same movement count for a quarter as much.
+    held.exact += (event.clientX - held.x) * held.perPixel * (event.shiftKey ? 0.25 : 1);
+    held.exact = Math.min(parseFloat(held.input.max), Math.max(parseFloat(held.input.min), held.exact));
+    held.x = event.clientX;
+    if (snap(held.input, held.exact) !== parseFloat(held.input.value)) put(held.input, held.exact);
+  });
+  for (const over of ["pointerup", "pointercancel"])
+    document.addEventListener(over, () => { held = null; });
+  // Twice on the slider or on its name: back to the default.
+  document.addEventListener("dblclick", event => {
+    const label = event.target.closest?.("label");
+    const input = label?.querySelector("input[type=range]");
+    if (!input || input.disabled || event.target.closest("output, input.entry")) return;
+    event.preventDefault();
+    reset(input);
+  });
+  // The keyboard, for a slider reached with Tab. The arrows, Home and End are
+  // the native control's already; these are the two it lacks.
+  document.addEventListener("keydown", event => {
+    const input = event.target.closest?.("input[type=range]");
+    if (!input) return;
+    const step = parseFloat(input.step) || 0.01;
+    const arrow = { ArrowLeft: -1, ArrowDown: -1, ArrowRight: 1, ArrowUp: 1 }[event.key];
+    if (arrow && event.shiftKey) {
+      event.preventDefault();
+      put(input, parseFloat(input.value) + arrow * step * 10);
+    } else if (event.key === "Delete" || event.key === "Backspace") {
+      event.preventDefault();
+      reset(input);
+    }
+  }, true);
+  // The number, typed. In the units it is shown in.
+  document.addEventListener("click", event => {
+    const readout = event.target.closest?.("label > output");
+    const input = readout?.closest("label").querySelector("input[type=range]");
+    if (!input || input.disabled) return;
+    // The number is inside the slider's `<label>`, and a click inside a label
+    // is a click on what it labels: the slider would take the focus the entry
+    // is about to be given, and the entry would close before a key was pressed.
+    event.preventDefault();
+    const entry = document.createElement("input");
+    entry.type = "text";
+    entry.className = "entry";
+    entry.setAttribute("aria-label", `${readout.closest("label").querySelector("span")?.textContent ?? "value"}, typed`);
+    // The number alone: "+1.25 EV" is how it is read, "1.25" is how it is typed.
+    entry.value = (readout.textContent.match(/[-+]?\d*\.?\d+/) ?? [""])[0].replace(/^\+/, "");
+    const unit = unitOf(input);
+    const shownStep = unit === UNITS.hundred || unit === UNITS.percent ? 1
+      : unit === UNITS.kelvin ? 50 : parseFloat(input.step) || 0.01;
+    const read = () => {
+      const typed = parseFloat(entry.value.replace(",", "."));
+      return Number.isFinite(typed) ? (unit ? unit.read(String(typed)) : typed) : null;
+    };
+    let settled = false;
+    const settle = commit => {
+      if (settled) return;
+      settled = true;
+      const value = commit ? read() : null;
+      entry.replaceWith(readout);
+      // Out of range is clamped, not refused: "200" typed into a control that
+      // stops at 100 means "all the way", and saying no would be pedantry.
+      if (value !== null) put(input, value);
+    };
+    entry.addEventListener("keydown", e => {
+      if (e.key === "Enter") settle(true);
+      else if (e.key === "Escape") { settle(false); e.stopPropagation(); }
+      else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+        const typed = parseFloat(entry.value.replace(",", "."));
+        if (!Number.isFinite(typed)) return;
+        const moved = typed + (e.key === "ArrowUp" ? 1 : -1) * shownStep * (e.shiftKey ? 10 : 1);
+        entry.value = String(Number(moved.toFixed(4)));
+        e.preventDefault();
+      }
+    });
+    entry.addEventListener("blur", () => settle(true));
+    readout.replaceWith(entry);
+    entry.focus();
+    entry.select();
+  });
+
   const setSlider = (id, value, format) => {
     if (dragging !== id) document.getElementById(id).value = value;
     // Not every slider has a number beside it: the three under the grading
@@ -1265,8 +1525,13 @@
     // the wheels was never synced at all: the tone curve, all twenty-four mixer
     // sliders, and white balance. Which is the exact failure this function was
     // written to prevent, arriving through the function itself.
+    const input = document.getElementById(id);
+    paint(input);
     const readout = document.getElementById(id + "-value");
-    if (readout) readout.textContent = format(value);
+    // Words win over numbers: "as shot" is what the caller has to say when the
+    // value is not one. Anything else is shown the one way every slider is.
+    const said = format(value);
+    if (readout) readout.textContent = /^[a-z ]+$/i.test(said) ? said : showValue(input, value);
   };
 
   const sync = (state, imageSize) => {
@@ -1365,9 +1630,22 @@
   // a frame or two later. Four times a second is far below anything a person
   // notices and costs a lock and a serialise.
   let seen = -1;
+  let learnt = false;
   setInterval(async () => {
     const epoch = toolEpoch;
     const s = await invoke("snapshot");
+    if (!learnt) {
+      // Once, before the first real sync: the shell's default edit, run through
+      // the same `sync` that fills the sliders in, and each one's value kept as
+      // what it goes back to. The markup has a default for every slider too,
+      // and two lists of defaults are two chances for one to be wrong.
+      learnt = true;
+      try {
+        sync(await invoke("edit_defaults"), s.image);
+        for (const input of document.querySelectorAll("input[type=range]")) input.dataset.default = input.value;
+      } catch (e) { tell("failed", `the panel broke learning the defaults: ${e && e.message || e}`); }
+      seen = -1;
+    }
     if (s.generation !== seen) {
       seen = s.generation;
       // Reported rather than swallowed. A throw in here is invisible — there is
@@ -1385,6 +1663,7 @@
     // not in the edit and cannot be — it is what the file recorded — so a
     // photograph that opens sideways would otherwise be doing it for a reason
     // nobody can see, which is the same as doing it for no reason.
+    try { showParts(s); } catch (e) { tell("failed", `the panel broke in parts: ${e && e.message || e}`); }
     // Anything the render loop needed to say — a refused pick, most often.
     hear();
     // Not if something was asked for while this was on its way: see `toolEpoch`.
@@ -1445,7 +1724,7 @@
     }
     const ctx = scope.getContext("2d");
     ctx.setTransform(scope.width / BINS, 0, 0, scope.height / TALL, 0, 0);
-    ctx.fillStyle = "#141418";
+    ctx.fillStyle = "#151515";
     ctx.fillRect(0, 0, BINS, TALL);
 
     // Square root rather than linear. A photograph's histogram is usually one
@@ -1477,7 +1756,7 @@
     // Luminance as a line over the top rather than a fill underneath. Filled, it
     // added to the three channels and the widget read as a white slab — losing
     // the colour information the primaries were chosen to carry.
-    ctx.strokeStyle = "#d0d0d8";
+    ctx.strokeStyle = "#b0b0b0";
     // In drawing units, so the line comes out about one device pixel however
     // wide the column and whatever the screen's scale.
     ctx.lineWidth = BINS / scope.width;
@@ -1587,7 +1866,7 @@
     const y = mid - Math.sin(angle) * tint.saturation * mid;
     // Drawn twice, dark under light, so the marker is visible against every
     // colour on the disc including white at the centre.
-    for (const [colour, radius] of [["#000000", 5.5 * dpr], ["#ffffff", 4 * dpr]]) {
+    for (const [colour, radius] of [["#000000", 5.5 * dpr], ["#ebebeb", 4 * dpr]]) {
       ctx.beginPath();
       ctx.arc(x, y, radius, 0, Math.PI * 2);
       ctx.strokeStyle = colour;
@@ -1726,12 +2005,12 @@
     }
     const ctx = curveCanvas.getContext("2d");
     ctx.setTransform(curveCanvas.width / size, 0, 0, curveCanvas.height / size, 0, 0);
-    ctx.fillStyle = "#141418";
+    ctx.fillStyle = "#151515";
     ctx.fillRect(0, 0, size, size);
 
     // Quarters, and the diagonal the curve started as — both faint, because they
     // are for orientation rather than for reading.
-    ctx.strokeStyle = "#26262e";
+    ctx.strokeStyle = "#2a2a2a";
     ctx.lineWidth = 1;
     for (let i = 1; i < 4; i++) {
       const at = Math.round((size * i) / 4) + 0.5;
@@ -1740,13 +2019,13 @@
       ctx.moveTo(0, at); ctx.lineTo(size, at);
       ctx.stroke();
     }
-    ctx.strokeStyle = "#2f2f38";
+    ctx.strokeStyle = "#333333";
     ctx.beginPath();
     ctx.moveTo(0, size); ctx.lineTo(size, 0);
     ctx.stroke();
 
     const m = tangents(curve);
-    ctx.strokeStyle = "#e8e8ea";
+    ctx.strokeStyle = "#ebebeb";
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     for (let px = 0; px <= size; px++) {
@@ -1759,7 +2038,7 @@
     for (const [x, y] of curve) {
       ctx.beginPath();
       ctx.arc(x * size, size - y * size, 4, 0, Math.PI * 2);
-      ctx.fillStyle = "#e8e8ea";
+      ctx.fillStyle = "#ebebeb";
       ctx.fill();
     }
   };
@@ -2734,7 +3013,7 @@
     flag.className = view.flag ?? "";
     const label = document.getElementById("label");
     label.textContent = view.colour ? view.colour.toUpperCase() : "";
-    label.style.color = { red: "#e0705f", yellow: "#d8bf63", green: "#6fc27a", blue: "#6f9ade" }[view.colour] ?? "";
+    label.style.color = { red: "#f0857a", yellow: "#e6c35c", green: "#7fcf8a", blue: "#7fb0f0" }[view.colour] ?? "";
     document.getElementById("counts").textContent =
       `${view.picks} picked · ${view.rejects} rejected` +
       // A clipboard nobody can see is a key that sometimes does nothing.
@@ -2761,8 +3040,8 @@
   // asked — one that would leave nothing on screen is turned off — so a page
   // that drew its own intentions would keep a chip lit for a filter nobody has.
 
-  const LABELS = [["red", "#e0705f"], ["yellow", "#d8bf63"],
-                  ["green", "#6fc27a"], ["blue", "#6f9ade"]];
+  const LABELS = [["red", "#f0857a"], ["yellow", "#e6c35c"],
+                  ["green", "#7fcf8a"], ["blue", "#7fb0f0"]];
   const starRow = document.getElementById("filter-stars");
   for (let n = 1; n <= 5; n++) {
     const button = document.createElement("button");
@@ -3227,6 +3506,9 @@
     if (!document.getElementById("palette").classList.contains("hidden")) return closePalette();
     if (!document.getElementById("sheet").classList.contains("hidden")) return toggleSheet();
     if (!document.getElementById("export").classList.contains("hidden")) return closeExport();
+    // Looking at "before" is something in hand, in the sense that matters: the
+    // photograph on screen is not the one the sliders describe.
+    if (comparing) return compareWith(null).then(() => invoke("snapshot")).then(showParts);
     if (armed !== null) return arm(null);
     if (picking) return pickWb(false);
     if (pickingRange) return pickRange(false);
@@ -3391,6 +3673,8 @@
       title: "Paste them onto everything selected", act: "paste_edit" },
     // The picker decides the rest: a name for one photograph, a folder for a
     // set, so the two cannot be asked for the wrong thing.
+    { id: "before-after", keys: ["\\"], scope: "develop", waits: false, group: "The edit",
+      title: "Before and after: the photograph as it opened, and back", run: () => toggleBefore() },
     { id: "export", keys: ["mod+shift+e"], scope: "any", waits: false, group: "The edit",
       title: "Export…", run: () => openExport() },
     { id: "export-again", keys: ["mod+e"], scope: "any", waits: false, group: "The edit",
@@ -3430,10 +3714,22 @@
   for (const command of COMMANDS)
     for (const key of command.keys) {
       // Two commands on one key is a bug nobody would find by pressing it: the
-      // second would simply never run.
-      if (byKey.has(key)) throw new Error(`${key} is bound twice: ${byKey.get(key).id}, ${command.id}`);
-      byKey.set(key, command);
+      // second would simply never run. One exception, and it is the only shape
+      // in which both can: one is the Library's and the other is Develop's, so
+      // where you are says which. `\` is that — the filter in the Library and
+      // before/after in Develop, which is the split Lightroom's hands already have.
+      const held = byKey.get(key) ?? [];
+      const scopes = [...held.map(c => c.scope), command.scope].sort().join("+");
+      if (held.length && scopes !== "develop+library")
+        throw new Error(`${key} is bound twice: ${held[0].id}, ${command.id}`);
+      byKey.set(key, [...held, command]);
     }
+  /// The command a key means, here: the one that belongs to this workspace when
+  /// two share it, and otherwise the one there is.
+  const commandFor = key => {
+    const held = byKey.get(key);
+    return held && (held.find(c => c.scope === workspace) ?? held[0]);
+  };
 
   // A key as the registry spells it. Shift is part of a letter or a named key
   // and not of a symbol, which already is what Shift made it: "?" arrives as
@@ -3513,7 +3809,7 @@
     // it always did, and Caps Lock changes nothing.
     // Bare keys only. A chord is not loosened: Ctrl+Shift+S must not become
     // Ctrl+S because nothing is on the first.
-    const command = byKey.get(key) ?? (chord ? undefined : byKey.get(key.replace("shift+", "")));
+    const command = commandFor(key) ?? (chord ? undefined : commandFor(key.replace("shift+", "")));
     if (command) return run(command.id), event.preventDefault();
     if (MOVED[key]) return tell("refused", MOVED[key].replace("⌃⇧", MAC ? "⌘⇧" : "Ctrl+Shift+")), event.preventDefault();
   });
@@ -3599,6 +3895,80 @@
     if (e.welcome) drawWelcome(e);
   });
   enter().catch(say);
+
+  // ---- Looking without changing ------------------------------------------------
+  //
+  // A section's heading says whether anything in it is changed, lets the
+  // photograph be seen without it for as long as the eye is held, and puts it
+  // back to nothing on a double-click of the dot. `\\` is the same look at the
+  // whole edit. None of it touches the edit: see `Session::set_compare`.
+  const PARTS = {
+    "s-white-balance": "white_balance", "s-tone": "tone", "s-presence": "presence", "s-curve": "curve",
+    "s-mixer": "mixer", "s-grade": "grading", "s-detail": "detail", "s-masks": "masks",
+    "s-spots": "spots", "s-effects": "effects", "s-calibration": "calibration",
+  };
+  const PART_NAMES = {
+    white_balance: "white balance", tone: "tone", presence: "presence", curve: "the curve", mixer: "the colour mixer",
+    grading: "grading", detail: "detail", masks: "local adjustments", spots: "spot removal",
+    effects: "effects", calibration: "calibration",
+  };
+  const comparingLine = document.getElementById("comparing");
+  let comparing = null;
+  const compareWith = what => invoke("compare", { with: what }).catch(say);
+  for (const [section, part] of Object.entries(PARTS)) {
+    const summary = document.getElementById(section)?.querySelector("summary");
+    if (!summary) continue;
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    dot.textContent = "•";
+    dot.dataset.part = part;
+    dot.title = "Changed. Double-click to put this section back to nothing.";
+    // A click on a heading opens and closes it; these two are not the heading.
+    dot.addEventListener("click", event => event.preventDefault());
+    dot.addEventListener("dblclick", event => {
+      event.preventDefault();
+      invoke("reset_part", { part }).then(e => {
+        if (e.event === "refused") tell("refused", e.reason);
+        else tell("info", `Put ${PART_NAMES[part]} back to nothing`);
+      }).catch(say);
+    });
+    const eye = document.createElement("button");
+    eye.className = "eye";
+    eye.textContent = "without";
+    eye.dataset.part = part;
+    eye.title = "Hold to see the photograph without this section";
+    eye.setAttribute("aria-label", `hold to see the photograph without ${PART_NAMES[part]}`);
+    eye.addEventListener("click", event => event.preventDefault());
+    const look = on => {
+      eye.classList.toggle("held", on);
+      compareWith(on ? { without: part } : null);
+    };
+    eye.addEventListener("pointerdown", event => { event.preventDefault(); eye.setPointerCapture(event.pointerId); look(true); });
+    for (const over of ["pointerup", "pointercancel", "lostpointercapture"])
+      eye.addEventListener(over, () => { if (eye.classList.contains("held")) look(false); });
+    // From the keyboard there is no holding: Space looks, Space again stops.
+    eye.addEventListener("keydown", event => {
+      if (event.key !== " " && event.key !== "Enter") return;
+      event.preventDefault();
+      look(!eye.classList.contains("held"));
+    });
+    summary.append(dot, eye);
+  }
+  const showParts = s => {
+    const touched = new Set(s.touched ?? []);
+    for (const mark of document.querySelectorAll("summary .dot, summary .eye"))
+      mark.classList.toggle("on", touched.has(mark.dataset.part));
+    comparing = s.compare ?? null;
+    comparingLine.classList.toggle("hidden", !comparing);
+    if (comparing)
+      comparingLine.textContent = comparing === "before"
+        ? "BEFORE — as it opened. \\ comes back."
+        : `WITHOUT ${PART_NAMES[comparing.without].toUpperCase()}`;
+    if (!comparing)
+      for (const eye of document.querySelectorAll("summary .eye.held")) eye.classList.remove("held");
+  };
+  const toggleBefore = () => compareWith(comparing === "before" ? null : "before")
+    .then(() => invoke("snapshot")).then(showParts);
 
   // ---- Export ------------------------------------------------------------------
   //
