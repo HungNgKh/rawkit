@@ -2593,6 +2593,17 @@ fn main() -> Result<()> {
                         if !moving {
                             session.set_haste(false);
                         }
+                        // A tool in hand works on what is on the canvas, so
+                        // the canvas has to be showing the edit: "before" has
+                        // no spots in it, and a spot placed over a blemish that
+                        // is not being drawn is placed blind.
+                        //
+                        // A selected adjustment does not count. It is "in hand"
+                        // to the pointer, but it is also exactly what somebody
+                        // holds the Local adjustments eye to look without.
+                        if session.compare().is_some() && !matches!(tool_name(), "" | "mask") {
+                            session.set_compare(None);
+                        }
                         // The same fact, told to the preview builder: while an
                         // edit is moving the GPU is for the edit.
                         if let Some(building) = &building {

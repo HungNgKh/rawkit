@@ -1442,13 +1442,22 @@
     held.x = event.clientX;
     if (snap(held.input, held.exact) !== parseFloat(held.input.value)) put(held.input, held.exact);
   });
-  for (const over of ["pointerup", "pointercancel"])
-    document.addEventListener(over, () => { held = null; });
+  // However it ends — let go, cancelled, or the capture taken away.
+  for (const over of ["pointerup", "pointercancel", "lostpointercapture"])
+    document.addEventListener(over, () => { held = null; }, true);
   // Twice on the slider or on its name: back to the default.
   document.addEventListener("dblclick", event => {
     const label = event.target.closest?.("label");
     const input = label?.querySelector("input[type=range]");
     if (!input || input.disabled || event.target.closest("output, input.entry")) return;
+    // On the thumb or on the name — not on the rail. Two quick presses on the
+    // rail are two steps towards the pointer, and must not be read as "reset".
+    if (event.target === input) {
+      const box = input.getBoundingClientRect();
+      const [min, max] = [parseFloat(input.min), parseFloat(input.max)];
+      const thumb = box.left + 7 + Math.max(box.width - 14, 1) * (parseFloat(input.value) - min) / (max - min);
+      if (Math.abs(event.clientX - thumb) > 12) return;
+    }
     event.preventDefault();
     reset(input);
   });
@@ -1631,6 +1640,7 @@
   // notices and costs a lock and a serialise.
   let seen = -1;
   let learnt = false;
+  let complained = false;
   setInterval(async () => {
     const epoch = toolEpoch;
     const s = await invoke("snapshot");
@@ -1639,11 +1649,21 @@
       // the same `sync` that fills the sliders in, and each one's value kept as
       // what it goes back to. The markup has a default for every slider too,
       // and two lists of defaults are two chances for one to be wrong.
-      learnt = true;
+      // Marked learnt only once it has been: set before the `await`, one
+      // failed call at launch would have left every slider without a default
+      // for the rest of the session. Said once, tried again next time round.
       try {
         sync(await invoke("edit_defaults"), s.image);
-        for (const input of document.querySelectorAll("input[type=range]")) input.dataset.default = input.value;
-      } catch (e) { tell("failed", `the panel broke learning the defaults: ${e && e.message || e}`); }
+        // Only what `sync` fills in. The sliders for one local adjustment or one
+        // spot are filled from whichever is selected, not from the edit, so what
+        // they hold at this moment is nobody's default; theirs is in the markup.
+        for (const input of document.querySelectorAll("input[type=range]"))
+          if (!input.closest("#s-masks, #s-spots")) input.dataset.default = input.value;
+        learnt = true;
+      } catch (e) {
+        if (!complained) tell("failed", `the panel broke learning the defaults: ${e && e.message || e}`);
+        complained = true;
+      }
       seen = -1;
     }
     if (s.generation !== seen) {
@@ -3954,6 +3974,11 @@
     });
     summary.append(dot, eye);
   }
+  // A pointer let go somewhere the page cannot see — another window — must not
+  // leave the canvas showing something that is not the edit.
+  window.addEventListener("blur", () => {
+    if (document.querySelector("summary .eye.held")) compareWith(null);
+  });
   const showParts = s => {
     const touched = new Set(s.touched ?? []);
     for (const mark of document.querySelectorAll("summary .dot, summary .eye"))

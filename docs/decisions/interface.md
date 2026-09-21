@@ -592,7 +592,9 @@ screen reader. What is replaced is what it does badly:
   is — which is what lets **Shift** make the same movement count a quarter.
   A press on the rail moves a tenth of the range towards it: a stray click
   cannot throw Exposure to +4.
-- **Double-click** the slider or its name: back to the default, one undo step.
+- **Double-click** the thumb or the name: back to the default, one undo step.
+  Not the rail: two quick presses there are two steps towards the pointer, and
+  the browser calls them a double-click.
   Delete does the same for a slider reached with Tab; Shift+arrow is ten steps.
 - **Click the number** to type one, in the units shown. Enter commits, Escape
   cancels, the arrows step. Out of range is clamped, not refused: "200" into a
@@ -646,7 +648,12 @@ Tone that also took the clarity away would compare against a picture nobody
 asked to see. Geometry is not a part, for the reason before keeps it.
 
 The first edit ends a comparison, or the slider moves and the picture does not.
-So does opening another photograph. Escape ends one: it is a rung of the
+So does opening another photograph, and so does picking up crop, the spot tool
+or a placement — "before" has no spots in it, and a spot placed over a blemish
+that is not being drawn is placed blind. A *selected* adjustment does not end
+one: it is exactly what somebody holds the Local adjustments eye to look
+without. A held eye lets go if the window loses focus, since the release it is
+waiting for may happen where the page cannot see. Escape ends one: it is a rung of the
 ladder, above the tools.
 
 The eye is held, not toggled, from a pointer; from the keyboard there is no
