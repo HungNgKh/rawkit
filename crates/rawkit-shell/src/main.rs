@@ -1121,7 +1121,14 @@ fn cull(
             // whole frame, in the fractions of it the rectangle is kept in.
             if mode() == MODE_CROP {
                 *CROP_DRAG.lock().expect("crop drag lock") = None;
-                *CROP_RECT.lock().expect("crop rect lock") = Some([0.0, 0.0, 1.0, 1.0]);
+                // The whole frame — or as much of it as the chosen shape allows.
+                let developed = session.0.lock().expect("session lock").developed_size();
+                let whole = [0.0, 0.0, 1.0, 1.0];
+                let rect = match *CROP_ASPECT.lock().expect("crop aspect lock") {
+                    Some(ratio) => fit_crop(whole, ratio, developed),
+                    None => whole,
+                };
+                *CROP_RECT.lock().expect("crop rect lock") = Some(rect);
                 notice("The whole frame again; keep it or cancel");
             }
             CullAction::SelectBy(0)
@@ -1878,6 +1885,7 @@ fn main() -> Result<()> {
             set_spot_mode,
             find_spot_source,
             set_brush,
+            crop_aspect,
             history,
             history_go,
             end_step,
@@ -4809,6 +4817,76 @@ fn set_brush(radius: Option<f32>, erase: Option<bool>) -> Result<(f32, bool), St
     ))
 }
 
+/// Hold the crop to a shape, or let it go. `shape` is "free", "original",
+/// "1:1", "3:2", "4:3", "5:4", "16:9", or "swap" to turn the current shape the
+/// other way. The shape is turned to match the rectangle already drawn — a
+/// portrait rectangle asked for 3:2 becomes 2:3 — and the rectangle is fitted to
+/// it at once, so the choice is seen rather than waiting for the next drag.
+/// Answers with the shape in words.
+#[tauri::command]
+fn crop_aspect(state: tauri::State<'_, Shared>, shape: String) -> Result<String, String> {
+    if mode() != MODE_CROP {
+        return Err("a shape is for the crop, and the crop is not in hand".into());
+    }
+    let session = state.0.lock().expect("session lock");
+    let developed = session.developed_size();
+    let (dw, dh) = (developed[0].max(1) as f64, developed[1].max(1) as f64);
+    let rect = CROP_RECT
+        .lock()
+        .expect("crop rect lock")
+        .unwrap_or([0.0, 0.0, 1.0, 1.0]);
+    let wide = (rect[2] - rect[0]) as f64 * dw >= (rect[3] - rect[1]) as f64 * dh;
+    let mut aspect = CROP_ASPECT.lock().expect("crop aspect lock");
+    let turned = |ratio: f64| {
+        if wide {
+            ratio.max(1.0 / ratio)
+        } else {
+            ratio.min(1.0 / ratio)
+        }
+    };
+    *aspect = match shape.as_str() {
+        "free" => None,
+        "swap" => match *aspect {
+            Some(ratio) => Some(1.0 / ratio),
+            None => return Err("the crop is free; choose a shape to turn".into()),
+        },
+        "original" => Some(turned(
+            session.image_size()[0] as f64 / session.image_size()[1].max(1) as f64,
+        )),
+        named => {
+            let (w, h) = named
+                .split_once(':')
+                .and_then(|(w, h)| Some((w.parse::<f64>().ok()?, h.parse::<f64>().ok()?)))
+                .filter(|(w, h)| *w > 0.0 && *h > 0.0)
+                .ok_or_else(|| format!("{named:?} is not a shape"))?;
+            Some(turned(w / h))
+        }
+    };
+    let placed = match *aspect {
+        Some(_) if shape == "swap" => Some(turn_crop(rect, developed)),
+        Some(ratio) => Some(fit_crop(rect, ratio, developed)),
+        None => None,
+    };
+    if let Some(placed) = placed {
+        *CROP_RECT.lock().expect("crop rect lock") = Some(placed);
+    }
+    Ok(match *aspect {
+        None => "free".into(),
+        Some(ratio) if ratio >= 1.0 => format!("{} wide", shape_words(ratio)),
+        Some(ratio) => format!("{} tall", shape_words(1.0 / ratio)),
+    })
+}
+
+/// A ratio in the words it was chosen as, near enough: 1.5 is "3:2".
+fn shape_words(ratio: f64) -> String {
+    for (w, h) in [(1, 1), (3, 2), (4, 3), (5, 4), (16, 9)] {
+        if (ratio - w as f64 / h as f64).abs() < 0.005 {
+            return format!("{w}:{h}");
+        }
+    }
+    format!("{ratio:.2}:1")
+}
+
 /// This photograph's edit history: the steps, oldest first, named by the
 /// command that made each, and how many of them are in force.
 #[tauri::command]
@@ -7048,6 +7126,141 @@ fn move_crop_edge(rect: &mut [f32; 4], was: [f32; 4], edge: usize, by: f32, smal
     };
 }
 
+/// The shape the crop is held to, as width over height in *pixels* of the frame
+/// on screen, already turned the way the rectangle is — 1.5 for a landscape 3:2,
+/// two thirds for a portrait one. `None` is free.
+///
+/// Kept between photographs and between crops, as Lightroom keeps its lock:
+/// somebody cropping a set for a 4:5 print wants every one of them 4:5 without
+/// choosing it again.
+static CROP_ASPECT: Mutex<Option<f64>> = Mutex::new(None);
+
+/// A rectangle held to `ratio` (pixels) after a corner or an edge moved.
+///
+/// Pure, so the arithmetic is tested without a window. A corner keeps the corner
+/// opposite it where it was, and the hand is projected onto the rectangle's
+/// diagonal: any movement along it counts, and a push straight in along one
+/// axis still shrinks the rectangle. The first version grew to whichever axis
+/// asked for more, and a push straight in did nothing at all, because the other
+/// axis was still asking for the full size. An edge keeps the edge opposite it and
+/// centres the other dimension on where it was. Either way the result stays
+/// inside the frame, shrinking both sides together when it would not fit.
+fn constrain_crop(
+    rect: [f32; 4],
+    was: [f32; 4],
+    grab: CropGrab,
+    ratio: f64,
+    developed: [u32; 2],
+) -> [f32; 4] {
+    // The ratio in fractions of the frame: width fraction over height fraction.
+    let k = ratio * developed[1].max(1) as f64 / developed[0].max(1) as f64;
+    let [l, t, r, b] = rect.map(|v| v as f64);
+    let was = was.map(|v| v as f64);
+    match grab {
+        CropGrab::Move => rect,
+        CropGrab::Corner(corner) => {
+            // The fixed corner, and which way the rectangle grows from it.
+            let (ax, ay, sx, sy) = match corner {
+                0 => (was[2], was[3], -1.0, -1.0),
+                1 => (was[0], was[3], 1.0, -1.0),
+                2 => (was[0], was[1], 1.0, 1.0),
+                _ => (was[2], was[1], -1.0, 1.0),
+            };
+            // Where the hand has the corner, from the fixed one, in pixels —
+            // projected onto the shape's diagonal, which in pixels runs
+            // (ratio, 1).
+            let (dw, dh) = (developed[0].max(1) as f64, developed[1].max(1) as f64);
+            let hx = if matches!(corner, 0 | 3) { l } else { r };
+            let hy = if matches!(corner, 0 | 1) { t } else { b };
+            let (vx, vy) = ((hx - ax) * sx * dw, (hy - ay) * sy * dh);
+            let along = ((vx * ratio + vy) / (ratio * ratio + 1.0)).max(8.0);
+            let (mut w, mut h) = (along * ratio / dw, along / dh);
+            let room_w = if sx > 0.0 { 1.0 - ax } else { ax };
+            let room_h = if sy > 0.0 { 1.0 - ay } else { ay };
+            if w > room_w {
+                w = room_w;
+                h = w / k;
+            }
+            if h > room_h {
+                h = room_h;
+                w = h * k;
+            }
+            let (x2, y2) = (ax + sx * w, ay + sy * h);
+            [ax.min(x2), ay.min(y2), ax.max(x2), ay.max(y2)].map(|v| v as f32)
+        }
+        CropGrab::Edge(edge) => {
+            if edge % 2 == 0 {
+                // Left or right moved: the width is the hand's, the height
+                // follows about the middle it had.
+                let mut w = r - l;
+                let middle = (was[1] + was[3]) / 2.0;
+                let mut h = w / k;
+                let room = 2.0 * middle.min(1.0 - middle);
+                if h > room {
+                    h = room;
+                    w = h * k;
+                }
+                let (left, right) = if edge == 0 {
+                    (was[2] - w, was[2])
+                } else {
+                    (was[0], was[0] + w)
+                };
+                [left, middle - h / 2.0, right, middle + h / 2.0].map(|v| v as f32)
+            } else {
+                let mut h = b - t;
+                let middle = (was[0] + was[2]) / 2.0;
+                let mut w = h * k;
+                let room = 2.0 * middle.min(1.0 - middle);
+                if w > room {
+                    w = room;
+                    h = w / k;
+                }
+                let (top, bottom) = if edge == 1 {
+                    (was[3] - h, was[3])
+                } else {
+                    (was[1], was[1] + h)
+                };
+                [middle - w / 2.0, top, middle + w / 2.0, bottom].map(|v| v as f32)
+            }
+        }
+    }
+}
+
+/// The largest rectangle of `ratio` (pixels) centred inside `rect`. What a
+/// newly chosen shape does to the crop already drawn: it is kept to, never
+/// grown past, since what somebody already cut away was cut on purpose.
+fn fit_crop(rect: [f32; 4], ratio: f64, developed: [u32; 2]) -> [f32; 4] {
+    let k = ratio * developed[1].max(1) as f64 / developed[0].max(1) as f64;
+    let [l, t, r, b] = rect.map(|v| v as f64);
+    let (mut w, mut h) = (r - l, b - t);
+    if w > h * k {
+        w = h * k;
+    } else {
+        h = w / k;
+    }
+    let (cx, cy) = ((l + r) / 2.0, (t + b) / 2.0);
+    [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0].map(|v| v as f32)
+}
+
+/// The rectangle turned a quarter about its middle: its width becomes its height,
+/// in pixels, and it shrinks only as much as the frame makes it. What Swap does.
+/// Fitting the turned shape inside the rectangle instead made every press of it
+/// smaller than the last.
+fn turn_crop(rect: [f32; 4], developed: [u32; 2]) -> [f32; 4] {
+    let (dw, dh) = (developed[0].max(1) as f64, developed[1].max(1) as f64);
+    let [l, t, r, b] = rect.map(|v| v as f64);
+    // Swapped in pixels, then back to fractions.
+    let (mut w, mut h) = ((b - t) * dh / dw, (r - l) * dw / dh);
+    let shrink = (1.0 / w).min(1.0 / h).min(1.0);
+    w *= shrink;
+    h *= shrink;
+    let (cx, cy) = ((l + r) / 2.0, (t + b) / 2.0);
+    // Slid, not shrunk, where it only overhangs one side.
+    let x = (cx - w / 2.0).clamp(0.0, 1.0 - w);
+    let y = (cy - h / 2.0).clamp(0.0, 1.0 - h);
+    [x, y, x + w, y + h].map(|v| v as f32)
+}
+
 /// Put the session into crop mode, and set up the rectangle from the crop the
 /// photograph already has.
 ///
@@ -7132,7 +7345,10 @@ fn advance_crop_rect(
     previous: [f32; 4],
 ) -> [f32; 4] {
     let developed = session.developed_size();
-    let rect = crop_from_drag(grab, was, start, now, session.viewport(), developed);
+    let mut rect = crop_from_drag(grab, was, start, now, session.viewport(), developed);
+    if let Some(ratio) = *CROP_ASPECT.lock().expect("crop aspect lock") {
+        rect = constrain_crop(rect, was, grab, ratio, developed);
+    }
     if grab == CropGrab::Move {
         let scale = session.viewport().scale;
         let dx = -((rect[0] - previous[0]) as f64) * developed[0] as f64 * scale;
@@ -9256,5 +9472,101 @@ mod argument_tests {
             Start::TestPattern
         );
         assert_ne!(start(&[], None), Start::TestPattern);
+    }
+}
+
+#[cfg(test)]
+mod crop_aspect_tests {
+    use super::*;
+
+    /// A 6000x4000 frame: 3:2 landscape, so a fraction and a pixel ratio differ.
+    const FRAME: [u32; 2] = [6000, 4000];
+
+    fn pixel_ratio(rect: [f32; 4]) -> f64 {
+        ((rect[2] - rect[0]) as f64 * FRAME[0] as f64)
+            / ((rect[3] - rect[1]) as f64 * FRAME[1] as f64)
+    }
+
+    fn inside(rect: [f32; 4]) -> bool {
+        rect.iter().all(|v| (-1e-6..=1.0 + 1e-6).contains(v))
+            && rect[0] < rect[2]
+            && rect[1] < rect[3]
+    }
+
+    #[test]
+    fn a_chosen_shape_is_the_largest_of_it_inside_what_was_drawn() {
+        let square = fit_crop([0.0, 0.0, 1.0, 1.0], 1.0, FRAME);
+        assert!((pixel_ratio(square) - 1.0).abs() < 1e-4);
+        // The whole height of a landscape frame, centred.
+        assert!((square[1] - 0.0).abs() < 1e-6 && (square[3] - 1.0).abs() < 1e-6);
+        assert!((square[0] + square[2] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_corner_keeps_the_corner_opposite_and_the_shape() {
+        let was = fit_crop([0.1, 0.1, 0.9, 0.9], 1.0, FRAME);
+        // Pull the bottom-right corner right and a little down.
+        let dragged = [was[0], was[1], was[2] + 0.05, was[3] + 0.01];
+        let held = constrain_crop(dragged, was, CropGrab::Corner(2), 1.0, FRAME);
+        assert_eq!([held[0], held[1]], [was[0], was[1]], "the top-left stays");
+        assert!((pixel_ratio(held) - 1.0).abs() < 1e-4);
+        assert!(inside(held));
+        // Dragged past the frame, it stops at the frame and keeps the shape.
+        let far = [was[0], was[1], 1.5, 1.5];
+        let held = constrain_crop(far, was, CropGrab::Corner(2), 1.0, FRAME);
+        assert!(inside(held) && (pixel_ratio(held) - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_corner_pushed_straight_in_shrinks_the_shape() {
+        // The hand moved only sideways, and inwards. It must still shrink: the
+        // first version kept the full size because the height was not asked
+        // to change.
+        let was = fit_crop([0.0, 0.0, 1.0, 1.0], 1.0, FRAME);
+        let dragged = [was[0], was[1], was[2] - 0.2, was[3]];
+        let held = constrain_crop(dragged, was, CropGrab::Corner(2), 1.0, FRAME);
+        assert!(
+            held[2] < was[2] && held[3] < was[3],
+            "{held:?} did not shrink from {was:?}"
+        );
+        assert!((pixel_ratio(held) - 1.0).abs() < 1e-4);
+        assert_eq!([held[0], held[1]], [was[0], was[1]]);
+    }
+
+    #[test]
+    fn an_edge_keeps_the_edge_opposite_and_centres_the_other_way() {
+        let was = fit_crop([0.2, 0.2, 0.8, 0.8], 1.5, FRAME);
+        let dragged = [was[0], was[1], was[2] - 0.1, was[3]];
+        let held = constrain_crop(dragged, was, CropGrab::Edge(2), 1.5, FRAME);
+        assert_eq!(held[0], was[0], "the left edge stays");
+        assert!((pixel_ratio(held) - 1.5).abs() < 1e-4);
+        let middle = |r: [f32; 4]| (r[1] + r[3]) / 2.0;
+        assert!((middle(held) - middle(was)).abs() < 1e-5);
+        // Widened until the height runs out: both stop, and the shape holds.
+        let wide = [was[0], was[1], 1.0, was[3]];
+        let held = constrain_crop(wide, was, CropGrab::Edge(2), 0.5, FRAME);
+        assert!(inside(held) && (pixel_ratio(held) - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_swap_turns_the_rectangle_and_does_not_shrink_it_each_time() {
+        let wide = fit_crop([0.3, 0.3, 0.7, 0.7], 1.5, FRAME);
+        let tall = turn_crop(wide, FRAME);
+        assert!((pixel_ratio(tall) - 1.0 / 1.5).abs() < 1e-4);
+        let back = turn_crop(tall, FRAME);
+        for (a, b) in back.iter().zip(wide) {
+            assert!((a - b).abs() < 1e-5, "{back:?} is not {wide:?}");
+        }
+        // A wide rectangle as tall as the frame cannot turn at full size: it
+        // shrinks just enough, and stays inside.
+        let full = fit_crop([0.0, 0.0, 1.0, 1.0], 1.5, FRAME);
+        assert!(inside(turn_crop(full, FRAME)));
+    }
+
+    #[test]
+    fn a_ratio_is_named_as_it_was_chosen() {
+        assert_eq!(shape_words(1.5), "3:2");
+        assert_eq!(shape_words(16.0 / 9.0), "16:9");
+        assert_eq!(shape_words(1.2345), "1.23:1");
     }
 }

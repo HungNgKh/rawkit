@@ -67,6 +67,7 @@ what a contributor would otherwise undo.
 | **I43** | Act, then offer Undo — no "sure?" | Deleting a preset, snapshot, collection or copy is one click, and the sentence that says so carries an Undo button. |
 | **I44** | A History list, kept per photograph for the sitting | Every step named, the one in force marked, the undone ones still listed; a change made while away is a step of its own. |
 | **I45** | The surround is a choice, and neutral | Dark `#1a1a1a` by default; grey, mid grey, white and black from the palette. Drawn by the presenter in linear light, remembered with the window. |
+| **I46** | Crop can be held to a shape | Free, Original, 1:1, 3:2, 4:3, 5:4, 16:9 and a Swap, in the crop's options row. A corner follows the hand along the diagonal; an edge centres the other side. |
 | **I21** | New never replaces a catalog, and only `--new` makes one | The picker's "replace?" is a question about a file. Without `--new`, a path that is not there is refused, not created. |
 
 ## I1 — one status line
@@ -1003,6 +1004,27 @@ photograph"), no key: it is set once per room, not per photograph. Remembered in
 `window.json` with the rest of this machine's preferences, not in the catalog.
 The grid and the strip draw their own grounds and are unchanged.
 
+## I46 — a shape for the crop
+
+The crop's options row (I35) carries a shape and a **Swap**. The shape is held in
+*pixels* of the frame on screen, turned to match the rectangle already drawn, and
+choosing one fits the largest rectangle of it inside the one drawn — never
+larger, because what was cut away was cut on purpose. It is kept between
+photographs and crops, as Lightroom's lock is: a set cropped for a 4:5 print
+wants every frame 4:5.
+
+While dragging, a **corner** keeps the corner opposite and the hand is projected
+onto the rectangle's diagonal, so any movement along it counts. The first version
+grew to whichever axis asked for more, and a push straight in along one axis did
+nothing: the other axis still asked for the full size (found by hand, now a
+test). An **edge** keeps the edge opposite and centres the other dimension where
+it was. Both stay inside the frame and shrink together when they must.
+
+**Swap** turns the rectangle a quarter about its middle and shrinks it only as
+much as the frame makes it. Fitting the turned shape *inside* the rectangle made
+every press smaller than the last. Reset gives the whole frame, or as much of it
+as the shape allows. The engine is unchanged: the crop is still four edges.
+
 ## If you change this
 
 | If you touch… | …this will tell you |
@@ -1050,6 +1072,7 @@ The grid and the strip draw their own grounds and are unchanged.
 | what a step of the edit history is | `the_history_names_its_steps_and_knows_where_it_is`, `a_let_go_ends_the_step_so_two_drags_are_two_undos`, `a_kept_history_comes_back_and_a_change_made_elsewhere_is_a_step` |
 | a new session command | give it words in `STEP_WORDS` in the page, or it shows in History under its own name |
 | what is round the photograph | `where_the_canvas_holds_no_photograph_the_surround_shows` (engine, GPU). Anything that writes the canvas outside the photograph must write alpha 0 |
+| how a crop keeps its shape | `crop_aspect_tests` — fit, a corner (and a push straight in), an edge, a swap and back |
 | how the window is divided | `frame::tests` — the four sides, the left panel giving way first, a hidden panel's width going to the photograph, the physical canvas meeting the bars at a fractional scale, and where a pointer lands |
 | a bar's height or a panel's width in the page | nothing automatic: the page must take it from `--top`, `--left`, `--panel`, `--bottom`, never a number of its own. Check by pixel: the page's border ends on the pixel before the canvas starts, on all four sides |
 | where an overlay lives | the welcome and import screens are top-level; the sheet, palette and export panel are in `#chrome` and call `needRight()` |
