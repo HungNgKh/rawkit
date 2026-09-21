@@ -3419,6 +3419,13 @@
   const folded = new Set();
   let foldedByDefault = null;
   const folderName = id => folderRows.find(f => f.id === id)?.name;
+  // And when the window comes back to the front: a scan from a terminal changes
+  // the tree without necessarily changing how many photographs there are, and
+  // coming back from the terminal is when somebody would look.
+  window.addEventListener("focus", () => {
+    foldersAskedAt = null;
+    if (latestView) drawFolders(latestView);
+  });
   const drawFolders = view => {
     if (view.in_library !== foldersAskedAt) {
       foldersAskedAt = view.in_library;

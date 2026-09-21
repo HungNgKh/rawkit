@@ -847,6 +847,13 @@ A folder is a `Source` like a collection, so the filter applies within it and th
 oracle checks it after every action in the tests. At most one of `viewing` and
 `folder` is set in the view.
 
+From review: the tree is also asked for again when the window comes back to the
+front, because a scan from a terminal can reshape it without changing how many
+photographs there are. A loop in the parents — nothing a scan makes, nothing the
+schema forbids — stops the count at the first folder seen twice; a step cap had
+stopped the hang and still added the same photographs round the loop hundreds of
+times. A drive with no path and no label is "Drive N", not "/".
+
 ## I38 — the filter bar
 
 F16. The chips were 11 px text in 18 px boxes and the star chips 15 px wide. Now
@@ -890,6 +897,12 @@ photograph and nothing else. Whether it may be honoured is the render loop's: wi
 a tool in hand it is refused and says so, as a key that changes photograph is. The
 wheel moves along the strip without changing anything; the strip comes back to the
 current photograph when that changes.
+
+From review: a press counts only on a drawn thumbnail. The bins had been centred
+on the gaps, so a press in the empty space after the last thumbnail chose a
+photograph off the edge. And presenting the strip cannot end the render loop: the
+photograph is already drawn by then, so a failure costs the strip and is said
+once.
 
 ## If you change this
 

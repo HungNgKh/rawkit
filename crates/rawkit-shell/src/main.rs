@@ -6356,8 +6356,14 @@ fn draw_strip(
     let origin = w / 2.0 - slot_w / 2.0 - centre * pitch;
 
     if let Some(x) = STRIP_CLICK.lock().expect("strip click lock").take() {
-        let at = ((x - origin + pad / 2.0) / pitch).floor();
-        if at >= 0.0 && (at as usize) < count {
+        // On a thumbnail, and one that is drawn: the gap between two slots and
+        // the empty end of the strip are nothing to click. Centring the bins on
+        // the gaps chose a photograph off the edge from a press in the space
+        // after the last one.
+        let at = ((x - origin) / pitch).floor();
+        let into = x - origin - at * pitch;
+        let drawn = at >= 0.0 && (at as usize) < count && into < slot_w && x >= 0.0 && x < w;
+        if drawn {
             if let Some(tool) = tool_in_hand() {
                 tell(Told::from(
                     format!("{} is in hand; finish or cancel it first", tool.name()).as_str(),
@@ -6734,8 +6740,17 @@ fn paint(
         presenter.draw_into(gpu, canvas, Some(overlay), &view, at)?;
         // Into the same frame, below: each draw loads what is there and writes
         // only its own rectangle, so the two do not have to be one texture.
+        //
+        // And not with `?`: the photograph is already drawn, and an error out of
+        // here ends the render loop. The strip is worth a line, not the window.
         if let Some((strip, below)) = strip {
-            presenter.draw_into(gpu, strip, None, &view, below)?;
+            if let Err(why) = presenter.draw_into(gpu, strip, None, &view, below) {
+                static SAID: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    complain(&anyhow!(why).context("the filmstrip could not be drawn"));
+                }
+            }
         }
     }
     frame.present();

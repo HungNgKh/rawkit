@@ -42,7 +42,7 @@ pub struct Folder {
 /// Every folder with something in it to show, ordered by path.
 pub fn tree(catalog: &Catalog) -> Result<Vec<Folder>, CatalogError> {
     let mut statement = catalog.connection().prepare(
-        "SELECT d.id, d.parent_id, d.relative_path, v.last_mount_path, v.label,
+        "SELECT d.id, d.parent_id, d.relative_path, v.last_mount_path, v.label, v.id,
                 (SELECT count(*) FROM files f JOIN images i ON i.file_id = f.id
                   WHERE f.folder_id = d.id AND f.missing = 0)
            FROM folders d JOIN volumes v ON v.id = d.volume_id
@@ -59,11 +59,14 @@ pub fn tree(catalog: &Catalog) -> Result<Vec<Folder>, CatalogError> {
             } else {
                 format!("{}/{relative}", mount.trim_end_matches('/'))
             };
+            let volume: i64 = r.get(5)?;
+            // A drive never seen and never named still needs a name that is not
+            // every other such drive's: "/" twice in a tree says nothing.
             let name = last_part(&relative)
                 .or_else(|| last_part(&mount))
                 .or(label)
-                .unwrap_or_else(|| "/".to_string());
-            let own: u32 = r.get(5)?;
+                .unwrap_or_else(|| format!("Drive {volume}"));
+            let own: u32 = r.get(6)?;
             Ok(Folder {
                 id: r.get(0)?,
                 parent_id: r.get(1)?,
@@ -79,7 +82,9 @@ pub fn tree(catalog: &Catalog) -> Result<Vec<Folder>, CatalogError> {
     // each folder rather than summed down a built tree: there are a few hundred
     // folders in a big library, and a chain is a few links long. A parent that
     // is not in the table ends the walk — and so does a loop, which the schema
-    // does not forbid and which must not hang the window.
+    // does not forbid: at the first folder seen twice, so no folder in it is
+    // counted twice either. Capping the steps instead stopped the hang and
+    // still added the same photographs round the loop hundreds of times.
     let at: HashMap<i64, usize> = folders.iter().enumerate().map(|(i, f)| (f.id, i)).collect();
     for index in 0..folders.len() {
         let own = folders[index].own;
@@ -87,10 +92,9 @@ pub fn tree(catalog: &Catalog) -> Result<Vec<Folder>, CatalogError> {
             continue;
         }
         let mut parent = folders[index].parent_id;
-        let mut steps = 0;
+        let mut seen = std::collections::HashSet::from([index]);
         while let Some(&above) = parent.as_ref().and_then(|id| at.get(id)) {
-            steps += 1;
-            if steps > folders.len() {
+            if !seen.insert(above) {
                 break;
             }
             folders[above].total += own;
@@ -203,6 +207,61 @@ mod tests {
         let folders = tree(&catalog).unwrap();
         assert!(folders.iter().all(|f| f.name != "day2"));
         assert_eq!(named(&folders, "shoot").total, 3);
+    }
+
+    #[test]
+    fn a_loop_in_the_parents_counts_each_photograph_once() {
+        let dir = tempdir();
+        let catalog = shoot(&dir);
+        let id = |name: &str| -> i64 {
+            catalog
+                .connection()
+                .query_row(
+                    "SELECT id FROM folders WHERE relative_path LIKE ?1",
+                    [format!("%{name}")],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let (day1, day2) = (id("day1"), id("day2"));
+        // day1 under day2 under day1: nothing a scan makes, and nothing the
+        // schema forbids.
+        catalog
+            .connection()
+            .execute(
+                "UPDATE folders SET parent_id = ?1 WHERE id = ?2",
+                [day2, day1],
+            )
+            .unwrap();
+        catalog
+            .connection()
+            .execute(
+                "UPDATE folders SET parent_id = ?1 WHERE id = ?2",
+                [day1, day2],
+            )
+            .unwrap();
+        let folders = tree(&catalog).unwrap();
+        assert_eq!(named(&folders, "day1").total, 3);
+        assert_eq!(named(&folders, "day2").total, 3);
+    }
+
+    #[test]
+    fn a_drive_never_seen_and_never_named_is_told_apart() {
+        let dir = tempdir();
+        let catalog = shoot(&dir);
+        catalog
+            .connection()
+            .execute(
+                "UPDATE volumes SET last_mount_path = NULL, label = NULL",
+                [],
+            )
+            .unwrap();
+        let folders = tree(&catalog).unwrap();
+        assert!(
+            folders.iter().any(|f| f.name.starts_with("Drive ")),
+            "{folders:?}"
+        );
+        assert!(folders.iter().all(|f| f.name != "/"));
     }
 
     #[test]
