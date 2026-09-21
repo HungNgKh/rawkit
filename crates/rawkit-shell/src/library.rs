@@ -341,6 +341,8 @@ pub enum CullAction {
     SurveyJudge(bool),
     /// Empty the comparison.
     ClearMarks,
+    /// Select every photograph that is showing.
+    SelectAll,
     /// Take this frame's look, to give to the marked ones.
     CopyEdit,
     /// Give the copied look to every marked frame.
@@ -499,6 +501,7 @@ impl CullAction {
             | CullAction::Undo
             | CullAction::Mark
             | CullAction::ClearMarks
+            | CullAction::SelectAll
             | CullAction::PasteEdit
             | CullAction::ShowCollection(_)
             | CullAction::TargetToggle
@@ -595,6 +598,68 @@ pub struct CullView {
     pub in_library: usize,
 }
 
+/// The selected photographs: the order they were selected in, and a way to ask
+/// "is this one?" that does not walk it.
+///
+/// It was a `Vec` and nothing asked often. Now the grid asks once for every
+/// cell it draws, sixty times a second, and Ctrl+A can put twenty thousand ids
+/// in here — a thousand cells each walking twenty thousand entries is a frame
+/// that takes a second. The set answers; the list keeps the order, which a
+/// survey and an export both show things in.
+#[derive(Debug, Default, Clone)]
+pub struct Selected {
+    order: Vec<i64>,
+    has: std::collections::HashSet<i64>,
+}
+
+impl Selected {
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    pub fn contains(&self, id: i64) -> bool {
+        self.has.contains(&id)
+    }
+
+    /// `false` if it was already there.
+    pub fn insert(&mut self, id: i64) -> bool {
+        let fresh = self.has.insert(id);
+        if fresh {
+            self.order.push(id);
+        }
+        fresh
+    }
+
+    /// `false` if it was not there.
+    pub fn remove(&mut self, id: i64) -> bool {
+        let was = self.has.remove(&id);
+        if was {
+            self.order.retain(|held| *held != id);
+        }
+        was
+    }
+
+    pub fn clear(&mut self) {
+        self.order.clear();
+        self.has.clear();
+    }
+
+    pub fn ids(&self) -> &[i64] {
+        &self.order
+    }
+}
+
+/// What a grid cell shows about its photograph, besides the photograph.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CellFacts {
+    pub flag: Option<Flag>,
+    pub label: Option<String>,
+    pub rating: u8,
+    /// A virtual copy: a second interpretation of a file that has another.
+    pub copy: bool,
+    pub selected: bool,
+}
+
 /// One page of [`Library::outstanding_page`].
 pub struct OutstandingPage {
     pub wanted: Vec<previews::Wanted>,
@@ -662,7 +727,11 @@ pub struct Library {
     /// quietly become a comparison of different photographs. A marked frame the
     /// filter no longer admits stays marked and is simply not shown — narrowing
     /// the view is not a decision about the comparison.
-    marked: Vec<i64>,
+    marked: Selected,
+    /// Where a range is measured from: the photograph a Shift-click extends
+    /// *from*. The last one clicked or toggled without Shift, which is every
+    /// file manager's rule and so already in everybody's hands.
+    anchor: Option<i64>,
     /// The look taken from a frame, waiting to be applied to the marked ones.
     ///
     /// Held rather than re-read from the source frame, so navigating away — or
@@ -748,7 +817,8 @@ impl Library {
             said: None,
             recorded: 0,
             request: None,
-            marked: Vec::new(),
+            marked: Selected::default(),
+            anchor: None,
         }))
     }
 
@@ -878,7 +948,7 @@ impl Library {
 
         let mut undo = Vec::new();
         let mut changed = 0;
-        for id in self.marked.clone() {
+        for id in self.marked.ids().to_vec() {
             let before = rawkit_catalog::edits::latest(&self.catalog, id)?.map(|(_, state)| state);
             let merged = EditState {
                 tone: look.tone,
@@ -936,6 +1006,7 @@ impl Library {
     pub fn marked(&self) -> Vec<usize> {
         let mut positions: Vec<usize> = self
             .marked
+            .ids()
             .iter()
             .filter_map(|id| self.position_of(*id))
             .collect();
@@ -992,7 +1063,7 @@ impl Library {
         // Anything still naming it would act on a row that is gone: a mark would
         // show an empty cell, and an undo would try to put a judgement back on
         // nothing.
-        self.marked.retain(|marked| *marked != image.id);
+        self.marked.remove(image.id);
         self.undo.retain(|undone| match undone {
             Undone::Judged { image: id, .. } => *id != image.id,
             Undone::Pasted { frames } => !frames.iter().any(|(id, _)| *id == image.id),
@@ -1039,7 +1110,7 @@ impl Library {
         if self.marked.is_empty() {
             vec![self.current().id]
         } else {
-            self.marked.clone()
+            self.marked.ids().to_vec()
         }
     }
 
@@ -1252,6 +1323,107 @@ impl Library {
     /// because the cell it lands on is already on screen.
     pub fn select(&mut self, index: usize) {
         self.index = index.min(self.sequence.len() - 1);
+        // A plain click is where the next range is measured from, and leaves
+        // the selection alone: it was built with a key, deliberately, and a
+        // click to look at something should not be able to throw it away.
+        self.anchor = self.id_at(self.index);
+    }
+
+    /// Ctrl-click: make this the active photograph, and select it or let it go.
+    pub fn toggle_at(&mut self, index: usize) {
+        self.index = index.min(self.sequence.len() - 1);
+        let Some(id) = self.id_at(self.index) else {
+            return;
+        };
+        if !self.marked.remove(id) {
+            self.marked.insert(id);
+        }
+        self.anchor = Some(id);
+        self.say_selected();
+    }
+
+    /// Shift-click: select everything *showing* from the anchor to here, and
+    /// make this the active photograph. Adds to what is selected — extending a
+    /// range must not drop the three picked out by hand before it.
+    ///
+    /// Over what is showing, so a range across a filter takes what can be seen
+    /// between its ends and nothing that cannot. The anchor stays where it was,
+    /// so a second Shift-click re-measures from the same place.
+    pub fn select_to(&mut self, index: usize) {
+        let index = index.min(self.sequence.len() - 1);
+        // An anchor the filter has since hidden measures from the active
+        // photograph instead, which is where the eye is.
+        let from = self
+            .anchor
+            .and_then(|id| self.position_of(id))
+            .unwrap_or(self.index);
+        let (low, high) = (from.min(index), from.max(index));
+        let ids: Vec<i64> = self.sequence.slice(low, high + 1).map(|i| i.id).collect();
+        for id in ids {
+            self.marked.insert(id);
+        }
+        self.index = index;
+        self.say_selected();
+    }
+
+    fn say_selected(&mut self) {
+        let count = self.marked().len();
+        self.say(match count {
+            0 => "Nothing selected".to_string(),
+            1 => "1 photograph selected".to_string(),
+            n => format!("{n} photographs selected"),
+        });
+    }
+
+    /// What a grid reports after a click, for the page: the clicks happen on
+    /// the canvas and no command carries the sentence back.
+    pub fn take_said(&mut self) -> Option<String> {
+        self.said.take()
+    }
+
+    /// What each of these slots shows besides its photograph. One query for the
+    /// page — it used to be one per cell per frame — and in the order asked.
+    pub fn cell_facts(&self, indices: &[usize]) -> Result<Vec<CellFacts>> {
+        let ids: Vec<Option<i64>> = indices.iter().map(|index| self.id_at(*index)).collect();
+        let list: Vec<String> = ids.iter().flatten().map(i64::to_string).collect();
+        if list.is_empty() {
+            return Ok(vec![CellFacts::default(); indices.len()]);
+        }
+        let mut statement = self.catalog.connection().prepare(&format!(
+            "SELECT id, flag, colour_label, rating, is_virtual_copy FROM images WHERE id IN ({})",
+            list.join(",")
+        ))?;
+        let found: std::collections::HashMap<i64, CellFacts> = statement
+            .query_map([], |r| {
+                let flag = match r.get::<_, Option<String>>(1)?.as_deref() {
+                    Some("pick") => Some(Flag::Pick),
+                    Some("reject") => Some(Flag::Reject),
+                    _ => None,
+                };
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    CellFacts {
+                        flag,
+                        label: r.get(2)?,
+                        rating: r.get::<_, Option<u8>>(3)?.unwrap_or(0),
+                        copy: r.get::<_, i64>(4)? != 0,
+                        selected: false,
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(ids
+            .into_iter()
+            .map(|id| {
+                let Some(id) = id else {
+                    return CellFacts::default();
+                };
+                CellFacts {
+                    selected: self.marked.contains(id),
+                    ..found.get(&id).cloned().unwrap_or_default()
+                }
+            })
+            .collect())
     }
 
     /// Ask for the current photograph to be loaded even though the selection did
@@ -1259,40 +1431,6 @@ impl Library {
     /// something else since the last time it ran.
     pub fn reopen(&mut self) {
         self.request = Some(self.index);
-    }
-
-    /// The flag on each image in a range of the sequence, for tinting cells.
-    ///
-    /// One query for the whole visible page rather than one per cell, because a
-    /// grid re-reads this every frame — pressing X has to change what the cell
-    /// looks like straight away.
-    #[allow(clippy::type_complexity)]
-    pub fn flags_in(&self, from: usize, to: usize) -> Result<Vec<(Option<Flag>, Option<String>)>> {
-        let slice: Vec<&LibraryImage> = self.sequence.slice(from, to).collect();
-        if slice.is_empty() {
-            return Ok(Vec::new());
-        }
-        let ids: Vec<String> = slice.iter().map(|i| i.id.to_string()).collect();
-        let mut statement = self.catalog.connection().prepare(&format!(
-            "SELECT id, flag, colour_label FROM images WHERE id IN ({})",
-            ids.join(",")
-        ))?;
-        #[allow(clippy::type_complexity)]
-        let found: std::collections::HashMap<i64, (Option<String>, Option<String>)> = statement
-            .query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
-            .collect::<std::result::Result<_, _>>()?;
-        Ok(slice
-            .iter()
-            .map(|image| {
-                let (flag, label) = found.get(&image.id).cloned().unwrap_or((None, None));
-                let flag = match flag.as_deref() {
-                    Some("pick") => Some(Flag::Pick),
-                    Some("reject") => Some(Flag::Reject),
-                    _ => None,
-                };
-                (flag, label)
-            })
-            .collect())
     }
 
     /// A preview for any image in the sequence, resolving its edit itself.
@@ -1717,16 +1855,23 @@ impl Library {
             CullAction::Mark => {
                 let id = self.current().id;
                 let frame = self.name_of(id);
-                match self.marked.iter().position(|marked| *marked == id) {
-                    Some(at) => {
-                        self.marked.remove(at);
-                        self.say(format!("Deselected {frame}"));
-                    }
-                    None => {
-                        self.marked.push(id);
-                        self.say(format!("Selected {frame}"));
-                    }
+                if self.marked.remove(id) {
+                    self.say(format!("Deselected {frame}"));
+                } else {
+                    self.marked.insert(id);
+                    self.say(format!("Selected {frame}"));
                 }
+                self.anchor = Some(id);
+            }
+            CullAction::SelectAll => {
+                for id in self.shown_ids() {
+                    self.marked.insert(id);
+                }
+                let count = self.marked().len();
+                self.say(match count {
+                    1 => "Selected the 1 photograph showing".to_string(),
+                    n => format!("Selected all {n} photographs showing"),
+                });
             }
             CullAction::ClearMarks => {
                 self.marked.clear();
@@ -1756,8 +1901,7 @@ impl Library {
                 // Out of the comparison, and the cursor lands on whatever is
                 // still in it — which is what makes this a winnowing rather
                 // than a survey you have to leave and re-enter.
-                if let Some(at) = self.marked.iter().position(|marked| *marked == id) {
-                    self.marked.remove(at);
+                if self.marked.remove(id) {
                     let shown = self.marked();
                     // The nearest one still being compared, forward first. The
                     // judged frame may also have left the filter, in which case
@@ -1806,8 +1950,8 @@ impl Library {
                     // has to restore the comparison — otherwise the key that
                     // reverses a mistake leaves you looking at a comparison the
                     // mistake is missing from.
-                    if !self.marked.is_empty() && !self.marked.contains(&image) {
-                        self.marked.push(image);
+                    if !self.marked.is_empty() {
+                        self.marked.insert(image);
                     }
                     if let Some(index) = self.position_of(image) {
                         self.go(index);
@@ -1998,7 +2142,7 @@ impl Library {
             undoable: !self.undo.is_empty(),
             copied: self.copied.is_some(),
             marked: self.marked().len(),
-            is_marked: self.marked.contains(&image.id),
+            is_marked: self.marked.contains(image.id),
             mode: crate::mode_name(),
             workspace: crate::workspace_name(),
             // Two seeks, measured at 2.5 and 5.7 µs and flat to twenty thousand
@@ -2851,6 +2995,89 @@ pub(crate) mod tests {
         assert_eq!(wanted.len(), 1);
         assert_eq!(wanted[0].image_id, first);
         assert_eq!(wanted[0].missing, previews::Level::BULK.to_vec());
+    }
+
+    #[test]
+    fn a_range_is_what_can_be_seen_between_its_two_ends() {
+        let dir = Scratch::new("select-range");
+        let mut library = library_at(&dir.0, 8);
+        let ids = library.shown_ids();
+
+        // Click the second, Shift-click the fifth: four photographs.
+        library.select(1);
+        library.select_to(4);
+        assert_eq!(library.selected_ids(), ids[1..=4].to_vec());
+        assert_eq!(library.index(), 4, "and the far end is the active one");
+        // Shift-click again measures from the same anchor, backwards this time,
+        // and adds: a range must not drop what was chosen before it.
+        library.select_to(0);
+        assert_eq!(library.selected_ids(), ids[0..=4].to_vec());
+
+        // Ctrl-click lets one go, and picks up another, and moves the anchor.
+        library.toggle_at(2);
+        library.toggle_at(7);
+        let mut expected = vec![ids[0], ids[1], ids[3], ids[4], ids[7]];
+        assert_eq!(library.selected_ids(), expected);
+        library.select_to(6);
+        expected.insert(4, ids[6]);
+        assert_eq!(library.selected_ids(), expected, "from the last Ctrl-click");
+        assert_eq!(
+            library.take_said().as_deref(),
+            Some("6 photographs selected")
+        );
+    }
+
+    #[test]
+    fn a_range_across_a_filter_takes_what_is_showing_and_nothing_hidden() {
+        let dir = Scratch::new("select-filtered");
+        let mut library = library_at(&dir.0, 6);
+        let ids = library.shown_ids();
+        // Pick the first, third and sixth, and show only the picks.
+        for index in [0, 2, 5] {
+            library.select(index);
+            library.act(CullAction::Pick).unwrap();
+        }
+        library.act(CullAction::SetFilter(picks())).unwrap();
+        assert_eq!(library.shown_ids(), vec![ids[0], ids[2], ids[5]]);
+
+        library.select(0);
+        library.select_to(2);
+        assert_eq!(library.selected_ids(), vec![ids[0], ids[2], ids[5]]);
+        // The two between them that the filter hides were never selected:
+        // clearing the filter shows three selected, not six.
+        library
+            .act(CullAction::SetFilter(Filter::default()))
+            .unwrap();
+        assert_eq!(library.selected_ids(), vec![ids[0], ids[2], ids[5]]);
+    }
+
+    #[test]
+    fn everything_showing_can_be_selected_at_once_and_a_cell_knows_it() {
+        let dir = Scratch::new("select-all");
+        let mut library = library_at(&dir.0, 4);
+        library.select(1);
+        library.act(CullAction::Rate(3)).unwrap();
+        library.select(2);
+        library.act(CullAction::Reject).unwrap();
+
+        let view = library.act(CullAction::SelectAll).unwrap();
+        assert_eq!(view.marked, 4);
+        assert_eq!(
+            view.said.as_deref(),
+            Some("Selected all 4 photographs showing")
+        );
+
+        let facts = library.cell_facts(&[2, 1, 99]).unwrap();
+        assert!(facts[0].selected && facts[1].selected);
+        assert_eq!(facts[0].flag, Some(Flag::Reject));
+        assert_eq!(
+            facts[1].rating, 3,
+            "in the order asked for, not the catalog's"
+        );
+        assert_eq!(facts[2], CellFacts::default(), "a slot with nothing in it");
+
+        library.act(CullAction::ClearMarks).unwrap();
+        assert!(!library.cell_facts(&[1]).unwrap()[0].selected);
     }
 
     #[test]

@@ -52,6 +52,9 @@ what a contributor would otherwise undo.
 | **I28** | Looking is not changing | `Session::set_compare`: before/after and a section's eye redraw the canvas and touch nothing — not the edit, the history, or the generation the autosave watches. |
 | **I29** | A key may belong to two commands only if one is the Library's and one is Develop's | `\` is the filter in the Library and before/after in Develop. |
 | **I30** | The chrome is neutral, and said once | Colour tokens on `:root`; R = G = B in every grey. 11 px is retired. |
+| **I31** | Active is a frame round the slot; selected is a ground behind it and a tick | Two things shown two ways, so a photograph that is both looks like both — and the pick's edge is no longer hidden on the one frame being looked at. |
+| **I32** | The marks on a cell are drawn, not typeset | Distance functions rasterised on the CPU, one texture per mark per size, composited by a third pipeline. No font on the GPU side (Q7). |
+| **I33** | Shift-click and Ctrl-click mean what a file manager's do | A range is over what is *showing*, and adds. A plain click moves the active photograph and leaves the selection alone. |
 | **I21** | New never replaces a catalog, and only `--new` makes one | The picker's "replace?" is a question about a file. Without `--new`, a path that is not there is refused, not created. |
 
 ## I1 — one status line
@@ -691,6 +694,70 @@ used in small areas. The slider's fill is grey on purpose. 11 px is retired;
 renderer's black, and Q6's choice of surround (black, dark, mid-grey, white)
 is not built. `-moz-` slider styling is minimal: no webview here is Gecko.
 
+## I31 — active, and selected
+
+F09: selection had three concepts and one of them had no picture. Selecting a
+photograph (`M`) drew *nothing* in the grid; the only trace was "3 selected" in
+small grey type. And the active photograph's white edge was drawn **on** the
+thumbnail, where it replaced the pick's cyan edge — so the one frame whose flag
+could not be seen was the one being looked at.
+
+**Active** is now a bright frame round the *slot*, in the gap between cells.
+**Selected** is a lighter ground behind the slot and a tick in its corner. A
+cell that is both shows both, and the photograph keeps its own edges: cyan for
+a pick, the label's colour inside it.
+
+A cell is drawn in three layers — grounds, photographs, marks — because a cell
+overwrites what is under it and a mark does not.
+
+Not in a survey: everything in one is selected, which is what a survey is *of*,
+so marking it would be a grey slab behind every frame and a tick on all of them.
+
+The survey's bleed-through (F17) — slivers of grid thumbnails at the edges —
+went when the grid started clearing before it drew (`468daad`). Confirmed here.
+
+## I32 — the marks are drawn, not typeset
+
+Stars, a flag for a pick, a cross for a reject, a tick for selected, two frames
+for a virtual copy. The owner's Q7: no text on the GPU side; a glyph atlas is a
+shaping question and a dependency under the licence gate, for five shapes. Each
+is a signed-distance function in `rawkit_engine::glyphs`, rasterised on the CPU
+at the size it is drawn — coverage is how far inside the edge a pixel's centre
+is — so they are sharp at any cell size and tested without a device.
+
+Every mark has a dark rim baked in, because they sit on photographs and a white
+star on a white sky is no star. Straight alpha, light inside, near-black round
+it; the shader's one tint colours the mark and leaves the rim dark.
+
+A rating is **one** texture as wide as its stars, not five cells: at the
+smallest cell size a thousand photographs are on screen. Marks are a tenth of
+the cell, never under ten pixels or over twenty-eight, and sit in the *slot's*
+corners rather than the photograph's, so they line up down a column of mixed
+orientations. `Cell::sprite` draws one: the image's alpha is its coverage, and a
+third pipeline composites it (premultiplied) where every other cell overwrites.
+
+What a cell carries comes from one query for the page (`Library::cell_facts`).
+It was one query per cell per frame.
+
+## I33 — Shift-click, Ctrl-click, Ctrl+A
+
+The file manager's gestures, which is why nobody has to be told them.
+Ctrl-click makes a photograph active and selects it or lets it go. Shift-click
+selects everything **showing** from the anchor to there — so a range across a
+filter takes what can be seen between its ends and nothing hidden — and *adds*:
+extending a range must not drop three picked out by hand before it. The anchor
+is the last photograph clicked or toggled without Shift. `Ctrl+A` selects all
+that is showing; `Ctrl+D` lets go.
+
+A plain click moves the active photograph and **leaves the selection alone**,
+which is not what a file manager does. Here a selection is built deliberately,
+with a key, often over minutes; a click to look at something should not be able
+to throw it away.
+
+The selection is a list and a set (`Selected`): the list keeps the order a
+survey and an export show things in, and the set answers "is this one?" for a
+thousand cells sixty times a second without walking twenty thousand ids.
+
 ## If you change this
 
 | If you touch… | …this will tell you |
@@ -722,6 +789,10 @@ is not built. `-moz-` slider styling is minimal: no webview here is Gecko.
 | what a part covers | `a_part_is_what_a_person_thinks_of_as_one_thing`. A new field of the edit belongs to a `Part`, or before/after will not clear it |
 | two commands on one key | the registry throws at load unless the scopes are `library` and `develop`; a load failure is on the status line |
 | a colour in the stylesheet | it is a token, or it is data (a band swatch, a label colour, a histogram channel) |
+| what a mark looks like | `rawkit_engine::glyphs` tests — lit at ten pixels, a dark opaque rim, nothing at the corners; and `a_mark_is_laid_over_a_thumbnail_and_the_thumbnail_shows_through_its_holes` on a GPU |
+| what Shift-click and Ctrl-click select | `a_range_is_what_can_be_seen_between_its_two_ends`, `a_range_across_a_filter_takes_what_is_showing_and_nothing_hidden` |
+| what a cell is told about its photograph | `everything_showing_can_be_selected_at_once_and_a_cell_knows_it` — in the order asked, and one query |
+| the order a cell's layers are drawn in | nothing automatic. Grounds, photographs, marks: a ground drawn after a photograph covers it |
 | what a launch opens | `what_is_named_is_what_opens`, `with_nothing_named_the_last_catalog_comes_back`, `a_catalog_that_was_closed_stays_closed`, `the_test_pattern_has_to_be_asked_for` |
 | the recent list | `the_last_one_opened_comes_first_and_is_listed_once`, `only_so_many_are_kept`, `a_bare_launch_reopens_the_last_one_only_if_it_is_there`, `a_list_that_cannot_be_read_is_an_empty_one` |
 | anything in `setup`, or in the navigation block of `tick` | nothing automatic. **No `?` on anything a missing file, a bad catalog or a corrupt preview can reach.** Check by hand with `target/scratch`-style catalogs whose files have been renamed |

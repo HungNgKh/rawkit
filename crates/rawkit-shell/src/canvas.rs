@@ -325,6 +325,8 @@ pub fn attach_input(
                 crate::pointer::Pointer::Press {
                     at,
                     double: event.event_type() == gtk::gdk::EventType::DoubleButtonPress,
+                    extend: event.state().contains(gtk::gdk::ModifierType::SHIFT_MASK),
+                    toggle: event.state().contains(gtk::gdk::ModifierType::CONTROL_MASK),
                 },
                 &pressed,
             );

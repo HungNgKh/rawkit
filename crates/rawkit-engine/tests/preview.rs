@@ -168,6 +168,7 @@ fn a_grid_puts_each_cell_where_it_was_told_and_tints_it() {
                 inner: ([0.0; 3], 0.0),
                 alpha: 1.0,
                 round: false,
+                sprite: false,
             },
             // A third the brightness, the way a rejected frame is drawn.
             rawkit_engine::Cell {
@@ -178,6 +179,7 @@ fn a_grid_puts_each_cell_where_it_was_told_and_tints_it() {
                 inner: ([0.0; 3], 0.0),
                 alpha: 1.0,
                 round: false,
+                sprite: false,
             },
         ],
     );
@@ -193,6 +195,72 @@ fn a_grid_puts_each_cell_where_it_was_told_and_tints_it() {
     // The two cells the grid was not given stay background.
     assert!(at(24, 8) < 0.05, "nothing was drawn top right");
     assert!(at(8, 24) < 0.05, "nothing was drawn bottom left");
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn a_mark_is_laid_over_a_thumbnail_and_the_thumbnail_shows_through_its_holes() {
+    // Every other cell overwrites. A badge that did would be a black square
+    // with a star in it, on top of the photograph it is about.
+    let Some(gpu) = gpu() else { return };
+    let renderer = Renderer::new(&gpu);
+    let blit = PreviewBlit::new(&gpu);
+    let canvas = renderer.create_canvas(&gpu, 32, 32);
+
+    let photograph = blit.upload(&gpu, &flat(255, 4, 4), 4, 4).expect("upload");
+    // Left half opaque white, right half fully transparent.
+    let mut half = Vec::new();
+    for _ in 0..4 {
+        for x in 0..4 {
+            half.extend_from_slice(&[255, 255, 255, if x < 2 { 255 } else { 0 }]);
+        }
+    }
+    let mark = blit.upload(&gpu, &half, 4, 4).expect("upload");
+    blit.draw_grid(
+        &gpu,
+        &canvas,
+        &[
+            rawkit_engine::Cell {
+                image: &photograph,
+                dest: [0, 0, 32, 32],
+                tint: [0.5, 0.5, 0.5],
+                edge: ([0.0; 3], 0.0),
+                inner: ([0.0; 3], 0.0),
+                alpha: 1.0,
+                round: false,
+                sprite: false,
+            },
+            rawkit_engine::Cell {
+                image: &mark,
+                dest: [0, 0, 32, 32],
+                // Gold, as a rating is.
+                tint: [1.0, 0.5, 0.0],
+                edge: ([0.0; 3], 0.0),
+                inner: ([0.0; 3], 0.0),
+                alpha: 1.0,
+                round: false,
+                sprite: true,
+            },
+        ],
+    );
+
+    let pixels = canvas.read_back(&gpu).expect("read back");
+    let at = |x: usize, y: usize| {
+        let i = (y * 32 + x) * 4;
+        [pixels[i], pixels[i + 1], pixels[i + 2]]
+    };
+    let on_the_mark = at(4, 16);
+    assert!(
+        (on_the_mark[0] - 1.0).abs() < 0.02
+            && (on_the_mark[1] - 0.5).abs() < 0.02
+            && on_the_mark[2] < 0.02,
+        "where the mark is opaque it is the tint: {on_the_mark:?}"
+    );
+    let through_the_hole = at(28, 16);
+    assert!(
+        through_the_hole.iter().all(|c| (c - 0.5).abs() < 0.02),
+        "where it is transparent the photograph is untouched: {through_the_hole:?}"
+    );
 }
 
 #[test]
@@ -230,6 +298,7 @@ fn a_cell_hanging_off_the_edge_is_cropped_rather_than_squashed() {
             inner: ([0.0; 3], 0.0),
             alpha: 1.0,
             round: false,
+            sprite: false,
         }],
     );
     let pixels = canvas.read_back(&gpu).expect("read back");
@@ -266,6 +335,7 @@ fn a_flag_and_a_colour_label_can_be_shown_at_once() {
             inner: ([1.0, 0.0, 0.0], 4.0),
             alpha: 1.0,
             round: false,
+            sprite: false,
         }],
     );
 
@@ -310,6 +380,7 @@ fn a_round_cell_draws_a_ring_and_leaves_the_middle_alone() {
             inner: ([0.0; 3], 0.0),
             alpha: 1.0,
             round: false,
+            sprite: false,
         }],
     );
     let before = canvas.read_back(&gpu).expect("read back");
@@ -325,6 +396,7 @@ fn a_round_cell_draws_a_ring_and_leaves_the_middle_alone() {
             inner: ([0.0; 3], 0.0),
             alpha: 1.0,
             round: true,
+            sprite: false,
         }],
     );
     let after = canvas.read_back(&gpu).expect("read back");
@@ -380,6 +452,7 @@ fn a_partly_covering_cell_lands_premultiplied_on_the_overlay() {
             inner: ([0.0; 3], 0.0),
             alpha: 0.55,
             round: false,
+            sprite: false,
         }],
     );
     let drawn = overlay.read_back(&gpu).expect("overlay read back");
@@ -434,6 +507,7 @@ fn an_opaque_cell_is_what_it_always_was() {
             inner: ([0.0; 3], 0.0),
             alpha: 1.0,
             round: false,
+            sprite: false,
         }],
     );
     let drawn = overlay.read_back(&gpu).expect("overlay read back");

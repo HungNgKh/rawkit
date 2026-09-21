@@ -26,6 +26,7 @@ use rawkit_editstate::EditState;
 pub mod aberration;
 pub mod calibrate;
 pub mod geometry;
+pub mod glyphs;
 pub mod guide;
 pub mod laplacian;
 pub mod mask;

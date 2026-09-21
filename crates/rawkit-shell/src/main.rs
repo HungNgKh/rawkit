@@ -959,16 +959,42 @@ struct Shelf(Option<Arc<Mutex<Library>>>);
 #[derive(serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PointerEvent {
-    Press { x: f64, y: f64, double: bool },
-    Motion { x: f64, y: f64 },
+    Press {
+        x: f64,
+        y: f64,
+        double: bool,
+        #[serde(default)]
+        shift: bool,
+        #[serde(default)]
+        ctrl: bool,
+    },
+    Motion {
+        x: f64,
+        y: f64,
+    },
     Release,
-    Scroll { x: f64, y: f64, notches: f64 },
+    Scroll {
+        x: f64,
+        y: f64,
+        notches: f64,
+    },
 }
 
 #[tauri::command]
 fn canvas_pointer(state: tauri::State<'_, Shared>, event: PointerEvent) {
     let routed = match event {
-        PointerEvent::Press { x, y, double } => pointer::Pointer::Press { at: [x, y], double },
+        PointerEvent::Press {
+            x,
+            y,
+            double,
+            shift,
+            ctrl,
+        } => pointer::Pointer::Press {
+            at: [x, y],
+            double,
+            extend: shift,
+            toggle: ctrl,
+        },
         PointerEvent::Motion { x, y } => pointer::Pointer::Motion { at: [x, y] },
         PointerEvent::Release => pointer::Pointer::Release,
         PointerEvent::Scroll { x, y, notches } => pointer::Pointer::Scroll {
@@ -2078,6 +2104,7 @@ fn main() -> Result<()> {
                 cells: std::collections::HashMap::new(),
                 absent: std::collections::HashSet::new(),
                 wanting: Vec::new(),
+                marks: std::collections::HashMap::new(),
                 scroll: 0.0,
                 followed: None,
             };
@@ -5135,7 +5162,16 @@ fn pick_white_balance(armed: bool) -> Result<bool, String> {
     Ok(armed)
 }
 
-pub(crate) static CANVAS_CLICK: Mutex<Option<([f64; 2], bool)>> = Mutex::new(None);
+pub(crate) static CANVAS_CLICK: Mutex<Option<Click>> = Mutex::new(None);
+
+/// A press on the grid: where, and what was held down with it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Click {
+    pub at: [f64; 2],
+    pub double: bool,
+    pub extend: bool,
+    pub toggle: bool,
+}
 /// Wheel notches since the last frame, positive downwards.
 pub(crate) static CANVAS_SCROLL: std::sync::atomic::AtomicI32 =
     std::sync::atomic::AtomicI32::new(0);
@@ -5639,6 +5675,10 @@ struct Grid {
     /// do next: the point of building in the background is lost on somebody
     /// watching placeholders while the far end of the library fills in.
     wanting: Vec<i64>,
+    /// The marks a cell carries — stars, a flag, a tick — drawn once per size
+    /// and kept on the GPU. See [`rawkit_engine::glyphs`].
+    marks:
+        std::collections::HashMap<(rawkit_engine::glyphs::Mark, u32), rawkit_engine::PreviewImage>,
     /// Vertical offset in canvas pixels.
     scroll: f64,
     /// The selection, column count, canvas height and number of cells the view
@@ -5774,8 +5814,12 @@ fn draw_grid(
         grid.scroll += notches as f64 * pitch_y * 0.5;
     }
 
-    // A click picks the cell under it; a double-click opens that cell.
-    if let Some(([x, y], double)) = CANVAS_CLICK.lock().expect("click lock").take() {
+    // A click makes the cell under it the active photograph; a double-click
+    // opens it. With Ctrl it is also selected or let go, and with Shift
+    // everything showing from the last plain click to here is selected — the
+    // file manager's two gestures, which is why nobody has to be told them.
+    if let Some(click) = CANVAS_CLICK.lock().expect("click lock").take() {
+        let [x, y] = click.at;
         let column = (x / pitch_x).floor() as i64;
         let row = ((y + grid.scroll - centring) / pitch_y).floor() as i64;
         if (0..columns as i64).contains(&column) && row >= 0 {
@@ -5783,10 +5827,19 @@ fn draw_grid(
             if let Some(&index) = shown.get(slot) {
                 selected = index;
                 let mut library = library.lock().expect("library lock");
-                library.select(index);
-                if double {
+                match (click.extend, click.toggle) {
+                    (true, _) => library.select_to(index),
+                    (false, true) => library.toggle_at(index),
+                    (false, false) => library.select(index),
+                }
+                if click.double {
                     library.reopen();
                     MODE.store(MODE_LOUPE, std::sync::atomic::Ordering::Relaxed);
+                }
+                // The click happened on the canvas, so no command carries the
+                // sentence back to the page.
+                if let Some(said) = library.take_said() {
+                    notice(said);
                 }
             }
         }
@@ -5883,13 +5936,64 @@ fn draw_grid(
         .take(building::NEAR)
         .collect();
 
-    let mut cells = Vec::new();
-    for (slot, &index) in shown
+    // What each visible photograph carries, in one query for the page. It was
+    // one per cell per frame.
+    let showing: Vec<(usize, usize)> = shown
         .iter()
+        .copied()
         .enumerate()
         .take(to.min(count))
         .skip(from.min(count))
-    {
+        .collect();
+    let indices: Vec<usize> = showing.iter().map(|(_, index)| *index).collect();
+    let facts = library.lock().expect("library lock").cell_facts(&indices)?;
+
+    // Marks are sized with the cell, and drawn once per size: a tenth of the
+    // cell, no smaller than ten pixels — below that a star is a smudge — and no
+    // larger than twenty-eight, past which it stops being a badge.
+    let badge = (cell * 0.11).round().clamp(10.0, 28.0) as u32;
+    for fact in &facts {
+        use rawkit_engine::glyphs::Mark;
+        let wanted = [
+            fact.selected.then_some(Mark::Selected),
+            (fact.rating > 0).then_some(Mark::Stars(fact.rating.min(5))),
+            fact.copy.then_some(Mark::Copy),
+            match fact.flag {
+                Some(rawkit_catalog::cull::Flag::Pick) => Some(Mark::Pick),
+                Some(rawkit_catalog::cull::Flag::Reject) => Some(Mark::Reject),
+                None => None,
+            },
+        ];
+        for mark in wanted.into_iter().flatten() {
+            if let std::collections::hash_map::Entry::Vacant(slot) = grid.marks.entry((mark, badge))
+            {
+                let glyph = rawkit_engine::glyphs::rasterise(mark, badge);
+                slot.insert(blit.upload(gpu, &glyph.rgba, glyph.width, glyph.height)?);
+            }
+        }
+    }
+    // A cell size somebody passed through on the way to another leaves its
+    // marks behind; they are a few kilobytes each and there are six sizes of
+    // eighteen, but there is no reason to keep what is not being drawn.
+    grid.marks.retain(|(_, size), _| *size == badge);
+
+    // Three layers, because a cell overwrites what is under it and a mark does
+    // not: what is behind the photographs, the photographs, the marks on them.
+    let (mut grounds, mut photographs, mut marks) = (Vec::new(), Vec::new(), Vec::new());
+    // How far a ground reaches into the gap round a slot. Half the gap, so two
+    // neighbours meet and do not overlap.
+    let reach = (gap / 2.0).floor().max(2.0);
+    let flat = |colour: [f32; 3], dest: [i32; 4]| rawkit_engine::Cell {
+        image: blank,
+        dest,
+        tint: colour,
+        edge: ([0.0; 3], 0.0),
+        inner: ([0.0; 3], 0.0),
+        alpha: 1.0,
+        round: false,
+        sprite: false,
+    };
+    for ((slot, index), fact) in showing.iter().copied().zip(&facts) {
         // A photograph with no preview yet is still a photograph in the library,
         // and it gets its place: a flat slot the shape of a frame. It used to be
         // skipped, so a catalog nobody had built previews for was a black
@@ -5913,14 +6017,39 @@ fn draw_grid(
         let (w, h) = (iw * scale, ih * scale);
         let slot_x = gap / 2.0 + column as f64 * pitch_x;
         let slot_y = centring + gap / 2.0 + row as f64 * pitch_y - grid.scroll;
+        let around = |by: f64| {
+            [
+                (slot_x - by).round() as i32,
+                (slot_y - by).round() as i32,
+                (cell + by * 2.0).round() as i32,
+                (slot_h + by * 2.0).round() as i32,
+            ]
+        };
 
-        let (flag, label) = library
-            .lock()
-            .expect("library lock")
-            .flags_in(index, index + 1)?
-            .pop()
-            .unwrap_or((None, None));
-        let tint = match flag {
+        // **Active** is a bright frame round the slot, and **selected** is a
+        // lighter ground behind it. Two different things, shown two different
+        // ways, so that a selected photograph that is also the active one looks
+        // like both. The frame used to be an edge drawn *on* the photograph,
+        // where it replaced the pick's cyan edge: the one frame whose flag could
+        // not be seen was the one being looked at.
+        //
+        // Not in a survey. Everything in one is selected — that is what a survey
+        // is of — so marking it would be a grey slab behind every frame and a
+        // tick on all of them, saying nothing.
+        let chosen = fact.selected && !survey;
+        let ground = if chosen {
+            [0.10, 0.10, 0.10]
+        } else {
+            [0.012, 0.012, 0.012]
+        };
+        if index == selected {
+            grounds.push(flat([0.9, 0.9, 0.9], around(reach)));
+            grounds.push(flat(ground, around(reach - reach.min(3.0))));
+        } else if chosen {
+            grounds.push(flat(ground, around(reach)));
+        }
+
+        let tint = match fact.flag {
             // The placeholder is a white texel, so its tint is its colour: a
             // grey a step above the surround, and neutral, because it sits
             // beside photographs being judged for colour. A rejected one is
@@ -5936,26 +6065,21 @@ fn draw_grid(
             Some(rawkit_catalog::cull::Flag::Reject) => [0.33, 0.33, 0.33],
             _ => [1.0, 1.0, 1.0],
         };
-        let edge = if index == selected {
-            ([0.95, 0.95, 0.98], 3.0)
-        } else {
-            match flag {
-                // Cyan, and deliberately not green: green is one of the four
-                // colour labels, so a green edge made a picked frame and a
-                // green-labelled one look identical. Selection is white, labels
-                // are red/yellow/green/blue, and a flag needs a hue of its own.
-                Some(rawkit_catalog::cull::Flag::Pick) => ([0.16, 0.58, 0.64], 2.0),
-                _ => ([0.0; 3], 0.0),
-            }
+        // Cyan, and deliberately not green: green is one of the four colour
+        // labels, so a green edge made a picked frame and a green-labelled one
+        // look identical. Labels are red/yellow/green/blue, and a flag needs a
+        // hue of its own.
+        let edge = match fact.flag {
+            Some(rawkit_catalog::cull::Flag::Pick) => ([0.16, 0.58, 0.64], 2.0),
+            _ => ([0.0; 3], 0.0),
         };
-
-        let inner = label
+        let inner = fact
+            .label
             .as_deref()
             .and_then(label_colour)
             .map(|colour| (colour, 3.0))
             .unwrap_or(([0.0; 3], 0.0));
-
-        cells.push(rawkit_engine::Cell {
+        photographs.push(rawkit_engine::Cell {
             image,
             dest: [
                 (slot_x + (cell - w) / 2.0).round() as i32,
@@ -5968,8 +6092,75 @@ fn draw_grid(
             inner,
             alpha: 1.0,
             round: false,
+            sprite: false,
         });
+
+        // The marks, in the slot's four corners rather than the photograph's:
+        // a portrait frame is narrower than its slot, and marks that followed
+        // the photograph would not line up down a column.
+        use rawkit_engine::glyphs::Mark;
+        let size = badge as f64;
+        let margin = (size * 0.3).round();
+        let mut mark = |what: Mark, tint: [f32; 3], right: bool, bottom: bool| {
+            let Some(image) = grid.marks.get(&(what, badge)) else {
+                return;
+            };
+            let width = image.width as f64;
+            let x = if right {
+                slot_x + cell - margin - width
+            } else {
+                slot_x + margin
+            };
+            let y = if bottom {
+                slot_y + slot_h - margin - size
+            } else {
+                slot_y + margin
+            };
+            marks.push(rawkit_engine::Cell {
+                image,
+                dest: [
+                    x.round() as i32,
+                    y.round() as i32,
+                    image.width as i32,
+                    image.height as i32,
+                ],
+                tint,
+                edge: ([0.0; 3], 0.0),
+                inner: ([0.0; 3], 0.0),
+                alpha: 1.0,
+                round: false,
+                sprite: true,
+            });
+        };
+        match fact.flag {
+            Some(rawkit_catalog::cull::Flag::Pick) => {
+                mark(Mark::Pick, [0.16, 0.58, 0.64], false, false)
+            }
+            Some(rawkit_catalog::cull::Flag::Reject) => {
+                mark(Mark::Reject, [0.87, 0.23, 0.19], false, false)
+            }
+            None => {}
+        }
+        if chosen {
+            mark(Mark::Selected, [1.0, 1.0, 1.0], true, false);
+        }
+        if fact.rating > 0 {
+            mark(
+                Mark::Stars(fact.rating.min(5)),
+                [0.79, 0.55, 0.11],
+                false,
+                true,
+            );
+        }
+        if fact.copy {
+            mark(Mark::Copy, [1.0, 1.0, 1.0], true, true);
+        }
     }
+    let cells: Vec<rawkit_engine::Cell> = grounds
+        .into_iter()
+        .chain(photographs)
+        .chain(marks)
+        .collect();
 
     let drawn = cells.len();
     // Cleared first, which `draw_over` does not do. It was `draw_over` for a
@@ -6502,6 +6693,7 @@ fn draw_crop(
         inner: ([0.0; 3], 0.0),
         alpha: CROP_DIM,
         round: false,
+        sprite: false,
     };
     // Four bands that do not overlap: a cell replaces rather than blends, so
     // overlapping ones would darken twice where they met.
@@ -6520,6 +6712,7 @@ fn draw_crop(
         inner: ([0.0; 3], 0.0),
         alpha,
         round: false,
+        sprite: false,
     };
     // Two *screen* pixels whatever the zoom: in canvas pixels the same line
     // thins out as you zoom away, and at fit on a 24 MP frame it came to one.
@@ -6556,6 +6749,7 @@ fn draw_crop(
             inner: ([0.0; 3], 0.0),
             alpha: 1.0,
             round: false,
+            sprite: false,
         });
     }
     *CROP_SCREEN.lock().expect("crop screen lock") = Some(screen);
@@ -6924,6 +7118,7 @@ fn draw_mask_handles(
             inner: ([0.0; 3], 0.0),
             alpha: 1.0,
             round: false,
+            sprite: false,
         });
     }
     *MASK_HANDLES.lock().expect("mask handles lock") = published;
@@ -7015,6 +7210,7 @@ fn draw_spots(
             inner: ([0.0; 3], 0.0),
             alpha: 1.0,
             round: true,
+            sprite: false,
         });
     }
     blit.draw_over(gpu, canvas_renderer.overlay(), &cells);
@@ -8000,6 +8196,8 @@ mod radial_tests {
             crate::pointer::Pointer::Press {
                 at: [300.0, 200.0],
                 double: false,
+                extend: false,
+                toggle: false,
             },
             crate::pointer::Pointer::Motion { at: [500.0, 400.0] },
             crate::pointer::Pointer::Motion { at: [700.0, 600.0] },
@@ -8021,6 +8219,8 @@ mod radial_tests {
             crate::pointer::Pointer::Press {
                 at: [300.0, 200.0],
                 double: false,
+                extend: false,
+                toggle: false,
             },
             crate::pointer::Pointer::Motion { at: [500.0, 400.0] },
             crate::pointer::Pointer::Release,
@@ -8059,6 +8259,8 @@ mod radial_tests {
             crate::pointer::Pointer::Press {
                 at: [500.0, 400.0],
                 double: false,
+                extend: false,
+                toggle: false,
             },
             crate::pointer::Pointer::Motion { at: [700.0, 560.0] },
             crate::pointer::Pointer::Release,
@@ -8077,6 +8279,8 @@ mod radial_tests {
             crate::pointer::Pointer::Press {
                 at: [500.0, 400.0],
                 double: false,
+                extend: false,
+                toggle: false,
             },
             crate::pointer::Pointer::Motion { at: [502.0, 401.0] },
             crate::pointer::Pointer::Release,

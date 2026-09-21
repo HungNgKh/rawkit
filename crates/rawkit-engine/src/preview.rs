@@ -58,6 +58,15 @@ pub struct Cell<'a> {
     /// repaired. The interior is discarded rather than drawn, so what shows
     /// through the middle is the photograph and not a thumbnail.
     pub round: bool,
+    /// Draw the image as a *mark* rather than a photograph: its alpha is how
+    /// much of what is underneath it covers, so a star has a star's outline and
+    /// not a square's. Composited, where every other cell overwrites — which is
+    /// what lets a badge sit on a thumbnail with a soft edge. `tint` still
+    /// multiplies the colour; `edge` and `inner` are ignored.
+    ///
+    /// Only onto the canvas. The overlay is composited by the presenter and has
+    /// never needed marks with holes in them.
+    pub sprite: bool,
 }
 
 /// A preview uploaded to the GPU, ready to be drawn at any zoom.
@@ -115,6 +124,9 @@ pub struct PreviewBlit {
     /// than one, because a render pipeline names the format it writes to and
     /// wgpu will not accept a pass whose attachment disagrees.
     overlay_pipeline: wgpu::RenderPipeline,
+    /// The canvas pipeline again, composited rather than overwriting. See
+    /// [`Cell::sprite`].
+    sprite_pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     region: wgpu::Buffer,
@@ -169,7 +181,7 @@ impl PreviewBlit {
                 bind_group_layouts: &[Some(&layout)],
                 immediate_size: 0,
             });
-        let build = |format: wgpu::TextureFormat| {
+        let build = |format: wgpu::TextureFormat, blend: Option<wgpu::BlendState>| {
             gpu.device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some("preview"),
@@ -186,7 +198,7 @@ impl PreviewBlit {
                         compilation_options: Default::default(),
                         targets: &[Some(wgpu::ColorTargetState {
                             format,
-                            blend: None,
+                            blend,
                             write_mask: wgpu::ColorWrites::ALL,
                         })],
                     }),
@@ -201,8 +213,14 @@ impl PreviewBlit {
         // format above the whole of the conversion. The overlay: eight bits,
         // and the fragment shader returns an alpha of 1 for everything it does
         // not discard, so a cell lands opaque on a transparent layer.
-        let pipeline = build(CANVAS_FORMAT);
-        let overlay_pipeline = build(crate::render::OVERLAY_FORMAT);
+        let pipeline = build(CANVAS_FORMAT, None);
+        let overlay_pipeline = build(crate::render::OVERLAY_FORMAT, None);
+        // Marks, composited over what is there. Premultiplied, because that is
+        // what the shader returns for everything.
+        let sprite_pipeline = build(
+            CANVAS_FORMAT,
+            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+        );
 
         let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("preview"),
@@ -226,6 +244,7 @@ impl PreviewBlit {
         Self {
             pipeline,
             overlay_pipeline,
+            sprite_pipeline,
             layout,
             sampler,
             region,
@@ -383,7 +402,7 @@ impl PreviewBlit {
             ]);
             regions[at + 16..at + 20].copy_from_slice(&[
                 if cell.round { 1.0 } else { 0.0 },
-                0.0,
+                if cell.sprite { 1.0 } else { 0.0 },
                 0.0,
                 0.0,
             ]);
@@ -472,12 +491,22 @@ impl PreviewBlit {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(if target.format() == CANVAS_FORMAT {
+            let on_canvas = target.format() == CANVAS_FORMAT;
+            let plain = if on_canvas {
                 &self.pipeline
             } else {
                 &self.overlay_pipeline
-            });
-            for (group, ([x, y, w, h], _)) in groups.iter().zip(&placed) {
+            };
+            pass.set_pipeline(plain);
+            let mut composited = false;
+            for (group, ([x, y, w, h], index)) in groups.iter().zip(&placed) {
+                // Switched only when it changes. A grid draws every photograph
+                // and then every mark, so that is twice a frame.
+                let sprite = cells[*index].sprite && on_canvas;
+                if sprite != composited {
+                    pass.set_pipeline(if sprite { &self.sprite_pipeline } else { plain });
+                    composited = sprite;
+                }
                 // The viewport maps the triangle onto the cell; the scissor stops
                 // the oversized part of it reaching anything else.
                 pass.set_viewport(*x as f32, *y as f32, *w as f32, *h as f32, 0.0, 1.0);

@@ -28,6 +28,10 @@ pub(crate) enum Pointer {
     Press {
         at: [f64; 2],
         double: bool,
+        /// Shift was down: extend the selection to here.
+        extend: bool,
+        /// Ctrl was down (Command on a Mac): select this one, or let it go.
+        toggle: bool,
     },
     Motion {
         at: [f64; 2],
@@ -87,7 +91,12 @@ const ZOOM_STEP: f64 = 1.15;
 
 pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
     match event {
-        Pointer::Press { at, double } => {
+        Pointer::Press {
+            at,
+            double,
+            extend,
+            toggle,
+        } => {
             // A white-balance pick is a click rather than a drag: it takes the
             // press, resolves on the next frame, and does not start a pan.
             if picking_wb() && !in_grid() {
@@ -174,7 +183,12 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
                 // The grid works out *which cell* this is, because it is the
                 // only place that knows the layout. Everything here does is say
                 // where the pointer was.
-                *CANVAS_CLICK.lock().expect("click lock") = Some((at, double));
+                *CANVAS_CLICK.lock().expect("click lock") = Some(crate::Click {
+                    at,
+                    double,
+                    extend,
+                    toggle,
+                });
             }
             *DRAG.lock().expect("drag lock") = Some(at);
         }

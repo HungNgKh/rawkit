@@ -31,7 +31,12 @@ struct Region {
     // `.x` above a half draws the cell as a ring inscribed in its rectangle and
     // discards everything else, so the photograph shows through the middle. For
     // the spot tool, where the marker has to show the radius it stands for and a
-    // square would claim the wrong area. `.yzw` unused.
+    // square would claim the wrong area.
+    //
+    // `.y` above a half draws the image as a *mark*: its alpha is its coverage,
+    // and the pipeline it is drawn with composites rather than overwrites. A
+    // star, a flag, a tick — shapes with holes, laid over a thumbnail. `.zw`
+    // unused.
     ring: vec4<f32>,
 }
 
@@ -73,6 +78,14 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
             discard;
         }
         return vec4<f32>(region.edge.rgb * a, a);
+    }
+    if (region.ring.y > 0.5) {
+        // Premultiplied like everything else here. The texture is decoded to
+        // linear by the sampler, so a mark's own colours — a white glyph with a
+        // dark rim baked round it — arrive ready to be tinted.
+        let mark = textureSample(image, image_sampler, cell);
+        let cover = mark.a * a;
+        return vec4<f32>(mark.rgb * region.tint.rgb * cover, cover);
     }
     // The edge is drawn in the cell's own rectangle rather than as extra
     // geometry, so selection and flags cost no draw calls and no second
