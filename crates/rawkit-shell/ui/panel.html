@@ -414,6 +414,7 @@
   #failed:not(.hidden) + #said { display: none; }
   #failed::after { content: "  dismiss"; color: var(--text-tertiary); }
   #failed.hidden, #job.hidden { display: none; }
+  #said-undo { margin-left: 10px; font-size: 12px; padding: 0 8px; line-height: 18px; }
   #job { flex: 0 1 auto; min-width: 0; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
   #job #job-text { overflow: hidden; text-overflow: ellipsis; }
   #keys { color: var(--text-tertiary); font-size: 12px; line-height: 1.7; }
@@ -457,6 +458,12 @@
   .tree .twisty:empty { visibility: hidden; }
   #left .saved button.pick { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
   #left .saved button.pick .name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .history { list-style: none; margin: 4px 0 0; padding: 0; }
+  .history button { display: block; width: 100%; text-align: left; background: none; border: 1px solid transparent;
+                     border-radius: 4px; padding: 2px 6px; color: var(--text-secondary); }
+  .history button:hover { background: var(--ground-raised); }
+  .history button.now { color: var(--text-primary); border-color: var(--focus); }
+  .history button.undone { color: var(--text-disabled); }
   #collection-search { width: 100%; box-sizing: border-box; margin: 2px 0 4px; }
   #left details > summary { padding-top: 12px; padding-bottom: 8px; }
 
@@ -726,6 +733,14 @@
       <input id="snapshot-name" type="text" placeholder="Name this state" maxlength="60">
       <button id="snapshot-take">Take</button>
     </div>
+  </details>
+  <!-- The visible half of undo: every step this photograph's edit has taken
+       in this sitting, the one in force marked, the ones undo took back still
+       listed until something new replaces them. Snapshots, above, are the
+       named places kept for good. -->
+  <details id="s-history" class="develop-only" open>
+    <summary>History</summary>
+    <ol class="history" id="history-list" reversed></ol>
   </details>
 </aside>
 
@@ -1003,7 +1018,7 @@
       </div>
       <div class="row" id="mask-brush-row">
         <button id="mask-erase">Erase</button>
-        <button id="mask-undo-stroke">Undo stroke</button>
+
       </div>
       <label id="mask-size-row"><span>Brush size</span>
         <input id="mask-size" type="range" min="0.005" max="0.4" step="0.005" value="0.08">
@@ -1133,6 +1148,7 @@
     <!-- An alert, so a failure is announced when it happens rather than found. -->
     <div id="failed" class="hidden" role="alert" title="click to dismiss"></div>
     <div id="said" role="status" aria-live="polite">ready</div>
+    <button id="said-undo" hidden>Undo</button>
   </div>
   <div id="job" class="hidden"><span id="job-text"></span><button id="job-stop" hidden>Stop</button></div>
 </footer>
@@ -1184,6 +1200,8 @@
     clearTimeout(fading);
     saidLine.className = level === "refused" ? "refused" : "";
     saidLine.textContent = text;
+    // What it offered to undo is no longer what was just said.
+    document.getElementById("said-undo").hidden = true;
     // News for a moment and then only a record. Dimmed rather than removed: a
     // line that empties itself makes you wonder what you missed.
     if (level !== "refused") fading = setTimeout(() => saidLine.classList.add("old"), 4000);
@@ -1781,6 +1799,7 @@
       // Reported rather than swallowed. A throw in here is invisible — there is
       // no console to watch — and one lived for a whole slice because of that.
       try { sync(s.state, s.image); } catch (e) { tell("failed", `the panel broke in sync: ${e && e.message || e}`); }
+      if (workspace === "develop") drawHistory();
     }
     // The division is the shell's answer, not ours: a window too narrow for
     // the width someone chose gets less, and the page finds out here.
@@ -2309,27 +2328,6 @@
   const snapshotName = document.getElementById("snapshot-name");
 
 
-  // Removing something saved takes two clicks, and the button says so in
-  // between. `confirm` would be the obvious answer and is the wrong one here:
-  // the three webviews do not agree about whether it opens at all, so a dialog
-  // that is a guard on one platform is a silent no-op on another.
-  const armDrop = (button, remove) => {
-    button.addEventListener("click", async () => {
-      if (!button.classList.contains("sure")) {
-        button.classList.add("sure");
-        button.textContent = "sure?";
-        // Disarmed again on its own, so a button left in the armed state cannot
-        // become a one-click delete for whoever comes back to the window.
-        setTimeout(() => {
-          button.classList.remove("sure");
-          button.textContent = "×";
-        }, 2500);
-        return;
-      }
-      try { await remove(); } catch (e) { say(e); }
-    });
-  };
-
   const savedRow = (name, note, open, remove) => {
     const li = document.createElement("li");
     const pick = document.createElement("button");
@@ -2340,8 +2338,12 @@
     const drop = document.createElement("button");
     drop.className = "drop";
     drop.textContent = "×";
-    drop.title = `forget ${name}`;
-    armDrop(drop, remove);
+    // One click. It used to take two, with "sure?" in between and a timer that
+    // disarmed it — timing-dependent, and inconsistent with a collection, which
+    // was guarded and undoable. Every one of these can be undone now, so the
+    // guard is the Undo beside the sentence that says it went.
+    drop.title = `delete ${name} — Undo brings it back`;
+    drop.addEventListener("click", () => { drop.blur(); remove(); });
     li.append(pick, drop);
     return li;
   };
@@ -2355,7 +2357,7 @@
         `carries ${preset.groups.join(", ")}`,
         () => invoke("apply_preset", { name: preset.name }).catch(say),
         async () => {
-          await invoke("forget_preset", { name: preset.name });
+          await act("forget_preset", preset.name);
           refreshPresets();
         },
       )));
@@ -2371,7 +2373,7 @@
         `edit version ${snap.version}`,
         () => invoke("restore_snapshot", { name: snap.name }).catch(say),
         async () => {
-          await invoke("forget_snapshot", { name: snap.name });
+          await act("forget_snapshot", snap.name);
           refreshSnapshots();
         },
       )));
@@ -2881,9 +2883,6 @@
   document.getElementById("mask-erase").addEventListener("click", () => {
     invoke("set_brush", { erase: !erasing }).catch(say);
   });
-  document.getElementById("mask-undo-stroke").addEventListener("click", () => {
-    invoke("undo_stroke").then(left => say(`${left} stroke${left === 1 ? "" : "s"} left`)).catch(say);
-  });
   document.getElementById("mask-size").addEventListener("input", (e) => {
     invoke("set_brush", { radius: Number(e.target.value) }).catch(say);
   });
@@ -2919,6 +2918,62 @@
       invoke("set_mask", { index: selected, control, value: Number(e.target.value) }).catch(say);
     });
   }
+
+  // ---- History ----------------------------------------------------------------
+  //
+  // The session names each step by the command that made it; these are the
+  // words for them. A command missing here shows as its own name rather than as
+  // nothing, so a new one is visible in the list the day it arrives.
+  const STEP_WORDS = {
+    set_exposure: "Exposure", set_contrast: "Contrast", set_highlights: "Highlights",
+    set_shadows: "Shadows", set_whites: "Whites", set_blacks: "Blacks",
+    set_perspective: "Perspective", set_effect: "Effects", set_calibration: "Calibration",
+    set_lens_vignette: "Lens vignetting", set_clarity: "Clarity", set_texture: "Texture",
+    set_dehaze: "Dehaze", set_temperature: "Temperature", set_tint: "Tint",
+    set_orientation: "Rotate", set_crop: "Crop", set_sharpen: "Sharpening",
+    set_sharpen_radius: "Sharpening radius", set_chroma_noise: "Colour noise",
+    set_defringe: "Colour fringing", set_lens: "Lens correction",
+    set_distortion_amount: "Distortion", set_luminance_noise: "Luminance noise",
+    set_saturation: "Saturation", set_vibrance: "Vibrance", set_hsl: "Colour mixer",
+    set_curve: "Tone curve", set_grade: "Colour grading", set_masks: "Local adjustment",
+    set_spots: "Spot removal", set_straighten: "Straighten", rotate_by: "Rotate",
+    set_edit_state: "Preset, snapshot or reset",
+    changed_elsewhere: "Changed in Library",
+  };
+  const historyList = document.getElementById("history-list");
+  let historyDrawn = "";
+  const drawHistory = async () => {
+    let history;
+    try { history = await invoke("history"); } catch (e) { return; }
+    const key = `${history.at}|${history.steps.join(",")}`;
+    if (key === historyDrawn) return;
+    historyDrawn = key;
+    // Newest first, "Opened" last: the list reads down from where you are.
+    const rows = ["Opened", ...history.steps.map(step => STEP_WORDS[step] ?? step)]
+      .map((words, at) => {
+        const li = document.createElement("li");
+        const button = document.createElement("button");
+        button.textContent = words;
+        button.classList.toggle("now", at === history.at);
+        button.classList.toggle("undone", at > history.at);
+        button.title = at > history.at ? "taken back; redo, or click, to put it back"
+          : at === history.at ? "where the edit is now" : "go back to here";
+        button.addEventListener("click", () => {
+          button.blur();
+          invoke("history_go", { to: at }).catch(say);
+        });
+        li.append(button);
+        return li;
+      });
+    historyList.replaceChildren(...rows.reverse());
+  };
+
+  // A control in the right column taken hold of starts a new undo step, so two
+  // drags of one slider are two presses of undo and not one. The session cannot
+  // tell a let-go from a pause; the page can.
+  document.getElementById("chrome").addEventListener("pointerdown", () => {
+    invoke("end_step").catch(() => {});
+  }, true);
 
   // ---- The divider ---------------------------------------------------------
   //
@@ -3063,6 +3118,8 @@
         String((tab.dataset.command === "develop") === (name === "develop")));
     // The column is a different column now; start it from the top.
     document.querySelector("main").scrollTop = 0;
+    // Its history was not being drawn while Library was up.
+    if (name === "develop") { historyDrawn = ""; drawHistory(); }
   };
 
   // The Library's panel: the judgement as things to press, and what is known
@@ -3367,8 +3424,8 @@
     const drop = document.createElement("button");
     drop.className = "drop";
     drop.textContent = "×";
-    drop.title = `delete ${collection.name} — the photographs stay, and Z brings it back`;
-    armDrop(drop, () => act("delete_collection", collection.id));
+    drop.title = `delete ${collection.name} — the photographs stay, and Undo brings it back`;
+    drop.addEventListener("click", () => { drop.blur(); act("delete_collection", collection.id); });
     li.append(rename, drop);
     return li;
   };
@@ -3642,13 +3699,39 @@
   };
   const MAC = /Mac|iPhone|iPad/.test(navigator.platform);
 
-  const UNDO_HINT = " · Z undoes it";
+  // Z and Space, which used to undo a judgement and go to the next photograph.
+  // From a grid they open the photograph, as Lightroom's do; on one they go
+  // between fit and 1:1 under the pointer. The first press says what moved,
+  // once per person, so a hand that still reaches for Z to undo finds out why
+  // the picture got bigger instead.
+  const zoomToggle = () => {
+    try {
+      if (!localStorage.getItem("taught-zoom")) {
+        localStorage.setItem("taught-zoom", "1");
+        tell("info", `Z and Space zoom now. ${MAC ? "⌘" : "Ctrl+"}Z undoes, and → is the next photograph`);
+      }
+    } catch (e) { /* no storage: the lesson is repeated, which is harmless */ }
+    if (mode === "grid" || mode === "survey") return run("loupe");
+    invoke("toggle_zoom").then(now => { scale = now; }).catch(say);
+  };
+
+  // What an action can be taken back by, beside what it said. A button and not
+  // only a key: a deletion made in Develop is a library change, and there the
+  // key undoes the edit — so the one way back that works from anywhere is here.
+  const undoOffer = document.getElementById("said-undo");
+  undoOffer.addEventListener("click", () => { undoOffer.hidden = true; act("undo"); });
   const act = async (action, value) => {
     try {
       const view = await invoke("cull", { action: value === undefined ? { action } : { action, value } });
       show(view);
-      if (view.said)
-        tell("info", view.said + (view.takes_back ? UNDO_HINT : ""));
+      if (view.said) {
+        tell("info", view.said + (view.takes_back && workspace === "library"
+          ? ` · ${MAC ? "⌘" : "Ctrl+"}Z undoes it` : ""));
+        undoOffer.hidden = !view.takes_back;
+      }
+      // An undo or a redo may have brought back, or taken away, a preset or a
+      // snapshot; the lists are asked again rather than guessed at.
+      if (action === "undo" || action === "redo") { refreshPresets(); refreshSnapshots(); }
     } catch (e) {
       say(e);
       // A refusal means the controls and the library may now disagree — a
@@ -3840,6 +3923,8 @@
       title: "Smaller cells in the grid", act: "cells", value: -1 },
     { id: "cells-larger", keys: ["=", "+"], scope: "library", waits: true, group: "Views",
       title: "Larger cells in the grid", act: "cells", value: 1 },
+    { id: "zoom-toggle", keys: ["z", " "], scope: "any", waits: false, group: "Views",
+      title: "Fit, or every pixel of the photograph under the pointer", run: () => zoomToggle() },
     { id: "fit", keys: ["f"], scope: "any", waits: false, group: "Views",
       title: "Fit the photograph in the window", run: () => send({ command: "fit_to_view" }) },
     { id: "fullscreen", keys: ["f11"], scope: "any", waits: false, group: "Views",
@@ -3865,7 +3950,7 @@
       title: "Zoom to 1:1", run: () => document.querySelector("[data-absolute]").click() },
 
     // -- moving
-    { id: "next", keys: ["arrowright", " "], scope: "any", waits: true, group: "Moving",
+    { id: "next", keys: ["arrowright"], scope: "any", waits: true, group: "Moving",
       title: "Next photograph", act: "next" },
     { id: "previous", keys: ["arrowleft"], scope: "any", waits: true, group: "Moving",
       title: "Previous photograph", act: "previous" },
@@ -3893,8 +3978,15 @@
       id: `label-${colour}`, keys: [key], scope: "any", waits: true, group: "Judging",
       title: `Label ${colour}; again to take it off`,
       act: "colour", value: colour, sheet: key === "6" ? "6 – 9  colour label" : null })),
-    { id: "undo", keys: ["z"], scope: "any", waits: true, group: "Judging",
-      title: "Undo the last judgement or collection change", act: "undo" },
+    // One undo, scoped by workspace: in Library it takes back the last change to
+    // the library — a judgement, a paste, a collection, a copy, a deleted preset
+    // or snapshot — and in Develop the last change to this photograph's edit.
+    // What you are doing is what you undo. Bare Z was the library's undo and is
+    // Lightroom's zoom; it zooms now, and says so the first time.
+    { id: "undo", keys: ["mod+z"], scope: "library", waits: true, group: "Judging",
+      title: "Undo the last change to the library", act: "undo" },
+    { id: "redo", keys: ["mod+shift+z", "mod+y"], scope: "library", waits: true, group: "Judging",
+      title: "Redo it", act: "redo" },
 
     // -- selecting and collecting
     { id: "select", keys: ["m"], scope: "library", waits: true, group: "Collecting",
@@ -3965,9 +4057,9 @@
     // someone to find: the develop controls and the judgements are undone
     // separately, because nothing joins their timelines — the library outlives
     // the session, and a session is rebuilt for every photograph.
-    { id: "edit-undo", keys: ["mod+z"], scope: "any", waits: false, group: "The edit",
+    { id: "edit-undo", keys: ["mod+z"], scope: "develop", waits: false, group: "The edit",
       title: "Undo the last change to the edit", run: () => send({ command: "undo" }) },
-    { id: "edit-redo", keys: ["mod+shift+z", "mod+y"], scope: "any", waits: false, group: "The edit",
+    { id: "edit-redo", keys: ["mod+shift+z", "mod+y"], scope: "develop", waits: false, group: "The edit",
       title: "Redo it", run: () => send({ command: "redo" }) },
     // They were bare S and A, and a bare A is one slip from rewriting every
     // selected photograph — the most expensive key on the board should not also

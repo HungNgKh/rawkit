@@ -445,7 +445,11 @@ fn placed_in(connection: &Connection, id: i64) -> Result<Vec<Placed>, CatalogErr
 ///
 /// Skips one that no longer exists, and one that is already a member — the
 /// place it has now is the newer decision.
-fn place(connection: &Connection, id: i64, placed: &[Placed]) -> Result<usize, CatalogError> {
+pub(crate) fn place(
+    connection: &Connection,
+    id: i64,
+    placed: &[Placed],
+) -> Result<usize, CatalogError> {
     // Prepared once. `Connection::execute` compiles its SQL on every call, and
     // undoing the deletion of a collection that held a whole library is twenty
     // thousand calls — the scale gate put that at 109 ms, most of it parsing.

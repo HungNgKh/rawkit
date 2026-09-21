@@ -37,7 +37,7 @@ filter.
 | **D6** | Nesting is a parent pointer | `parent_id`. One kind of container. |
 | **D7** | What is on screen is one value | `Sequence { source, filter, rows, shown }`, with one constructor. |
 | **D8** | K has a target, and the catalog remembers it | `is_target`, one row at most, seeded on the quick collection. |
-| **D9** | Everything done to a collection is undone by Z | The catalog answers a removal with what it removed; the shell keeps that and hands it back. |
+| **D9** | Everything done to a collection can be undone (Ctrl+Z in Library since S13; bare Z until then) | The catalog answers a removal with what it removed; the shell keeps that and hands it back. |
 
 Deferred, deliberately: **gapped keys and moving a block of frames**, until there
 is a drag to need them.

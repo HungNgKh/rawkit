@@ -83,18 +83,20 @@ Keys, most of them Lightroom's, so the hands already know them:
 
 | | |
 |---|---|
-| `G` `E` `R` | grid, loupe, crop |
+| `G` `E` `D` | grid, one photograph, develop |
 | `←` `→` `↑` `↓` | move through the shoot |
+| `Z` `Space` | fit, or every pixel under the pointer (from the grid: open the photograph) |
 | `0`–`5`, `6`–`9` | rating, colour label |
 | `P` `X` `U` | pick, reject, clear the flag |
-| `M` `C` | mark a frame, compare what is marked |
-| `S` `A` | copy this look, apply it to the marked frames |
-| `[` `]` | rotate a quarter turn |
-| `⌃Z` `⌃⇧Z` | undo and redo the edit (`⌘` on macOS) |
-| `Z` | undo a culling judgement — a separate history |
+| `M` `N` | select a photograph, survey the selected side by side |
+| `⌃Z` `⌃⇧Z` | undo and redo — in Library the last change to the library, in Develop the last change to the edit (`⌘` on macOS) |
+| `⌃⇧C` `⌃⇧V` | copy this look, paste it onto the selected photographs |
+| `R` `Q` `W` | crop, spot removal, white-balance picker |
 | `L` / `⇧L` | add a graduated or radial local adjustment, then drag on the photograph to place it |
 | `B` / `⇧B` | add a brush, or switch it between painting and erasing |
-| `⌃E` / `⌃⇧E` | export this photograph / export the picks |
+| `⌃⇧E` / `⌃E` | export… / export again with the last settings |
+| `F6` `F7` `F8` | hide the filmstrip, the left panel, the right panel |
+| `⌃K` `?` | find any command by name, every key |
 
 The develop controls live in the column on the right, and the sections you
 leave open are remembered.

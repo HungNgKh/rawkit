@@ -312,6 +312,30 @@ enum Undone {
     },
     /// A collection that was deleted, with everything nested in it.
     Deleted(Removed),
+    /// A collection an undo brought back, under the id it came back with.
+    /// Only ever on the redo side: redoing deletes it again.
+    Restored {
+        collection: i64,
+    },
+    /// A virtual copy that was made. Undoing it removes it — keeping everything,
+    /// so that redoing brings back the same photograph.
+    CopyMade {
+        image: i64,
+    },
+    /// A virtual copy that was removed, with its history, snapshots, judgement
+    /// and places.
+    CopyRemoved(rawkit_catalog::copies::RemovedCopy),
+    /// A preset that was deleted, and one an undo brought back.
+    PresetForgotten(rawkit_catalog::presets::Forgotten),
+    PresetRestored {
+        name: String,
+    },
+    /// A snapshot that was deleted, and one an undo brought back.
+    SnapshotForgotten(rawkit_catalog::snapshots::Forgotten),
+    SnapshotRestored {
+        image: i64,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -330,8 +354,15 @@ pub enum CullAction {
     ClearFlag,
     Colour(String),
     ClearColour,
-    /// Put back what the last judgement replaced, and go to that frame.
+    /// Take back the last change to the library: a judgement, a paste, a
+    /// collection change, a copy made or removed, a preset or snapshot deleted.
     Undo,
+    /// Put back what the last undo took back.
+    Redo,
+    /// Delete a saved preset. Not asked twice: it can be undone.
+    ForgetPreset(String),
+    /// Delete one of this photograph's snapshots. Likewise.
+    ForgetSnapshot(String),
     /// Set this frame aside to compare, or take it back out.
     Mark,
     /// Move within the marked set rather than through the whole shoot.
@@ -388,7 +419,7 @@ pub enum CullAction {
         id: i64,
         name: String,
     },
-    /// Delete a collection and everything nested in it. Z brings it back whole.
+    /// Delete a collection and everything nested in it. Undo brings it back whole.
     DeleteCollection(i64),
     /// Make a collection holding the frames set aside to compare, or this one if
     /// none are. Named, because a collection nobody named is one nobody can find
@@ -486,7 +517,9 @@ impl CullAction {
             CullAction::CopyEdit
             | CullAction::SetTarget(_)
             | CullAction::RenameCollection { .. }
-            | CullAction::NewCollection(_) => false,
+            | CullAction::NewCollection(_)
+            | CullAction::ForgetPreset(_)
+            | CullAction::ForgetSnapshot(_) => false,
             // Standing still, which is what the shell resolves a view change to.
             CullAction::SelectBy(0) => false,
             CullAction::Next
@@ -503,6 +536,7 @@ impl CullAction {
             | CullAction::ClearColour
             | CullAction::SurveyJudge(_)
             | CullAction::Undo
+            | CullAction::Redo
             | CullAction::Mark
             | CullAction::ClearMarks
             | CullAction::SelectAll
@@ -544,6 +578,8 @@ pub struct CullView {
     pub picks: usize,
     pub rejects: usize,
     pub undoable: bool,
+    /// Whether there is something undo took back that could be put back.
+    pub redoable: bool,
     /// Whether a look is on the clipboard. Shown, because a clipboard nobody can
     /// see is a key that sometimes does nothing for no visible reason.
     pub copied: bool,
@@ -725,6 +761,11 @@ pub struct Library {
     /// Bounded because it is a convenience, not a history: the versioned record
     /// is what `edit_states` is for, and a rating deliberately has none.
     undo: Vec<Undone>,
+    /// What undo has taken back, newest last. Cleared by anything new, because
+    /// redoing onto a library that has since changed would replay a decision
+    /// somebody has already replaced — the edit history's rule, for the same
+    /// reason.
+    redo: Vec<Undone>,
     /// A navigation the render loop has not acted on yet.
     request: Option<usize>,
     /// Frames set aside to compare against each other, by catalog id, kept in
@@ -819,6 +860,7 @@ impl Library {
             collections: listed,
             target,
             undo: Vec::new(),
+            redo: Vec::new(),
             copied: None,
             paste_requested: false,
             dirtied: Vec::new(),
@@ -1045,6 +1087,7 @@ impl Library {
     pub fn add_copy(&mut self, state: &EditState) -> Result<String> {
         let source = self.current().id;
         let id = rawkit_catalog::copies::create(&self.catalog, source, None, state)?;
+        self.remember(Undone::CopyMade { image: id });
         // A copy starts undecided, so a filter on flag or rating will not have
         // it. Rather than making something the user cannot see, the filter comes
         // off — the same rule as a filter that empties, and for the same reason:
@@ -1067,29 +1110,217 @@ impl Library {
     /// [`rawkit_catalog::copies::delete`] for what deleting that would cost.
     pub fn remove_copy(&mut self) -> Result<String> {
         let image = self.current().clone();
-        rawkit_catalog::copies::delete(&self.catalog, image.id)?;
-        // Anything still naming it would act on a row that is gone: a mark would
-        // show an empty cell, and an undo would try to put a judgement back on
-        // nothing.
-        self.marked.remove(image.id);
-        self.undo.retain(|undone| match undone {
-            Undone::Judged { image: id, .. } => *id != image.id,
-            Undone::Pasted { frames } => !frames.iter().any(|(id, _)| *id == image.id),
-            // These are safe to keep. Putting a deleted photograph back is
-            // skipped by the catalog, and taking one out that is not there is
-            // nothing — neither can act on a row that is gone.
-            Undone::TakenOut { .. } | Undone::Added { .. } | Undone::Deleted(_) => true,
-        });
+        let removed = self.remove_copy_of(image.id)?;
+        self.remember(Undone::CopyRemoved(removed));
+        Ok(image.label())
+    }
+
+    /// Remove a copy, keeping it, and put the library right after it.
+    ///
+    /// Nothing on the undo stack is purged. What sits below this removal can
+    /// only be reached by undoing it first, which brings the copy back under
+    /// the same id — so a record that names it is right again by the time it
+    /// is reached. The stack being last-in-first-out is the whole argument.
+    fn remove_copy_of(&mut self, id: i64) -> Result<rawkit_catalog::copies::RemovedCopy> {
+        let removed = rawkit_catalog::copies::delete_keeping(&self.catalog, id)?;
+        // A mark would show an empty cell for a photograph that is not there.
+        self.marked.remove(id);
         self.resequence(None)?;
         // Deleting an image takes it out of every collection it was in, and the
-        // held list is a *copy* of those counts. This was the mutation that did
-        // not know the copy existed: three arms of `act` kept it fresh and this
-        // one, which is not in `act` at all, left a chip reading one more than
-        // the collection held.
+        // held list is a copy of those counts.
         self.refresh_collections()?;
         // And one smaller, possibly by a pick or a reject as well.
         self.tally = cull::tally(&self.catalog)?;
-        Ok(image.label())
+        Ok(removed)
+    }
+
+    /// Delete a preset, keeping it for undo.
+    fn forget_preset(&mut self, name: &str) -> Result<()> {
+        let forgotten = rawkit_catalog::presets::forget_keeping(&self.catalog, name)?
+            .ok_or_else(|| anyhow!("there is no preset called {name}"))?;
+        self.remember(Undone::PresetForgotten(forgotten));
+        self.say(format!("Deleted the preset {name}"));
+        Ok(())
+    }
+
+    /// Delete one of this photograph's snapshots, keeping it for undo.
+    fn forget_snapshot(&mut self, name: &str) -> Result<()> {
+        let image = self.current().id;
+        let forgotten = rawkit_catalog::snapshots::forget_keeping(&self.catalog, image, name)?
+            .ok_or_else(|| anyhow!("this photograph has no snapshot called {name}"))?;
+        self.remember(Undone::SnapshotForgotten(forgotten));
+        self.say(format!("Deleted the snapshot {name}"));
+        Ok(())
+    }
+
+    /// Delete a collection and everything nested in it, and put the library
+    /// right after it. Answers with what is needed to bring it all back.
+    fn delete_collection(&mut self, id: i64) -> Result<Removed> {
+        let removed = collections::remove(&self.catalog, id)?;
+        // The ids it had mean nothing now, and SQLite will give them to the
+        // next collections made. A record still naming one would put its
+        // photographs into a stranger — on either stack.
+        let gone: Vec<i64> = removed.ids().collect();
+        let names_gone = |undone: &Undone| match undone {
+            Undone::TakenOut { collection, .. }
+            | Undone::Added { collection, .. }
+            | Undone::Restored { collection } => !gone.contains(collection),
+            _ => true,
+        };
+        self.undo.retain(names_gone);
+        self.redo.retain(names_gone);
+        // A delete can take the target with it, directly or nested.
+        self.target = collections::target(&self.catalog)?;
+        self.refresh_collections()?;
+        if let Source::Collection(viewing) = self.sequence.source() {
+            if gone.contains(&viewing) {
+                let standing = self.current().id;
+                self.resequence(Some(standing))?;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Apply one record — undoing what it describes — and answer with the
+    /// record that would apply it again. Undo and redo are both this: an undo
+    /// is a record taken off one stack and its inverse put on the other.
+    ///
+    /// Each arm says what it did, and stands on a photograph it touched, so a
+    /// reversal is seen rather than trusted.
+    fn reverse(&mut self, undone: Undone, redoing: bool) -> Result<Undone> {
+        let verb = if redoing { "Redid" } else { "Undid" };
+        Ok(match undone {
+            Undone::Pasted { frames } => {
+                let mut now = Vec::with_capacity(frames.len());
+                for (id, before) in &frames {
+                    let current =
+                        rawkit_catalog::edits::latest(&self.catalog, *id)?.map(|(_, state)| state);
+                    let state = before.clone().unwrap_or_default();
+                    self.save_edit(*id, &state, rawkit_editstate::EditSource::User)?;
+                    now.push((*id, current));
+                }
+                if let Some(index) = frames.first().and_then(|(id, _)| self.position_of(*id)) {
+                    self.go(index);
+                    self.index = index;
+                }
+                self.say(format!("{verb} the paste onto {}", frames.len()));
+                Undone::Pasted { frames: now }
+            }
+            Undone::Judged {
+                image,
+                before: previous,
+            } => {
+                let standing = cull::judgement(&self.catalog, image)?;
+                self.write_judgement(image, &standing, &previous)?;
+                // Putting the judgement back can put the *frame* back: a
+                // filtered pass drops what it judges, and an undo that could
+                // not return you to the photograph you were wrong about would
+                // be no use at all. Asked about the one frame whose judgement
+                // changed, in both directions.
+                self.settle(image)?;
+                // A survey drops what it judges too, so the key that reverses a
+                // mistake has to restore the comparison as well.
+                if !redoing && !self.marked.is_empty() {
+                    self.marked.insert(image);
+                }
+                if let Some(index) = self.position_of(image) {
+                    self.go(index);
+                    self.index = index;
+                } else {
+                    // Only reachable if the frame went missing from disk in
+                    // between. The judgement is written either way.
+                    self.index = self.index.min(self.sequence.len() - 1);
+                }
+                // Named after the frame came back, so a judgement that had
+                // dropped it out of the filter can still be called by name.
+                self.say(format!("{verb} the judgement on {}", self.name_of(image)));
+                Undone::Judged {
+                    image,
+                    before: standing,
+                }
+            }
+            Undone::TakenOut { collection, placed } => {
+                collections::put_back(&self.catalog, collection, &placed)?;
+                let back = placed.first().map(|p| p.image);
+                self.after_membership_changed(collection, back)?;
+                self.say(format!(
+                    "Put {} back in {}",
+                    placed.len(),
+                    self.collection_name(collection)
+                ));
+                Undone::Added {
+                    collection,
+                    images: placed.iter().map(|p| p.image).collect(),
+                }
+            }
+            Undone::Added { collection, images } => {
+                let placed = collections::take_out(&self.catalog, collection, &images)?;
+                self.after_membership_changed(collection, None)?;
+                self.say(format!(
+                    "Took {} back out of {}",
+                    images.len(),
+                    self.collection_name(collection)
+                ));
+                Undone::TakenOut { collection, placed }
+            }
+            Undone::Deleted(removed) => {
+                let collection = collections::restore(&self.catalog, &removed)?;
+                // It may have been the target, and comes back as one.
+                self.target = collections::target(&self.catalog)?;
+                self.refresh_collections()?;
+                self.say(format!("Brought {} back", removed.name()));
+                Undone::Restored { collection }
+            }
+            Undone::Restored { collection } => {
+                let name = self.collection_name(collection);
+                let removed = self.delete_collection(collection)?;
+                self.say(format!("Deleted {name} again; its photographs stay"));
+                Undone::Deleted(removed)
+            }
+            Undone::CopyMade { image } => {
+                let name = self.name_of(image);
+                let removed = self.remove_copy_of(image)?;
+                self.say(format!("Removed {name}"));
+                Undone::CopyRemoved(removed)
+            }
+            Undone::CopyRemoved(removed) => {
+                rawkit_catalog::copies::restore(&self.catalog, &removed)?;
+                let image = removed.id();
+                self.resequence(Some(image))?;
+                self.refresh_collections()?;
+                self.tally = cull::tally(&self.catalog)?;
+                self.say(format!("Brought back {}", self.name_of(image)));
+                Undone::CopyMade { image }
+            }
+            Undone::PresetForgotten(forgotten) => {
+                rawkit_catalog::presets::put_back(&self.catalog, &forgotten)?;
+                self.say(format!("Brought back the preset {}", forgotten.name));
+                Undone::PresetRestored {
+                    name: forgotten.name,
+                }
+            }
+            Undone::PresetRestored { name } => {
+                let forgotten = rawkit_catalog::presets::forget_keeping(&self.catalog, &name)?
+                    .ok_or_else(|| anyhow!("there is no preset called {name} any more"))?;
+                self.say(format!("Deleted the preset {name} again"));
+                Undone::PresetForgotten(forgotten)
+            }
+            Undone::SnapshotForgotten(forgotten) => {
+                rawkit_catalog::snapshots::put_back(&self.catalog, &forgotten)?;
+                self.say(format!("Brought back the snapshot {}", forgotten.name));
+                Undone::SnapshotRestored {
+                    image: forgotten.image_id,
+                    name: forgotten.name,
+                }
+            }
+            Undone::SnapshotRestored { image, name } => {
+                let forgotten =
+                    rawkit_catalog::snapshots::forget_keeping(&self.catalog, image, &name)?
+                        .ok_or_else(|| anyhow!("there is no snapshot called {name} any more"))?;
+                self.say(format!("Deleted the snapshot {name} again"));
+                Undone::SnapshotForgotten(forgotten)
+            }
+        })
     }
 
     /// Write a judgement, and move the held tally by what it changed.
@@ -1155,6 +1386,12 @@ impl Library {
     /// Keep something that can be taken back, and forget the oldest.
     fn remember(&mut self, undone: Undone) {
         self.recorded += 1;
+        self.redo.clear();
+        self.stack(undone);
+    }
+
+    /// Onto the undo stack without touching the redo one: what a redo leaves.
+    fn stack(&mut self, undone: Undone) {
         self.undo.push(undone);
         if self.undo.len() > UNDO_DEPTH {
             self.undo.remove(0);
@@ -1643,7 +1880,7 @@ impl Library {
         // Counted rather than read off the stack's length, which does not
         // change when a full stack takes a new entry and drops its oldest.
         let recorded = self.recorded;
-        let undoing = matches!(action, CullAction::Undo);
+        let undoing = matches!(action, CullAction::Undo | CullAction::Redo);
         match action {
             // Resolved before they reach here — they change which view is
             // showing, not which photograph. Listed rather than caught by a
@@ -1723,30 +1960,11 @@ impl Library {
             }
             CullAction::DeleteCollection(id) => {
                 let name = self.collection_name(id);
-                let removed = collections::remove(&self.catalog, id)?;
+                let removed = self.delete_collection(id)?;
                 // The reassurance is the message. "Deleted" beside a list of
                 // photographs reads as the photographs having gone.
                 self.say(format!("Deleted {name}; its photographs stay"));
-                // The ids it had mean nothing now, and SQLite will give them to
-                // the next collections made. An undo record still naming one
-                // would put its photographs into a stranger.
-                let gone: Vec<i64> = removed.ids().collect();
-                self.undo.retain(|undone| match undone {
-                    Undone::TakenOut { collection, .. } | Undone::Added { collection, .. } => {
-                        !gone.contains(collection)
-                    }
-                    _ => true,
-                });
                 self.remember(Undone::Deleted(removed));
-                // A delete can take the target with it, directly or nested.
-                self.target = collections::target(&self.catalog)?;
-                self.refresh_collections()?;
-                if let Source::Collection(viewing) = self.sequence.source() {
-                    if gone.contains(&viewing) {
-                        let standing = self.current().id;
-                        self.resequence(Some(standing))?;
-                    }
-                }
             }
             CullAction::NewCollection(name) => {
                 // What is marked, or what is under the cursor — the same rule
@@ -1944,90 +2162,27 @@ impl Library {
                     }
                 }
             }
+            // A record that cannot be applied — a copy whose place was taken, a
+            // preset saved again under its name — is dropped with the reason
+            // said: kept, it would stand in front of everything below it.
             CullAction::Undo => match self.undo.pop() {
-                Some(Undone::Pasted { frames }) => {
-                    for (id, before) in &frames {
-                        let state = before.clone().unwrap_or_default();
-                        self.save_edit(*id, &state, rawkit_editstate::EditSource::User)?;
-                    }
-                    // Back to a frame it touched, so the reversal is visible
-                    // rather than something the user has to go and check.
-                    if let Some(index) = frames.first().and_then(|(id, _)| self.position_of(*id)) {
-                        self.go(index);
-                        self.index = index;
-                    }
-                    self.say(format!("Undid the paste onto {}", frames.len()));
-                }
-                Some(Undone::Judged {
-                    image,
-                    before: previous,
-                }) => {
-                    let standing = cull::judgement(&self.catalog, image)?;
-                    self.write_judgement(image, &standing, &previous)?;
-                    // Putting the judgement back can put the *frame* back: a
-                    // filtered pass drops what it judges, and an undo that could
-                    // not return you to the photograph you were wrong about
-                    // would be no use at all.
-                    // Asked about the one frame whose judgement changed, in
-                    // both directions: it may be coming back into a filtered
-                    // view, or — if the filter was changed since — leaving one.
-                    // This was a full re-read of the sequence, and the one of
-                    // six that forgot which collection it was in.
-                    self.settle(image)?;
-                    // A survey drops what it judges too, so the same keypress
-                    // has to restore the comparison — otherwise the key that
-                    // reverses a mistake leaves you looking at a comparison the
-                    // mistake is missing from.
-                    if !self.marked.is_empty() {
-                        self.marked.insert(image);
-                    }
-                    if let Some(index) = self.position_of(image) {
-                        self.go(index);
-                        self.index = index;
-                    } else {
-                        // Only reachable if the frame went missing from disk
-                        // between the judgement and the undo. The judgement is
-                        // restored either way; the cursor stays where it can be.
-                        self.index = self.index.min(self.sequence.len() - 1);
-                    }
-                    // Named after the frame came back, so a judgement that had
-                    // dropped it out of the filter can still be called by name.
-                    self.say(format!("Undid the judgement on {}", self.name_of(image)));
-                }
-                Some(Undone::TakenOut { collection, placed }) => {
-                    collections::put_back(&self.catalog, collection, &placed)?;
-                    // Standing on a frame that came back, when the view is of
-                    // that collection, so the reversal is seen rather than
-                    // trusted. It is in the collection again, so asking for it
-                    // cannot widen the view.
-                    let back = placed.first().map(|p| p.image);
-                    self.after_membership_changed(collection, back)?;
-                    self.say(format!(
-                        "Put {} back in {}",
-                        placed.len(),
-                        self.collection_name(collection)
-                    ));
-                }
-                Some(Undone::Added { collection, images }) => {
-                    collections::take_out(&self.catalog, collection, &images)?;
-                    self.after_membership_changed(collection, None)?;
-                    self.say(format!(
-                        "Took {} back out of {}",
-                        images.len(),
-                        self.collection_name(collection)
-                    ));
-                }
-                Some(Undone::Deleted(removed)) => {
-                    collections::restore(&self.catalog, &removed)?;
-                    // It may have been the target, and comes back as one.
-                    self.target = collections::target(&self.catalog)?;
-                    self.refresh_collections()?;
-                    self.say(format!("Brought {} back", removed.name()));
+                Some(undone) => {
+                    let inverse = self.reverse(undone, false)?;
+                    self.redo.push(inverse);
                 }
                 // Said, because a key that does nothing looks broken and this
                 // one has a reason.
                 None => self.say("Nothing to undo"),
             },
+            CullAction::Redo => match self.redo.pop() {
+                Some(undone) => {
+                    let inverse = self.reverse(undone, true)?;
+                    self.stack(inverse);
+                }
+                None => self.say("Nothing to redo"),
+            },
+            CullAction::ForgetPreset(name) => self.forget_preset(&name)?,
+            CullAction::ForgetSnapshot(name) => self.forget_snapshot(&name)?,
         }
         // Every shortcut the sequence takes is a claim that it ends where a full
         // read of the catalog would. In tests, hold it to that after each action.
@@ -2168,6 +2323,7 @@ impl Library {
             picks,
             rejects,
             undoable: !self.undo.is_empty(),
+            redoable: !self.redo.is_empty(),
             copied: self.copied.is_some(),
             marked: self.marked().len(),
             is_marked: self.marked.contains(image.id),
@@ -2223,7 +2379,24 @@ pub struct Saver {
     /// changing it must not write a version: that would mark every browsed image
     /// as edited and fill the history with decisions nobody made.
     opened_at: u64,
+    /// Each photograph's edit history, kept while another one is open, so that
+    /// going to the next frame and back does not cost the undo steps made on
+    /// this one. For as long as the window is open, not across a relaunch: the
+    /// catalog keeps every version, and this is only the sitting's way through
+    /// them. The number is when it was left, for letting the oldest go.
+    kept: std::collections::HashMap<i64, (u64, rawkit_session::Kept)>,
+    left: u64,
 }
+
+/// How many photographs' histories are kept while others are open. A history
+/// is at most two hundred steps of a few hundred bytes; a hundred photographs
+/// of it is a few megabytes at the very worst, and nobody goes back through
+/// more than a shoot's worth in one sitting.
+const KEPT_HISTORIES: usize = 100;
+
+/// What a step is called when the edit changed while the photograph was not
+/// open — a paste from the Library, or an undo of one. The page words it.
+pub const CHANGED_ELSEWHERE: &str = "changed_elsewhere";
 
 /// How long an edit has to stand still before it is written.
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(800);
@@ -2237,6 +2410,8 @@ impl Saver {
             image: None,
             settled: None,
             opened_at,
+            kept: std::collections::HashMap::new(),
+            left: 0,
         }
     }
 
@@ -2310,7 +2485,23 @@ impl Saver {
                 library.current().id,
             )
         };
+        // The history of the photograph being left, before the session forgets it.
+        if let Some(leaving) = self.image {
+            self.left += 1;
+            self.kept.insert(leaving, (self.left, session.keep()));
+            if self.kept.len() > KEPT_HISTORIES {
+                let oldest = self
+                    .kept
+                    .iter()
+                    .min_by_key(|(_, (at, _))| *at)
+                    .map(|(id, _)| *id);
+                if let Some(oldest) = oldest {
+                    self.kept.remove(&oldest);
+                }
+            }
+        }
         self.image = Some(id);
+        let resumed = self.kept.remove(&id).map(|(_, kept)| kept);
         match catalog_result {
             Ok(Some((version, saved))) => {
                 eprintln!("edit       : restored v{version} for image {id}");
@@ -2318,12 +2509,18 @@ impl Saver {
                 // the user did to it, and through the command bus the first
                 // press of undo would restore the *previous* image's edit.
                 session.load(saved);
+                if let Some(kept) = resumed {
+                    session.resume(kept, CHANGED_ELSEWHERE);
+                }
             }
             Ok(None) => {
                 // A photograph nobody has edited opens as shot. Applying the
                 // default explicitly rather than assuming the session already
                 // holds it, because the previous image's edit is what it holds.
                 session.load(EditState::default());
+                if let Some(kept) = resumed {
+                    session.resume(kept, CHANGED_ELSEWHERE);
+                }
             }
             Err(e) => {
                 // As shot, for the reason above and more so: what the session
@@ -3298,6 +3495,158 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn what_undo_takes_back_redo_puts_back_and_undo_takes_back_again() {
+        // Every kind of record, through the whole round: undo, redo, undo. The
+        // oracle re-reads the catalog after each, so "where it started" is the
+        // catalog's answer and not the held state's.
+        let dir = Scratch::new("redo");
+        let mut library = library_at(&dir.0, 4);
+        let first = library.current().id;
+        let judgement = |l: &Library| cull::judgement(&l.catalog, first).unwrap();
+
+        library.act(CullAction::Pick).unwrap();
+        library.act(CullAction::Previous).unwrap();
+        let picked = judgement(&library);
+        library.act(CullAction::Undo).unwrap();
+        assert_ne!(judgement(&library), picked);
+        let view = library.act(CullAction::Redo).unwrap();
+        assert_eq!(judgement(&library), picked);
+        assert_eq!(
+            view.said.as_deref(),
+            Some(format!("Redid the judgement on {}", library.name_of(first)).as_str())
+        );
+        library.act(CullAction::Undo).unwrap();
+        assert_ne!(judgement(&library), picked);
+
+        // A collection deleted, brought back, deleted again, brought back.
+        library
+            .act(CullAction::NewCollection("Shelf".into()))
+            .unwrap();
+        let shelf = library
+            .collections
+            .iter()
+            .find(|c| c.name == "Shelf")
+            .unwrap()
+            .id;
+        library.act(CullAction::DeleteCollection(shelf)).unwrap();
+        library.act(CullAction::Undo).unwrap();
+        assert!(library.collections.iter().any(|c| c.name == "Shelf"));
+        library.act(CullAction::Redo).unwrap();
+        assert!(!library.collections.iter().any(|c| c.name == "Shelf"));
+        library.act(CullAction::Undo).unwrap();
+        let shelf = library
+            .collections
+            .iter()
+            .find(|c| c.name == "Shelf")
+            .unwrap();
+        assert_eq!(shelf.count, 1, "it came back holding what it held");
+
+        // Anything new ends what redo could have put back.
+        library.act(CullAction::Undo).unwrap();
+        assert!(library.view().unwrap().redoable);
+        library.act(CullAction::Rate(2)).unwrap();
+        let view = library.act(CullAction::Redo).unwrap();
+        assert_eq!(view.said.as_deref(), Some("Nothing to redo"));
+    }
+
+    #[test]
+    fn a_removed_copy_comes_back_where_it_was_and_goes_again() {
+        let dir = Scratch::new("copy-undo");
+        let mut library = library_at(&dir.0, 3);
+        let mut warmer = EditState::default();
+        warmer.tone.exposure_ev = 0.6;
+        library.add_copy(&warmer).unwrap();
+        let copy = library.current().id;
+        library.act(CullAction::TargetToggle).unwrap();
+        library.act(CullAction::Rate(4)).unwrap();
+        let before = library.view().unwrap().in_library;
+
+        library.remove_copy().unwrap();
+        assert_eq!(library.view().unwrap().in_library, before - 1);
+        let view = library.act(CullAction::Undo).unwrap();
+        assert_eq!(view.in_library, before);
+        assert_eq!(
+            library.current().id,
+            copy,
+            "standing on the copy that came back"
+        );
+        assert_eq!(
+            cull::judgement(&library.catalog, copy).unwrap().rating,
+            Some(4)
+        );
+        assert!(collections::holds(&library.catalog, library.target, copy).unwrap());
+        let (_, state) = rawkit_catalog::edits::latest(&library.catalog, copy)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, warmer);
+
+        // The rating and the collection change below the removal are still
+        // right, because the copy came back under its own id.
+        library.act(CullAction::Undo).unwrap();
+        assert_eq!(
+            cull::judgement(&library.catalog, copy).unwrap().rating,
+            None
+        );
+
+        // And the copy's making is undoable too: back to three photographs.
+        library.act(CullAction::Undo).unwrap();
+        let view = library.act(CullAction::Undo).unwrap();
+        assert_eq!(view.in_library, before - 1);
+        let view = library.act(CullAction::Redo).unwrap();
+        assert_eq!(view.in_library, before);
+    }
+
+    #[test]
+    fn a_deleted_preset_or_snapshot_is_one_undo_away() {
+        let dir = Scratch::new("forget-undo");
+        let mut library = library_at(&dir.0, 2);
+        let mut look = EditState::default();
+        look.tone.contrast = 0.4;
+        rawkit_catalog::presets::save(
+            &library.catalog,
+            "Night",
+            &look,
+            &[rawkit_editstate::Group::Tone],
+        )
+        .unwrap();
+        let image = library.current().id;
+        rawkit_catalog::snapshots::take(&library.catalog, image, "Flat", &look).unwrap();
+
+        let view = library
+            .act(CullAction::ForgetPreset("Night".into()))
+            .unwrap();
+        assert!(view.takes_back);
+        assert_eq!(view.said.as_deref(), Some("Deleted the preset Night"));
+        assert!(rawkit_catalog::presets::get(&library.catalog, "Night")
+            .unwrap()
+            .is_none());
+        library.act(CullAction::Undo).unwrap();
+        assert!(rawkit_catalog::presets::get(&library.catalog, "Night")
+            .unwrap()
+            .is_some());
+
+        library
+            .act(CullAction::ForgetSnapshot("Flat".into()))
+            .unwrap();
+        assert!(
+            rawkit_catalog::snapshots::read(&library.catalog, image, "Flat")
+                .unwrap()
+                .is_none()
+        );
+        let view = library.act(CullAction::Undo).unwrap();
+        assert_eq!(view.said.as_deref(), Some("Brought back the snapshot Flat"));
+        assert_eq!(
+            rawkit_catalog::snapshots::read(&library.catalog, image, "Flat").unwrap(),
+            Some(look)
+        );
+
+        // Asking to delete what is not there is refused, and records nothing.
+        assert!(library
+            .act(CullAction::ForgetPreset("Nobody".into()))
+            .is_err());
+    }
+
+    #[test]
     fn every_change_says_what_it_did_and_says_it_once() {
         let dir = Scratch::new("said");
         let mut library = library_at(&dir.0, 5);
@@ -3566,7 +3915,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn removing_a_copy_leaves_the_photograph_and_forgets_what_named_it() {
+    fn removing_a_copy_leaves_the_photograph_and_its_undo_comes_first() {
         let dir = Scratch::new("copy-remove");
         let mut library = library_at(&dir.0, 2);
         library.add_copy(&EditState::default()).unwrap();
@@ -3581,9 +3930,16 @@ pub(crate) mod tests {
         assert_eq!(view.total, 2, "the two photographs are still there");
         assert_eq!(view.copy, None);
         assert_eq!(view.marked, 0, "a mark on a row that is gone");
-        assert!(
-            !view.undoable,
-            "an undo that would put a judgement back on nothing"
+        // The rating below the removal is kept, and is not reached until the
+        // removal has been undone — which puts the copy back under its id, so
+        // the rating has a photograph to go back onto.
+        assert!(view.undoable);
+        let view = library.act(CullAction::Undo).unwrap();
+        assert_eq!(view.copy.as_deref(), Some("copy 1"));
+        let view = library.act(CullAction::Undo).unwrap();
+        assert_eq!(
+            view.said.as_deref(),
+            Some("Undid the judgement on DSC00000.ARW (copy 1)")
         );
     }
 

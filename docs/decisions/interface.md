@@ -62,6 +62,10 @@ what a contributor would otherwise undo.
 | **I38** | The filter bar is controls, not chips | 26 px targets; the flag choice is one segmented radio; "Filter on ✕" says it is on and turns it off. |
 | **I39** | Collections can be searched, and a second click does nothing | A match keeps its parents. Clicking the collection being walked used to leave it — a toggle nobody could see. |
 | **I40** | The filmstrip is drawn by the GPU inside the canvas, in every view, and F6 hides it | One row of the current source, centred on the photograph being looked at, with the grid's marks. A press chooses; the wheel moves along it. |
+| **I41** | One undo, scoped by workspace | Ctrl+Z / Ctrl+Shift+Z undo and redo the library in Library and the edit in Develop. Z and Space zoom. |
+| **I42** | Everything the library does can be undone, and redone | Copies made and removed, presets and snapshots deleted join the stack; redo is "undo the undo" — every record has an inverse. |
+| **I43** | Act, then offer Undo — no "sure?" | Deleting a preset, snapshot, collection or copy is one click, and the sentence that says so carries an Undo button. |
+| **I44** | A History list, kept per photograph for the sitting | Every step named, the one in force marked, the undone ones still listed; a change made while away is a step of its own. |
 | **I21** | New never replaces a catalog, and only `--new` makes one | The picker's "replace?" is a question about a file. Without `--new`, a path that is not there is refused, not created. |
 
 ## I1 — one status line
@@ -128,9 +132,9 @@ Only the view an action returns carries it — a view that was merely asked for
 describes state, so it is `None` there and nothing is said twice. Moving between
 photographs says nothing: the photograph changing is the feedback.
 
-The sentence never names a key. The page appends `UNDO_HINT` (*"· Z undoes
-it"*), which is the one line to change when undo moves to `Ctrl+Z` — and appends
-it only when the view says `takes_back`: that **this action** recorded something.
+The sentence never names a key. The page appends the hint (*"· Ctrl+Z undoes
+it"*, in Library only since S13 — see I41) and an Undo button, and only when the
+view says `takes_back`: that **this action** recorded something.
 `undoable` is the wrong question. Pressing P on a frame that is already a pick
 records nothing, and a hint gated on "the stack is not empty" would promise to
 reverse whatever was put there earlier. `takes_back` is a counter compared
@@ -904,6 +908,79 @@ photograph off the edge. And presenting the strip cannot end the render loop: th
 photograph is already drawn by then, so a failure costs the strip and is said
 once.
 
+## I41 — one undo, scoped by workspace
+
+F10: bare Z undid judgements, collection changes and pastes; Ctrl+Z undid the
+edit; the brush had its own "Undo stroke"; snapshots were a fourth way back. Now
+**Ctrl+Z and Ctrl+Shift+Z** (Ctrl+Y too) are the only undo keys, and what they
+undo is the kind of thing being done: in **Library** the last change to the
+library, in **Develop** the last change to this photograph's edit. The registry's
+library-and-develop pair rule (I29) is what lets one key mean both.
+
+**Z and Space zoom** (Q2, decided by the owner over a recorded dissent): on one
+photograph they go between fit and 1:1, holding still the point under the
+pointer; from a grid they open the photograph, as Lightroom's do. Space was
+"next" and Z was undo, so the first press says what moved — once per person,
+remembered in the page's storage, a convenience that is harmless to repeat.
+The pointer's position is only known under GTK, which reports hovering; under a
+cutout the page forwards drags only, and 1:1 centres.
+
+**A step ends when the next gesture starts.** The session coalesces a run of one
+control into one step and cannot tell a let-go from a pause, so two brush
+strokes — or two drags of one slider — were one step, which is why "Undo stroke"
+existed. The shell now closes the open step on a press on the canvas, and the
+page on a press anywhere in the right column. Not on release: the render loop can
+still be laying down the last points of a stroke after the button comes up.
+"Undo stroke" is gone; Ctrl+Z takes back one stroke.
+
+## I42 — the library's stack, both ways
+
+Making a virtual copy, removing one, deleting a preset and deleting a snapshot
+were in no undo. They are records on the library's stack now, alongside
+judgements, pastes and collection changes. Removing a copy keeps everything that
+cascades with it — every version of its edit, its snapshots, its judgement, its
+places in collections — and restoring puts it back **under the same id or not at
+all**: every other record naming it names that id. Nothing on the stack is purged
+when a copy goes, as it used to be: what sits below the removal is reached only
+after undoing it, which brings the id back. Last-in-first-out is the argument.
+
+**Redo** is not a second set of records. Applying any record returns its inverse:
+a judgement's is the judgement it replaced, a paste's is the edits it overwrote,
+taking out is putting in, a deleted collection's is "delete it again" under the
+id it came back with. Undo moves a record from one stack to the other; redo moves
+it back; anything new clears redo, as a fresh edit clears the edit's.
+
+A record that cannot be applied — a copy whose id was taken, a preset saved again
+under its name — is dropped with the reason said, not kept in front of everything
+below it. Presets and snapshots are refused rather than overwritten: the one saved
+since is the newer decision.
+
+## I43 — act, then offer Undo
+
+F19: "sure?" armed for two and a half seconds and disarmed itself — timing-bound,
+and inconsistent (a collection was guarded and undoable, a preset guarded and
+not, the quick collection's "empty" one click). Everything with a × is undoable
+now, so it is one click, and the status bar's sentence carries an **Undo** button.
+A button and not only a key: a preset deleted in Develop is a library change, and
+there Ctrl+Z undoes the edit. The "Ctrl+Z undoes it" hint is shown in Library only,
+where it is true.
+
+## I44 — History
+
+In Develop's left panel under Snapshots: every step of this photograph's edit in
+this sitting, newest first, the one in force outlined and the ones undo took back
+greyed until something new replaces them. A click goes there through the same
+undo and redo the keys use. Steps are named by the command that made them and
+worded by the page; a command it has no words for shows under its own name.
+
+**Kept per photograph while the window is open.** Going to the next frame and
+back used to cost every undo step. The shell keeps each photograph's history
+when it is left (the last hundred) and resumes it when it is opened again. If the
+edit it opens with is not the one the history ended on — a paste from the Library,
+or an undo of one — that change is a step of its own, "Changed in Library", so a
+paste can be taken back from either workspace. Not across a relaunch: the catalog
+keeps every version, and this is only the sitting's path through them.
+
 ## If you change this
 
 | If you touch… | …this will tell you |
@@ -947,6 +1024,9 @@ once.
 | who reads the notice | `grep -n 'take_notice' panel.html` shows only `hear` |
 | what a folder counts, or what choosing one shows | `folders::tests` in the catalog (own and total, under it too, missing files, virtual copies) and `a_folder_is_a_place_to_look_and_the_filter_still_applies_in_it` |
 | the strip's height or when it shows | `the_strip_is_inside_the_canvas_and_only_when_there_is_room`. Its drawing and its clicks are checked by hand: a click opens, the wheel moves without opening, a click with crop in hand is refused, the strip's top meets the photograph's bottom by pixel |
+| what undo and redo do to the library | `what_undo_takes_back_redo_puts_back_and_undo_takes_back_again`, `a_removed_copy_comes_back_where_it_was_and_goes_again`, `a_deleted_preset_or_snapshot_is_one_undo_away`; in the catalog `a_removed_copy_comes_back_with_everything_it_had` and its refusal |
+| what a step of the edit history is | `the_history_names_its_steps_and_knows_where_it_is`, `a_let_go_ends_the_step_so_two_drags_are_two_undos`, `a_kept_history_comes_back_and_a_change_made_elsewhere_is_a_step` |
+| a new session command | give it words in `STEP_WORDS` in the page, or it shows in History under its own name |
 | how the window is divided | `frame::tests` — the four sides, the left panel giving way first, a hidden panel's width going to the photograph, the physical canvas meeting the bars at a fractional scale, and where a pointer lands |
 | a bar's height or a panel's width in the page | nothing automatic: the page must take it from `--top`, `--left`, `--panel`, `--bottom`, never a number of its own. Check by pixel: the page's border ends on the pixel before the canvas starts, on all four sides |
 | where an overlay lives | the welcome and import screens are top-level; the sheet, palette and export panel are in `#chrome` and call `needRight()` |

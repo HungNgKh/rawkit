@@ -768,15 +768,6 @@ fn apply_preset(
     Ok(event)
 }
 
-#[tauri::command]
-fn forget_preset(state: tauri::State<'_, Shelf>, name: String) -> Result<(), String> {
-    let Some(library) = state.0.clone() else {
-        return Err("no catalog is open".into());
-    };
-    let library = library.lock().expect("library lock");
-    rawkit_catalog::presets::forget(library.catalog(), &name).map_err(|e| e.to_string())
-}
-
 /// The places this photograph can be returned to.
 #[tauri::command]
 fn snapshots(state: tauri::State<'_, Shelf>) -> Result<Vec<serde_json::Value>, String> {
@@ -835,16 +826,6 @@ fn restore_snapshot(
     let saved = saved.ok_or_else(|| format!("there is no snapshot called {name:?}"))?;
     let mut session = shared.0.lock().expect("session lock");
     Ok(session.apply(Command::SetEditState(Box::new(saved))))
-}
-
-#[tauri::command]
-fn forget_snapshot(state: tauri::State<'_, Shelf>, name: String) -> Result<(), String> {
-    let Some(library) = state.0.clone() else {
-        return Err("no catalog is open".into());
-    };
-    let library = library.lock().expect("library lock");
-    let image = library.current().id;
-    rawkit_catalog::snapshots::forget(library.catalog(), image, &name).map_err(|e| e.to_string())
 }
 
 /// A group name from the page, refused rather than skipped when it is not one
@@ -1868,11 +1849,9 @@ fn main() -> Result<()> {
             touched_groups,
             save_preset,
             apply_preset,
-            forget_preset,
             snapshots,
             take_snapshot,
             restore_snapshot,
-            forget_snapshot,
             set_panel_width,
             frame,
             show_panels,
@@ -1898,7 +1877,10 @@ fn main() -> Result<()> {
             set_spot_mode,
             find_spot_source,
             set_brush,
-            undo_stroke,
+            history,
+            history_go,
+            end_step,
+            toggle_zoom,
             measure_lens
         ])
         .setup(move |app| {
@@ -4812,30 +4794,64 @@ fn set_brush(radius: Option<f32>, erase: Option<bool>) -> Result<(f32, bool), St
     ))
 }
 
-/// Take back the last stroke of the selected brush.
-///
-/// Undo would do it too, and this is here because a brush is the one mask where
-/// the last thing you did is a *stroke* rather than a slider — so there should
-/// be somewhere to say that without hunting for how many undo steps it was.
+/// This photograph's edit history: the steps, oldest first, named by the
+/// command that made each, and how many of them are in force.
 #[tauri::command]
-fn undo_stroke(state: tauri::State<'_, Shared>) -> Result<usize, String> {
-    let index = SELECTED_MASK.load(std::sync::atomic::Ordering::Relaxed);
+fn history(state: tauri::State<'_, Shared>) -> serde_json::Value {
+    let (steps, at) = state.0.lock().expect("session lock").history();
+    serde_json::json!({ "steps": steps, "at": at })
+}
+
+/// Go to a point in the history: back or forward one step at a time, through
+/// the same undo and redo a key press uses, so nothing about going there by
+/// clicking differs from going there by keys.
+#[tauri::command]
+fn history_go(state: tauri::State<'_, Shared>, to: usize) -> Result<(), String> {
     let mut session = state.0.lock().expect("session lock");
-    let mut masks = session.state().masks.clone();
-    let Some(rawkit_editstate::MaskShape::Brush { strokes, .. }) =
-        masks.get_mut(index).map(|m| &mut m.shape)
-    else {
-        return Err("no brush is selected".into());
-    };
-    if strokes.pop().is_none() {
-        return Err("nothing painted yet".into());
+    loop {
+        let (steps, at) = session.history();
+        if to > steps.len() {
+            return Err(format!("the history has {} steps", steps.len()));
+        }
+        let command = match to.cmp(&at) {
+            std::cmp::Ordering::Equal => return Ok(()),
+            std::cmp::Ordering::Less => Command::Undo,
+            std::cmp::Ordering::Greater => Command::Redo,
+        };
+        if matches!(session.apply(command), Event::Refused { .. }) {
+            return Err("that step cannot be reached".into());
+        }
     }
-    let left = strokes.len();
-    session.apply(Command::SetMasks {
-        masks,
-        control: u8::MAX,
-    });
-    Ok(left)
+}
+
+/// A slider has been taken hold of: whatever it does next is a new undo step.
+/// The page's half of what a press on the canvas does in `pointer::route`.
+#[tauri::command]
+fn end_step(state: tauri::State<'_, Shared>) {
+    state.0.lock().expect("session lock").end_step();
+}
+
+/// Between fitting the photograph and every pixel of it on a pixel of the
+/// screen, holding still the point under the pointer. Answers with the scale
+/// it went to.
+#[tauri::command]
+fn toggle_zoom(state: tauri::State<'_, Shared>) -> f64 {
+    let mut session = state.0.lock().expect("session lock");
+    if session.is_fitted() {
+        let size = session.viewport().size;
+        let middle = [size[0] as f64 / 2.0, size[1] as f64 / 2.0];
+        let anchor = HOVER
+            .lock()
+            .expect("hover lock")
+            .filter(|at| {
+                (0.0..size[0] as f64).contains(&at[0]) && (0.0..size[1] as f64).contains(&at[1])
+            })
+            .unwrap_or(middle);
+        session.apply(Command::ZoomTo { scale: 1.0, anchor });
+    } else {
+        session.apply(Command::FitToView);
+    }
+    session.viewport().scale
 }
 
 /// Measure this photograph's lateral chromatic aberration and correct it.
@@ -5259,6 +5275,12 @@ fn pick_white_balance(armed: bool) -> Result<bool, String> {
 }
 
 pub(crate) static CANVAS_CLICK: Mutex<Option<Click>> = Mutex::new(None);
+
+/// Where the pointer last was over the canvas, in canvas pixels, whether or not
+/// a button was down. What a zoom to 1:1 holds still. Only GTK reports a pointer
+/// that is merely hovering; under a cutout the page forwards drags, and the zoom
+/// falls back to the middle.
+pub(crate) static HOVER: Mutex<Option<[f64; 2]>> = Mutex::new(None);
 
 /// A press on the grid: where, and what was held down with it.
 #[derive(Debug, Clone, Copy)]

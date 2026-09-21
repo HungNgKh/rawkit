@@ -119,6 +119,67 @@ pub fn forget(catalog: &Catalog, image_id: i64, name: &str) -> Result<(), Catalo
     Ok(())
 }
 
+/// A snapshot that was forgotten, as [`put_back`] needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forgotten {
+    pub image_id: i64,
+    pub name: String,
+    version: i64,
+    created_at: i64,
+}
+
+/// [`forget`], keeping the row. `None` when there was nothing by that name.
+pub fn forget_keeping(
+    catalog: &Catalog,
+    image_id: i64,
+    name: &str,
+) -> Result<Option<Forgotten>, CatalogError> {
+    let row = catalog
+        .connection()
+        .query_row(
+            "SELECT version, created_at FROM snapshots WHERE image_id = ?1 AND name = ?2",
+            rusqlite::params![image_id, name],
+            |r| {
+                Ok(Forgotten {
+                    image_id,
+                    name: name.to_string(),
+                    version: r.get(0)?,
+                    created_at: r.get(1)?,
+                })
+            },
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    if row.is_some() {
+        forget(catalog, image_id, name)?;
+    }
+    Ok(row)
+}
+
+/// Put a forgotten snapshot back, naming the version it named. Refused when a
+/// snapshot of that name has been taken since — the newer one is kept.
+pub fn put_back(catalog: &Catalog, forgotten: &Forgotten) -> Result<(), CatalogError> {
+    let inserted = catalog.connection().execute(
+        "INSERT INTO snapshots (image_id, version, name, created_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (image_id, name) DO NOTHING",
+        rusqlite::params![
+            forgotten.image_id,
+            forgotten.version,
+            forgotten.name,
+            forgotten.created_at
+        ],
+    )?;
+    if inserted == 0 {
+        return Err(CatalogError::Unsupported(
+            "a snapshot with that name has been taken since, and it is kept",
+        ));
+    }
+    Ok(())
+}
+
 fn head_version(catalog: &Catalog, image_id: i64) -> Result<u32, CatalogError> {
     catalog
         .connection()
@@ -271,5 +332,19 @@ mod tests {
         take(&c, first, "Here", &at_contrast(0.1)).unwrap();
         assert!(all(&c, second).unwrap().is_empty());
         assert_eq!(read(&c, second, "Here").unwrap(), None);
+    }
+
+    #[test]
+    fn a_forgotten_snapshot_comes_back_naming_the_same_version() {
+        let (_dir, c, image) = library_with_one_image();
+        take(&c, image, "Flat", &at_contrast(0.2)).unwrap();
+        crate::edits::save(&c, image, &at_contrast(0.6), EditSource::User).unwrap();
+
+        let gone = forget_keeping(&c, image, "Flat")
+            .unwrap()
+            .expect("it was there");
+        assert_eq!(read(&c, image, "Flat").unwrap(), None);
+        put_back(&c, &gone).unwrap();
+        assert_eq!(read(&c, image, "Flat").unwrap(), Some(at_contrast(0.2)));
     }
 }

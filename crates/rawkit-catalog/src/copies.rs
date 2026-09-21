@@ -117,6 +117,185 @@ pub fn delete(catalog: &Catalog, image_id: i64) -> Result<(), CatalogError> {
     }
 }
 
+/// A virtual copy that was removed, with everything that hung off it, as
+/// [`restore`] needs it. Opaque: the only thing to do with one is hand it back.
+///
+/// Its previews are not kept. They are files as well as rows, the files are the
+/// sweep's to delete, and a copy that comes back is simply built again.
+#[derive(Debug, Clone)]
+pub struct RemovedCopy {
+    id: i64,
+    file_id: i64,
+    name: Option<String>,
+    rating: Option<i64>,
+    flag: Option<String>,
+    colour: Option<String>,
+    created_at: i64,
+    /// Every version of its edit: `(version, json, hash, source, created_at)`.
+    edits: Vec<(i64, String, String, String, i64)>,
+    /// Its snapshots: `(version, name, created_at)`.
+    snapshots: Vec<(i64, String, i64)>,
+    /// The collections it was in, and where.
+    memberships: Vec<(i64, i64)>,
+}
+
+impl RemovedCopy {
+    /// The id it had, and has again when it comes back.
+    pub fn id(&self) -> i64 {
+        self.id
+    }
+
+    /// What it was called.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+}
+
+/// [`delete`], keeping what [`restore`] needs to put it all back.
+///
+/// Read and removed in one transaction, so what is kept is exactly what went.
+pub fn delete_keeping(catalog: &Catalog, image_id: i64) -> Result<RemovedCopy, CatalogError> {
+    let transaction = catalog.connection().unchecked_transaction()?;
+    let row = transaction
+        .query_row(
+            "SELECT file_id, is_virtual_copy, copy_name, rating, flag, colour_label, created_at
+               FROM images WHERE id = ?1",
+            [image_id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .map_err(|_| CatalogError::Sqlite(format!("no image {image_id}")))?;
+    let (file_id, is_copy, name, rating, flag, colour, created_at) = row;
+    if is_copy == 0 {
+        return Err(CatalogError::Unsupported(
+            "that is the photograph itself, not a copy of it",
+        ));
+    }
+    let edits = {
+        let mut statement = transaction.prepare(
+            "SELECT version, json, edit_state_hash, source, created_at
+               FROM edit_states WHERE image_id = ?1 ORDER BY version",
+        )?;
+        let rows = statement.query_map([image_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let snapshots = {
+        let mut statement = transaction
+            .prepare("SELECT version, name, created_at FROM snapshots WHERE image_id = ?1")?;
+        let rows = statement.query_map([image_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let memberships = {
+        let mut statement = transaction
+            .prepare("SELECT collection_id, position FROM collection_images WHERE image_id = ?1")?;
+        let rows = statement.query_map([image_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    transaction.execute("DELETE FROM images WHERE id = ?1", [image_id])?;
+    transaction.commit()?;
+    Ok(RemovedCopy {
+        id: image_id,
+        file_id,
+        name,
+        rating,
+        flag,
+        colour,
+        created_at,
+        edits,
+        snapshots,
+        memberships,
+    })
+}
+
+/// Put a removed copy back: its row under the id it had, its whole edit
+/// history, its snapshots, its judgement, and its places in the collections
+/// that still exist.
+///
+/// The same id or nothing. Every other record of it — an undo naming it, a
+/// selection — names that id, so coming back as a different photograph would
+/// be a new copy with the old one's things, and those records would point at a
+/// stranger. Refused, and said, when the id or the name has been taken since;
+/// and when its file has gone from the catalog.
+pub fn restore(catalog: &Catalog, removed: &RemovedCopy) -> Result<(), CatalogError> {
+    let transaction = catalog.connection().unchecked_transaction()?;
+    let taken: bool = transaction.query_row(
+        "SELECT EXISTS (SELECT 1 FROM images WHERE id = ?1)",
+        [removed.id],
+        |r| r.get(0),
+    )?;
+    let name_taken: bool = transaction.query_row(
+        "SELECT EXISTS (SELECT 1 FROM images WHERE file_id = ?1 AND copy_name = ?2)",
+        rusqlite::params![removed.file_id, removed.name],
+        |r| r.get(0),
+    )?;
+    let file_there: bool = transaction.query_row(
+        "SELECT EXISTS (SELECT 1 FROM files WHERE id = ?1)",
+        [removed.file_id],
+        |r| r.get(0),
+    )?;
+    if taken || name_taken || !file_there {
+        return Err(CatalogError::Unsupported(
+            "that copy cannot come back: its place in the catalog has been taken since",
+        ));
+    }
+    transaction.execute(
+        "INSERT INTO images (id, file_id, is_virtual_copy, copy_name, rating, flag, colour_label, created_at)
+         VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            removed.id,
+            removed.file_id,
+            removed.name,
+            removed.rating,
+            removed.flag,
+            removed.colour,
+            removed.created_at
+        ],
+    )?;
+    for (version, json, hash, source, created_at) in &removed.edits {
+        transaction.execute(
+            "INSERT INTO edit_states (image_id, version, json, edit_state_hash, source, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![removed.id, version, json, hash, source, created_at],
+        )?;
+    }
+    for (version, name, created_at) in &removed.snapshots {
+        transaction.execute(
+            "INSERT INTO snapshots (image_id, version, name, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![removed.id, version, name, created_at],
+        )?;
+    }
+    for (collection, position) in &removed.memberships {
+        let still: bool = transaction.query_row(
+            "SELECT EXISTS (SELECT 1 FROM collections WHERE id = ?1)",
+            [collection],
+            |r| r.get(0),
+        )?;
+        if still {
+            crate::collections::place(
+                &transaction,
+                *collection,
+                &[crate::collections::Placed {
+                    image: removed.id,
+                    position: *position,
+                }],
+            )?;
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 /// Every interpretation of one file, the original first.
 pub fn all_for_file(catalog: &Catalog, file_id: i64) -> Result<Vec<Copy>, CatalogError> {
     let mut statement = catalog.connection().prepare(
@@ -352,5 +531,83 @@ mod tests {
         let original = cull::sequence(&catalog, &cull::Filter::default()).unwrap()[0].id;
         assert!(delete(&catalog, original).is_err());
         assert!(delete(&catalog, 9999).is_err());
+    }
+
+    #[test]
+    fn a_removed_copy_comes_back_with_everything_it_had() {
+        // Undo is only honest if what returns is what went: the same photograph
+        // with its whole history, its snapshots, its judgement and its places.
+        let dir = tempdir();
+        let catalog = library(&dir);
+        let original = cull::sequence(&catalog, &cull::Filter::default()).unwrap()[0].id;
+        let copy = create(&catalog, original, None, &warmer()).unwrap();
+        let mut later = warmer();
+        later.tone.contrast = 0.3;
+        edits::save(&catalog, copy, &later, EditSource::User).unwrap();
+        crate::snapshots::take(&catalog, copy, "Before contrast", &warmer()).unwrap();
+        catalog
+            .connection()
+            .execute(
+                "UPDATE images SET rating = 4, flag = 'pick' WHERE id = ?1",
+                [copy],
+            )
+            .unwrap();
+        let shelf = crate::collections::create(&catalog, "Shelf", None).unwrap();
+        crate::collections::add(&catalog, shelf, &[original, copy]).unwrap();
+
+        let removed = delete_keeping(&catalog, copy).unwrap();
+        assert!(edits::latest(&catalog, copy).unwrap().is_none());
+        restore(&catalog, &removed).unwrap();
+
+        // All three versions: the copy's first edit, the contrast, and the one
+        // the snapshot saved.
+        let versions: i64 = catalog
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM edit_states WHERE image_id = ?1",
+                [copy],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(versions, 3);
+        let (_, state) = edits::latest(&catalog, copy).unwrap().unwrap();
+        assert_eq!(state, warmer());
+        let judged: (Option<i64>, Option<String>) = catalog
+            .connection()
+            .query_row(
+                "SELECT rating, flag FROM images WHERE id = ?1",
+                [copy],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(judged, (Some(4), Some("pick".into())));
+        assert!(crate::collections::holds(&catalog, shelf, copy).unwrap());
+        assert_eq!(
+            crate::snapshots::read(&catalog, copy, "Before contrast").unwrap(),
+            Some(warmer())
+        );
+    }
+
+    #[test]
+    fn a_copy_whose_place_was_taken_is_refused_and_nothing_changes() {
+        let dir = tempdir();
+        let catalog = library(&dir);
+        let original = cull::sequence(&catalog, &cull::Filter::default()).unwrap()[0].id;
+        let copy = create(&catalog, original, None, &warmer()).unwrap();
+        let removed = delete_keeping(&catalog, copy).unwrap();
+        // The next copy is given the same name, and here the same id too.
+        let again = create(&catalog, original, None, &EditState::default()).unwrap();
+        assert!(restore(&catalog, &removed).is_err());
+        let (_, state) = edits::latest(&catalog, again).unwrap().unwrap();
+        assert_eq!(state, EditState::default(), "the newer copy is untouched");
+    }
+
+    #[test]
+    fn the_photograph_itself_cannot_be_removed_to_keep() {
+        let dir = tempdir();
+        let catalog = library(&dir);
+        let original = cull::sequence(&catalog, &cull::Filter::default()).unwrap()[0].id;
+        assert!(delete_keeping(&catalog, original).is_err());
+        assert!(edits::latest(&catalog, original).is_ok());
     }
 }

@@ -106,6 +106,11 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
             extend,
             toggle,
         } => {
+            // A new gesture is a new undo step. Closed here, at the start of the
+            // next one, and not when the button comes up: the render loop may
+            // still be laying down the last points of a stroke after the
+            // release, and those belong to the stroke that is ending.
+            session.lock().expect("session lock").end_step();
             // A white-balance pick is a click rather than a drag: it takes the
             // press, resolves on the next frame, and does not start a pan.
             if picking_wb() && !in_grid() {
@@ -203,6 +208,8 @@ pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
         }
 
         Pointer::Motion { at } => {
+            // Where the pointer is, for a zoom that holds the point under it.
+            *crate::HOVER.lock().expect("hover lock") = Some(at);
             // The far end follows the pointer. Where that lands on the sensor is
             // the render loop's question, not this one's.
             if let Some(drag) = crate::CROP_DRAG.lock().expect("crop drag lock").as_mut() {

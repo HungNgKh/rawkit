@@ -85,6 +85,15 @@ pub const TEMPERATURE_RANGE_K: std::ops::RangeInclusive<f32> = 1000.0..=50_000.0
 /// photograph accumulates in one sitting, and a drag is one of them.
 const MAX_STEPS: usize = 200;
 
+/// One photograph's edit history, held while another photograph is open. See
+/// [`Session::keep`] and [`Session::resume`].
+#[derive(Debug, Clone)]
+pub struct Kept {
+    past: std::collections::VecDeque<(EditState, &'static str)>,
+    future: Vec<(EditState, &'static str)>,
+    state: EditState,
+}
+
 /// A part of the edit a person can look at the photograph without, and put
 /// back to nothing.
 ///
@@ -668,11 +677,11 @@ pub struct Session {
     generation: u64,
     /// States to step back to, oldest first. See [`Session::apply`] for what
     /// counts as one step.
-    past: std::collections::VecDeque<EditState>,
+    past: std::collections::VecDeque<(EditState, &'static str)>,
     /// States undo has taken back, newest last. Cleared by any fresh edit,
     /// because redoing onto a history that has since branched would replay a
     /// decision the user has already replaced.
-    future: Vec<EditState>,
+    future: Vec<(EditState, &'static str)>,
     /// Whether the view is *fitted* rather than at a scale someone chose.
     ///
     /// Not derivable from the scale: after the window changes size the fitting
@@ -773,6 +782,11 @@ impl Session {
 
     pub fn state(&self) -> &EditState {
         &self.state
+    }
+
+    /// Whether the view is fitted rather than at a scale somebody chose.
+    pub fn is_fitted(&self) -> bool {
+        self.fitted
     }
 
     pub fn viewport(&self) -> Viewport {
@@ -1007,6 +1021,64 @@ impl Session {
         // A comparison belongs to the photograph it was asked of.
         self.compare = None;
         self.edit_changed()
+    }
+
+    /// The steps of this photograph's history, oldest first, and how many of
+    /// them are in force. Each step is named by the command that made it —
+    /// `set_exposure`, `set_masks` — for the page to put into words; the ones
+    /// past `at` are what undo has taken back and redo would put back.
+    pub fn history(&self) -> (Vec<&'static str>, usize) {
+        let steps = self
+            .past
+            .iter()
+            .map(|(_, label)| *label)
+            .chain(self.future.iter().rev().map(|(_, label)| *label))
+            .collect();
+        (steps, self.past.len())
+    }
+
+    /// Close the step that is open, so the next change starts a new one.
+    ///
+    /// For the shell to call when a pointer is let go. A drag on the canvas is
+    /// a run of commands to the same control, and without this two strokes of
+    /// a brush — or two drags of one handle — were one step, and one press of
+    /// undo took both back. The session still knows nothing about pointers;
+    /// the shell, which does, says where one gesture ended.
+    pub fn end_step(&mut self) {
+        self.step = None;
+    }
+
+    /// This photograph's history, for keeping while another one is open.
+    pub fn keep(&self) -> Kept {
+        Kept {
+            past: self.past.clone(),
+            future: self.future.clone(),
+            state: self.state.clone(),
+        }
+    }
+
+    /// Put a kept history back, after [`Session::load`] has opened the same
+    /// photograph again.
+    ///
+    /// If the edit it was opened with is the one the history ended on, the
+    /// history is exactly as it was left. If not, something changed it while it
+    /// was not open — a paste from the Library, most often — and that change is
+    /// a step of its own, called `changed`: undo goes back through it to where
+    /// this sitting left off, which is how a paste can be taken back from
+    /// either workspace. What redo held is dropped then, as any fresh change
+    /// drops it.
+    pub fn resume(&mut self, kept: Kept, changed: &'static str) {
+        self.past = kept.past;
+        if kept.state == self.state {
+            self.future = kept.future;
+        } else {
+            if self.past.len() == MAX_STEPS {
+                self.past.pop_front();
+            }
+            self.past.push_back((kept.state, changed));
+            self.future.clear();
+        }
+        self.step = None;
     }
 
     fn dispatch(&mut self, command: Command) -> Event {
@@ -1472,18 +1544,18 @@ impl Session {
         if self.past.len() == MAX_STEPS {
             self.past.pop_front();
         }
-        self.past.push_back(before);
+        self.past.push_back((before, control.0));
         // A discrete command leaves no step open, so whatever comes next starts
         // its own — two rotates are two steps even though the name is the same.
         self.step = coalesces.then_some(control);
     }
 
     fn step_back(&mut self) -> Event {
-        let Some(previous) = self.past.pop_back() else {
+        let Some((previous, label)) = self.past.pop_back() else {
             return refused("undo", "nothing to undo");
         };
         self.future
-            .push(std::mem::replace(&mut self.state, previous));
+            .push((std::mem::replace(&mut self.state, previous), label));
         // The step that was open is now the one we just left, so an edit
         // arriving next must not merge into it.
         self.step = None;
@@ -1491,11 +1563,11 @@ impl Session {
     }
 
     fn step_forward(&mut self) -> Event {
-        let Some(next) = self.future.pop() else {
+        let Some((next, label)) = self.future.pop() else {
             return refused("redo", "nothing to redo");
         };
         self.past
-            .push_back(std::mem::replace(&mut self.state, next));
+            .push_back((std::mem::replace(&mut self.state, next), label));
         self.step = None;
         self.edit_changed()
     }
@@ -2158,6 +2230,62 @@ mod tests {
         );
         s.apply(Command::Undo);
         assert_eq!(s.state().orientation, start);
+    }
+
+    #[test]
+    fn the_history_names_its_steps_and_knows_where_it_is() {
+        let mut s = session();
+        s.apply(Command::SetExposure(0.5));
+        s.apply(Command::SetContrast(0.2));
+        s.apply(Command::SetContrast(0.3)); // the same drag: still one step
+        assert_eq!(s.history(), (vec!["set_exposure", "set_contrast"], 2));
+        s.apply(Command::Undo);
+        // Undone, but still listed, so it can be gone back to.
+        assert_eq!(s.history(), (vec!["set_exposure", "set_contrast"], 1));
+        s.apply(Command::SetShadows(0.1));
+        assert_eq!(s.history(), (vec!["set_exposure", "set_shadows"], 2));
+    }
+
+    #[test]
+    fn a_let_go_ends_the_step_so_two_drags_are_two_undos() {
+        let mut s = session();
+        s.apply(Command::SetContrast(0.2));
+        s.end_step();
+        s.apply(Command::SetContrast(0.4));
+        s.apply(Command::Undo);
+        assert_eq!(s.state().tone.contrast, 0.2, "one drag back, not both");
+    }
+
+    #[test]
+    fn a_kept_history_comes_back_and_a_change_made_elsewhere_is_a_step() {
+        let mut s = session();
+        s.apply(Command::SetExposure(0.5));
+        s.apply(Command::SetExposure(0.7));
+        let kept = s.keep();
+
+        // Opened again as it was left: exactly the history it had.
+        s.load(kept_state(&kept));
+        s.resume(kept.clone(), "changed");
+        assert_eq!(s.history(), (vec!["set_exposure"], 1));
+
+        // Opened again after a paste from the Library changed it.
+        let mut pasted = EditState::default();
+        pasted.tone.contrast = 0.6;
+        s.load(pasted.clone());
+        s.resume(kept, "changed");
+        assert_eq!(s.history(), (vec!["set_exposure", "changed"], 2));
+        s.apply(Command::Undo);
+        assert_eq!(
+            s.state().tone.exposure_ev,
+            0.7,
+            "back to where the sitting left off"
+        );
+        s.apply(Command::Redo);
+        assert_eq!(s.state(), &pasted);
+    }
+
+    fn kept_state(kept: &Kept) -> EditState {
+        kept.state.clone()
     }
 
     #[test]

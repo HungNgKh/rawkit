@@ -110,6 +110,65 @@ pub fn forget(catalog: &Catalog, name: &str) -> Result<(), CatalogError> {
     Ok(())
 }
 
+/// A preset that was forgotten, as [`put_back`] needs it: the row exactly, so
+/// what comes back is what went and not a re-encoding of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forgotten {
+    pub name: String,
+    json: String,
+    groups: String,
+    created_at: i64,
+}
+
+/// [`forget`], keeping the row. `None` when there was nothing by that name.
+pub fn forget_keeping(catalog: &Catalog, name: &str) -> Result<Option<Forgotten>, CatalogError> {
+    let row = catalog
+        .connection()
+        .query_row(
+            "SELECT name, json, groups, created_at FROM presets WHERE name = ?1",
+            rusqlite::params![name],
+            |r| {
+                Ok(Forgotten {
+                    name: r.get(0)?,
+                    json: r.get(1)?,
+                    groups: r.get(2)?,
+                    created_at: r.get(3)?,
+                })
+            },
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    if row.is_some() {
+        forget(catalog, name)?;
+    }
+    Ok(row)
+}
+
+/// Put a forgotten preset back. Refused when a preset of that name has been
+/// saved since: that one is the newer decision, and overwriting it with an
+/// older one because somebody pressed undo would lose it silently.
+pub fn put_back(catalog: &Catalog, forgotten: &Forgotten) -> Result<(), CatalogError> {
+    let inserted = catalog.connection().execute(
+        "INSERT INTO presets (name, json, groups, created_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (name) DO NOTHING",
+        rusqlite::params![
+            forgotten.name,
+            forgotten.json,
+            forgotten.groups,
+            forgotten.created_at
+        ],
+    )?;
+    if inserted == 0 {
+        return Err(CatalogError::Unsupported(
+            "a preset with that name has been saved since, and it is kept",
+        ));
+    }
+    Ok(())
+}
+
 fn decode((name, json, groups): (String, String, String)) -> Result<Preset, CatalogError> {
     let state: EditState = serde_json::from_str(&json)
         .map_err(|e| CatalogError::Sqlite(format!("preset {name:?}: {e}")))?;
@@ -268,5 +327,27 @@ mod tests {
             .unwrap();
         assert!(get(&c, "Future").is_err());
         assert!(all(&c).is_err());
+    }
+
+    #[test]
+    fn a_forgotten_preset_comes_back_as_it_was_and_never_over_a_newer_one() {
+        let c = catalog();
+        save(&c, "Warm", &warm_and_contrasty(), &[Group::Tone]).unwrap();
+        let gone = forget_keeping(&c, "Warm").unwrap().expect("it was there");
+        assert_eq!(get(&c, "Warm").unwrap(), None);
+        put_back(&c, &gone).unwrap();
+        assert_eq!(
+            get(&c, "Warm").unwrap().unwrap().state,
+            warm_and_contrasty()
+        );
+
+        let gone = forget_keeping(&c, "Warm").unwrap().unwrap();
+        save(&c, "Warm", &EditState::default(), &[Group::Tone]).unwrap();
+        assert!(put_back(&c, &gone).is_err());
+        assert_eq!(
+            get(&c, "Warm").unwrap().unwrap().state,
+            EditState::default()
+        );
+        assert_eq!(forget_keeping(&c, "Nobody").unwrap(), None);
     }
 }
