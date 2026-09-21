@@ -565,6 +565,14 @@ fn clearing_a_window_sized_overlay_costs_less_than_a_frame() {
         .expect("clears");
     let each = started.elapsed() / runs;
     println!("clearing a 4400x2720 overlay: {each:?} each over {runs} runs");
+    // A software adapter clears with the CPU, so its time is a memset on
+    // whatever machine CI lent us and says nothing about the trade above. It
+    // failed on the hosted runner's lavapipe most pushes, which taught CI to be
+    // ignored. Still run, so the path is exercised; not judged.
+    if gpu.adapter_info.device_type == wgpu::DeviceType::Cpu {
+        println!("(a CPU adapter: {}; not judged)", gpu.adapter_info.name);
+        return;
+    }
     assert!(
         each < std::time::Duration::from_millis(8),
         "a per-frame overlay clear costs {each:?}, which is a frame at 120 Hz"

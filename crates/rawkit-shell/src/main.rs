@@ -135,8 +135,8 @@
 //! wgpu clears the window to a green no interface would ever use, so the check
 //! is by value rather than by eye. Take several captures a second apart.
 
-#[cfg(target_os = "linux")]
 mod building;
+#[cfg(target_os = "linux")]
 mod canvas;
 mod exporting;
 mod importing;
