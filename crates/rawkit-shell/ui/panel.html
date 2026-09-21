@@ -833,7 +833,9 @@
   const invoke = window.__TAURI__.core.invoke;
   /// Whether nothing is open. The shell's fact, asked for once: what is open
   /// cannot change under a page, because opening something else is a relaunch.
-  let atWelcome = false;
+  /// `null` until the shell has answered, and treated as yes until then: a key
+  /// pressed in those first milliseconds has no photograph it could be about.
+  let atWelcome = null;
 
   // ---- Saying what happened --------------------------------------------------
   //
@@ -3310,7 +3312,7 @@
     if (!command) return;
     // Nothing is open, so nothing that acts on a photograph has one to act on.
     // Dropped without a word: the welcome screen is already saying why.
-    if (atWelcome && !command.welcome) return;
+    if (atWelcome !== false && !command.welcome) return;
     const blocked = obstacle(command);
     if (blocked?.kind === "tool")
       return tell("refused", `${blocked.tool.name} is in hand — ${blocked.tool.exits}`);

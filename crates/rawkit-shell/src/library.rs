@@ -2094,6 +2094,18 @@ impl Saver {
         }
     }
 
+    /// Stop writing for the photograph on screen, until the next one opens.
+    ///
+    /// For a photograph that could not be read. What is on the canvas then is a
+    /// flat dark stand-in, the session still holds that photograph's *real*
+    /// edit, and the sliders still work — so somebody pushing exposure up to
+    /// see whether anything is there would be editing a picture they cannot
+    /// see, and it would be saved. It opens next time with an edit nobody chose.
+    pub fn set_aside(&mut self) {
+        self.image = None;
+        self.settled = None;
+    }
+
     /// Put the current photograph's stored edit into the session, and treat that
     /// as the state it opened in.
     pub fn restore(&mut self, session: &mut Session) {
@@ -3579,6 +3591,44 @@ mod saver_tests {
             on_second.is_none(),
             "and the frame that was never touched has no version at all"
         );
+    }
+
+    #[test]
+    fn a_photograph_that_could_not_be_read_is_not_edited_by_accident() {
+        // What is on the canvas is a flat dark stand-in. The sliders still
+        // work, and somebody will push exposure up to see if anything is there.
+        let dir = Scratch::new("saver-set-aside");
+        let library = Arc::new(Mutex::new(library_at(&dir.0, 2)));
+        let first = library.lock().unwrap().current().id;
+        let session = Arc::new(Mutex::new(Session::new(
+            [100, 100],
+            64,
+            EditState::default(),
+            rawkit_editstate::Orientation::AsShot,
+        )));
+        let mut saver = Saver::new(Some(library.clone()), session.clone());
+        saver.restore(&mut session.lock().unwrap());
+        saver.set_aside();
+
+        session.lock().unwrap().apply(Command::SetExposure(3.0));
+        saver.flush();
+        let nothing =
+            rawkit_catalog::edits::latest(library.lock().unwrap().catalog(), first).unwrap();
+        assert!(nothing.is_none(), "an edit to a picture nobody could see");
+
+        // The next photograph opens, and writing starts again with it.
+        library.lock().unwrap().act(CullAction::Next).unwrap();
+        let second = library.lock().unwrap().current().id;
+        library.lock().unwrap().take_request();
+        saver.restore(&mut session.lock().unwrap());
+        session.lock().unwrap().apply(Command::SetExposure(0.5));
+        saver.flush();
+        let library = library.lock().unwrap();
+        let saved = rawkit_catalog::edits::latest(library.catalog(), second).unwrap();
+        assert_eq!(saved.map(|(_, s)| s.tone.exposure_ev), Some(0.5));
+        assert!(rawkit_catalog::edits::latest(library.catalog(), first)
+            .unwrap()
+            .is_none());
     }
 
     /// Opening a photograph and moving on must write nothing.

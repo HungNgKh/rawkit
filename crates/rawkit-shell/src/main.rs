@@ -1170,7 +1170,13 @@ fn leave_for(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
     if exporting {
         return Err("an export is still running, and opening something else would end it".into());
     }
-    *LEAVING.lock().expect("leaving lock") = Some(Leaving::For(arguments));
+    // The first way out asked for is the one taken. A file picker answers on a
+    // thread of its own, whenever somebody gets round to it, and must not turn
+    // a window that was closed in the meantime into one that reopens.
+    let mut leaving = LEAVING.lock().expect("leaving lock");
+    if leaving.is_none() {
+        *leaving = Some(Leaving::For(arguments));
+    }
     Ok(())
 }
 
@@ -1603,9 +1609,15 @@ fn main() -> Result<()> {
                         remember_window(&app_handle, &remembering, true);
                         // Held for one frame, so the render loop can write the
                         // edit that is still in its settle timer. See `LEAVING`.
-                        if TICKING.load(std::sync::atomic::Ordering::Relaxed) {
+                        //
+                        // Asked twice, it closes at once. The loop could die
+                        // between being found alive and being asked, and a
+                        // window nothing can close is worse than a lost edit.
+                        let mut leaving = LEAVING.lock().expect("leaving lock");
+                        let asked_already = matches!(*leaving, Some(Leaving::Quit));
+                        if TICKING.load(std::sync::atomic::Ordering::Relaxed) && !asked_already {
                             api.prevent_close();
-                            *LEAVING.lock().expect("leaving lock") = Some(Leaving::Quit);
+                            *leaving = Some(Leaving::Quit);
                         }
                         return;
                     }
@@ -1675,6 +1687,7 @@ fn main() -> Result<()> {
             // among many, so the catalog opens and that frame is a flat stand-in
             // with the reason on the status line; on its own it was the whole
             // of what was asked for, so the answer is the welcome screen.
+            let mut standing_in = false;
             let (mut loaded, raw) = match raw {
                 None if start == Start::TestPattern => (Loaded::open(None, DEFAULT_TILE)?, None),
                 None => (Loaded::stand_in(DEFAULT_TILE), None),
@@ -1682,6 +1695,7 @@ fn main() -> Result<()> {
                     Ok(loaded) => (loaded, Some(path)),
                     Err(why) => {
                         failure(format!("{why:#}"));
+                        standing_in = true;
                         (
                             Loaded::stand_in(DEFAULT_TILE),
                             library.is_some().then_some(path),
@@ -1717,6 +1731,9 @@ fn main() -> Result<()> {
             let exporting_from = library.clone();
             // Whatever was last decided about this photograph, if anything was.
             saver.restore(&mut shared.lock().expect("session lock"));
+            if standing_in {
+                saver.set_aside();
+            }
 
             // Routes 1 and 2 put the canvas over the whole window; route 3 gives
             // it a window of its own, ending where the chrome begins.
@@ -1857,6 +1874,22 @@ fn main() -> Result<()> {
 
                 // First, because it is the last thing this process does.
                 let leaving = LEAVING.lock().expect("leaving lock").take();
+                // Asked again here, where the answer is acted on: an export
+                // that began after the command looked would be ended by this.
+                let exporting = EXPORTING
+                    .lock()
+                    .expect("export lock")
+                    .as_ref()
+                    .is_some_and(|export| export.finished.is_none());
+                let leaving = match leaving {
+                    Some(Leaving::For(_)) if exporting => {
+                        tell(Told::from(
+                            "an export has started, and opening something else would end it",
+                        ));
+                        None
+                    }
+                    other => other,
+                };
                 if let Some(leaving) = leaving {
                     saver.flush();
                     remember_window(&leaving_app, &leaving_window, true);
@@ -2084,6 +2117,7 @@ fn main() -> Result<()> {
                     if let Some(stand_in) = stand_in.take() {
                         canvas_renderer.reload(&gpu, &stand_in.frame());
                         showing.raw = Some(stand_in);
+                        saver.set_aside();
                     }
                     eprintln!(
                         "open       : {} in {:.0} ms",
@@ -2151,6 +2185,7 @@ fn main() -> Result<()> {
                         Ok(next) => next,
                         Err(why) => {
                             failure(format!("{why:#}"));
+                            saver.set_aside();
                             Loaded::stand_in(DEFAULT_TILE)
                         }
                     };

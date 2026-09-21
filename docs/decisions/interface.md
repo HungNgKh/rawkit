@@ -451,6 +451,12 @@ header read, the preview lookup and the texture upload no longer use `?`.
 A missing file says it is not there, in those words, before the decoder is
 asked: what the decoder says is "io error: Input/output error".
 
+While a stand-in is showing, nothing is written for that photograph
+(`Saver::set_aside`). The session still holds its real edit and the sliders
+still work, so somebody pushing exposure up to see whether anything is there
+would have been editing a picture they could not see — and it would have been
+saved.
+
 ## I19 — every way out goes through the render loop
 
 `LEAVING` is a request the render loop acts on at the top of its next frame:
@@ -461,7 +467,13 @@ still in its settle timer.
 Closing the window is one of those ways out, which it was not before: the close
 is held for a frame (`prevent_close`) and the loop exits the process. That is
 only safe while the loop is alive — `TICKING` — because a window held open for
-a loop that has died could never be closed.
+a loop that has died could never be closed. And a second close closes at once:
+the loop can die between being found alive and being asked.
+
+The first way out asked for is the one taken. A file picker answers on its own
+thread whenever somebody gets round to it, and must not turn a window closed in
+the meantime into one that reopens on a catalog. The export check is made
+twice — by the command, and again by the loop where the answer is acted on.
 
 ## I20 — what the shell says has a command of its own
 
@@ -500,6 +512,7 @@ only reply. Now only `--new` — which only New passes — may create one.
 | what a command does, which keys it has, or whether it waits | `page_contract::the_page_and_the_shell_agree_about_what_waits_for_a_tool`, and the registry throws at load on a key bound twice |
 | the shape of a registry entry | the same test — it reads `{ id: `, `act: "…"`, `value: …`, `waits: …` as text |
 | what the view carries per keypress | `the_view_says_where_a_photograph_is_kept`; the `holding 1` and `taken 1` columns of the scale gate |
+| what is written while a stand-in is showing | `a_photograph_that_could_not_be_read_is_not_edited_by_accident` |
 | what a launch opens | `what_is_named_is_what_opens`, `with_nothing_named_the_last_catalog_comes_back`, `a_catalog_that_was_closed_stays_closed`, `the_test_pattern_has_to_be_asked_for` |
 | the recent list | `the_last_one_opened_comes_first_and_is_listed_once`, `only_so_many_are_kept`, `a_bare_launch_reopens_the_last_one_only_if_it_is_there`, `a_list_that_cannot_be_read_is_an_empty_one` |
 | anything in `setup`, or in the navigation block of `tick` | nothing automatic. **No `?` on anything a missing file, a bad catalog or a corrupt preview can reach.** Check by hand with `target/scratch`-style catalogs whose files have been renamed |
