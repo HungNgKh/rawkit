@@ -55,6 +55,9 @@ what a contributor would otherwise undo.
 | **I31** | Active is a frame round the slot; selected is a ground behind it and a tick | Two things shown two ways, so a photograph that is both looks like both — and the pick's edge is no longer hidden on the one frame being looked at. |
 | **I32** | The marks on a cell are drawn, not typeset | Distance functions rasterised on the CPU, one texture per mark per size, composited by a third pipeline. No font on the GPU side (Q7). |
 | **I33** | Shift-click and Ctrl-click mean what a file manager's do | A range is over what is *showing*, and adds. A plain click moves the active photograph and leaves the selection alone. |
+| **I34** | The window is divided by the shell, and the page draws at its numbers | Top bar, left panel, right panel, status bar: four insets in `frame.rs`. The Linux canvas is placed from them and the page is handed them. |
+| **I35** | The tool-options bar is a permanent row, not one that appears with a tool | Picking up crop must not move the photograph under the handles. The row holds the filter in Library. |
+| **I36** | Panels hide with F7 and F8, not Tab | Tab moves the keyboard through the controls; taking it would take the panel from anybody who drives it that way. |
 | **I21** | New never replaces a catalog, and only `--new` makes one | The picker's "replace?" is a question about a file. Without `--new`, a path that is not there is refused, not created. |
 
 ## I1 — one status line
@@ -774,6 +777,53 @@ also wants. Measured at twenty thousand photographs on the development machine:
 the frame is drawn without marks and the failure is said once — an error out of a
 frame ends the render loop, and marks are not worth the window.
 
+## I34 — the shell divides the window
+
+A bar across the top, navigation on the left, the controls on the right, a status
+bar across the bottom, and the photograph in the gap. **Every size is a number in
+`frame.rs`**, and three things read it: the Linux canvas, which is an X window
+placed in the gap; both pointer deliverers, which ask `Frame::to_canvas` (GTK) or
+the same arithmetic in the page (cutout); and the page, which is handed the frame
+through `frame` and every poll and draws its bars at exactly those sizes. A page
+that chose its own heights would leave the photograph over a bar's edge or a line
+of page showing beside it — checked by pixel on all four edges, windowed and
+fullscreen, after the divider and after F7 and F8.
+
+The insets are scaled and the canvas is what remains, rather than each of five
+numbers being rounded alone, so at a fractional scale the canvas still meets the
+bars exactly.
+
+In a narrow window the **left panel goes first**, then the right one shrinks to
+its minimum; the photograph keeps its 320. Navigation can be reached by key; the
+controls beside the photograph are what it is being looked at for.
+
+The welcome screen and the import sheet are outside every region: the right column
+can be hidden, and a way in that went with it would leave an empty window. The
+sheet, the palette and the export panel stay in the right column, and asking for
+one while it is hidden brings the column back.
+
+Found on the way: the pointer's edge had been measured once at startup, so after
+the window grew, a click on the new part of the photograph went nowhere. Both the
+frame and the window size are now read per event.
+
+## I35 — a tool-options row that is always there
+
+The designer's tool-options bar appeared only while a tool was in hand. That
+resizes the canvas as crop is picked up: the photograph jumps a row's height
+under the handles somebody is reaching for, and a keypress rebuilds the
+swapchain. So the top bar has **two rows in both workspaces**: the second is the
+filter in Library, and in Develop what is in hand and how to put it down — or,
+with nothing in hand, the tool keys. It costs 36 pixels of photograph and buys a
+canvas that changes size only when the window or a panel does.
+
+## I36 — F7 and F8
+
+Lightroom hides panels with Tab. Here Tab is how the keyboard reaches a slider,
+and a key that hid the control it was about to reach would take the panel away
+from anyone driving it that way. F7 and F8 are Lightroom's own keys for the left
+and right panels; "hide both" is in the palette without a key. What is hidden is
+remembered with the window.
+
 ## If you change this
 
 | If you touch… | …this will tell you |
@@ -815,6 +865,9 @@ frame ends the render loop, and marks are not worth the window.
 | the recent list | `the_last_one_opened_comes_first_and_is_listed_once`, `only_so_many_are_kept`, `a_bare_launch_reopens_the_last_one_only_if_it_is_there`, `a_list_that_cannot_be_read_is_an_empty_one` |
 | anything in `setup`, or in the navigation block of `tick` | nothing automatic. **No `?` on anything a missing file, a bad catalog or a corrupt preview can reach.** Check by hand with `target/scratch`-style catalogs whose files have been renamed |
 | who reads the notice | `grep -n 'take_notice' panel.html` shows only `hear` |
+| how the window is divided | `frame::tests` — the four sides, the left panel giving way first, a hidden panel's width going to the photograph, the physical canvas meeting the bars at a fractional scale, and where a pointer lands |
+| a bar's height or a panel's width in the page | nothing automatic: the page must take it from `--top`, `--left`, `--panel`, `--bottom`, never a number of its own. Check by pixel: the page's border ends on the pixel before the canvas starts, on all four sides |
+| where an overlay lives | the welcome and import screens are top-level; the sheet, palette and export panel are in `#chrome` and call `needRight()` |
 | a new command that should work with nothing open | mark it `welcome: true` in the registry, or the welcome screen drops it |
 | a new static that holds something about the open catalog | nothing to do — that is what I16 buys. Do not add a "reset" path |
 | anything that writes a message in the page | there must be exactly one writer: `grep -n 'saidLine\.\|failedLine\.' panel.html` shows only `tell` and the dismiss handler |

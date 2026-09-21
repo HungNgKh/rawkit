@@ -78,14 +78,10 @@ impl rwh::HasDisplayHandle for CanvasWindow {
 /// Pack a canvas widget into the window, beside whatever webview is already
 /// there, and return handles to its X window.
 ///
-/// `panel_width` is how much of the window the chrome keeps, on the right. The
-/// split is horizontal because a landscape photograph is limited by its short
-/// edge, and a strip across the top takes from exactly that edge — the same
-/// frame is half again as large beside a column as it is beneath a strip.
-///
-/// The canvas is not laid out by `default_vbox` at all: it is a child X window
-/// with explicit geometry, which is why the split can be whichever way suits
-/// the picture rather than whichever way the box packs.
+/// Where it goes is [`crate::frame`]'s: the canvas is not laid out by
+/// `default_vbox` at all but is a child X window with explicit geometry, which
+/// is why the window can be divided whichever way suits the picture rather than
+/// whichever way the box packs.
 ///
 /// No size comes back: at this point the widget has an X window but GTK has not
 /// laid the toplevel out, so it measures 2x2 and would be a trap to trust.
@@ -131,31 +127,27 @@ pub fn init_threads() {
 /// canvas is control rather than a chore, but it does mean the tracking below
 /// has to be written by hand.
 ///
-/// `panel` is read on every allocation rather than captured once, because the
-/// divider can move it while the window stays exactly the same size. It must be
-/// the width the panel is actually *given* rather than the one someone asked
-/// for: in a window too narrow for their choice the two differ, and placing this
-/// window from one while the surface is configured from the other leaves the
-/// canvas and its swapchain describing different rectangles.
-pub fn attach(
-    window: &tauri::Window,
-    panel: &'static std::sync::atomic::AtomicI32,
-) -> Result<CanvasWindow> {
+/// The frame is read on every allocation rather than captured once, because the
+/// divider and the panel keys change it while the window stays exactly the same
+/// size. It must be the frame the layout *settled* rather than what somebody
+/// asked for: in a window too narrow for their choice the two differ, and
+/// placing this window from one while the surface is configured from the other
+/// leaves the canvas and its swapchain describing different rectangles.
+pub fn attach(window: &tauri::Window) -> Result<CanvasWindow> {
     let gtk_window = window.gtk_window()?;
     let parent = gtk_window
         .window()
         .ok_or_else(|| anyhow!("the toplevel has no X window yet"))?;
 
-    let panel_width = panel.load(std::sync::atomic::Ordering::Relaxed);
     let (width, height) = (gtk_window.allocated_width(), gtk_window.allocated_height());
-    // At the origin, ending where the chrome begins. The photograph takes the
-    // left of the window and the controls the right, which is also why nothing
-    // downstream carries an offset any more.
+    // Between the bars and the panels. The surface is this window, so nothing
+    // downstream carries an offset: the canvas's own origin is the photograph's.
+    let [x, y, width, height] = crate::frame::current().canvas((width, height));
     let attributes = gdk::WindowAttr {
-        x: Some(0),
-        y: Some(0),
-        width: (width - panel_width).max(1),
-        height: height.max(1),
+        x: Some(x),
+        y: Some(y),
+        width,
+        height,
         window_type: gdk::WindowType::Child,
         wclass: gdk::WindowWindowClass::InputOutput,
         // The parent's visual, so the child is the same depth as the surface
@@ -197,7 +189,7 @@ pub fn attach(
     // divider, which changes where the canvas ends without changing the window.
     CHILD.with(|slot| *slot.borrow_mut() = Some(child.clone()));
     gtk_window.connect_size_allocate(move |_, allocation| {
-        place(&child, panel, allocation.width(), allocation.height());
+        place(&child, allocation.width(), allocation.height());
     });
 
     Ok(CanvasWindow {
@@ -222,15 +214,16 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Put the canvas where the panel is not.
+/// Put the canvas where the bars and the panels are not.
 ///
 /// Logical units throughout, which is what GTK allocations are in. GDK scales to
 /// device pixels on a HiDPI display, and the surface is configured from the
 /// window's *physical* size — the two agree because they are the same rectangle
-/// expressed twice, not because anyone converts between them here.
-fn place(child: &gdk::Window, panel: &std::sync::atomic::AtomicI32, width: i32, height: i32) {
-    let panel = panel.load(std::sync::atomic::Ordering::Relaxed);
-    child.move_resize(0, 0, (width - panel).max(1), height.max(1));
+/// expressed twice by [`crate::frame::Frame`], not because anyone converts
+/// between them here.
+fn place(child: &gdk::Window, width: i32, height: i32) {
+    let [x, y, width, height] = crate::frame::current().canvas((width, height));
+    child.move_resize(x, y, width, height);
 }
 
 /// Take the canvas off the screen, for a window with nothing to show in it.
@@ -256,21 +249,33 @@ pub fn show() {
     });
 }
 
-/// Re-place the canvas after the divider has moved, with the window unchanged.
+/// Re-place the canvas after the divider has moved or a panel was shown or
+/// hidden, with the window unchanged.
 ///
 /// Must be called on the GTK main thread; on Linux the render loop runs there,
 /// which is what makes this callable at all.
-pub fn reposition(window: &tauri::Window, panel: &std::sync::atomic::AtomicI32) -> Result<()> {
+pub fn reposition(window: &tauri::Window) -> Result<()> {
     let gtk_window = window.gtk_window()?;
     let (width, height) = (gtk_window.allocated_width(), gtk_window.allocated_height());
     // Empty only if this is not the thread `attach` ran on, which on Linux it
     // always is: the render loop is a GTK timeout on the main context.
     CHILD.with(|slot| {
         if let Some(child) = slot.borrow().as_ref() {
-            place(child, panel, width, height);
+            place(child, width, height);
         }
     });
     Ok(())
+}
+
+/// Where a point on the toplevel falls on the canvas, in the canvas's physical
+/// pixels, or nowhere.
+///
+/// The frame and the window's size are read per event, not captured. They
+/// were: the edge was measured once at startup, so after the window grew or the
+/// divider moved, a click on the new part of the photograph went nowhere.
+fn to_canvas(window: &impl IsA<gtk::Widget>, at: (f64, f64), scale: f64) -> Option<[f64; 2]> {
+    let size = (window.allocated_width(), window.allocated_height());
+    crate::frame::current().to_canvas(size, at, scale)
 }
 
 /// Route pointer input over the canvas into the session.
@@ -286,10 +291,9 @@ pub fn reposition(window: &tauri::Window, panel: &std::sync::atomic::AtomicI32) 
 ///
 /// So the handlers below see pointer events over the canvas as if they happened
 /// on the window, in the window's coordinates, and the only thing to do is
-/// notice which side of the chrome they fall on.
+/// notice whether they fall between the bars and the panels.
 pub fn attach_input(
     window: &tauri::Window,
-    panel_width: i32,
     session: std::sync::Arc<std::sync::Mutex<rawkit_session::Session>>,
 ) -> Result<()> {
     use gtk::gdk::EventMask;
@@ -306,21 +310,13 @@ pub fn attach_input(
     // Logical coordinates from GTK, physical everywhere in the session and the
     // surface. Converting here means the rest of the shell never has to know
     // which it is holding.
-    // The canvas starts at the window's origin and stops where the chrome
-    // begins, so a pointer is over the photograph exactly when it is left of
-    // that edge. No offset to subtract — the previous strip layout needed one
-    // and getting it wrong put every click a chrome's height out.
-    let edge = (gtk_window.allocated_width() - panel_width) as f64;
-    let to_canvas = move |(x, y): (f64, f64)| -> Option<[f64; 2]> {
-        (x < edge).then_some([x * scale, y * scale])
-    };
 
     // GTK's job here is to say *where*, in canvas pixels. What the event means
     // is `pointer::route`, which the cutout front end calls too — two deliverers
     // of pointer events, one idea of what they mean.
     let pressed = session.clone();
-    gtk_window.connect_button_press_event(move |_, event| {
-        if let Some(at) = to_canvas(event.position()) {
+    gtk_window.connect_button_press_event(move |widget, event| {
+        if let Some(at) = to_canvas(widget, event.position(), scale) {
             crate::pointer::route(
                 crate::pointer::Pointer::Press {
                     at,
@@ -341,16 +337,16 @@ pub fn attach_input(
     });
 
     let moved = session.clone();
-    gtk_window.connect_motion_notify_event(move |_, event| {
-        if let Some(at) = to_canvas(event.position()) {
+    gtk_window.connect_motion_notify_event(move |widget, event| {
+        if let Some(at) = to_canvas(widget, event.position(), scale) {
             crate::pointer::route(crate::pointer::Pointer::Motion { at }, &moved);
         }
         gtk::glib::Propagation::Proceed
     });
 
     let zoomed = session;
-    gtk_window.connect_scroll_event(move |_, event| {
-        let Some(at) = to_canvas(event.position()) else {
+    gtk_window.connect_scroll_event(move |widget, event| {
+        let Some(at) = to_canvas(widget, event.position(), scale) else {
             return gtk::glib::Propagation::Proceed;
         };
         // GTK reports a direction for a wheel and a delta for a trackpad, and

@@ -44,18 +44,57 @@
      Route 3 gives the canvas its own window and never sets this, which is why
      it is a class rather than the default. */
   body.cutout { background: transparent; }
-  body.cutout #chrome { background: var(--ground-panel); }
+  body.cutout #chrome, body.cutout #top, body.cutout #left, body.cutout #status { background: var(--ground-panel); }
 
-  /* A column on the right rather than a strip across the top. A landscape
-     photograph is limited by its short edge and a strip takes from exactly
-     that edge — the same 3:2 frame goes from 864x576 to 1080x720 by moving the
-     controls sideways. The width is `PANEL_WIDTH` in main.rs and the two have
-     to agree: the canvas is a separate window placed at that boundary, so a
-     disagreement is a strip of photograph behind the panel or a strip of
-     desktop beside it. */
-  #chrome { position: fixed; top: 0; right: 0; bottom: 0; width: var(--panel, 360px);
-            display: flex; flex-direction: column; background: var(--ground-panel);
+  /* The frame: a bar across the top, navigation on the left, the controls on
+     the right, a status bar across the bottom, and the photograph in the gap.
+     The four sizes are the shell's (frame.rs) and arrive as these variables;
+     the defaults below are only what the first paint uses before it answers.
+     The canvas is a separate window placed in the gap, so a size of the page's
+     own would be a strip of photograph behind a bar or of desktop beside it.
+
+     The right panel is a column rather than a strip across the top because a
+     landscape photograph is limited by its short edge, and a strip takes from
+     exactly that edge — the same 3:2 frame goes from 864x576 to 1080x720 by
+     moving the controls sideways. */
+  :root { --top: 76px; --left: 260px; --panel: 360px; --bottom: 28px; }
+  #top { position: fixed; top: 0; left: 0; right: 0; height: var(--top); box-sizing: border-box;
+         display: flex; flex-direction: column; background: var(--ground-panel);
+         border-bottom: 1px solid var(--ground-raised); }
+  #top .row1 { flex: 0 0 40px; display: flex; align-items: center; gap: 14px; padding: 0 12px;
+               min-width: 0; }
+  #top .row2 { flex: 1 1 auto; display: flex; align-items: center; gap: 12px; padding: 0 12px;
+               min-width: 0; border-top: 1px solid var(--ground-raised); overflow: hidden; }
+  #left { position: fixed; top: var(--top); left: 0; bottom: var(--bottom); width: var(--left);
+          box-sizing: border-box; overflow-y: auto; overscroll-behavior: contain;
+          padding: 4px 14px 16px; background: var(--ground-panel);
+          border-right: 1px solid var(--ground-raised); }
+  #chrome { position: fixed; top: var(--top); right: 0; bottom: var(--bottom); width: var(--panel);
+            box-sizing: border-box; display: flex; flex-direction: column; background: var(--ground-panel);
             border-left: 1px solid var(--ground-raised); }
+
+  /* Where you are, what you are looking at, and what you can do from here. */
+  #workspaces { display: flex; gap: 2px; flex-shrink: 0; }
+  #workspaces.hidden { visibility: hidden; }
+  #workspaces button[role=tab] { font-weight: 600; letter-spacing: .02em; padding: 4px 14px; }
+  #workspaces button[role=tab][aria-selected=true] {
+    color: var(--ground-panel); background: var(--text-primary); border-color: var(--text-primary); }
+  #where { flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 10px;
+           white-space: nowrap; overflow: hidden; }
+  #source { color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; }
+  #this { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+  #this::before { content: "▸"; color: var(--text-tertiary); }
+  #views { display: flex; gap: 2px; flex-shrink: 0; }
+  #views button { padding: 3px 10px; font-size: 12px; }
+  #views button kbd { font: inherit; color: var(--text-tertiary); margin-left: 6px; }
+  #views button.on { color: var(--ground-panel); background: var(--text-primary); border-color: var(--text-primary); }
+  #views button.on kbd { color: var(--ground-raised); }
+  #doing { display: flex; gap: 4px; flex-shrink: 0; }
+  #doing button { padding: 3px 10px; }
+  #idle { color: var(--text-tertiary); font-size: 12px; white-space: nowrap; overflow: hidden;
+          text-overflow: ellipsis; }
+  /* Nothing in hand is a hint; something in hand is the row. */
+  body[data-workspace="develop"] #inhand:not(.hidden) ~ #idle { display: none; }
 
   /* The divider: eight pixels of grab area over a one-pixel line, because a
      one-pixel target is a target you hunt for.
@@ -152,8 +191,8 @@
   summary .eye.on { visibility: visible; }
   summary .eye:hover { color: var(--text-primary); border-color: var(--border-control); }
   summary .eye.held { color: var(--on-attention); background: var(--attention); }
-  #comparing { color: var(--on-attention); background: var(--attention); border-radius: 3px; padding: 2px 6px;
-               margin-top: 4px; font-weight: 600; }
+  #comparing { color: var(--on-attention); background: var(--attention); border-radius: 3px; padding: 2px 8px;
+               font-weight: 600; white-space: nowrap; margin-left: auto; }
   #comparing.hidden { display: none; }
   output { width: 44px; text-align: right; font-variant-numeric: tabular-nums;
            flex-shrink: 0; }
@@ -167,11 +206,6 @@
      were dimmed to 45 % in the grid and still took clicks. */
   body[data-workspace="library"] .develop-only,
   body[data-workspace="develop"] .library-only { display: none !important; }
-  #workspaces { display: flex; gap: 4px; padding: 10px 16px 0; }
-  #workspaces.hidden { display: none; }
-  #workspaces button[role=tab] { flex: 1 1 0; font-weight: 600; letter-spacing: .02em; }
-  #workspaces button[role=tab][aria-selected=true] {
-    color: var(--ground-panel); background: var(--text-primary); border-color: var(--text-primary); }
   #zoom { margin-left: auto; display: flex; gap: 3px; }
   #zoom button { padding: 1px 7px; font-size: 12px; }
 
@@ -242,7 +276,6 @@
   #export #export-failed li { padding: 2px 0; overflow-wrap: anywhere; }
   #export #export-failed li b { color: var(--danger); font-weight: 600; }
   #job { display: flex; gap: 8px; align-items: baseline; }
-  #job #job-text { flex: 1 1 auto; min-width: 0; }
   #job button { flex: 0 0 auto; font: inherit; font-size: 12px; padding: 0 6px; }
 
   /* The palette: every command, by name. In the column for the reason the sheet
@@ -338,17 +371,17 @@
   #mode.tool { color: var(--ground-panel); background: var(--attention); border-color: var(--attention); }
 
   /* What is in hand and how to put it down, always, in words and as buttons.
-     It lives in the footer because that is the one part of the column that
-     cannot scroll away, and HTML cannot be drawn over the photograph where the
+     It lives in the top bar's second row, the tool-options bar, because that
+     never scrolls away and HTML cannot be drawn over the photograph where the
      tool actually is. */
-  #inhand { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
-            padding-bottom: 7px; margin-bottom: 7px; border-bottom: 1px solid var(--ground-raised); }
+  #inhand { display: flex; align-items: center; gap: 10px; min-width: 0; white-space: nowrap; }
   #inhand.hidden { display: none; }
   #inhand .what { color: var(--attention); font-weight: 600; letter-spacing: .04em;
                   text-transform: uppercase; font-size: 12px; }
-  #inhand .how { color: var(--text-secondary); flex: 1 1 auto; }
+  #inhand .how { color: var(--text-secondary); flex: 0 1 auto; min-width: 0; overflow: hidden;
+                 text-overflow: ellipsis; }
   #inhand .do { display: flex; gap: 6px; }
-  #inhand button { padding: 3px 9px; font-size: 12px; }
+  #inhand button { padding: 2px 9px; font-size: 12px; }
 
   /* The status line: the one place the application says what happened, pinned
      under the column so it is on screen whatever has been scrolled to. It used
@@ -359,27 +392,30 @@
      failed gets a line of its own and stays until it is dismissed — an edit that
      did not reach the catalog must not be replaced by "Picked" a second later.
      Colours are checked against the var(--ground-panel) ground: 10.4, 5.9, 8.6 and 6.6 to 1. */
-  #status { flex-shrink: 0; border-top: 1px solid var(--ground-raised); padding: 8px 16px 9px;
-            font-size: 12px; line-height: 1.45; }
-  #said { color: var(--text-secondary); min-height: 1.45em; overflow-wrap: anywhere;
-          transition: color .6s ease; }
-  #said.old { color: var(--text-tertiary); }
-  #said.refused { color: var(--attention); }
-  #failed { color: var(--danger); overflow-wrap: anywhere; cursor: pointer;
-            padding-bottom: 6px; margin-bottom: 6px; border-bottom: 1px solid var(--ground-raised); }
-  #failed::after { content: "  dismiss"; color: var(--text-tertiary); }
-  #failed.hidden, #job.hidden { display: none; }
-  #standing { display: flex; gap: 10px; color: var(--text-tertiary); margin-top: 2px;
-              font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #status { position: fixed; left: 0; right: 0; bottom: 0; height: var(--bottom); box-sizing: border-box;
+            display: flex; align-items: center; gap: 18px; padding: 0 12px; background: var(--ground-panel);
+            border-top: 1px solid var(--ground-raised); font-size: 12px; white-space: nowrap; }
+  #standing { flex: 0 1 auto; min-width: 0; display: flex; gap: 12px; color: var(--text-tertiary);
+              font-variant-numeric: tabular-nums; overflow: hidden; }
   #standing > span { overflow: hidden; text-overflow: ellipsis; }
+  #standing > span + span::before { content: "·"; margin-right: 12px; color: var(--text-disabled); }
   /* Nothing selected is nothing to say, and an empty span would still claim its
      gap and push the rest of the row in by it. */
   #standing > span:empty { display: none; }
-  #aim { flex: 0 1 auto; min-width: 0; }
-  /* A row to itself. Sharing one with the standing facts in a 330-pixel column
-     ellipsised all three — "2 sele…  K → q…  exported 0 file(s), 0.0 MB in 2.3s…". */
-  #job { color: var(--text-secondary); margin-top: 2px; overflow-wrap: anywhere;
-         font-variant-numeric: tabular-nums; }
+  #message { flex: 1 1 auto; min-width: 0; display: flex; }
+  #said, #failed { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  #said { color: var(--text-secondary); transition: color .6s ease; }
+  #said.old { color: var(--text-tertiary); }
+  #said.refused { color: var(--attention); }
+  /* A failure has the line until it is dismissed, and what was said since waits
+     behind it — one line cannot hold both, and the failure is the one that
+     must not be missed. */
+  #failed { color: var(--danger); cursor: pointer; }
+  #failed:not(.hidden) + #said { display: none; }
+  #failed::after { content: "  dismiss"; color: var(--text-tertiary); }
+  #failed.hidden, #job.hidden { display: none; }
+  #job { flex: 0 1 auto; min-width: 0; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+  #job #job-text { overflow: hidden; text-overflow: ellipsis; }
   #keys { color: var(--text-tertiary); font-size: 12px; line-height: 1.7; }
   .reading { color: var(--text-tertiary); font-size: 12px; margin-top: 8px;
              font-variant-numeric: tabular-nums; }
@@ -465,18 +501,10 @@
   .clip.lit#clip-white { color: var(--danger); }
   .clip.lit#clip-black { color: var(--info); }
 
-  /* The culling readout, stacked rather than strung along a bar. In a column
-     there is no room for a row, and there is no need for one either. */
-  #cull { padding: 10px 16px; border-bottom: 1px solid var(--ground-raised);
-          font-variant-numeric: tabular-nums; flex-shrink: 0; }
-  #cull.hidden { display: none; }
-  #cull .line { display: flex; align-items: baseline; gap: 10px; }
-  #cull .line + .line { margin-top: 5px; }
-  #frame { font-weight: 600; overflow: hidden; text-overflow: ellipsis;
-           white-space: nowrap; }
-  #position, #counts { color: var(--text-tertiary); font-size: 12px; }
-  #counts { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #stars { letter-spacing: 2px; color: var(--attention); margin-left: auto; flex-shrink: 0; }
+  /* The photograph in Develop, in the top bar: its name, and what was decided
+     about it, as a readout. Library shows the same as controls in the panel. */
+  #frame { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #stars { letter-spacing: 2px; color: var(--attention); flex-shrink: 0; }
   #mode { color: var(--text-tertiary); text-transform: uppercase; letter-spacing: .08em; font-size: 12px;
           border: 1px solid var(--border-subtle); border-radius: 3px; padding: 1px 6px; flex-shrink: 0; }
   #copy { color: var(--ground-well); background: var(--info); border-radius: 3px;
@@ -488,7 +516,7 @@
   /* The filter row. Chips rather than a menu, because what is being looked at
      has to be readable without opening anything — a narrowed library that does
      not say so is a library with photographs missing from it. */
-  #filter { flex-wrap: wrap; gap: 6px; }
+  #filter { display: flex; align-items: center; gap: 12px; min-width: 0; }
   #filter.narrowed { color: var(--attention); }
   #filter button { font: inherit; font-size: 12px; line-height: 1.5;
                    background: none; color: var(--text-tertiary); border: 1px solid var(--border-subtle);
@@ -503,15 +531,9 @@
   #filter-stars button { letter-spacing: 0; padding: 0 3px; }
 </style>
 
-<div id="chrome">
-<div id="divider" title="drag to resize the panel"></div>
-<div id="workspaces" class="hidden" role="tablist" aria-label="workspace">
-  <button data-command="grid" role="tab">Library</button>
-  <button data-command="develop" role="tab">Develop</button>
-  <button data-command="export">Export…</button>
-  <button data-command="palette" aria-label="find a command">⌕</button>
-  <button data-command="shortcuts" id="sheet-open" aria-label="keyboard shortcuts">?</button>
-</div>
+<!-- Over the whole window, and so outside every region of the frame: the right
+     column can be hidden, and a way in that went with it would leave a window
+     with nothing in it. -->
 <div id="welcome" class="hidden" role="main" aria-labelledby="welcome-title">
  <div class="inner">
   <div class="mark">rawkit</div>
@@ -550,6 +572,115 @@
   </div>
  </div>
 </div>
+
+<!-- The frame. Every size here is the shell's (see frame.rs): on Linux the
+     canvas is an X window placed in the gap these leave, so a bar drawn at a
+     size of the page's own choosing would be covered by the photograph or leave
+     a line of page showing beside it. -->
+<header id="top">
+  <div class="row1">
+    <div id="workspaces" class="hidden" role="tablist" aria-label="workspace">
+      <button data-command="grid" role="tab">Library</button>
+      <button data-command="develop" role="tab">Develop</button>
+    </div>
+    <div id="where">
+      <span id="source" title="what the arrows walk through"></span>
+      <span id="this" class="develop-only">
+        <span id="frame"></span>
+        <span id="copy" class="hidden" title="a virtual copy: one RAW, a second interpretation"></span>
+        <span id="flag"></span>
+        <span id="stars"></span>
+        <span id="label"></span>
+      </span>
+    </div>
+    <div id="views" class="library-only" role="group" aria-label="view">
+      <button data-command="grid" data-view="grid">Grid<kbd>G</kbd></button>
+      <button data-command="loupe" data-view="loupe">Loupe<kbd>E</kbd></button>
+      <button data-command="survey" data-view="survey">Survey<kbd>N</kbd></button>
+    </div>
+    <span id="mode">loupe</span>
+    <div id="doing">
+      <button data-command="add-folder">Add folder…</button>
+      <button data-command="export">Export…</button>
+      <button data-command="palette" aria-label="find a command" title="Find a command (Ctrl+K)">⌕</button>
+      <button data-command="shortcuts" id="sheet-open" aria-label="keyboard shortcuts" title="Keyboard shortcuts (?)">?</button>
+    </div>
+  </div>
+  <!-- The options of what is being done: what the arrows walk through in
+       Library, what is in hand and how to put it down in Develop. A row in both,
+       so picking up a tool does not move the photograph under it. -->
+  <div class="row2">
+    <div id="filter" class="library-only" title="what the arrows walk through, and what ⌃⇧E exports">
+      <span class="set" id="filter-flags">
+        <button data-flag="">all</button>
+        <button data-flag="pick">picks</button>
+        <button data-flag="reject">rejects</button>
+        <button data-flag="unflagged">undecided</button>
+      </span>
+      <span class="set" id="filter-stars" title="at least this many stars"></span>
+      <span class="set" id="filter-colours"></span>
+      <!-- One chip, for the collection being viewed, because it answers the
+           question the rest of this line does — what the arrows walk through.
+           Pressing it goes back to the whole library. Choosing a collection is in
+           the panel on the left: a chip each stopped being readable at about eight. -->
+      <span class="set" id="filter-collections"></span>
+    </div>
+    <div id="inhand" class="develop-only hidden">
+      <span class="what"></span><span class="how"></span><span class="do"></span>
+    </div>
+    <div id="idle" class="develop-only">R crop · Q spots · L gradient · ⇧L radial · B brush · W white balance</div>
+    <div id="comparing" class="hidden" role="status"></div>
+  </div>
+</header>
+
+<!-- Where to go: on the left, where navigation always is. -->
+<aside id="left" aria-label="navigation">
+  <details id="s-collections" class="library-only" open>
+    <summary>Collections</summary>
+    <!-- A list rather than chips: a name, a count, and the three things done
+         to a collection, in a shape that still reads with a hundred of them. -->
+    <ul class="saved" id="collection-list"></ul>
+    <p class="empty">★ is where K sends a photograph.</p>
+    <div class="row"><button id="collection-new">New from selection…</button></div>
+    <div class="form hidden" id="collection-form">
+      <div class="row">
+        <input id="collection-name" type="text" placeholder="Name this collection" maxlength="60">
+      </div>
+      <div class="row">
+        <button id="collection-save">Create</button>
+        <button id="collection-cancel">Cancel</button>
+      </div>
+    </div>
+  </details>
+  <details id="s-presets" class="develop-only" open>
+    <summary>Presets</summary>
+    <ul class="saved" id="preset-list"></ul>
+    <p class="empty" id="preset-empty">Nothing saved yet.</p>
+    <div class="row"><button id="preset-new">Save this look…</button></div>
+    <div class="form hidden" id="preset-form">
+      <div class="row">
+        <input id="preset-name" type="text" placeholder="Name this look" maxlength="60">
+      </div>
+      <div class="groups" id="preset-groups"></div>
+      <div class="row">
+        <button id="preset-save">Save</button>
+        <button id="preset-cancel">Cancel</button>
+      </div>
+    </div>
+  </details>
+  <details id="s-snapshots" class="develop-only" open>
+    <summary>Snapshots</summary>
+    <ul class="saved" id="snapshot-list"></ul>
+    <p class="empty" id="snapshot-empty">Nowhere to go back to yet.</p>
+    <div class="row">
+      <input id="snapshot-name" type="text" placeholder="Name this state" maxlength="60">
+      <button id="snapshot-take">Take</button>
+    </div>
+  </details>
+</aside>
+
+<div id="chrome">
+<div id="divider" title="drag to resize the panel"></div>
 <div id="export" class="hidden" role="dialog" aria-labelledby="export-title">
   <header><h2 id="export-title">Export</h2><button id="export-close" aria-label="close">✕</button></header>
   <h3>What</h3>
@@ -627,43 +758,12 @@
     <button data-tool="wb" data-command="wb">WB<kbd>W</kbd></button>
   </div>
 </div>
-<div id="cull" class="hidden">
-  <div class="line">
-    <span id="frame"></span>
-    <span id="copy" class="hidden" title="a virtual copy: one RAW, a second interpretation"></span>
-    <span id="stars"></span>
-  </div>
-  <div class="line">
-    <span id="position"></span>
-    <span id="flag"></span>
-    <span id="label"></span>
-    <span id="mode">loupe</span>
-  </div>
-  <div class="line">
-    <span id="counts"></span>
-  </div>
-  <div class="line" id="filter" title="what the arrows walk through, and what ⌃⇧E exports">
-    <span class="set" id="filter-flags">
-      <button data-flag="">all</button>
-      <button data-flag="pick">picks</button>
-      <button data-flag="reject">rejects</button>
-      <button data-flag="unflagged">undecided</button>
-    </span>
-    <span class="set" id="filter-stars" title="at least this many stars"></span>
-    <span class="set" id="filter-colours"></span>
-    <!-- One chip, for the collection being viewed, because it answers the
-         question the rest of this line does — what the arrows walk through.
-         Pressing it goes back to the whole library. Choosing a collection is in
-         the panel below: a chip each stopped being readable at about eight. -->
-    <span class="set" id="filter-collections"></span>
-  </div>
-</div>
 
 <main>
   <section id="s-info" class="library-only">
-    <!-- The judgement as controls, at a size a hand can hit. The header above
-         says the same things in eleven pixels, which is a readout; this is
-         where they are changed by somebody who has not learned the keys yet. -->
+    <!-- The judgement as controls, at a size a hand can hit, and the only
+         account of it in Library: the top bar says it only in Develop, where
+         this section is not shown. -->
     <div class="row judge" id="info-flag">
       <button data-command="pick">Pick</button>
       <button data-command="unflag">Unflagged</button>
@@ -674,50 +774,8 @@
     <dl id="info-facts"></dl>
   </section>
 
-  <details id="s-collections" class="library-only">
-    <summary>Collections</summary>
-    <!-- A list rather than chips: a name, a count, and the three things done
-         to a collection, in a shape that still reads with a hundred of them. -->
-    <ul class="saved" id="collection-list"></ul>
-    <p class="empty">★ is where K sends a photograph.</p>
-    <div class="row"><button id="collection-new">New from selection…</button></div>
-    <div class="form hidden" id="collection-form">
-      <div class="row">
-        <input id="collection-name" type="text" placeholder="Name this collection" maxlength="60">
-      </div>
-      <div class="row">
-        <button id="collection-save">Create</button>
-        <button id="collection-cancel">Cancel</button>
-      </div>
-    </div>
-  </details>
 
-  <details id="s-presets" class="develop-only">
-    <summary>Presets</summary>
-    <ul class="saved" id="preset-list"></ul>
-    <p class="empty" id="preset-empty">Nothing saved yet.</p>
-    <div class="row"><button id="preset-new">Save this look…</button></div>
-    <div class="form hidden" id="preset-form">
-      <div class="row">
-        <input id="preset-name" type="text" placeholder="Name this look" maxlength="60">
-      </div>
-      <div class="groups" id="preset-groups"></div>
-      <div class="row">
-        <button id="preset-save">Save</button>
-        <button id="preset-cancel">Cancel</button>
-      </div>
-    </div>
-  </details>
 
-  <details id="s-snapshots" class="develop-only">
-    <summary>Snapshots</summary>
-    <ul class="saved" id="snapshot-list"></ul>
-    <p class="empty" id="snapshot-empty">Nowhere to go back to yet.</p>
-    <div class="row">
-      <input id="snapshot-name" type="text" placeholder="Name this state" maxlength="60">
-      <button id="snapshot-take">Take</button>
-    </div>
-  </details>
 
   <details id="s-white-balance" class="develop-only"><summary>White balance</summary>
     <label><span>Temp</span>
@@ -1011,21 +1069,23 @@
   </details>
 
 </main>
+</div>
+<!-- The status bar, the width of the window: where things stand on the left,
+     what just happened in the middle, what is running on the right. -->
 <footer id="status">
-  <div id="inhand" class="hidden">
-    <span class="what"></span><span class="how"></span><span class="do"></span>
-  </div>
-  <!-- An alert, so a failure is announced when it happens rather than found. -->
-  <div id="failed" class="hidden" role="alert" title="click to dismiss"></div>
-  <div id="said" role="status" aria-live="polite">ready</div>
   <div id="standing">
+    <span id="position"></span>
+    <span id="counts"></span>
     <span id="chosen"></span>
     <span id="aim"></span>
   </div>
-  <div id="comparing" class="hidden" role="status"></div>
+  <div id="message">
+    <!-- An alert, so a failure is announced when it happens rather than found. -->
+    <div id="failed" class="hidden" role="alert" title="click to dismiss"></div>
+    <div id="said" role="status" aria-live="polite">ready</div>
+  </div>
   <div id="job" class="hidden"><span id="job-text"></span><button id="job-stop" hidden>Stop</button></div>
 </footer>
-</div>
 
 <script type="module">
   // The whole of the UI's contract with the engine. Commands go down, events
@@ -1672,13 +1732,9 @@
       // no console to watch — and one lived for a whole slice because of that.
       try { sync(s.state, s.image); } catch (e) { tell("failed", `the panel broke in sync: ${e && e.message || e}`); }
     }
-    // The panel's width is the shell's answer, not ours: a window too narrow
-    // for the width someone chose gets less, and the page finds out here.
-    if (!dividing && s.panel && s.panel !== shownPanel) {
-      shownPanel = s.panel;
-      setPanel(s.panel);
-      redrawWide();
-    }
+    // The division is the shell's answer, not ours: a window too narrow for
+    // the width someone chose gets less, and the page finds out here.
+    if (!dividing) applyFrame(s.frame);
     // Which way up, and why. Two facts rather than one: the camera's turn is
     // not in the edit and cannot be — it is what the file recorded — so a
     // photograph that opens sideways would otherwise be doing it for a reason
@@ -2827,11 +2883,35 @@
 
   const divider = document.getElementById("divider");
   const setPanel = px => document.documentElement.style.setProperty("--panel", `${px}px`);
-  /// The width last applied from the shell, so the poll does not restyle and
-  /// redraw two canvases four times a second for no reason.
-  let shownPanel = null;
+  /// How the shell divided the window, last time it said. The cutout's pointer
+  /// forwarding reads it too: it is where the photograph is.
+  let frameNow = { top: 76, left: 260, right: 360, bottom: 28 };
+  /// The same, as last applied, so the poll does not restyle and redraw two
+  /// canvases four times a second for no reason.
+  let shownFrame = "";
+  const applyFrame = frame => {
+    if (!frame) return;
+    const key = `${frame.top},${frame.left},${frame.right},${frame.bottom}`;
+    if (key === shownFrame) return;
+    shownFrame = key;
+    frameNow = frame;
+    const style = document.documentElement.style;
+    style.setProperty("--top", `${frame.top}px`);
+    style.setProperty("--left", `${frame.left}px`);
+    style.setProperty("--bottom", `${frame.bottom}px`);
+    if (frame.right) setPanel(frame.right);
+    // A panel of no width is a hidden one, not one squeezed to a sliver.
+    document.getElementById("left").hidden = !frame.left;
+    document.getElementById("chrome").hidden = !frame.right;
+    redrawWide();
+  };
+  invoke("frame").then(applyFrame).catch(() => {});
 
-  invoke("panel_width").then(setPanel).catch(() => {});
+  /// F7 and F8. The sheet, the palette and the export panel open in the right
+  /// column, so asking for one of them with the column hidden brings it back —
+  /// a key that opened something nobody could see would read as a dead key.
+  const panels = which => invoke("show_panels", { which }).catch(say);
+  const needRight = () => { if (!frameNow.right) panels("right"); };
 
   let dividing = false;
   divider.addEventListener("pointerdown", event => {
@@ -2918,7 +2998,6 @@
   // Pointer input over the canvas is the opposite case, and is why `canvas.rs`
   // exists.
 
-  const strip = document.getElementById("cull");
   // ---- Library and Develop ------------------------------------------------------
   // What has been drawn, kept apart from what is so: the page starts out
   // believing Develop, and a shell that agrees must still get its tab lit.
@@ -3012,7 +3091,10 @@
   const show = view => {
     if (!view) return;
     latestView = view;
-    strip.classList.remove("hidden");
+    // Where the arrows walk: the whole catalog, or one collection of it.
+    const viewing = (view.collections ?? []).find(c => c.id === view.viewing);
+    document.getElementById("source").textContent =
+      viewing ? (viewing.is_quick ? "Quick Collection" : viewing.name) : "All photographs";
     document.getElementById("frame").textContent = view.filename;
     // Two rows can carry the same filename, and the copy name is the only thing
     // that tells them apart — in the readout, and in the name of anything
@@ -3283,19 +3365,17 @@
   // without a round trip, and both paths end in the same router, so a drag
   // means the same thing either way.
   if (cutout) {
-    const chromeLeft = () =>
-      document.getElementById("chrome").getBoundingClientRect().left;
     // Canvas pixels: the session works in the surface's own coordinates, and
-    // the page is the only place that knows the device ratio.
-    //
-    // The test is horizontal now, and there is nothing to subtract: the
-    // photograph starts at the window's origin, so a pointer is over it exactly
-    // when it is left of the chrome.
+    // the page is the only place that knows the device ratio. The photograph is
+    // the gap the shell's frame leaves — the same test `Frame::to_canvas` makes
+    // for GTK's events.
     const at = event => {
       const dpr = window.devicePixelRatio || 1;
-      return event.clientX >= chromeLeft()
-        ? null
-        : { x: event.clientX * dpr, y: event.clientY * dpr };
+      const f = frameNow;
+      const x = event.clientX - f.left, y = event.clientY - f.top;
+      const width = window.innerWidth - f.left - f.right;
+      const height = window.innerHeight - f.top - f.bottom;
+      return x < 0 || y < 0 || x >= width || y >= height ? null : { x: x * dpr, y: y * dpr };
     };
     // Not `send`, which is already the command bus in this scope; this is the
     // other direction of traffic and shadowing it would be a trap.
@@ -3496,6 +3576,8 @@
     drawTool();
     if (mode === name) return;
     mode = name;
+    for (const button of document.querySelectorAll("#views button"))
+      button.classList.toggle("on", button.dataset.view === name);
     drawTool();
     outlived();
   }
@@ -3573,6 +3655,15 @@
       title: "Fit the photograph in the window", run: () => send({ command: "fit_to_view" }) },
     { id: "fullscreen", keys: ["f11"], scope: "any", waits: false, group: "Views",
       title: "Full screen", run: () => invoke("toggle_fullscreen").catch(say) },
+    // Lightroom's keys, and not its Tab: here Tab moves the keyboard through
+    // the panel's controls, and a key that hid the control it was about to
+    // reach would take the panel away from anybody who drives it that way.
+    { id: "panel-left", keys: ["f7"], scope: "any", waits: false, group: "Views",
+      title: "Show or hide the left panel", run: () => panels("left") },
+    { id: "panel-right", keys: ["f8"], scope: "any", waits: false, group: "Views",
+      title: "Show or hide the right panel", run: () => panels("right") },
+    { id: "panels", keys: [], scope: "any", waits: false, group: "Views",
+      title: "Hide both side panels, or bring them back", run: () => panels("both") },
     { id: "shortcuts", keys: ["?", "f1"], scope: "any", waits: false, group: "Views",
       title: "Keyboard shortcuts", run: () => toggleSheet() },
     { id: "palette", keys: ["mod+k"], scope: "any", waits: false, group: "Views",
@@ -4088,6 +4179,7 @@
   /// twenty thousand full-size files because nothing happened to be selected.
   const AGAIN_WITHOUT_ASKING = 24;
   const openExport = async scope => {
+    needRight();
     palette.classList.add("hidden");
     document.getElementById("sheet").classList.add("hidden");
     exportKept = await invoke("export_panel");
@@ -4264,6 +4356,7 @@
   // The sheet, drawn from the registry when it is asked for.
   const sheet = document.getElementById("sheet");
   const toggleSheet = () => {
+    needRight();
     // One panel over the column at a time, from whichever side it is asked.
     palette.classList.add("hidden");
     if (!sheet.classList.toggle("hidden")) {
@@ -4384,6 +4477,7 @@
     paletteBox.blur();
   };
   const openPalette = () => {
+    needRight();
     sheet.classList.add("hidden");
     palette.classList.remove("hidden");
     paletteBox.value = "";
