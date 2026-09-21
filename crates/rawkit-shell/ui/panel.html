@@ -2935,7 +2935,7 @@
   const setPanel = px => document.documentElement.style.setProperty("--panel", `${px}px`);
   /// How the shell divided the window, last time it said. The cutout's pointer
   /// forwarding reads it too: it is where the photograph is.
-  let frameNow = { top: 76, left: 260, right: 360, bottom: 28 };
+  let frameNow = { top: 76, left: 260, right: 360, bottom: 28, strip: 96 };
   /// The same, as last applied, so the poll does not restyle and redraw two
   /// canvases four times a second for no reason.
   let shownFrame = "";
@@ -3840,6 +3840,8 @@
     // Lightroom's keys, and not its Tab: here Tab moves the keyboard through
     // the panel's controls, and a key that hid the control it was about to
     // reach would take the panel away from anybody who drives it that way.
+    { id: "filmstrip", keys: ["f6"], scope: "any", waits: false, group: "Views",
+      title: "Show or hide the filmstrip", run: () => panels("strip") },
     { id: "panel-left", keys: ["f7"], scope: "any", waits: false, group: "Views",
       title: "Show or hide the left panel", run: () => panels("left") },
     { id: "panel-right", keys: ["f8"], scope: "any", waits: false, group: "Views",

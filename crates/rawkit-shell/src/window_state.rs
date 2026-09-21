@@ -44,6 +44,9 @@ pub struct Remembered {
     pub left_hidden: bool,
     #[serde(default)]
     pub right_hidden: bool,
+    /// The filmstrip, F6.
+    #[serde(default)]
+    pub strip_hidden: bool,
 }
 
 /// Where this machine's settings live, made if it is not there.
@@ -91,7 +94,7 @@ pub fn save(app: &tauri::AppHandle, state: Remembered) {
 /// saving it would reopen a window the size of the display and not fullscreen —
 /// which is neither state the user was in. Keeping the previous value is the
 /// better answer, and it costs a `None`.
-pub fn of(window: &tauri::Window, panel: f64, shown: (bool, bool)) -> Option<Remembered> {
+pub fn of(window: &tauri::Window, panel: f64, shown: (bool, bool, bool)) -> Option<Remembered> {
     if window.is_fullscreen().unwrap_or(false) {
         return None;
     }
@@ -107,5 +110,6 @@ pub fn of(window: &tauri::Window, panel: f64, shown: (bool, bool)) -> Option<Rem
         maximised: window.is_maximized().unwrap_or(false),
         left_hidden: !shown.0,
         right_hidden: !shown.1,
+        strip_hidden: !shown.2,
     })
 }

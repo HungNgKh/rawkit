@@ -216,6 +216,14 @@ impl CanvasRenderer {
         self.shown = None;
     }
 
+    /// A canvas of its own for something drawn beside the photograph — the
+    /// filmstrip — from the same renderer, so it presents through the same
+    /// output transform.
+    pub fn create_canvas(&self, gpu: &Gpu, width: u32, height: u32) -> Canvas {
+        self.renderer
+            .create_canvas(gpu, width.max(1), height.max(1))
+    }
+
     pub fn presenter(&self) -> &Presenter {
         &self.presenter
     }

@@ -914,7 +914,7 @@ fn frame() -> frame::Frame {
 /// Show or hide the side panels. F7 is the left, F8 the right, and both at once
 /// is the culling view with nothing beside the photograph.
 ///
-/// `which` is "left", "right" or "both"; each is a toggle, because the keys are,
+/// `which` is "left", "right", "both" or "strip"; each is a toggle, because the keys are,
 /// and "both" hides the two if either is showing — pressing it on a half-bare
 /// window should bare it, not bring back the one that was hidden. Answered with
 /// the frame as wanted, before the window has settled it: the page draws the
@@ -922,6 +922,13 @@ fn frame() -> frame::Frame {
 #[tauri::command]
 fn show_panels(window: tauri::Window, which: String) -> Result<frame::Frame, String> {
     let now = frame::wanted(0);
+    if which == "strip" {
+        frame::want_strip(!frame::strip_wanted());
+        let size = window.inner_size().map_err(|e| e.to_string())?;
+        *PENDING_RESIZE.lock().expect("resize lock") = Some((size.width, size.height));
+        remember_window(&window.app_handle().clone(), &window, false);
+        return Ok(frame::current());
+    }
     let (left, right) = match which.as_str() {
         "left" => (!now.left, now.right),
         "right" => (now.left, !now.right),
@@ -1908,6 +1915,7 @@ fn main() -> Result<()> {
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 frame::want(!saved.left_hidden, !saved.right_hidden);
+                frame::want_strip(!saved.strip_hidden);
             }
             let (gpu, surface, layout, window_handle) = build_window(app, route, saved)?;
             eprintln!(
@@ -2083,10 +2091,15 @@ fn main() -> Result<()> {
                 EditState::default(),
                 loaded.orientation,
             );
-            session.apply(Command::Resize {
-                width: layout.canvas.width,
-                height: layout.canvas.height,
-            });
+            // The strip is laid out before anything is open, on the chance that
+            // a catalog will be; without one there is nothing for it to walk.
+            // Divided again on the first frame, which comes before any paint.
+            if frame::strip_possible(library.is_some()) {
+                let size = window_handle.inner_size()?;
+                *PENDING_RESIZE.lock().expect("resize lock") = Some((size.width, size.height));
+            }
+            let [width, height] = layout.photograph();
+            session.apply(Command::Resize { width, height });
             session.apply(Command::FitToView);
 
             let shared = Arc::new(Mutex::new(session));
@@ -2104,11 +2117,8 @@ fn main() -> Result<()> {
 
             attach_input(&window_handle, shared.clone())?;
 
-            let mut canvas_renderer = session_canvas::CanvasRenderer::new(
-                &gpu,
-                &loaded.frame(),
-                [layout.canvas.width, layout.canvas.height],
-            );
+            let mut canvas_renderer =
+                session_canvas::CanvasRenderer::new(&gpu, &loaded.frame(), layout.photograph());
             let blit = rawkit_engine::PreviewBlit::new(&gpu);
             // One white pixel, uploaded once. The crop outline is drawn as four
             // thin cells whose edge colour covers them entirely, so this is
@@ -2123,6 +2133,7 @@ fn main() -> Result<()> {
                 scroll: 0.0,
                 followed: None,
             };
+            let mut strip = Strip::default();
             let mut showing = Showing {
                 path: raw.clone(),
                 size: loaded.size,
@@ -2169,18 +2180,14 @@ fn main() -> Result<()> {
             // texture per tile so a pan redraws only what it exposes — should be
             // decided by what a pan actually costs rather than by the fact that
             // it obviously costs something.
-            let mut surface_size = [layout.canvas.width, layout.canvas.height];
+            let mut surface_size = layout.photograph();
             // Where the photograph goes inside the swapchain. Under route 3 that
             // is all of it; under a cutout it starts below the chrome.
             // The origin under every route now: the chrome is a column beside
             // the photograph rather than a strip above it, so there is nothing
             // to push it down past.
-            let mut canvas_rect = [
-                layout.origin[0],
-                layout.origin[1],
-                layout.canvas.width,
-                layout.canvas.height,
-            ];
+            let mut canvas_rect = layout.photograph_at();
+            let mut strip_rect = layout.strip_at();
             let mut stats = FrameStats::default();
             let navigating = library.clone();
             // Four caches used to live here — the crop rectangle, the spot
@@ -2308,7 +2315,13 @@ fn main() -> Result<()> {
                 if let (Some(library), Some(building)) = (&navigating, &mut building) {
                     // Only while the grid is up. Its list is from the last frame
                     // it drew, and in the loupe that may be a long time ago.
-                    let near: &[i64] = if in_grid() { &grid.wanting } else { &[] };
+                    // Or the strip's, in the loupe: what is either side of the
+                    // photograph being looked at is what will be looked at next.
+                    let near: &[i64] = if in_grid() {
+                        &grid.wanting
+                    } else {
+                        &strip.wanting
+                    };
                     let pumped = building.pump(library, near);
                     for said in pumped.said {
                         match said {
@@ -2325,6 +2338,8 @@ fn main() -> Result<()> {
                     for id in pumped.recorded {
                         grid.absent.remove(&id);
                         grid.cells.remove(&id);
+                        strip.absent.remove(&id);
+                        strip.cells.remove(&id);
                     }
                 }
 
@@ -2348,8 +2363,9 @@ fn main() -> Result<()> {
                     config.width = now.surface.width;
                     config.height = now.surface.height;
                     surface.configure(&gpu.device, &config);
-                    surface_size = [now.canvas.width, now.canvas.height];
-                    canvas_rect = [now.origin[0], now.origin[1], now.canvas.width, now.canvas.height];
+                    surface_size = now.photograph();
+                    canvas_rect = now.photograph_at();
+                    strip_rect = now.strip_at();
                     // The session measures the viewport in these pixels, so it
                     // has to be told before anything asks it what to draw.
                     let mut session = shared.lock().expect("session lock");
@@ -2409,6 +2425,15 @@ fn main() -> Result<()> {
                         // after: anything the loupe left in it belongs to a
                         // view that is no longer on screen.
                         canvas_renderer.clear_overlay(&gpu);
+                        let shown = strip_for(
+                            &gpu,
+                            &blit,
+                            &canvas_renderer,
+                            Some(library),
+                            &mut strip,
+                            &white,
+                            strip_rect,
+                        );
                         paint(
                             &gpu,
                             &surface,
@@ -2416,6 +2441,7 @@ fn main() -> Result<()> {
                             canvas_renderer.canvas(),
                             canvas_renderer.overlay(),
                             canvas_rect,
+                            shown,
                         )?;
                         stats.record(drawn, started.elapsed());
                         return Ok(());
@@ -3292,6 +3318,15 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+                let shown = strip_for(
+                    &gpu,
+                    &blit,
+                    &canvas_renderer,
+                    navigating.as_deref(),
+                    &mut strip,
+                    &white,
+                    strip_rect,
+                );
                 paint(
                     &gpu,
                     &surface,
@@ -3299,6 +3334,7 @@ fn main() -> Result<()> {
                     canvas_renderer.canvas(),
                     canvas_renderer.overlay(),
                     canvas_rect,
+                    shown,
                 )?;
                 // Emptied for this frame's marks, *after* presenting the last
                 // frame's. The loop renders after it presents, so the overlay
@@ -3714,6 +3750,45 @@ struct Layout {
     /// has a window of its own; under a cutout, past the left panel and below
     /// the top bar.
     origin: [u32; 2],
+    /// The filmstrip's height at the bottom of `canvas`, in physical pixels;
+    /// zero when there is none. The photograph is what is above it.
+    strip: u32,
+}
+
+impl Layout {
+    /// The photograph's size: the canvas above the strip. What the session is
+    /// told its viewport is, and what a grid lays out in.
+    fn photograph(&self) -> [u32; 2] {
+        [self.canvas.width, (self.canvas.height - self.strip).max(1)]
+    }
+
+    /// Where in the surface the photograph goes.
+    fn photograph_at(&self) -> [u32; 4] {
+        let [width, height] = self.photograph();
+        [self.origin[0], self.origin[1], width, height]
+    }
+
+    /// Where in the surface the strip goes, if there is one.
+    fn strip_at(&self) -> Option<[u32; 4]> {
+        let [width, height] = self.photograph();
+        (self.strip > 0).then_some([self.origin[0], self.origin[1] + height, width, self.strip])
+    }
+}
+
+/// Where the strip starts, down the canvas, in physical pixels; `u32::MAX` for
+/// none. The pointer router asks, because a press there is a choice of
+/// photograph and not a pan.
+pub(crate) static STRIP_TOP: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// A press on the strip, at this distance across it, for the render loop.
+pub(crate) static STRIP_CLICK: Mutex<Option<f64>> = Mutex::new(None);
+/// Wheel notches over the strip, to move along it without changing photograph.
+pub(crate) static STRIP_SCROLL: Mutex<f64> = Mutex::new(0.0);
+
+/// Whether a point on the canvas is on the strip.
+pub(crate) fn on_strip(at: [f64; 2]) -> bool {
+    at[1] >= STRIP_TOP.load(std::sync::atomic::Ordering::Relaxed) as f64
 }
 
 /// Write the window's geometry down, at most once a second unless it is the
@@ -3736,7 +3811,8 @@ fn remember_window(app: &tauri::AppHandle, window: &tauri::Window, force: bool) 
     }
     let panel = PANEL_NOW.load(Ordering::Relaxed) as f64;
     let shown = frame::wanted(0);
-    if let Some(state) = window_state::of(window, panel, (shown.left, shown.right)) {
+    let shown = (shown.left, shown.right, frame::strip_wanted());
+    if let Some(state) = window_state::of(window, panel, shown) {
         window_state::save(app, state);
     }
 }
@@ -3773,11 +3849,17 @@ impl Layout {
         frame::settle(division);
         let [x, y, width, height] = division.canvas_physical((window.width, window.height), scale);
         let canvas = tauri::PhysicalSize::new(width, height);
+        let strip = division.strip_physical(height, scale);
+        STRIP_TOP.store(
+            if strip > 0 { height - strip } else { u32::MAX },
+            std::sync::atomic::Ordering::Relaxed,
+        );
         match route {
             Route::Cutout => Layout {
                 surface: window,
                 canvas,
                 origin: [x, y],
+                strip,
             },
             // The probe route, which has never placed its chrome correctly; it
             // gets the whole window so that what it does draw is at least whole.
@@ -3785,11 +3867,13 @@ impl Layout {
                 surface: window,
                 canvas: window,
                 origin: [0, 0],
+                strip: 0,
             },
             Route::NativeChild => Layout {
                 surface: canvas,
                 canvas,
                 origin: [0, 0],
+                strip,
             },
         }
     }
@@ -6204,6 +6288,331 @@ fn draw_grid(
     Ok(drawn)
 }
 
+/// The filmstrip: what it holds between frames.
+///
+/// Its own cache rather than the grid's, because the two are about different
+/// photographs — the grid keeps what is near its scroll position, the strip
+/// what is near the photograph being looked at — and each throws away what the
+/// other would want.
+#[derive(Default)]
+struct Strip {
+    canvas: Option<rawkit_engine::Canvas>,
+    cells: std::collections::HashMap<i64, rawkit_engine::PreviewImage>,
+    absent: std::collections::HashSet<i64>,
+    marks:
+        std::collections::HashMap<(rawkit_engine::glyphs::Mark, u32), rawkit_engine::PreviewImage>,
+    /// The photograph it was last centred on. When that changes the strip
+    /// comes back to it, whatever the wheel had done.
+    centre: Option<usize>,
+    /// How far the wheel has moved it from there, in slots.
+    offset: f64,
+    /// Visible slots with no preview, nearest the middle first, for the builder.
+    wanting: Vec<i64>,
+}
+
+/// Draw the strip into its own canvas, for presenting below the photograph.
+///
+/// One row of the current source, the photograph being looked at in the middle
+/// with a bright frame round it, the same marks as a grid cell. A press on a
+/// slot makes that photograph the current one — refused, and said, while a tool
+/// is in hand, as a key that changes photograph is. The wheel moves along the
+/// row without changing anything.
+#[allow(clippy::too_many_arguments)]
+fn draw_strip(
+    gpu: &Gpu,
+    blit: &rawkit_engine::PreviewBlit,
+    canvas_renderer: &session_canvas::CanvasRenderer,
+    library: &Mutex<Library>,
+    strip: &mut Strip,
+    blank: &rawkit_engine::PreviewImage,
+    size: [u32; 2],
+) -> Result<()> {
+    use rawkit_engine::glyphs::Mark;
+    if strip.canvas.as_ref().map(|c| c.size()) != Some(size) {
+        strip.canvas = Some(canvas_renderer.create_canvas(gpu, size[0], size[1]));
+    }
+    let (w, h) = (size[0] as f64, size[1] as f64);
+    let pad = (h * 0.08).round().max(3.0);
+    let slot_h = (h - pad * 2.0).max(1.0);
+    let slot_w = (slot_h * 1.5).round();
+    let pitch = slot_w + pad;
+
+    let (count, current) = {
+        let library = library.lock().expect("library lock");
+        (library.count(), library.index())
+    };
+    if count == 0 {
+        return Ok(());
+    }
+    if strip.centre != Some(current) {
+        strip.centre = Some(current);
+        strip.offset = 0.0;
+    }
+    let notches = std::mem::take(&mut *STRIP_SCROLL.lock().expect("strip scroll lock"));
+    strip.offset += notches;
+    let centre = (current as f64 + strip.offset).clamp(0.0, (count - 1) as f64);
+    strip.offset = centre - current as f64;
+    // Where slot zero would start, so that the centre slot is in the middle.
+    let origin = w / 2.0 - slot_w / 2.0 - centre * pitch;
+
+    if let Some(x) = STRIP_CLICK.lock().expect("strip click lock").take() {
+        let at = ((x - origin + pad / 2.0) / pitch).floor();
+        if at >= 0.0 && (at as usize) < count {
+            if let Some(tool) = tool_in_hand() {
+                tell(Told::from(
+                    format!("{} is in hand; finish or cancel it first", tool.name()).as_str(),
+                ));
+            } else {
+                let mut library = library.lock().expect("library lock");
+                library.select(at as usize);
+                if !in_grid() {
+                    library.reopen();
+                }
+                if let Some(said) = library.take_said() {
+                    notice(said);
+                }
+            }
+        }
+    }
+
+    let first = ((-origin) / pitch).floor().max(0.0) as usize;
+    let last = (((w - origin) / pitch).ceil().max(0.0) as usize).min(count);
+    let visible: Vec<(usize, i64)> = {
+        let library = library.lock().expect("library lock");
+        (first..last)
+            .filter_map(|index| Some((index, library.id_at(index)?)))
+            .collect()
+    };
+
+    let mut wanted: Vec<(usize, i64)> = visible
+        .iter()
+        .copied()
+        .filter(|(_, id)| !strip.cells.contains_key(id) && !strip.absent.contains(id))
+        .collect();
+    wanted.sort_by_key(|(index, _)| index.abs_diff(current));
+    let needed = slot_w as u32;
+    let (mut loaded, mut missed) = (0, 0);
+    for (index, id) in wanted {
+        if loaded == LOADS_PER_FRAME || missed == MISSES_PER_FRAME {
+            break;
+        }
+        let decoded = library
+            .lock()
+            .expect("library lock")
+            .preview_at(index, needed, None)?;
+        match decoded {
+            Some(decoded) => {
+                let image = blit.upload(gpu, &decoded.rgba, decoded.width, decoded.height)?;
+                strip.cells.insert(id, image);
+                loaded += 1;
+            }
+            None => {
+                strip.absent.insert(id);
+                missed += 1;
+            }
+        }
+    }
+    let keep: std::collections::HashSet<i64> = visible.iter().map(|(_, id)| *id).collect();
+    strip.cells.retain(|id, _| keep.contains(id));
+    strip.absent.retain(|id| keep.contains(id));
+    let mut wanting: Vec<(usize, i64)> = visible
+        .iter()
+        .copied()
+        .filter(|(_, id)| strip.absent.contains(id))
+        .collect();
+    wanting.sort_by_key(|(index, _)| index.abs_diff(current));
+    strip.wanting = wanting
+        .into_iter()
+        .map(|(_, id)| id)
+        .take(building::NEAR)
+        .collect();
+
+    let indices: Vec<usize> = visible.iter().map(|(index, _)| *index).collect();
+    let facts = library
+        .lock()
+        .expect("library lock")
+        .cell_facts(&indices)
+        .unwrap_or_else(|_| vec![library::CellFacts::default(); indices.len()]);
+
+    let badge = (slot_h * 0.16).round().clamp(10.0, 16.0) as u32;
+    for fact in &facts {
+        let marks = [
+            (fact.rating > 0).then_some(Mark::Stars(fact.rating.min(5))),
+            match fact.flag {
+                Some(rawkit_catalog::cull::Flag::Pick) => Some(Mark::Pick),
+                Some(rawkit_catalog::cull::Flag::Reject) => Some(Mark::Reject),
+                None => None,
+            },
+        ];
+        for mark in marks.into_iter().flatten() {
+            if let std::collections::hash_map::Entry::Vacant(slot) =
+                strip.marks.entry((mark, badge))
+            {
+                let glyph = rawkit_engine::glyphs::rasterise(mark, badge);
+                slot.insert(blit.upload(gpu, &glyph.rgba, glyph.width, glyph.height)?);
+            }
+        }
+    }
+    strip.marks.retain(|(_, size), _| *size == badge);
+
+    let flat = |colour: [f32; 3], dest: [i32; 4]| rawkit_engine::Cell {
+        image: blank,
+        dest,
+        tint: colour,
+        edge: ([0.0; 3], 0.0),
+        inner: ([0.0; 3], 0.0),
+        alpha: 1.0,
+        round: false,
+        sprite: false,
+    };
+    // A line along the top, so the strip reads as a band under the photograph
+    // and not as more of it.
+    let mut grounds = vec![flat([0.03, 0.03, 0.03], [0, 0, size[0] as i32, 1])];
+    let (mut photographs, mut marks) = (Vec::new(), Vec::new());
+    for ((index, id), fact) in visible.iter().copied().zip(&facts) {
+        let slot_x = origin + index as f64 * pitch;
+        let slot_y = pad;
+        let held = strip.cells.get(&id);
+        let waiting = held.is_none();
+        let image = held.unwrap_or(blank);
+        let (iw, ih) = if waiting {
+            (slot_w, slot_h)
+        } else {
+            (image.width as f64, image.height as f64)
+        };
+        let scale = (slot_w / iw).min(slot_h / ih);
+        let (pw, ph) = (iw * scale, ih * scale);
+        if index == current {
+            let by = (pad / 2.0).floor().max(2.0);
+            grounds.push(flat(
+                [0.9, 0.9, 0.9],
+                [
+                    (slot_x - by).round() as i32,
+                    (slot_y - by).round() as i32,
+                    (slot_w + by * 2.0).round() as i32,
+                    (slot_h + by * 2.0).round() as i32,
+                ],
+            ));
+            grounds.push(flat(
+                [0.012, 0.012, 0.012],
+                [
+                    (slot_x - by + 2.0).round() as i32,
+                    (slot_y - by + 2.0).round() as i32,
+                    (slot_w + by * 2.0 - 4.0).round() as i32,
+                    (slot_h + by * 2.0 - 4.0).round() as i32,
+                ],
+            ));
+        }
+        let tint = match fact.flag {
+            Some(rawkit_catalog::cull::Flag::Reject) if waiting => [0.008, 0.008, 0.008],
+            _ if waiting => [0.025, 0.025, 0.025],
+            Some(rawkit_catalog::cull::Flag::Reject) => [0.33, 0.33, 0.33],
+            _ => [1.0, 1.0, 1.0],
+        };
+        let edge = match fact.flag {
+            Some(rawkit_catalog::cull::Flag::Pick) => ([0.16, 0.58, 0.64], 2.0),
+            _ => ([0.0; 3], 0.0),
+        };
+        let inner = fact
+            .label
+            .as_deref()
+            .and_then(label_colour)
+            .map(|colour| (colour, 2.0))
+            .unwrap_or(([0.0; 3], 0.0));
+        photographs.push(rawkit_engine::Cell {
+            image,
+            dest: [
+                (slot_x + (slot_w - pw) / 2.0).round() as i32,
+                (slot_y + (slot_h - ph) / 2.0).round() as i32,
+                pw.round() as i32,
+                ph.round() as i32,
+            ],
+            tint,
+            edge,
+            inner,
+            alpha: 1.0,
+            round: false,
+            sprite: false,
+        });
+        let margin = (badge as f64 * 0.3).round();
+        let mut mark = |what: Mark, tint: [f32; 3], bottom: bool| {
+            let Some(image) = strip.marks.get(&(what, badge)) else {
+                return;
+            };
+            let y = if bottom {
+                slot_y + slot_h - margin - badge as f64
+            } else {
+                slot_y + margin
+            };
+            marks.push(rawkit_engine::Cell {
+                image,
+                dest: [
+                    (slot_x + margin).round() as i32,
+                    y.round() as i32,
+                    image.width as i32,
+                    image.height as i32,
+                ],
+                tint,
+                edge: ([0.0; 3], 0.0),
+                inner: ([0.0; 3], 0.0),
+                alpha: 1.0,
+                round: false,
+                sprite: true,
+            });
+        };
+        match fact.flag {
+            Some(rawkit_catalog::cull::Flag::Pick) => mark(Mark::Pick, [0.16, 0.58, 0.64], false),
+            Some(rawkit_catalog::cull::Flag::Reject) => {
+                mark(Mark::Reject, [0.87, 0.23, 0.19], false)
+            }
+            None => {}
+        }
+        if fact.rating > 0 {
+            mark(Mark::Stars(fact.rating.min(5)), [0.79, 0.55, 0.11], true);
+        }
+    }
+    let cells: Vec<rawkit_engine::Cell> = grounds
+        .into_iter()
+        .chain(photographs)
+        .chain(marks)
+        .collect();
+    let canvas = strip.canvas.as_ref().expect("made above");
+    blit.draw_grid(gpu, canvas, &cells);
+    Ok(())
+}
+
+/// The strip for this frame, if there is one to present.
+///
+/// A strip that cannot be drawn costs the strip and not the window — an error
+/// out of a frame ends the render loop — and is said once.
+fn strip_for<'a>(
+    gpu: &Gpu,
+    blit: &rawkit_engine::PreviewBlit,
+    canvas_renderer: &session_canvas::CanvasRenderer,
+    library: Option<&Mutex<Library>>,
+    strip: &'a mut Strip,
+    blank: &rawkit_engine::PreviewImage,
+    rect: Option<[u32; 4]>,
+) -> Option<(&'a rawkit_engine::Canvas, [u32; 4])> {
+    let (rect, library) = (rect?, library?);
+    if let Err(why) = draw_strip(
+        gpu,
+        blit,
+        canvas_renderer,
+        library,
+        strip,
+        blank,
+        [rect[2], rect[3]],
+    ) {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            complain(&why);
+        }
+        return None;
+    }
+    Some((strip.canvas.as_ref()?, rect))
+}
+
 /// The cell size that lets `count` frames fill the canvas.
 ///
 /// Tries every column count and keeps the one that makes the cells largest. A
@@ -6284,6 +6693,7 @@ fn paint(
     canvas: &rawkit_engine::Canvas,
     overlay: &rawkit_engine::Overlay,
     at: [u32; 4],
+    strip: Option<(&rawkit_engine::Canvas, [u32; 4])>,
 ) -> Result<()> {
     use wgpu::CurrentSurfaceTexture as Current;
     let frame = match surface.get_current_texture() {
@@ -6322,6 +6732,11 @@ fn paint(
         gpu.queue.submit([encoder.finish()]);
     } else {
         presenter.draw_into(gpu, canvas, Some(overlay), &view, at)?;
+        // Into the same frame, below: each draw loads what is there and writes
+        // only its own rectangle, so the two do not have to be one texture.
+        if let Some((strip, below)) = strip {
+            presenter.draw_into(gpu, strip, None, &view, below)?;
+        }
     }
     frame.present();
     Ok(())

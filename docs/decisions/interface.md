@@ -61,6 +61,7 @@ what a contributor would otherwise undo.
 | **I37** | A folder is a place to look, as a collection is | Choosing one shows it *and every folder under it*, in the library's order, with the filter still applying. "All photographs" is how back, for both. |
 | **I38** | The filter bar is controls, not chips | 26 px targets; the flag choice is one segmented radio; "Filter on ✕" says it is on and turns it off. |
 | **I39** | Collections can be searched, and a second click does nothing | A match keeps its parents. Clicking the collection being walked used to leave it — a toggle nobody could see. |
+| **I40** | The filmstrip is drawn by the GPU inside the canvas, in every view, and F6 hides it | One row of the current source, centred on the photograph being looked at, with the grid's marks. A press chooses; the wheel moves along it. |
 | **I21** | New never replaces a catalog, and only `--new` makes one | The picker's "replace?" is a question about a file. Without `--new`, a path that is not there is refused, not created. |
 
 ## I1 — one status line
@@ -864,6 +865,32 @@ back. Clicking the collection already being walked does nothing — "All
 photographs" says what going back is. "New from selection…" is "New from the
 selected…", the word the rest of the window uses since S11.
 
+## I40 — the filmstrip
+
+A band 96 pixels high across the bottom of the canvas: one row of whatever is being
+walked through, the current photograph in the middle with the grid's bright frame
+round it, and the grid's pick edge, reject dimming, label and marks. **Drawn by the
+GPU in the canvas's own window**, into a canvas of its own that is presented below
+the photograph in the same frame — thumbnails as page elements would be pixels
+crossing to the page, and would not survive twenty thousand. Its own thumbnail
+cache, because the grid keeps what is near its scroll position and the strip what
+is near the photograph, and each would evict what the other wants. In the loupe
+the preview builder is told what the strip is missing, as it is told the grid's.
+
+**In every view, not only the loupe.** The strip is part of the frame, so the
+photograph's size does not depend on the view and switching from the grid to the
+loupe resizes nothing. F6 hides it; that is remembered with the window. It is not
+drawn when nothing is open (a single photograph has no neighbours) or when the
+photograph above it would be less than three strips tall.
+
+A press on a slot makes that photograph the current one: in the loupe it opens, in
+the grid the active cell moves. The press is taken in the pointer router before
+anything armed — a crop handle, a picker, a pan — because the strip is a choice of
+photograph and nothing else. Whether it may be honoured is the render loop's: with
+a tool in hand it is refused and says so, as a key that changes photograph is. The
+wheel moves along the strip without changing anything; the strip comes back to the
+current photograph when that changes.
+
 ## If you change this
 
 | If you touch… | …this will tell you |
@@ -906,6 +933,7 @@ selected…", the word the rest of the window uses since S11.
 | anything in `setup`, or in the navigation block of `tick` | nothing automatic. **No `?` on anything a missing file, a bad catalog or a corrupt preview can reach.** Check by hand with `target/scratch`-style catalogs whose files have been renamed |
 | who reads the notice | `grep -n 'take_notice' panel.html` shows only `hear` |
 | what a folder counts, or what choosing one shows | `folders::tests` in the catalog (own and total, under it too, missing files, virtual copies) and `a_folder_is_a_place_to_look_and_the_filter_still_applies_in_it` |
+| the strip's height or when it shows | `the_strip_is_inside_the_canvas_and_only_when_there_is_room`. Its drawing and its clicks are checked by hand: a click opens, the wheel moves without opening, a click with crop in hand is refused, the strip's top meets the photograph's bottom by pixel |
 | how the window is divided | `frame::tests` — the four sides, the left panel giving way first, a hidden panel's width going to the photograph, the physical canvas meeting the bars at a fractional scale, and where a pointer lands |
 | a bar's height or a panel's width in the page | nothing automatic: the page must take it from `--top`, `--left`, `--panel`, `--bottom`, never a number of its own. Check by pixel: the page's border ends on the pixel before the canvas starts, on all four sides |
 | where an overlay lives | the welcome and import screens are top-level; the sheet, palette and export panel are in `#chrome` and call `needRight()` |

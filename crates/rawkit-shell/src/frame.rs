@@ -44,6 +44,15 @@ pub const PANEL_MAX: f64 = 640.0;
 /// Where the right panel starts, the first time.
 pub const PANEL_DEFAULT: i32 = 360;
 
+/// The filmstrip: a band across the bottom of the canvas, one row of the
+/// current source with the photograph being looked at in the middle. Drawn by
+/// the GPU inside the canvas's own window — thumbnails as page elements would be
+/// pixels crossing to the page, and would not survive twenty thousand of them.
+pub const STRIP: i32 = 96;
+/// Below this much photograph above it, the strip is not drawn: a band of
+/// thumbnails taller than a third of what it is under is the wrong way round.
+const STRIP_ROOM: i32 = 3 * STRIP;
+
 /// The least photograph worth showing, in logical pixels. What gives way in a
 /// window too narrow for everything: the panels, not the picture. The left one
 /// goes first — navigation can be reached by key; the controls beside the
@@ -58,6 +67,10 @@ pub struct Frame {
     pub left: i32,
     pub right: i32,
     pub bottom: i32,
+    /// The filmstrip's height, at the bottom of the canvas and inside it. Zero
+    /// when it is hidden, when nothing is open to fill it, or when the window is
+    /// too short to spare it.
+    pub strip: i32,
 }
 
 /// What somebody asked for, before the window has had its say.
@@ -67,6 +80,7 @@ pub struct Wanted {
     pub panel: i32,
     pub left: bool,
     pub right: bool,
+    pub strip: bool,
 }
 
 /// Divide a window of this logical size.
@@ -86,11 +100,18 @@ pub fn divide(window: (f64, f64), wanted: Wanted) -> Frame {
     } else {
         0
     };
+    let height = window.1 as i32 - TOP - BOTTOM;
+    let strip = if wanted.strip && height - STRIP >= STRIP_ROOM {
+        STRIP
+    } else {
+        0
+    };
     Frame {
         top: TOP,
         left,
         right,
         bottom: BOTTOM,
+        strip,
     }
 }
 
@@ -126,6 +147,12 @@ impl Frame {
         ]
     }
 
+    /// The strip's height in physical pixels, for a canvas this tall. Never all
+    /// of it: there is always a photograph above.
+    pub fn strip_physical(&self, canvas_height: u32, scale: f64) -> u32 {
+        ((self.strip as f64 * scale).round() as u32).min(canvas_height.saturating_sub(1))
+    }
+
     /// Where a point in the window's logical coordinates falls on the canvas,
     /// in the canvas's physical pixels — or nowhere, if it is on a bar or a
     /// panel. The one question both pointer deliverers ask.
@@ -150,11 +177,16 @@ static NOW: Mutex<Frame> = Mutex::new(Frame {
     left: LEFT,
     right: PANEL_DEFAULT,
     bottom: BOTTOM,
+    strip: STRIP,
 });
 
 /// Whether each panel is wanted. F7 and F8, remembered with the window.
 static LEFT_WANTED: AtomicBool = AtomicBool::new(true);
 static RIGHT_WANTED: AtomicBool = AtomicBool::new(true);
+/// F6. And whether there is anything for a strip to show: nothing, until a
+/// catalog is known to be open — a single photograph has no neighbours.
+static STRIP_WANTED: AtomicBool = AtomicBool::new(true);
+static STRIP_POSSIBLE: AtomicBool = AtomicBool::new(true);
 
 pub fn current() -> Frame {
     *NOW.lock().expect("frame lock")
@@ -169,7 +201,23 @@ pub fn wanted(panel: i32) -> Wanted {
         panel,
         left: LEFT_WANTED.load(Relaxed),
         right: RIGHT_WANTED.load(Relaxed),
+        strip: STRIP_WANTED.load(Relaxed) && STRIP_POSSIBLE.load(Relaxed),
     }
+}
+
+/// Whether the strip is asked for, whatever the window can spare.
+pub fn strip_wanted() -> bool {
+    STRIP_WANTED.load(Relaxed)
+}
+
+pub fn want_strip(shown: bool) {
+    STRIP_WANTED.store(shown, Relaxed);
+}
+
+/// Whether there is a catalog for a strip to walk. Returns whether that
+/// changed, which is when the window needs dividing again.
+pub fn strip_possible(possible: bool) -> bool {
+    STRIP_POSSIBLE.swap(possible, Relaxed) != possible
 }
 
 pub fn want(left: bool, right: bool) {
@@ -185,6 +233,7 @@ mod tests {
         panel: 360,
         left: true,
         right: true,
+        strip: false,
     };
 
     #[test]
@@ -233,6 +282,27 @@ mod tests {
         assert_eq!((x, y), (325, 95));
         assert_eq!(x + w + (360.0f64 * 1.25).round() as u32, 2400);
         assert_eq!(y + h + (28.0f64 * 1.25).round() as u32, 1350);
+    }
+
+    #[test]
+    fn the_strip_is_inside_the_canvas_and_only_when_there_is_room() {
+        let with = Wanted {
+            strip: true,
+            ..BOTH
+        };
+        let frame = divide((1920.0, 1080.0), with);
+        assert_eq!(frame.strip, STRIP);
+        // The canvas is the same rectangle either way: the strip is part of it.
+        assert_eq!(
+            frame.canvas((1920, 1080)),
+            divide((1920.0, 1080.0), BOTH).canvas((1920, 1080))
+        );
+        assert_eq!(frame.strip_physical(1952, 2.0), 192);
+        // 76 + 28 + 96 + 288 = 488: any shorter and there is no strip.
+        assert_eq!(divide((1920.0, 488.0), with).strip, STRIP);
+        assert_eq!(divide((1920.0, 487.0), with).strip, 0);
+        // Never the whole canvas, whatever the numbers.
+        assert_eq!(frame.strip_physical(100, 2.0), 99);
     }
 
     #[test]

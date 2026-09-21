@@ -91,6 +91,15 @@ const ZOOM_STEP: f64 = 1.15;
 
 pub(crate) fn route(event: Pointer, session: &Arc<Mutex<Session>>) {
     match event {
+        // The filmstrip is a row of photographs to choose from, in every view
+        // and whatever is armed: a press there is a choice, never a pan, a pick
+        // or a crop handle. The render loop decides whether it may be honoured.
+        Pointer::Press { at, .. } if crate::on_strip(at) => {
+            *crate::STRIP_CLICK.lock().expect("strip click lock") = Some(at[0]);
+        }
+        Pointer::Scroll { at, notches } if crate::on_strip(at) => {
+            *crate::STRIP_SCROLL.lock().expect("strip scroll lock") += notches;
+        }
         Pointer::Press {
             at,
             double,
