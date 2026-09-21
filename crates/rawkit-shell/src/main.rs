@@ -890,8 +890,17 @@ fn cull(
     action: CullAction,
 ) -> Result<CullView, Told> {
     let Some(library) = &state.0 else {
-        return Err("no library is open; pass a .rawkit catalog".into());
+        return Err("no catalog is open".into());
     };
+    // A folder is being added on a connection of its own, which holds the
+    // catalog's write lock; SQLite here does not wait for that, it fails. The
+    // page's sheet takes the keyboard, but it learns of an import by asking,
+    // and a key can arrive before it has asked.
+    if IMPORTING.load(std::sync::atomic::Ordering::Relaxed)
+        || PENDING_IMPORT.lock().expect("import lock").is_some()
+    {
+        return Err("a folder is being added; this will work again in a moment".into());
+    }
     // Here as well as in the page, which checks first and says which keys put
     // the tool down. The page is where a key arrives, but it is a string nobody
     // compiles, and a rule that protects a judgement from being made by
@@ -1163,6 +1172,21 @@ fn open_catalog(path: &Path, create: bool) -> Result<Option<Library>> {
 /// leaving would end it part-way through a folder with nothing to say which
 /// files were written.
 fn leave_for(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
+    // A folder being added is a transaction in flight. Leaving would not harm
+    // the catalog — it rolls back — but the person pressed Add, and would come
+    // back to a catalog without the folder and nothing to say why. Closing the
+    // window is still allowed: that is somebody asking to leave.
+    if IMPORTING.load(std::sync::atomic::Ordering::Relaxed)
+        || PENDING_IMPORT.lock().expect("import lock").is_some()
+    {
+        return Err("a folder is being added; this will work again when it has finished".into());
+    }
+    leave_now(arguments)
+}
+
+/// [`leave_for`] without asking whether an import is running — for the import,
+/// whose last act is to reopen the catalog it has just added to.
+fn leave_now(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
     let exporting = EXPORTING
         .lock()
         .expect("export lock")
@@ -1424,7 +1448,7 @@ fn start_import(folder: PathBuf) {
                     added.to_string().into(),
                     catalog.into_os_string(),
                 ];
-                match leave_for(again) {
+                match leave_now(again) {
                     Ok(()) => shared.opening(added),
                     Err(why) => shared.fail(format!(
                         "{added} photographs were added, but the catalog could not be reopened \

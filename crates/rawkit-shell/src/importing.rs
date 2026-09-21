@@ -10,8 +10,10 @@
 //! The folder is walked and compared with the catalog before anything is kept,
 //! and the person is told what would happen — "1 268 to add, 212 already here"
 //! — on a button that says the number. The count is a dry run of the scan
-//! itself ([`rawkit_catalog::scan::scan_watched`]), so it cannot disagree with
-//! what the scan then does.
+//! itself ([`rawkit_catalog::scan::scan_watched`]), so the two apply one rule.
+//! They are still two looks at a disk that may be changing — a card still
+//! being copied to — so the sentence at the end gives the number that was
+//! added, not the number that was promised.
 //!
 //! # Its own connection, and why that is safe here
 //!

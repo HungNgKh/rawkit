@@ -166,11 +166,27 @@ pub fn scan_watched(
         .stored()
         .to_string();
     let standing = standing_root(&transaction, &volume)?;
+    // The one question asked of the disk, and it has three answers. "Not
+    // found" is a library that moved. Anything else that is not "there" — a
+    // share that has gone to sleep, a permission that came and went — is
+    // *cannot tell*, and the scan stops rather than guess: guessing "moved"
+    // when it has not re-points the volume, which is the corruption this
+    // function exists to prevent.
+    let standing_is_there = match standing.as_ref().map(|(_, at)| std::fs::metadata(at)) {
+        None => false,
+        Some(Ok(found)) => found.is_dir(),
+        Some(Err(gone)) if gone.kind() == std::io::ErrorKind::NotFound => false,
+        Some(Err(why)) => {
+            let at = standing.as_ref().map_or("", |(_, at)| at.as_str());
+            return Err(CatalogError::Io(format!(
+                "{at} holds photographs already in this catalog and cannot be read just now \
+                 ({why}), so nothing was added — try again when it can"
+            )));
+        }
+    };
     let rooting = Rooting::decide(
         standing.as_ref().map(|(_, at)| at.as_str()),
-        standing
-            .as_ref()
-            .is_some_and(|(_, at)| Path::new(at).is_dir()),
+        standing_is_there,
         &stored_root,
         convention,
     );
@@ -425,10 +441,13 @@ fn standing_root(
 
 /// Re-spell every folder on a volume from a root further up.
 ///
-/// Longest path first. The new spelling of a folder is longer than the old, so
-/// the only row it can collide with on the way is one longer than itself —
-/// which, in this order, has already moved out of the way. The case that shows
-/// it: a library root holding a subfolder with the same name as the prefix.
+/// Deepest first. A folder's new spelling has more names in it than its old
+/// one, so the only row it can collide with on the way is one deeper than
+/// itself — which, in this order, has already moved out of the way. The case
+/// that shows it: a library root holding a subfolder with the same name as the
+/// prefix. Counted in names and not in bytes: what must not collide is the
+/// *key*, and on a filesystem that folds case and normalises accents a key's
+/// length and its spelling's can order two folders differently.
 fn widen(
     transaction: &rusqlite::Transaction<'_>,
     volume_id: i64,
@@ -442,7 +461,7 @@ fn widen(
         let rows = statement.query_map([volume_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<Result<_, _>>()?
     };
-    folders.sort_by_key(|(_, path)| std::cmp::Reverse(path.len()));
+    folders.sort_by_key(|(_, path)| std::cmp::Reverse(components(path).1.len()));
     let mut was_root = None;
     for (id, path) in folders {
         let moved = if path.is_empty() {
@@ -993,6 +1012,42 @@ mod tests {
         let report = test_scan(&mut catalog, &dir.join("now"));
         assert_eq!((report.added, report.unchanged), (0, 1));
         assert!(whereabouts(&catalog).iter().all(|(_, there)| *there));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_cannot_be_read_stops_the_scan_rather_than_being_guessed_at() {
+        // Not "not found": there, and refusing to be looked at — what a share
+        // that has gone to sleep looks like. Guessing "moved" would re-point the
+        // volume at the folder being added and lose the one already in it.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir();
+        write(&dir.join("locked/was/a.ARW"), b"raw");
+        write(&dir.join("other/b.ARW"), b"raw");
+        let mut catalog = library(&dir);
+        test_scan(&mut catalog, &dir.join("locked/was"));
+
+        let locked = dir.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads through any permission, and a test must not assume it is
+        // not running as root: find out what the disk actually says.
+        let blind = matches!(
+            std::fs::metadata(locked.join("was")),
+            Err(ref why) if why.kind() != std::io::ErrorKind::NotFound
+        );
+        let refused = scan_on(
+            &mut catalog,
+            &dir.join("other"),
+            VolumeId::Uuid("test-volume".into()),
+            no_metadata,
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if blind {
+            assert!(matches!(refused, Err(CatalogError::Io(_))), "{refused:?}");
+            assert_eq!(filenames(&catalog).len(), 1, "and nothing was added");
+        }
+        assert!(whereabouts(&catalog).iter().all(|(_, there)| *there));
+        assert_eq!(missing(&catalog), 0);
     }
 
     #[test]

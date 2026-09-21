@@ -52,7 +52,8 @@ transaction as the scan.
 | the standing root, again | nothing changes |
 | a folder inside it | scanned relative to the standing root |
 | a folder beside it, above it, or elsewhere on the drive | the root moves up to their common ancestor — `/` or `C:/` if that is all they share |
-| anything, when the standing root **is no longer there** | taken to be where the library went: the root is re-pointed, as before |
+| anything, when the standing root **is not found** | taken to be where the library went: the root is re-pointed, as before |
+| anything, when the standing root **cannot be read** for any other reason | the scan stops and says so. A share that has gone to sleep is not a library that moved, and guessing that it is re-points the volume — the corruption this exists to prevent |
 
 **Weighed against:** rooting every volume at its mount point. It is the cleaner
 model — a remount is then unambiguous — and `VolumeId::resolve` already finds
@@ -70,10 +71,13 @@ the scan always made. A library folder *renamed* and a second folder *added* in
 one step cannot be told apart from the spellings. Relink by content hash is the
 answer to that and is separate work.
 
-`widen` re-spells longest path first. A folder's new spelling is longer than its
-old one, so the only row it can collide with is one longer than itself, which in
-that order has already moved. The case that shows it is a library root holding a
-subfolder with the same name as the prefix being added.
+`widen` re-spells deepest folder first. A folder's new spelling has more names
+in it than its old one, so the only row it can collide with is one deeper than
+itself, which in that order has already moved. Counted in names and not in
+bytes, because what must not collide is the key, and under a convention that
+folds case and normalises accents a key and its spelling can differ in length.
+The case that shows it is a library root holding a subfolder with the same name
+as the prefix being added.
 
 ## A2 — missing, for the folder that was looked in
 
@@ -108,7 +112,9 @@ action is to add a folder; a folder dropped on the window is added.
 ## A5 — count, then ask
 
 `Stage::Counted { fresh, already, unreadable }`, from a dry run with a reader
-that reads no files — names and sizes are enough to count. The button reads
+that reads no files — names and sizes are enough to count. One rule for the
+count and the scan, but two looks at a disk that may still be changing, so the
+sentence at the end gives the number that was added. The button reads
 "Add 1 268 photographs". Folders that could not be listed are counted on the
 sheet, because a number that is short with no reason given looks like a scan
 that missed things. A folder with nothing new in it never reaches the question:
@@ -127,7 +133,10 @@ So there are none. The render loop flushes the pending edit, then does nothing
 until the import ends — no saver, no preview pump — and the page's sheet covers
 the window and takes the keyboard. On Linux the canvas is unmapped for the
 duration, because the sheet is the page's and the canvas is over the page.
-An import is refused while an export is running, for the reason a relaunch is.
+An import is refused while an export is running, for the reason a relaunch is —
+and while an import runs, the shell itself refuses a rating, an export, and
+opening something else. The page learns of an import by asking, up to 150 ms
+late, and a rule that protects a transaction should not depend on a poll.
 
 One connection for both halves, held across the question between them: closing
 a catalog writes a rolling backup, and an import should cost the rotation one
@@ -166,6 +175,7 @@ themselves, what is on screen first.
 | how folder rows are re-spelled | `a_subfolder_named_like_the_folder_above_it_survives_the_root_moving_up` — and its check that no folder is left without a parent |
 | what a scan may call missing | `a_file_missing_from_one_folder_is_not_every_other_folders_problem` |
 | finding a library that moved | `a_library_that_has_moved_is_found_where_it_went` |
+| what "the standing root is not there" means | `a_root_that_cannot_be_read_stops_the_scan_rather_than_being_guessed_at` — not found is moved; anything else is *cannot tell*, and stops |
 | the import's stages, and that nothing is kept until somebody says so | `it_counts_asks_and_then_adds`, `saying_no_keeps_nothing`, `stopped_part_way_it_keeps_nothing` |
 | what happens when there is nothing new | `a_folder_already_in_the_catalog_is_nothing_to_add` — nobody is asked a question with one answer |
 | a failure on the sheet | `a_folder_that_is_not_there_is_a_failure_that_stays_until_read` |
