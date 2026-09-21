@@ -307,6 +307,8 @@ pub fn write(
     }
 
     let mut report = ExportReport::default();
+    // Decided for the whole batch before anything is written. See [`names`].
+    let named = names(chosen, delivery.format.extension());
     let gpu = Gpu::new()?;
     let renderer = Renderer::with_tile_size(&gpu, DEFAULT_TILE);
 
@@ -321,8 +323,8 @@ pub fn write(
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let sender = sender.clone();
-            let (next, stopped, chosen, gpu, renderer) =
-                (&next, &stopped, &chosen, &gpu, &renderer);
+            let (next, stopped, chosen, named, gpu, renderer) =
+                (&next, &stopped, &chosen, &named, &gpu, &renderer);
             scope.spawn(move || loop {
                 if stopped.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
@@ -337,13 +339,7 @@ pub fn write(
                     break;
                 };
                 let destination = match to {
-                    // `stem` rather than the file's own name, because a virtual
-                    // copy shares that name: two interpretations of one frame
-                    // would write one file, and the second would be skipped as
-                    // already there — an export that quietly lost half its work.
-                    Destination::Folder(dir) => {
-                        dir.join(format!("{}.{}", image.stem(), delivery.format.extension()))
-                    }
+                    Destination::Folder(dir) => dir.join(&named[index]),
                     Destination::File(path) => path.clone(),
                 };
                 let outcome = if destination.exists() && !delivery.overwrite {
@@ -394,6 +390,37 @@ pub fn write(
 
     progress(chosen.len() - report.not_started, chosen.len(), "");
     Ok(report)
+}
+
+/// The file each photograph becomes in a folder: one name each, no two alike.
+///
+/// From `stem` rather than the file's own name, because a virtual copy shares
+/// that name: two interpretations of one frame would write one file.
+///
+/// And numbered where two photographs would still collide. `DSC00042.ARW` from
+/// two cameras, or from two years of one camera's counter going round, is the
+/// ordinary state of a library — and into one folder the second was either
+/// skipped as "already there", which is an export that quietly lost a
+/// photograph, or, with replace on, written over the first. The first keeps the
+/// name and the rest get `-2`, `-3`, in the order they were chosen, so the same
+/// set exported twice gets the same names and "leave what is there" still
+/// means what it says. Compared without case, because two of the three
+/// filesystems this runs on compare that way.
+fn names(chosen: &[Chosen], extension: &str) -> Vec<String> {
+    let mut taken = std::collections::HashSet::new();
+    chosen
+        .iter()
+        .map(|chosen| {
+            let stem = chosen.image.stem();
+            let mut name = format!("{stem}.{extension}");
+            let mut n = 1;
+            while !taken.insert(name.to_lowercase()) {
+                n += 1;
+                name = format!("{stem}-{n}.{extension}");
+            }
+            name
+        })
+        .collect()
 }
 
 /// Gather and write in one call, into a folder. What the command line does.
@@ -561,6 +588,43 @@ mod tests {
 
         drop(catalog);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_photographs_with_one_name_become_two_files() {
+        // The same counter value from two cameras, in two folders of one
+        // library. Into one folder the second used to be skipped as already
+        // there — or, with replace on, written over the first.
+        let chosen: Vec<Chosen> = [
+            ("/a/DSC00042.ARW", "DSC00042.ARW"),
+            ("/b/DSC00042.ARW", "DSC00042.ARW"),
+            ("/c/dsc00042.arw", "dsc00042.arw"),
+            ("/a/DSC00043.ARW", "DSC00043.ARW"),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, (path, filename))| Chosen {
+            image: cull::LibraryImage {
+                id: i as i64,
+                path: path.to_string(),
+                filename: filename.to_string(),
+                copy_name: None,
+                volume: 1,
+            },
+            state: EditState::default(),
+            profile: None,
+        })
+        .collect();
+        assert_eq!(
+            names(&chosen, "jpg"),
+            [
+                "DSC00042.jpg",
+                "DSC00042-2.jpg",
+                "dsc00042-3.jpg",
+                "DSC00043.jpg"
+            ],
+            "the first keeps the name; the order is the order chosen, so it is stable"
+        );
     }
 
     #[test]

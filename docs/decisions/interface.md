@@ -524,6 +524,21 @@ settings — the designer's assignment, and the reverse of what the two chords
 did before. Again means the same *how*, of what is meant now: if the last
 export was of a selection and nothing is selected today, it is of what is shown.
 
+Again runs at once only when it can destroy nothing and surprise nobody: up to
+24 photographs, and never when the last export replaced what was there —
+"replace" is remembered with the rest, was probably turned on to fix one file,
+and must not ride along onto whatever is selected today. Otherwise it opens the
+panel with everything filled in, one Enter away: `Ctrl+E` meant "this photograph" for a
+long time, and it must not come to mean twenty thousand full-size files
+because nothing happened to be selected.
+
+Two photographs with one file name become two files. `DSC00042.ARW` from two
+cameras is the ordinary state of a library, and into one folder the second was
+skipped as already there — or, with replace on, written over the first. The
+writer now names the whole batch before it writes any of it: the first keeps
+the name, the rest are numbered in the order chosen, so the same set exported
+twice gets the same names.
+
 An export can be stopped, between photographs: what is being written is
 finished, because half a JPEG is worse than one more. `write`'s progress
 callback answers whether to go on. The line at the end says how many were
@@ -574,6 +589,7 @@ a scope: "web, 2048" is how, and which photographs is asked every time.
 | what is written while a stand-in is showing | `a_photograph_that_could_not_be_read_is_not_edited_by_accident` |
 | what the panel can ask for | `every_format_the_panel_offers_is_one_the_writer_has`, `what_cannot_be_carried_out_is_refused_in_words`, `the_defaults_lose_nothing_nobody_asked_to_lose` |
 | what "selected" and "shown" mean to an export | `what_an_export_is_given_is_what_the_window_is_showing` (shell), `a_list_is_gathered_in_the_order_it_was_given` (deliver) |
+| what each file in a batch is called | `two_photographs_with_one_name_become_two_files`, `a_copy_and_its_original_do_not_write_the_same_file` |
 | where export settings are kept | `the_last_settings_and_the_presets_come_back`, `a_file_somebody_edited_badly_is_a_first_run` |
 | anything in `tick` that must happen in the grid too | it goes **before** the `in_grid()` early return. The pump, the import and the export all do |
 | what a launch opens | `what_is_named_is_what_opens`, `with_nothing_named_the_last_catalog_comes_back`, `a_catalog_that_was_closed_stays_closed`, `the_test_pattern_has_to_be_asked_for` |

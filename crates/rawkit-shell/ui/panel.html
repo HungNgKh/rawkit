@@ -482,7 +482,7 @@
   <h3>What</h3>
   <label class="what"><input type="radio" name="export-scope" value="selected"><span><b id="export-n-selected">0</b> selected</span></label>
   <label class="what"><input type="radio" name="export-scope" value="shown"><span><b id="export-n-shown">0</b> <span id="export-shown-as">shown</span></span></label>
-  <label class="what"><input type="radio" name="export-scope" value="current"><span>This photograph</span></label>
+  <label class="what"><input type="radio" name="export-scope" value="current"><span>This photograph <span id="export-this" style="color:#8a8a92"></span></span></label>
   <h3>How</h3>
   <div class="row"><span>Preset</span>
     <select id="export-preset" aria-label="preset"></select>
@@ -3622,8 +3622,8 @@
   const exportSettings = () => ({
     scope: exportScope(),
     format: exportField("format").value,
-    quality: Number(exportField("quality").value) || 92,
-    long_edge: exportField("size").value === "edge" ? Number(exportField("edge").value) || 0 : 0,
+    quality: Number(exportField("quality").value),
+    long_edge: exportField("size").value === "edge" ? Number(exportField("edge").value) : 0,
     sharpening: exportField("sharpen").value,
     replace: exportField("exists").value === "replace",
     folder: exportFolder,
@@ -3638,6 +3638,9 @@
     const narrowed = latestView && (latestView.filter?.flagged || latestView.filter?.min_rating
       || latestView.filter?.colour || latestView.viewing !== null);
     exportField("shown-as").textContent = narrowed ? "shown, as filtered" : "shown — everything";
+    // Named, because the arrow keys still move behind this panel and "this"
+    // is whichever photograph they have reached.
+    exportField("this").textContent = latestView ? `— ${latestView.filename}` : "";
     const none = exportPanel.querySelector("input[value=selected]");
     none.disabled = counts.selected === 0;
     none.closest("label").classList.toggle("none", counts.selected === 0);
@@ -3682,22 +3685,48 @@
   };
   const EXPORT_DEFAULTS = { scope: "shown", format: "jpeg", quality: 92, long_edge: 0,
                             sharpening: "none", replace: false, folder: null };
-  const openExport = async () => {
+  /// How many photographs "export again" will write without showing the panel
+  /// first. One key used to mean "this photograph"; it must not come to mean
+  /// twenty thousand full-size files because nothing happened to be selected.
+  const AGAIN_WITHOUT_ASKING = 24;
+  const openExport = async scope => {
     palette.classList.add("hidden");
     document.getElementById("sheet").classList.add("hidden");
     exportKept = await invoke("export_panel");
+    // A folder picked for a panel that was closed before the picker answered
+    // belongs to that panel, not to this one.
+    await invoke("take_export_folder").catch(() => null);
     listExportPresets();
     fillExport(exportKept.last ?? EXPORT_DEFAULTS, false);
     // What somebody has just selected is what they most likely mean; with
     // nothing selected, what is on screen.
-    const wanted = exportCounts().selected > 0 ? "selected" : "shown";
+    const wanted = scope ?? (exportCounts().selected > 0 ? "selected" : "shown");
     exportPanel.querySelector(`input[value=${wanted}]`).checked = true;
     drawExport();
     exportPanel.classList.remove("hidden");
     exportGo.focus();
   };
   const closeExport = () => exportPanel.classList.add("hidden");
-  const startExport = settings => invoke("export_with", { settings }).then(closeExport).catch(say);
+  /// Why these settings cannot be sent, or nothing. The shell checks the same
+  /// things and says the same things — but it takes whole numbers that are not
+  /// negative, and one that is would be turned away at the door with a
+  /// deserialiser's sentence instead of reaching the check that has a human's.
+  /// And `0 || 92` is 92: a typed nought must be refused, not quietly replaced.
+  const exportProblem = settings => {
+    const whole = n => Number.isInteger(n);
+    if (settings.format === "jpeg" && !(whole(settings.quality) && settings.quality >= 1 && settings.quality <= 100))
+      return "JPEG quality runs from 1 to 100";
+    if (exportField("size").value === "edge" && !(whole(settings.long_edge) && settings.long_edge >= 64))
+      return "the long edge is a whole number of pixels, 64 or more";
+    return null;
+  };
+  const startExport = settings => {
+    const problem = exportProblem(settings);
+    if (problem) return tell("refused", problem);
+    // A format that has no quality still sends one the shell will accept.
+    if (settings.format !== "jpeg" && !(settings.quality >= 1 && settings.quality <= 100)) settings.quality = 92;
+    return invoke("export_with", { settings }).then(closeExport).catch(say);
+  };
   const exportAgain = async () => {
     const kept = await invoke("export_panel");
     // Nothing to do again: the first export is made in the panel.
@@ -3705,6 +3734,16 @@
     // The same *how*, of what is meant now — not of whatever was selected the
     // last time, which may be nothing at all today.
     const scope = kept.last.scope === "selected" && exportCounts().selected === 0 ? "shown" : kept.last.scope;
+    const n = exportCounts()[scope];
+    // Again runs at once only when it can destroy nothing and surprise nobody.
+    // "Replace" is remembered with the rest, and was probably turned on to fix
+    // one file — it must not ride along onto whatever is selected today.
+    if (kept.last.replace || n > AGAIN_WITHOUT_ASKING) {
+      tell("info", kept.last.replace
+        ? "The last export replaced what was there, so it is asking first"
+        : `That is ${n.toLocaleString()} photographs, so it is asking first`);
+      return openExport(scope);
+    }
     startExport({ ...kept.last, scope });
   };
   exportPanel.addEventListener("change", event => {
