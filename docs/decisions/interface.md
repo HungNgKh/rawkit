@@ -68,6 +68,7 @@ what a contributor would otherwise undo.
 | **I44** | A History list, kept per photograph for the sitting | Every step named, the one in force marked, the undone ones still listed; a change made while away is a step of its own. |
 | **I45** | The surround is a choice, and neutral | Dark `#1a1a1a` by default; grey, mid grey, white and black from the palette. Drawn by the presenter in linear light, remembered with the window. |
 | **I46** | Crop can be held to a shape | Free, Original, 1:1, 3:2, 4:3, 5:4, 16:9 and a Swap, in the crop's options row. A corner follows the hand along the diagonal; an edge centres the other side. |
+| **I47** | On Linux a drop is taken from GTK, not from Tauri | Tauri's drop event never arrived: WebKitGTK refused the drag at the protocol level. First tested with a real XDND drag in this change. |
 | **I21** | New never replaces a catalog, and only `--new` makes one | The picker's "replace?" is a question about a file. Without `--new`, a path that is not there is refused, not created. |
 
 ## I1 — one status line
@@ -1024,6 +1025,31 @@ it was. Both stay inside the frame and shrink together when they must.
 much as the frame makes it. Fitting the turned shape *inside* the rectangle made
 every press smaller than the last. Reset gives the whole frame, or as much of it
 as the shape allows. The engine is unchanged: the crop is still four edges.
+
+## I47 — drops on Linux
+
+Drag-and-drop had never been tested: nothing here could synthesise an XDND drag.
+A helper window that offers a path as a GTK drag source (`target/scratch/
+dragsource.py`, driven by `dropon.sh`, mouse only) can. The first real drop
+showed that **it had never worked**: the page saw `dragenter` and `dragover`
+carrying `text/uri-list`, GTK saw the motion on the webview, and at the release
+GTK sent a leave and no drop — refused at the protocol level, whether or not the
+page cancelled `dragover`, so wry was never told and neither was Tauri. A bare
+WebKitGTK view accepted the same drag; which of the wrapped webview's settings
+makes the difference is not known.
+
+So on the native-child route the drop is taken from the webview's own GTK
+signals (`canvas::take_drops`): a drag carrying URIs is accepted as a copy over
+the page, its data is asked for on release, and the first path goes through
+`leave_for_path` like every other way of opening something. Drags of anything
+else inside the page go on to WebKit untouched. Windows and macOS keep Tauri's
+event, which is still untested by hand there.
+
+Checked: a folder dropped on the panel opens the import sheet; a catalog
+relaunches into it; a RAW dropped on the welcome screen opens it. **Not over
+the photograph**: on Linux the canvas is an X window of its own, GTK finds no
+widget under it, and a drop there is ignored — the panels, the bars and the
+welcome screen take drops.
 
 ## If you change this
 

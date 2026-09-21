@@ -364,6 +364,72 @@ pub fn attach_input(
     Ok(())
 }
 
+/// Take files dropped on the page, and hand the first one to `open`.
+///
+/// # Why this is not Tauri's drop event
+///
+/// Tauri learns of a drop from wry, and wry learns of it from WebKitGTK's own
+/// drag signals — which only arrive if WebKit *accepts* the drop, and here it
+/// never did. Driven by a real XDND drag from a helper window (the first time a
+/// drop was tested at all), the page saw `dragenter` and `dragover` carrying
+/// `text/uri-list`, GTK saw the motion, and at the release GTK sent a leave and
+/// no drop: the drag was refused at the protocol level, with or without the page
+/// cancelling `dragover`. A bare WebKitGTK view accepted the same drag. Rather
+/// than keep guessing at which of Tauri's settings makes the difference, the
+/// drop is taken here, from the same signals, one step earlier: a drag that
+/// carries a list of URIs is accepted as a copy while it is over the page, its
+/// data is asked for when it is let go, and the first path is opened.
+///
+/// Only drags carrying URIs are taken. Anything the page drags inside itself —
+/// text, a selection — goes on to WebKit as before, because these handlers
+/// return false for it.
+pub fn take_drops(window: &tauri::WebviewWindow, open: fn(std::path::PathBuf)) -> Result<()> {
+    window.with_webview(move |webview| {
+        let view = webview.inner();
+        let uris = gdk::Atom::intern("text/uri-list");
+        let carries = move |context: &gdk::DragContext| context.list_targets().contains(&uris);
+        // Whether the data about to arrive is the drop's, rather than the
+        // requests WebKit makes on its own while a drag passes over.
+        let dropping = std::rc::Rc::new(std::cell::Cell::new(false));
+
+        let motion_carries = carries;
+        view.connect_drag_motion(move |_, context, _, _, time| {
+            if !motion_carries(context) {
+                return false;
+            }
+            context.drag_status(gdk::DragAction::COPY, time);
+            true
+        });
+
+        let drop_carries = carries;
+        let asked = dropping.clone();
+        view.connect_drag_drop(move |widget, context, _, _, time| {
+            if !drop_carries(context) {
+                return false;
+            }
+            asked.set(true);
+            widget.drag_get_data(context, &gdk::Atom::intern("text/uri-list"), time);
+            true
+        });
+
+        view.connect_drag_data_received(move |_, context, _, _, data, _, time| {
+            if !dropping.replace(false) {
+                return;
+            }
+            let first = data.uris().into_iter().find_map(|uri| {
+                gtk::glib::filename_from_uri(&uri)
+                    .ok()
+                    .map(|(path, _)| path)
+            });
+            context.drag_finish(first.is_some(), false, time);
+            if let Some(path) = first {
+                open(path);
+            }
+        });
+    })?;
+    Ok(())
+}
+
 /// The monitor's ICC profile, as the desktop advertises it.
 ///
 /// X11 has carried this since the ICC Profiles in X specification: the colour

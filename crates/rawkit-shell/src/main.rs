@@ -3953,6 +3953,13 @@ fn build_window(
             // rectangles for one canvas and looks like half a photograph.
             let layout = Layout::for_window(route, window.inner_size()?, window.scale_factor()?);
             let canvas = canvas::attach(&window.as_ref().window())?;
+            // Dropped files, taken from GTK here rather than from Tauri's event,
+            // which never arrives on this route; see `canvas::take_drops`.
+            canvas::take_drops(&window, |path| {
+                if let Err(why) = leave_for_path(&path) {
+                    tell(Told::from(why.as_str()));
+                }
+            })?;
             eprintln!("canvas     : X window {canvas:?}");
             let (gpu, surface) = Gpu::with_surface(canvas)?;
             let handle = window.as_ref().window();
