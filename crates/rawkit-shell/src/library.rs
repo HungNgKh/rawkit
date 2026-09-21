@@ -287,6 +287,11 @@ enum Undone {
     Judged {
         image: i64,
         before: Judgement,
+        /// The judgement also took the frame out of a comparison. Undoing puts
+        /// it back in and redoing takes it out again — without this, a redo
+        /// left it in, and a plain judgement's undo added the frame to whatever
+        /// was selected at the time.
+        surveyed: bool,
     },
     /// What each frame's edit was before the paste. `None` means it had none —
     /// restoring that writes the identity edit rather than deleting a version,
@@ -1181,6 +1186,20 @@ impl Library {
         Ok(removed)
     }
 
+    /// Read back what the library holds from the catalog, after a record that
+    /// failed partway: some of it may have been written. Answers with the
+    /// failure, which is still what gets said — the record is dropped, not
+    /// retried, because one that cannot be applied would stand in front of
+    /// everything below it.
+    fn resync_after(&mut self, why: anyhow::Error) -> anyhow::Error {
+        let standing = self.current().id;
+        let _ = collections::target(&self.catalog).map(|target| self.target = target);
+        let _ = self.refresh_collections();
+        let _ = cull::tally(&self.catalog).map(|tally| self.tally = tally);
+        let _ = self.resequence(Some(standing));
+        why
+    }
+
     /// Apply one record — undoing what it describes — and answer with the
     /// record that would apply it again. Undo and redo are both this: an undo
     /// is a record taken off one stack and its inverse put on the other.
@@ -1209,6 +1228,7 @@ impl Library {
             Undone::Judged {
                 image,
                 before: previous,
+                surveyed,
             } => {
                 let standing = cull::judgement(&self.catalog, image)?;
                 self.write_judgement(image, &standing, &previous)?;
@@ -1219,9 +1239,14 @@ impl Library {
                 // changed, in both directions.
                 self.settle(image)?;
                 // A survey drops what it judges too, so the key that reverses a
-                // mistake has to restore the comparison as well.
-                if !redoing && !self.marked.is_empty() {
-                    self.marked.insert(image);
+                // mistake has to restore the comparison as well — and the key
+                // that redoes it has to take it out again.
+                if surveyed {
+                    if redoing {
+                        self.marked.remove(image);
+                    } else {
+                        self.marked.insert(image);
+                    }
                 }
                 if let Some(index) = self.position_of(image) {
                     self.go(index);
@@ -1237,6 +1262,7 @@ impl Library {
                 Undone::Judged {
                     image,
                     before: standing,
+                    surveyed,
                 }
             }
             Undone::TakenOut { collection, placed } => {
@@ -2140,6 +2166,7 @@ impl Library {
                 } else {
                     format!("Rejected {frame}; out of the comparison")
                 });
+                let recorded = self.recorded;
                 self.judge(|j| Judgement {
                     flag: Some(flag),
                     ..j
@@ -2148,6 +2175,13 @@ impl Library {
                 // still in it — which is what makes this a winnowing rather
                 // than a survey you have to leave and re-enter.
                 if self.marked.remove(id) {
+                    // Said on the record the judgement just left, so undo and
+                    // redo carry the comparison with them.
+                    if self.recorded != recorded {
+                        if let Some(Undone::Judged { surveyed, .. }) = self.undo.last_mut() {
+                            *surveyed = true;
+                        }
+                    }
                     let shown = self.marked();
                     // The nearest one still being compared, forward first. The
                     // judged frame may also have left the filter, in which case
@@ -2166,19 +2200,19 @@ impl Library {
             // preset saved again under its name — is dropped with the reason
             // said: kept, it would stand in front of everything below it.
             CullAction::Undo => match self.undo.pop() {
-                Some(undone) => {
-                    let inverse = self.reverse(undone, false)?;
-                    self.redo.push(inverse);
-                }
+                Some(undone) => match self.reverse(undone, false) {
+                    Ok(inverse) => self.redo.push(inverse),
+                    Err(why) => return Err(self.resync_after(why)),
+                },
                 // Said, because a key that does nothing looks broken and this
                 // one has a reason.
                 None => self.say("Nothing to undo"),
             },
             CullAction::Redo => match self.redo.pop() {
-                Some(undone) => {
-                    let inverse = self.reverse(undone, true)?;
-                    self.stack(inverse);
-                }
+                Some(undone) => match self.reverse(undone, true) {
+                    Ok(inverse) => self.stack(inverse),
+                    Err(why) => return Err(self.resync_after(why)),
+                },
                 None => self.say("Nothing to redo"),
             },
             CullAction::ForgetPreset(name) => self.forget_preset(&name)?,
@@ -2225,7 +2259,11 @@ impl Library {
             return Ok(false);
         }
         self.write_judgement(id, &before, &after)?;
-        self.remember(Undone::Judged { image: id, before });
+        self.remember(Undone::Judged {
+            image: id,
+            before,
+            surveyed: false,
+        });
         self.settle(id)
     }
 
@@ -2485,23 +2523,30 @@ impl Saver {
                 library.current().id,
             )
         };
-        // The history of the photograph being left, before the session forgets it.
-        if let Some(leaving) = self.image {
-            self.left += 1;
-            self.kept.insert(leaving, (self.left, session.keep()));
-            if self.kept.len() > KEPT_HISTORIES {
-                let oldest = self
-                    .kept
-                    .iter()
-                    .min_by_key(|(_, (at, _))| *at)
-                    .map(|(id, _)| *id);
-                if let Some(oldest) = oldest {
-                    self.kept.remove(&oldest);
+        // The history of the photograph being left, before the session forgets
+        // it. The same photograph opened again — after a paste onto it, most
+        // often — is carried straight across: through the map it would count
+        // against the cap for an instant and push out somebody else's history.
+        let resumed = match self.image {
+            Some(leaving) if leaving == id => Some(session.keep()),
+            Some(leaving) => {
+                self.left += 1;
+                self.kept.insert(leaving, (self.left, session.keep()));
+                if self.kept.len() > KEPT_HISTORIES {
+                    let oldest = self
+                        .kept
+                        .iter()
+                        .min_by_key(|(_, (at, _))| *at)
+                        .map(|(id, _)| *id);
+                    if let Some(oldest) = oldest {
+                        self.kept.remove(&oldest);
+                    }
                 }
+                self.kept.remove(&id).map(|(_, kept)| kept)
             }
-        }
+            None => self.kept.remove(&id).map(|(_, kept)| kept),
+        };
         self.image = Some(id);
-        let resumed = self.kept.remove(&id).map(|(_, kept)| kept);
         match catalog_result {
             Ok(Some((version, saved))) => {
                 eprintln!("edit       : restored v{version} for image {id}");
@@ -3547,6 +3592,70 @@ pub(crate) mod tests {
         library.act(CullAction::Rate(2)).unwrap();
         let view = library.act(CullAction::Redo).unwrap();
         assert_eq!(view.said.as_deref(), Some("Nothing to redo"));
+    }
+
+    #[test]
+    fn a_survey_judgement_goes_back_into_the_comparison_and_out_again() {
+        let dir = Scratch::new("survey-redo");
+        let mut library = library_at(&dir.0, 4);
+        for _ in 0..3 {
+            library.act(CullAction::Mark).unwrap();
+            library.act(CullAction::Next).unwrap();
+        }
+        library.select(0);
+        assert_eq!(library.view().unwrap().marked, 3);
+        library.act(CullAction::SurveyJudge(true)).unwrap();
+        assert_eq!(library.view().unwrap().marked, 2);
+        library.act(CullAction::Undo).unwrap();
+        assert_eq!(library.view().unwrap().marked, 3);
+        library.act(CullAction::Redo).unwrap();
+        assert_eq!(
+            library.view().unwrap().marked,
+            2,
+            "redone as it was first done"
+        );
+        library.act(CullAction::Undo).unwrap();
+        assert_eq!(library.view().unwrap().marked, 3);
+
+        // A plain pick took nothing out of the selection, so its undo puts
+        // nothing into it.
+        library.select(3);
+        library.act(CullAction::Pick).unwrap();
+        library.act(CullAction::Undo).unwrap();
+        assert!(!library.view().unwrap().is_marked);
+        assert_eq!(library.view().unwrap().marked, 3);
+    }
+
+    #[test]
+    fn an_undo_that_cannot_be_applied_is_said_and_let_go() {
+        let dir = Scratch::new("undo-refused");
+        let mut library = library_at(&dir.0, 2);
+        let look = EditState::default();
+        rawkit_catalog::presets::save(
+            &library.catalog,
+            "Night",
+            &look,
+            &[rawkit_editstate::Group::Tone],
+        )
+        .unwrap();
+        library
+            .act(CullAction::ForgetPreset("Night".into()))
+            .unwrap();
+        // Saved again under the same name behind the library's back.
+        rawkit_catalog::presets::save(
+            &library.catalog,
+            "Night",
+            &look,
+            &[rawkit_editstate::Group::Tone],
+        )
+        .unwrap();
+        assert!(library.act(CullAction::Undo).is_err());
+        let view = library.view().unwrap();
+        assert!(
+            !view.undoable,
+            "the record that cannot be applied is not kept"
+        );
+        assert!(!view.redoable);
     }
 
     #[test]

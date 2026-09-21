@@ -952,7 +952,12 @@ it back; anything new clears redo, as a fresh edit clears the edit's.
 
 A record that cannot be applied — a copy whose id was taken, a preset saved again
 under its name — is dropped with the reason said, not kept in front of everything
-below it. Presets and snapshots are refused rather than overwritten: the one saved
+below it, and what the library holds is read back from the catalog first, since
+part of it may have been written.
+
+A judgement carries whether it also took the frame out of a comparison. Undoing
+puts it back in and redoing takes it out again; a plain judgement's undo no
+longer adds the frame to whatever happens to be selected (found in review). Presets and snapshots are refused rather than overwritten: the one saved
 since is the newer decision.
 
 ## I43 — act, then offer Undo
