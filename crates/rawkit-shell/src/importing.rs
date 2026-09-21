@@ -1,9 +1,13 @@
 //! Adding a folder of photographs, from the window.
 //!
-//! Add *in place*: the photographs stay where they are and the catalog learns
-//! where that is. Nothing is copied, moved or renamed — the safe half of
-//! "import", and the one that can be trusted with a stranger's library. Copying
-//! from a card is a different promise and a later piece of work.
+//! Two ways, chosen after the count. **In place**: the photographs stay where
+//! they are and the catalog learns where that is; nothing is copied, moved or
+//! renamed. **Copied off a card**: each file is copied into a folder for the day
+//! it was taken, checked against the original before it is kept, and the copies
+//! are added — [`rawkit_catalog::ingest`], the command line's import, with the
+//! window's progress and Stop. The card is never written to. A folder with a
+//! `DCIM` in it is taken for a card and offered the copy first, because
+//! photographs left on a card go when it is formatted.
 //!
 //! # Count first, then ask
 //!
@@ -59,6 +63,16 @@ pub enum Stage {
         /// Folders that could not be listed. Said, because a number that is
         /// short with no reason given looks like a scan that missed things.
         unreadable: usize,
+        /// It looks like a camera's card, so copying is what is offered first.
+        /// Photographs left on a card are photographs that go when it is
+        /// formatted.
+        card: bool,
+    },
+    /// Copying off a card, before the copies are added.
+    Copying {
+        done: usize,
+        total: usize,
+        name: String,
     },
     Adding {
         done: usize,
@@ -110,11 +124,31 @@ impl Shared {
     }
 }
 
+/// What somebody said to the count.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Decision {
+    /// Add them where they are.
+    InPlace,
+    /// Copy them into dated folders under here, verify each, and add the copies.
+    CopyTo(PathBuf),
+    No,
+}
+
 /// How an import ended.
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
     /// This many photographs are in the catalog that were not before.
     Added(usize),
+    /// Copied off a card and added. `already` were at the destination byte for
+    /// byte and were left as they were; `failed` could not be copied or did not
+    /// survive verification, and the first of them is named with why.
+    Copied {
+        added: usize,
+        already: usize,
+        failed: usize,
+        first_failure: Option<String>,
+        stopped: bool,
+    },
     /// Everything in the folder was there already, or there was nothing in it.
     Nothing,
     Cancelled,
@@ -133,7 +167,7 @@ pub fn run(
     folder: &Path,
     volume: impl FnOnce(&Path) -> Result<VolumeId, CatalogError>,
     metadata: impl FnMut(&Path) -> Option<FileMetadata>,
-    decide: &Receiver<bool>,
+    decide: &Receiver<Decision>,
 ) -> Outcome {
     shared.set(Some(Stage::Counting { found: 0 }));
     let finished = attempt(shared, catalog, folder, volume, metadata, decide);
@@ -160,8 +194,8 @@ fn attempt(
     catalog: &Path,
     folder: &Path,
     volume: impl FnOnce(&Path) -> Result<VolumeId, CatalogError>,
-    metadata: impl FnMut(&Path) -> Option<FileMetadata>,
-    decide: &Receiver<bool>,
+    mut metadata: impl FnMut(&Path) -> Option<FileMetadata>,
+    decide: &Receiver<Decision>,
 ) -> Result<Outcome, CatalogError> {
     let mut catalog = Catalog::open(catalog)?;
     let volume = volume(folder)?;
@@ -189,10 +223,44 @@ fn attempt(
         fresh: counted.added,
         already: counted.unchanged + counted.updated,
         unreadable: counted.unreadable.len(),
+        card: looks_like_a_card(folder),
     }));
     // A sender that has gone away is an answer too, and it is no.
-    if !decide.recv().unwrap_or(false) {
-        return Err(CatalogError::Cancelled);
+    let into = match decide.recv().unwrap_or(Decision::No) {
+        Decision::No => return Err(CatalogError::Cancelled),
+        Decision::InPlace => None,
+        Decision::CopyTo(into) => Some(into),
+    };
+
+    // Copied, verified, filed by date, and the copies added — the ingest the
+    // command line has, with the window's progress and its Stop.
+    if let Some(into) = into {
+        let report = rawkit_catalog::ingest::ingest(
+            &mut catalog,
+            folder,
+            &into,
+            &mut metadata,
+            |done, total, name| {
+                if !name.is_empty() {
+                    shared.set(Some(Stage::Copying {
+                        done,
+                        total,
+                        name: name.to_string(),
+                    }));
+                }
+                going(shared)
+            },
+        )?;
+        return Ok(Outcome::Copied {
+            added: report.scanned.as_ref().map_or(0, |scanned| scanned.added),
+            already: report.already_there,
+            failed: report.failed.len(),
+            first_failure: report
+                .failed
+                .first()
+                .map(|(path, why)| format!("{}: {why}", name_of(path))),
+            stopped: report.stopped,
+        });
     }
 
     let added = scan::scan_watched(&mut catalog, folder, volume, metadata, false, |progress| {
@@ -209,6 +277,15 @@ fn attempt(
 }
 
 /// The folder a person would call it by.
+/// A camera's card, or a folder on one: `DCIM` is the one folder every camera
+/// writes, by the DCF standard.
+pub fn looks_like_a_card(folder: &Path) -> bool {
+    folder.join("DCIM").is_dir()
+        || folder
+            .components()
+            .any(|part| part.as_os_str().eq_ignore_ascii_case("DCIM"))
+}
+
 pub fn name_of(folder: &Path) -> String {
     folder.file_name().map_or_else(
         || folder.display().to_string(),
@@ -219,7 +296,7 @@ pub fn name_of(folder: &Path) -> String {
 /// Where the import in this process is, if there is one.
 pub struct Running {
     pub shared: std::sync::Arc<Shared>,
-    pub decide: std::sync::mpsc::Sender<bool>,
+    pub decide: std::sync::mpsc::Sender<Decision>,
     pub folder: PathBuf,
 }
 
@@ -272,10 +349,11 @@ mod tests {
                 Stage::Counted {
                     fresh: 3,
                     already: 0,
-                    unreadable: 0
+                    unreadable: 0,
+                    card: false,
                 }
             );
-            say.send(true).unwrap();
+            say.send(Decision::InPlace).unwrap();
             assert_eq!(worker.join().unwrap(), Outcome::Added(3));
         });
         assert_eq!(shared.stage(), None);
@@ -283,11 +361,55 @@ mod tests {
     }
 
     #[test]
+    fn a_card_is_offered_for_copying_and_the_copies_are_added() {
+        let scratch = Scratch::new("import-card");
+        let card = scratch.0.join("CARD");
+        let shots = card.join("DCIM").join("100MSDCF");
+        std::fs::create_dir_all(&shots).unwrap();
+        for n in 0..2 {
+            std::fs::write(shots.join(format!("DSC{n:05}.ARW")), format!("raw {n}")).unwrap();
+        }
+        let catalog = scratch.0.join("library.rawkit");
+        let into = scratch.0.join("Pictures");
+        let shared = Shared::default();
+        let (say, decide) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let (shared, catalog, card) = (&shared, &catalog, &card);
+            let worker =
+                scope.spawn(move || run(shared, catalog, card, volume, scan::no_metadata, &decide));
+            loop {
+                if let Some(Stage::Counted { card, fresh, .. }) = shared.stage() {
+                    assert!(card, "a folder holding DCIM is a card");
+                    assert_eq!(fresh, 2);
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            say.send(Decision::CopyTo(into.clone())).unwrap();
+            assert_eq!(
+                worker.join().unwrap(),
+                Outcome::Copied {
+                    added: 2,
+                    already: 0,
+                    failed: 0,
+                    first_failure: None,
+                    stopped: false
+                }
+            );
+        });
+        // Copied, not moved: the card still has both, and the library has the
+        // copies — undated here, because this test reads no headers.
+        assert!(shots.join("DSC00000.ARW").exists());
+        assert!(into.join("undated").join("DSC00001.ARW").exists());
+        assert_eq!(photographs(&catalog), 2);
+    }
+
+    #[test]
     fn saying_no_keeps_nothing() {
         let (_scratch, catalog, folder) = fixture("import-declined", 3);
         let shared = Shared::default();
         let (say, decide) = std::sync::mpsc::channel();
-        say.send(false).unwrap();
+        say.send(Decision::No).unwrap();
         let outcome = run(
             &shared,
             &catalog,
@@ -304,7 +426,7 @@ mod tests {
     fn a_folder_already_in_the_catalog_is_nothing_to_add() {
         let (_scratch, catalog, folder) = fixture("import-again", 2);
         let (say, decide) = std::sync::mpsc::channel();
-        say.send(true).unwrap();
+        say.send(Decision::InPlace).unwrap();
         let shared = Shared::default();
         assert_eq!(
             run(
@@ -318,7 +440,7 @@ mod tests {
             Outcome::Added(2)
         );
         // Nobody is asked anything the second time: there is nothing to decide.
-        let (_nobody, decide) = std::sync::mpsc::channel::<bool>();
+        let (_nobody, decide) = std::sync::mpsc::channel::<Decision>();
         assert_eq!(
             run(
                 &shared,
@@ -337,7 +459,7 @@ mod tests {
         let (_scratch, catalog, folder) = fixture("import-stopped", 6);
         let shared = Shared::default();
         let (say, decide) = std::sync::mpsc::channel();
-        say.send(true).unwrap();
+        say.send(Decision::InPlace).unwrap();
         let mut read = 0;
         let outcome = run(
             &shared,
@@ -361,7 +483,7 @@ mod tests {
     fn a_folder_that_is_not_there_is_a_failure_that_stays_until_read() {
         let (scratch, catalog, _folder) = fixture("import-nowhere", 0);
         let shared = Shared::default();
-        let (_say, decide) = std::sync::mpsc::channel::<bool>();
+        let (_say, decide) = std::sync::mpsc::channel::<Decision>();
         let outcome = run(
             &shared,
             &catalog,

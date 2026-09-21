@@ -333,6 +333,11 @@
   #import .also.failed { color: var(--danger); }
   #import progress { width: 100%; height: 6px; margin: 14px 0 0; accent-color: var(--attention); }
   #import .promise { color: var(--text-tertiary); margin: 22px 0 0; }
+  #import-how { margin: 18px 0 0; }
+  #import-how label { display: flex; align-items: baseline; gap: 10px; margin: 8px 0; cursor: pointer; }
+  #import-how label > span { color: var(--text-primary); }
+  #import-how b { font-weight: 500; overflow-wrap: anywhere; }
+  #import-how button { font: inherit; font-size: 12px; padding: 1px 8px; margin-left: 6px; }
   #import .buttons { display: flex; gap: 10px; justify-content: flex-end; margin-top: 28px; }
   #import .buttons button { font: inherit; padding: 8px 16px; border-radius: 6px; cursor: pointer;
                             background: var(--ground-raised); border: 1px solid var(--border-subtle); color: var(--text-primary); }
@@ -582,7 +587,7 @@
     It never changes the photographs themselves.</p>
   <p id="welcome-said" role="status"></p>
   <div class="ways one" id="welcome-add" hidden>
-    <button class="primary" data-command="add-folder"><b>Add a folder of photographs…</b><span>They stay where they are: nothing is copied, moved or renamed</span><kbd></kbd></button>
+    <button class="primary" data-command="add-folder"><b>Add a folder of photographs…</b><span>Where they are, or copied off a card and checked. Nothing is ever moved or renamed</span><kbd></kbd></button>
   </div>
   <div class="ways">
     <button data-command="open-catalog"><b>Open a catalog…</b><span>A .rawkit file you already have</span><kbd></kbd></button>
@@ -605,7 +610,15 @@
   <p class="what" id="import-what" role="status"></p>
   <p class="also" id="import-also"></p>
   <progress id="import-bar" max="1" value="0" hidden></progress>
-  <p class="promise">They stay where they are. Nothing is copied, moved or renamed.</p>
+  <!-- Two promises, and the one being made is the one shown. Copying is offered
+       first for a camera's card: photographs left on a card go when it is
+       formatted. -->
+  <div id="import-how" hidden>
+    <label><input type="radio" name="import-how" value="copy"><span>Copy them to
+      <b id="import-to"></b> <button id="import-to-change">Change…</button></span></label>
+    <label><input type="radio" name="import-how" value="place"><span>Leave them where they are</span></label>
+  </div>
+  <p class="promise" id="import-promise">They stay where they are. Nothing is copied, moved or renamed.</p>
   <div class="buttons">
     <button id="import-cancel">Cancel</button>
     <button id="import-go" class="primary" hidden></button>
@@ -4628,7 +4641,22 @@
   const importCancel = document.getElementById("import-cancel");
   const importBar = document.getElementById("import-bar");
   const counted = n => n === 1 ? "1 photograph" : `${n.toLocaleString()} photographs`;
+  // Copy or place, for the import that is up. Chosen from what the folder looks
+  // like the first time the count arrives, and the person's from then on.
+  let importHow = null;
+  const importPromises = {
+    place: "They stay where they are. Nothing is copied, moved or renamed.",
+    copy: "Each copy is checked against the original before it is kept, filed in a folder for the day it was taken. The card is left as it is.",
+  };
+  for (const radio of document.querySelectorAll("input[name=import-how]"))
+    radio.addEventListener("change", () => { importHow = radio.value; drawImport(lastImport); });
+  document.getElementById("import-to-change").addEventListener("click", event => {
+    event.preventDefault();
+    invoke("pick_copy_destination").catch(say);
+  });
+  let lastImport = null;
   const drawImport = job => {
+    lastImport = job;
     importing = !!job;
     importSheet.classList.toggle("hidden", !job);
     if (!job) return;
@@ -4641,19 +4669,41 @@
     also.textContent = "";
     importGo.hidden = true;
     importBar.hidden = true;
+    const how = document.getElementById("import-how");
+    how.hidden = true;
+    if (!job) importHow = null;
     importCancel.textContent = "Cancel";
     importCancel.hidden = false;
     if (at.stage === "counting") {
       what.textContent = at.found ? `Looking… ${counted(at.found)} so far` : "Looking…";
     } else if (at.stage === "counted") {
-      what.textContent = `${counted(at.fresh)} to add.`;
+      if (importHow === null) importHow = at.card ? "copy" : "place";
+      how.hidden = false;
+      document.getElementById("import-to").textContent = job.copy_to ?? "a folder not yet chosen";
+      for (const radio of document.querySelectorAll("input[name=import-how]"))
+        radio.checked = radio.value === importHow;
+      document.getElementById("import-promise").textContent = importPromises[importHow];
+      // Copying, the count is of what is there to copy: whether each is new is
+      // only known once it is compared with what the destination has, and the
+      // result says how many were there already.
+      what.textContent = importHow === "copy"
+        ? `${counted(at.fresh + at.already)} ${at.card ? "on the card" : "in this folder"}.`
+        : `${counted(at.fresh)} to add.`;
       const notes = [];
       if (at.already) notes.push(`${counted(at.already)} already in this catalog`);
       if (at.unreadable) notes.push(`${at.unreadable === 1 ? "1 folder" : `${at.unreadable} folders`} could not be looked in`);
       also.textContent = notes.join(" · ");
-      importGo.textContent = at.fresh ? `Add ${counted(at.fresh)}` : "Read them again";
+      importGo.textContent = importHow === "copy" ? `Copy ${counted(at.fresh || at.already)}`
+        : at.fresh ? `Add ${counted(at.fresh)}` : "Read them again";
       importGo.hidden = false;
       if (document.activeElement !== importGo && document.activeElement !== importCancel) importGo.focus();
+    } else if (at.stage === "copying") {
+      what.textContent = `Copying ${(at.done + 1).toLocaleString()} of ${at.total.toLocaleString()}`;
+      also.textContent = at.name;
+      importBar.hidden = false;
+      importBar.max = Math.max(at.total, 1);
+      importBar.value = at.done;
+      importCancel.textContent = "Stop";
     } else if (at.stage === "adding") {
       what.textContent = `Adding ${(at.done + 1).toLocaleString()} of ${at.total.toLocaleString()}`;
       also.textContent = at.name;
@@ -4671,7 +4721,8 @@
       importCancel.textContent = "Close";
     }
   };
-  importGo.addEventListener("click", () => invoke("confirm_import").catch(say));
+  importGo.addEventListener("click", () =>
+    invoke("confirm_import", { copy: importHow === "copy" }).catch(say));
   importCancel.addEventListener("click", () => invoke("cancel_import").catch(say));
   setInterval(() => invoke("import_progress").then(drawImport).catch(() => {}), 150);
 

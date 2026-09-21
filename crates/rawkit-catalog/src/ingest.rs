@@ -49,6 +49,10 @@ pub struct IngestReport {
     pub failed: Vec<(PathBuf, String)>,
     /// What the scan that followed found.
     pub scanned: Option<ScanReport>,
+    /// Asked to stop before every file was copied. What had arrived by then is
+    /// still verified and catalogued: it is on the disk, and a library that did
+    /// not list it would be hiding files somebody has.
+    pub stopped: bool,
 }
 
 /// Copy every supported file under `source` into `destination`, then catalog it.
@@ -58,13 +62,15 @@ pub struct IngestReport {
 /// RAW fixture. It is called on the *source*, because where a file lands depends
 /// on when it was taken.
 ///
-/// `progress` is called with `(done, total, name)` before each file.
+/// `progress` is called with `(done, total, name)` before each file, and
+/// answers whether to go on. Stopping is between files: one being copied is
+/// finished and verified first, because half a file is worse than none.
 pub fn ingest(
     catalog: &mut Catalog,
     source: &Path,
     destination: &Path,
     mut metadata: impl FnMut(&Path) -> Option<FileMetadata>,
-    mut progress: impl FnMut(usize, usize, &str),
+    mut progress: impl FnMut(usize, usize, &str) -> bool,
 ) -> Result<IngestReport, CatalogError> {
     let source = source
         .canonicalize()
@@ -97,7 +103,10 @@ pub fn ingest(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        progress(done, total, &name);
+        if !progress(done, total, &name) {
+            report.stopped = true;
+            break;
+        }
 
         let folder = destination.join(day_folder(metadata(file).and_then(|m| m.captured_at)));
         if let Err(e) = std::fs::create_dir_all(&folder) {
@@ -113,7 +122,9 @@ pub fn ingest(
             Err(e) => report.failed.push((file.clone(), e)),
         }
     }
-    progress(total, total, "");
+    if !report.stopped {
+        progress(total, total, "");
+    }
 
     // Catalog what arrived, not what was asked for: a file that failed
     // verification is not in the library, and a library that lists it would be
@@ -316,7 +327,7 @@ mod tests {
         destination: &Path,
         times: &[(&str, i64)],
     ) -> IngestReport {
-        ingest(catalog, source, destination, taken(times), |_, _, _| {}).unwrap()
+        ingest(catalog, source, destination, taken(times), |_, _, _| true).unwrap()
     }
 
     #[test]
@@ -346,6 +357,39 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_between_files_keeps_and_lists_what_arrived() {
+        let dir = tempdir();
+        let source = card(
+            &dir,
+            &[
+                ("DSC00001.ARW", b"one"),
+                ("DSC00002.ARW", b"two"),
+                ("DSC00003.ARW", b"three"),
+            ],
+        );
+        let library_root = dir.join("photos");
+        let mut catalog = library(&dir);
+        // Stopped when asked about the second file: the first is kept.
+        let report = ingest(
+            &mut catalog,
+            &source,
+            &library_root,
+            taken(&[
+                ("DSC00001.ARW", AUGUST_30),
+                ("DSC00002.ARW", AUGUST_30),
+                ("DSC00003.ARW", AUGUST_30),
+            ]),
+            |done, _, _| done < 1,
+        )
+        .unwrap();
+        assert!(report.stopped);
+        assert_eq!(report.copied, 1);
+        assert!(library_root.join("2026/2026-08-30/DSC00001.ARW").exists());
+        assert!(!library_root.join("2026/2026-08-30/DSC00002.ARW").exists());
+        assert_eq!(report.scanned.expect("what arrived is catalogued").added, 1);
+    }
+
+    #[test]
     fn a_photograph_with_no_date_is_set_aside_rather_than_guessed_at() {
         // A file's modification time is when it was copied, not when it was
         // taken. Filing by it would be quietly wrong in a way nobody checks.
@@ -358,7 +402,7 @@ mod tests {
             &source,
             &library_root,
             |_: &Path| None,
-            |_, _, _| {},
+            |_, _, _| true,
         )
         .unwrap();
 
@@ -461,7 +505,7 @@ mod tests {
             &source,
             &inside,
             |_: &Path| None,
-            |_, _, _| {},
+            |_, _, _| true,
         );
         assert!(refused.is_err(), "an import into the card was allowed");
     }

@@ -326,6 +326,7 @@ fn main() -> Result<()> {
                         eprint!("\rcopying    : {done}/{total} {name}   ");
                         last = name.to_string();
                     }
+                    true
                 },
             )?;
             eprintln!();

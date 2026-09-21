@@ -1593,6 +1593,49 @@ fn start_import(folder: PathBuf) {
                 }
                 return;
             }
+            importing::Outcome::Copied {
+                added,
+                already,
+                failed,
+                first_failure,
+                stopped,
+            } => {
+                let mut said = match added {
+                    0 => "Nothing new was copied".to_string(),
+                    1 => "Copied and added 1 photograph".to_string(),
+                    n => format!("Copied and added {n} photographs"),
+                };
+                if stopped {
+                    said.push_str(", then stopped as asked");
+                }
+                if already > 0 {
+                    said.push_str(&format!("; {already} were already there, and were left"));
+                }
+                if let Some(first) = first_failure {
+                    said.push_str(&format!("; {failed} could not be copied — {first}"));
+                }
+                if added > 0 {
+                    let again = vec![
+                        "--added".into(),
+                        added.to_string().into(),
+                        "--said".into(),
+                        said.clone().into(),
+                        catalog.into_os_string(),
+                    ];
+                    match leave_now(again) {
+                        Ok(()) => shared.opening(added),
+                        Err(why) => shared.fail(format!(
+                            "{said}, but the catalog could not be reopened to show them: {why}"
+                        )),
+                    }
+                    return;
+                }
+                if failed > 0 {
+                    failure(said);
+                } else {
+                    notice(said);
+                }
+            }
             importing::Outcome::Nothing => {
                 notice(format!(
                     "Nothing to add: every photograph in {name} is already in this catalog"
@@ -1603,6 +1646,56 @@ fn start_import(folder: PathBuf) {
             importing::Outcome::Failed => return,
         }
         *IMPORT.lock().expect("import lock") = None;
+    });
+}
+
+/// Where photographs copied off a card go: dated folders under this. Chosen once
+/// and remembered, in `import.json` beside the other settings of this machine —
+/// it is a place on this computer's disks, not something about the catalog.
+static COPY_TO: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct ImportSettings {
+    copy_to: Option<PathBuf>,
+}
+
+fn import_settings_path() -> Option<PathBuf> {
+    Some(CONFIG_DIR.get()?.as_ref()?.join("import.json"))
+}
+
+/// The folder copies go into: the one chosen, or Pictures/rawkit until one is.
+fn copy_destination() -> Option<PathBuf> {
+    let mut held = COPY_TO.lock().expect("copy destination lock");
+    if held.is_none() {
+        let saved = import_settings_path()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str::<ImportSettings>(&text).ok())
+            .and_then(|settings| settings.copy_to);
+        *held = saved.or_else(|| {
+            let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+            Some(PathBuf::from(home).join("Pictures").join("rawkit"))
+        });
+    }
+    held.clone()
+}
+
+/// Choose where copies off a card go. The answer is kept for next time.
+#[tauri::command]
+fn pick_copy_destination(app: tauri::AppHandle) {
+    use tauri_plugin_dialog::DialogExt;
+    app.dialog().file().pick_folder(|chosen| {
+        let Some(folder) = chosen.and_then(|p| p.into_path().ok()) else {
+            return;
+        };
+        *COPY_TO.lock().expect("copy destination lock") = Some(folder.clone());
+        if let Some(path) = import_settings_path() {
+            let settings = ImportSettings {
+                copy_to: Some(folder),
+            };
+            if let Ok(text) = serde_json::to_string_pretty(&settings) {
+                let _ = std::fs::write(path, text);
+            }
+        }
     });
 }
 
@@ -1637,12 +1730,13 @@ fn import_progress() -> Option<serde_json::Value> {
         "folder": running.folder.display().to_string(),
         "name": importing::name_of(&running.folder),
         "at": running.shared.stage(),
+        "copy_to": copy_destination().map(|to| to.display().to_string()),
     }))
 }
 
 /// Go on and add what was counted.
 #[tauri::command]
-fn confirm_import() -> Result<(), String> {
+fn confirm_import(copy: bool) -> Result<(), String> {
     let import = IMPORT.lock().expect("import lock");
     let running = import.as_ref().ok_or("nothing is waiting to be added")?;
     if !matches!(
@@ -1651,9 +1745,17 @@ fn confirm_import() -> Result<(), String> {
     ) {
         return Err("nothing is waiting to be added".into());
     }
+    let decision = if copy {
+        let into = copy_destination().ok_or(
+            "there is nowhere to copy them to yet — choose a folder for the photographs first",
+        )?;
+        importing::Decision::CopyTo(into)
+    } else {
+        importing::Decision::InPlace
+    };
     running
         .decide
-        .send(true)
+        .send(decision)
         .map_err(|_| "the import has already ended".to_string())
 }
 
@@ -1667,12 +1769,16 @@ fn cancel_import() {
     };
     match running.shared.stage() {
         Some(importing::Stage::Counted { .. }) => {
-            let _ = running.decide.send(false);
+            let _ = running.decide.send(importing::Decision::No);
         }
         Some(importing::Stage::Failed { .. }) | None => *import = None,
         // Already in the catalog, and the relaunch is on its way.
         Some(importing::Stage::Opening { .. }) => {}
-        Some(importing::Stage::Counting { .. } | importing::Stage::Adding { .. }) => {
+        Some(
+            importing::Stage::Counting { .. }
+            | importing::Stage::Adding { .. }
+            | importing::Stage::Copying { .. },
+        ) => {
             running.shared.stop();
         }
     }
@@ -1694,6 +1800,10 @@ struct Arguments {
     /// How many photographs the import that started this process added, for it
     /// to say so. A relaunch cannot carry a sentence across any other way.
     added: Option<usize>,
+    /// What the import that started this process has to say, whole, when
+    /// there is more to it than a count — a copy off a card that skipped some
+    /// files and could not copy others. Said instead of the count's sentence.
+    said: Option<String>,
     /// The synthetic mosaic, for looking at the renderer with no file to hand.
     /// It used to be what a bare launch showed — a pink test card with live
     /// sliders and not a word of explanation — which is a developer's tool
@@ -1719,6 +1829,7 @@ fn parse_arguments(args: impl Iterator<Item = String>) -> Result<Arguments> {
             "--added" => {
                 parsed.added = args.next().and_then(|n| n.parse().ok());
             }
+            "--said" => parsed.said = args.next(),
             "--new" => parsed.new = true,
             "--test-pattern" => parsed.test_pattern = true,
             _ if arg.starts_with('-') && arg != "-" => {
@@ -1840,6 +1951,7 @@ fn main() -> Result<()> {
             add_folder_dialog,
             import_progress,
             confirm_import,
+            pick_copy_destination,
             cancel_import,
             open_catalog_dialog,
             open_photograph_dialog,
@@ -2011,7 +2123,9 @@ fn main() -> Result<()> {
                 Start::Catalog { path, create } => match open_catalog(path, *create) {
                     Ok(Some(library)) => {
                         opened = Some(path.clone());
-                        if let Some(added) = arguments.added {
+                        if let Some(said) = &arguments.said {
+                            notice(said.clone());
+                        } else if let Some(added) = arguments.added {
                             notice(match added {
                                 1 => "Added 1 photograph".to_string(),
                                 n => format!("Added {n} photographs"),

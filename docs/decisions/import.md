@@ -21,10 +21,11 @@ How photographs get into a catalog: from the terminal (`rawkit catalog --scan`,
 | A1 | A volume's root **widens**; it is never re-pointed at the folder being scanned | Adding a second folder on a drive used to lose the first. |
 | A2 | "Missing" is decided for the folder that was scanned, not for the volume | A scan says nothing about folders it did not look in. |
 | A3 | A scan can be watched, stopped, and tried without being kept | `scan_watched`: progress, `Cancelled`, `dry_run`. One code path for the count before and the scan after. |
-| A4 | The window adds **in place**, and only that, for now | Nothing is copied, moved or renamed. Copying from a card is a different promise and later work. |
+| A4 | The window adds **in place** — or, since A8, copies off a card | In place: nothing is copied, moved or renamed. |
 | A5 | Count first, then ask, on a button that says the number | The count is a dry run of the scan that follows. |
 | A6 | The import has its own connection, and the window stands still for it | One transaction of a dozen seconds cannot sit under the keypress lock; and with no `busy_timeout`, nothing else may write while it runs. |
 | A7 | An import ends in a relaunch | The library in the process is the one from before. Interface decision I16. |
+| A8 | A card is copied, checked, filed by date and then added | The sheet offers copy or in place after the count; a folder with `DCIM` defaults to copy. The command line's ingest, with progress and Stop. |
 
 ## A1 — the root widens
 
@@ -155,10 +156,41 @@ a relaunch cannot carry a sentence any other way — and to open on the grid,
 which is what "here is what arrived" looks like. The previews then build
 themselves, what is on screen first.
 
+## A8 — copied off a card
+
+After the count, the sheet asks how: **copy them to** a folder (remembered in
+`import.json` beside this machine's other settings; Pictures/rawkit until one is
+chosen) or **leave them where they are**. A folder that has `DCIM` in it, or is
+inside one, is taken for a camera's card and the copy is chosen first:
+photographs left on a card go when it is formatted. Otherwise in place is.
+
+The copy is `rawkit_catalog::ingest` — what `rawkit ingest` does — so there is
+one rule for where a file lands (`2026/2026-08-30/`, the camera's name kept, a
+suffix only when a different file already has it), for proving a copy (hashed
+as read, hashed again where it landed, renamed into place only then), and for
+what is already there (same bytes at the same place: left, and counted). Its
+progress drives the sheet's bar and **Stop** is heard between files; a file
+being copied is finished and checked first, because half a file is worse than
+none. What arrived before a stop is still catalogued — it is on the disk.
+
+The count says how many are *on the card*, not how many are new: that is only
+known when each is compared with what the destination has, and the sentence at
+the end says it — *"Copied and added 12 photographs; 3 were already there, and
+were left; 1 could not be copied — DSC00012.ARW: …"*. When anything was added,
+the sentence crosses the relaunch whole (`--said`); when nothing was, it is said
+where the window is, as a failure if a file could not be copied.
+
+Checked in the window with a card made of copies of two sample photographs:
+dropped on a new catalog, copy offered first, both filed under their day, the
+card untouched, the catalog reopened with them; the same card again copied
+nothing and said both were already there.
+
 ## Not built, and known
 
-- **Copy from a card** (`rawkit ingest` from the window): destination, date
-  folders, duplicate skip, verification. The plan's second half of S8.
+- **Duplicates across the library.** A copy is skipped only when the same bytes
+  are at the same dated path under the destination. A photograph already
+  catalogued from somewhere else is copied again (the catalog would then list
+  it twice, as two files with one hash).
 - **Choosing what to add.** The designer's sheet has a grid of thumbnails with a
   tick on each. This adds the folder or does not.
 - **Stopping is per file.** A header read on a slow card is the longest a Stop
