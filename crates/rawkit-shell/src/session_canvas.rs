@@ -30,6 +30,10 @@ use rawkit_session::{Session, TileId, Viewport};
 pub struct CanvasRenderer {
     renderer: Renderer,
     presenter: Presenter,
+    /// What shows round the photograph, kept here as well as in the presenter:
+    /// a presenter rebuilt for a new format or a monitor profile starts from the
+    /// default, and this is what it is told again.
+    surround: [f32; 3],
     buffers: TileBuffers,
     canvas: Canvas,
     /// What the interface draws over the photograph, in a layer of its own.
@@ -72,6 +76,7 @@ impl CanvasRenderer {
         let overlay = renderer.create_overlay(gpu, width, height);
         Self {
             presenter: Presenter::new(gpu, rawkit_engine::CANVAS_FORMAT),
+            surround: rawkit_engine::present::DEFAULT_SURROUND,
             renderer,
             buffers,
             canvas,
@@ -87,6 +92,13 @@ impl CanvasRenderer {
     /// the surface is configured after the canvas exists.
     pub fn target(&mut self, gpu: &Gpu, format: wgpu::TextureFormat) {
         self.presenter = Presenter::new(gpu, format);
+        self.presenter.set_surround(gpu, self.surround);
+    }
+
+    /// Change what shows round the photograph, now and after any rebuild.
+    pub fn set_surround(&mut self, gpu: &Gpu, linear: [f32; 3]) {
+        self.surround = linear;
+        self.presenter.set_surround(gpu, linear);
     }
 
     /// The same, but correcting for a monitor that is not sRGB.
@@ -97,6 +109,7 @@ impl CanvasRenderer {
         lut: &rawkit_export::display::DisplayLut,
     ) {
         self.presenter = Presenter::with_display_lut(gpu, format, lut.entries(), lut.grid());
+        self.presenter.set_surround(gpu, self.surround);
     }
 
     /// Point the renderer at a different photograph.

@@ -1124,7 +1124,7 @@ fn cull(
                 // The whole frame — or as much of it as the chosen shape allows.
                 let developed = session.0.lock().expect("session lock").developed_size();
                 let whole = [0.0, 0.0, 1.0, 1.0];
-                let rect = match *CROP_ASPECT.lock().expect("crop aspect lock") {
+                let rect = match crop_ratio(developed) {
                     Some(ratio) => fit_crop(whole, ratio, developed),
                     None => whole,
                 };
@@ -1618,7 +1618,12 @@ fn start_import(folder: PathBuf) {
                     let again = vec![
                         "--added".into(),
                         added.to_string().into(),
-                        "--said".into(),
+                        if failed > 0 {
+                            "--said-failed"
+                        } else {
+                            "--said"
+                        }
+                        .into(),
                         said.clone().into(),
                         catalog.into_os_string(),
                     ];
@@ -1804,6 +1809,9 @@ struct Arguments {
     /// there is more to it than a count — a copy off a card that skipped some
     /// files and could not copy others. Said instead of the count's sentence.
     said: Option<String>,
+    /// That sentence reports a failure — a photograph that could not be copied —
+    /// and is said as one, not as news.
+    said_failed: bool,
     /// The synthetic mosaic, for looking at the renderer with no file to hand.
     /// It used to be what a bare launch showed — a pink test card with live
     /// sliders and not a word of explanation — which is a developer's tool
@@ -1830,6 +1838,10 @@ fn parse_arguments(args: impl Iterator<Item = String>) -> Result<Arguments> {
                 parsed.added = args.next().and_then(|n| n.parse().ok());
             }
             "--said" => parsed.said = args.next(),
+            "--said-failed" => {
+                parsed.said = args.next();
+                parsed.said_failed = true;
+            }
             "--new" => parsed.new = true,
             "--test-pattern" => parsed.test_pattern = true,
             _ if arg.starts_with('-') && arg != "-" => {
@@ -2124,7 +2136,11 @@ fn main() -> Result<()> {
                     Ok(Some(library)) => {
                         opened = Some(path.clone());
                         if let Some(said) = &arguments.said {
-                            notice(said.clone());
+                            if arguments.said_failed {
+                                failure(said.clone());
+                            } else {
+                                notice(said.clone());
+                            }
                         } else if let Some(added) = arguments.added {
                             notice(match added {
                                 1 => "Added 1 photograph".to_string(),
@@ -2492,7 +2508,7 @@ fn main() -> Result<()> {
                 // for every view, so told once rather than per frame.
                 let chosen = SURROUND.load(std::sync::atomic::Ordering::Relaxed);
                 if SURROUND_TOLD.swap(chosen, std::sync::atomic::Ordering::Relaxed) != chosen {
-                    canvas_renderer.presenter().set_surround(&gpu, surround().2);
+                    canvas_renderer.set_surround(&gpu, surround().2);
                 }
 
                 // Before the grid's early return. It sat after it, so an export
@@ -4968,22 +4984,24 @@ fn crop_aspect(state: tauri::State<'_, Shared>, shape: String) -> Result<String,
     *aspect = match shape.as_str() {
         "free" => None,
         "swap" => match *aspect {
-            Some(ratio) => Some(1.0 / ratio),
+            Some(Aspect::Fixed(ratio)) => Some(Aspect::Fixed(1.0 / ratio)),
+            Some(Aspect::Original { turned }) => Some(Aspect::Original { turned: !turned }),
             None => return Err("the crop is free; choose a shape to turn".into()),
         },
-        "original" => Some(turned(
-            session.image_size()[0] as f64 / session.image_size()[1].max(1) as f64,
-        )),
+        // The photograph's own shape, the way the photograph is — not turned
+        // to the rectangle, because "original" means as it was taken.
+        "original" => Some(Aspect::Original { turned: false }),
         named => {
             let (w, h) = named
                 .split_once(':')
                 .and_then(|(w, h)| Some((w.parse::<f64>().ok()?, h.parse::<f64>().ok()?)))
                 .filter(|(w, h)| *w > 0.0 && *h > 0.0)
                 .ok_or_else(|| format!("{named:?} is not a shape"))?;
-            Some(turned(w / h))
+            Some(Aspect::Fixed(turned(w / h)))
         }
     };
-    let placed = match *aspect {
+    let ratio = aspect.map(|aspect| aspect.ratio(developed));
+    let placed = match ratio {
         Some(_) if shape == "swap" => Some(turn_crop(rect, developed)),
         Some(ratio) => Some(fit_crop(rect, ratio, developed)),
         None => None,
@@ -4991,7 +5009,7 @@ fn crop_aspect(state: tauri::State<'_, Shared>, shape: String) -> Result<String,
     if let Some(placed) = placed {
         *CROP_RECT.lock().expect("crop rect lock") = Some(placed);
     }
-    Ok(match *aspect {
+    Ok(match ratio {
         None => "free".into(),
         Some(ratio) if ratio >= 1.0 => format!("{} wide", shape_words(ratio)),
         Some(ratio) => format!("{} tall", shape_words(1.0 / ratio)),
@@ -7254,7 +7272,43 @@ fn move_crop_edge(rect: &mut [f32; 4], was: [f32; 4], edge: usize, by: f32, smal
 /// Kept between photographs and between crops, as Lightroom keeps its lock:
 /// somebody cropping a set for a 4:5 print wants every one of them 4:5 without
 /// choosing it again.
-static CROP_ASPECT: Mutex<Option<f64>> = Mutex::new(None);
+static CROP_ASPECT: Mutex<Option<Aspect>> = Mutex::new(None);
+
+/// A shape for the crop: a fixed ratio, or the photograph's own.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Aspect {
+    /// Width over height in pixels, already turned.
+    Fixed(f64),
+    /// Whatever the frame on screen is, turned or not. Re-derived from each
+    /// photograph rather than frozen: it was a number, taken from the photograph
+    /// it was chosen on, and a 3:2 "Original" then held a 4:3 frame to 3:2.
+    Original { turned: bool },
+}
+
+impl Aspect {
+    /// The ratio for a frame of this pixel size.
+    fn ratio(self, developed: [u32; 2]) -> f64 {
+        match self {
+            Aspect::Fixed(ratio) => ratio,
+            Aspect::Original { turned } => {
+                let own = developed[0].max(1) as f64 / developed[1].max(1) as f64;
+                if turned {
+                    1.0 / own
+                } else {
+                    own
+                }
+            }
+        }
+    }
+}
+
+/// The ratio the crop is held to now, if any, for this frame.
+fn crop_ratio(developed: [u32; 2]) -> Option<f64> {
+    CROP_ASPECT
+        .lock()
+        .expect("crop aspect lock")
+        .map(|aspect| aspect.ratio(developed))
+}
 
 /// A rectangle held to `ratio` (pixels) after a corner or an edge moved.
 ///
@@ -7467,7 +7521,7 @@ fn advance_crop_rect(
 ) -> [f32; 4] {
     let developed = session.developed_size();
     let mut rect = crop_from_drag(grab, was, start, now, session.viewport(), developed);
-    if let Some(ratio) = *CROP_ASPECT.lock().expect("crop aspect lock") {
+    if let Some(ratio) = crop_ratio(developed) {
         rect = constrain_crop(rect, was, grab, ratio, developed);
     }
     if grab == CropGrab::Move {
@@ -9682,6 +9736,42 @@ mod crop_aspect_tests {
         // shrinks just enough, and stays inside.
         let full = fit_crop([0.0, 0.0, 1.0, 1.0], 1.5, FRAME);
         assert!(inside(turn_crop(full, FRAME)));
+    }
+
+    #[test]
+    fn original_is_each_photographs_own_shape() {
+        // It was frozen into the number of the photograph it was chosen on.
+        let original = Aspect::Original { turned: false };
+        assert!((original.ratio([6000, 4000]) - 1.5).abs() < 1e-9);
+        assert!((original.ratio([4000, 3000]) - 4.0 / 3.0).abs() < 1e-9);
+        assert!(
+            (original.ratio([4000, 6000]) - 2.0 / 3.0).abs() < 1e-9,
+            "a portrait stays one"
+        );
+        assert!((Aspect::Original { turned: true }.ratio([6000, 4000]) - 2.0 / 3.0).abs() < 1e-9);
+        assert_eq!(Aspect::Fixed(1.25).ratio([6000, 4000]), 1.25);
+    }
+
+    #[test]
+    fn a_copy_that_lost_a_photograph_says_so_as_a_failure_after_the_relaunch() {
+        let parsed = parse_arguments(
+            [
+                "--added",
+                "3",
+                "--said-failed",
+                "Copied and added 3; 1 could not be copied",
+                "x.rawkit",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap();
+        assert!(parsed.said_failed);
+        assert_eq!(
+            parsed.said.as_deref(),
+            Some("Copied and added 3; 1 could not be copied")
+        );
+        assert_eq!(parsed.added, Some(3));
     }
 
     #[test]

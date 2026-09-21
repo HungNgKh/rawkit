@@ -178,7 +178,9 @@ known when each is compared with what the destination has, and the sentence at
 the end says it — *"Copied and added 12 photographs; 3 were already there, and
 were left; 1 could not be copied — DSC00012.ARW: …"*. When anything was added,
 the sentence crosses the relaunch whole (`--said`); when nothing was, it is said
-where the window is, as a failure if a file could not be copied.
+where the window is, as a failure if a file could not be copied. — as a failure (`--said-failed`) when a
+file could not be copied, so the relaunched window says it at the level it
+deserves and puts it in the log (found in review; it was said as news).
 
 Checked in the window with a card made of copies of two sample photographs:
 dropped on a new catalog, copy offered first, both filed under their day, the

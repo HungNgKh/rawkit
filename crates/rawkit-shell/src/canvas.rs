@@ -387,7 +387,12 @@ pub fn take_drops(window: &tauri::WebviewWindow, open: fn(std::path::PathBuf)) -
     window.with_webview(move |webview| {
         let view = webview.inner();
         let uris = gdk::Atom::intern("text/uri-list");
-        let carries = move |context: &gdk::DragContext| context.list_targets().contains(&uris);
+        // A drag that began in this window — WebKit offers a URI for an image
+        // or a link dragged inside the page — is the page's, not a file
+        // arriving; only a drag from another application is taken.
+        let carries = move |context: &gdk::DragContext| {
+            context.drag_get_source_widget().is_none() && context.list_targets().contains(&uris)
+        };
         // Whether the data about to arrive is the drop's, rather than the
         // requests WebKit makes on its own while a drag passes over.
         let dropping = std::rc::Rc::new(std::cell::Cell::new(false));

@@ -1005,6 +1005,11 @@ photograph"), no key: it is set once per room, not per photograph. Remembered in
 `window.json` with the rest of this machine's preferences, not in the catalog.
 The grid and the strip draw their own grounds and are unchanged.
 
+The canvas renderer holds the chosen surround as well as the presenter does:
+the presenter is rebuilt when the surface format or the monitor's profile is
+set, starts again from the default, and is told the choice again (found in
+review).
+
 ## I46 — a shape for the crop
 
 The crop's options row (I35) carries a shape and a **Swap**. The shape is held in
@@ -1026,6 +1031,11 @@ much as the frame makes it. Fitting the turned shape *inside* the rectangle made
 every press smaller than the last. Reset gives the whole frame, or as much of it
 as the shape allows. The engine is unchanged: the crop is still four edges.
 
+**Original** follows each photograph: it is kept as "the frame's own shape"
+and worked out from the frame on screen whenever it is used. It was a number
+taken from the photograph it was chosen on, and on the next photograph a 4:3
+frame was held to 3:2 (found in review).
+
 ## I47 — drops on Linux
 
 Drag-and-drop had never been tested: nothing here could synthesise an XDND drag.
@@ -1044,6 +1054,10 @@ the page, its data is asked for on release, and the first path goes through
 `leave_for_path` like every other way of opening something. Drags of anything
 else inside the page go on to WebKit untouched. Windows and macOS keep Tauri's
 event, which is still untested by hand there.
+
+A drag that *began in this window* is left to WebKit even when it carries a
+URI — an image or a link dragged inside the page offers one — so only a drag
+from another application is taken as a file arriving (found in review).
 
 Checked: a folder dropped on the panel opens the import sheet; a catalog
 relaunches into it; a RAW dropped on the welcome screen opens it. **Not over
