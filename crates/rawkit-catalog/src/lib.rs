@@ -61,6 +61,9 @@ pub enum CatalogError {
     Io(String),
     #[error("{0}")]
     Unsupported(&'static str),
+    /// Whoever was watching said stop. Nothing was kept.
+    #[error("stopped before it finished, and nothing was changed")]
+    Cancelled,
     /// A stored edit this build cannot faithfully render.
     #[error(transparent)]
     EditState(#[from] rawkit_editstate::EditStateError),

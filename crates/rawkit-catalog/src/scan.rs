@@ -110,7 +110,42 @@ pub fn scan_on(
     catalog: &mut Catalog,
     root: &Path,
     volume: VolumeId,
+    metadata: impl FnMut(&Path) -> Option<FileMetadata>,
+) -> Result<ScanReport, CatalogError> {
+    scan_watched(catalog, root, volume, metadata, false, |_| true)
+}
+
+/// How far a scan has got, for whoever is watching one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Progress<'a> {
+    /// Still listing folders; this many photographs found so far.
+    Walking { found: usize },
+    /// Reading what was found into the catalog.
+    Reading {
+        done: usize,
+        total: usize,
+        name: &'a str,
+    },
+}
+
+/// A scan that can be watched, stopped, and tried without being kept.
+///
+/// `watch` is told how far it has got and answers whether to go on. `false`
+/// ends the scan with [`CatalogError::Cancelled`] and **nothing is kept**: the
+/// whole scan is one transaction, so there is no half-added folder to explain.
+///
+/// `dry_run` does everything and then rolls back. It is how the window says
+/// "1 268 to add, 212 already here" *before* anyone presses the button — the
+/// same code as the scan that follows, so the two cannot disagree, and with a
+/// `metadata` that reads nothing it costs a directory listing and a lookup a
+/// file.
+pub fn scan_watched(
+    catalog: &mut Catalog,
+    root: &Path,
+    volume: VolumeId,
     mut metadata: impl FnMut(&Path) -> Option<FileMetadata>,
+    dry_run: bool,
+    mut watch: impl FnMut(Progress<'_>) -> bool,
 ) -> Result<ScanReport, CatalogError> {
     let root = root
         .canonicalize()
@@ -119,20 +154,50 @@ pub fn scan_on(
 
     let mut report = ScanReport::default();
     let mut found = Vec::new();
-    walk(&root, &mut found, &mut report);
+    if !walk(&root, &mut found, &mut report, &mut watch) {
+        return Err(CatalogError::Cancelled);
+    }
 
     let transaction = catalog.connection_mut().transaction()?;
-    let volume_id = upsert_volume(&transaction, &volume, &root, convention)?;
+    // Where this volume's paths are measured from — which adding a second
+    // folder may have to change. See [`Rooting`].
+    let stored_root = CatalogPath::new(&root, convention)
+        .map_err(|e| CatalogError::Io(e.to_string()))?
+        .stored()
+        .to_string();
+    let standing = standing_root(&transaction, &volume)?;
+    let rooting = Rooting::decide(
+        standing.as_ref().map(|(_, at)| at.as_str()),
+        standing
+            .as_ref()
+            .is_some_and(|(_, at)| Path::new(at).is_dir()),
+        &stored_root,
+        convention,
+    );
+    let base = match &rooting {
+        Rooting::Here => stored_root.clone(),
+        Rooting::Inside { base } => base.clone(),
+        Rooting::Widen { to, .. } => to.clone(),
+    };
+    if let (Rooting::Widen { to, prefix }, Some((volume_id, _))) = (&rooting, &standing) {
+        widen(&transaction, *volume_id, to, prefix, convention)?;
+    }
+    let volume_id = upsert_volume(&transaction, &volume, Path::new(&base), convention)?;
+    let base = PathBuf::from(&base);
+    // The part of the volume this scan looked at, as the catalog spells it.
+    // Only files under it can be called missing for not having been seen.
+    let scanned = relative_to(&root, &base, convention)?;
     let now = seconds_now();
 
     // Everything this scan touched, so the sweep below can tell absence from
     // "in a folder we did not visit".
     let mut seen = Vec::new();
 
-    for file in &found {
+    let total = found.len();
+    for (done, file) in found.iter().enumerate() {
         let parent = file.path.parent().unwrap_or(&root);
-        let relative = parent.strip_prefix(&root).unwrap_or(Path::new(""));
-        let folder_id = upsert_folder(&transaction, volume_id, relative, convention)?;
+        let relative = relative_to(parent, &base, convention)?;
+        let folder_id = upsert_folder(&transaction, volume_id, Path::new(&relative), convention)?;
         let name = file
             .path
             .file_name()
@@ -140,6 +205,14 @@ pub fn scan_on(
             .unwrap_or_default();
         let key = CatalogPath::new(Path::new(&name), convention)
             .map_err(|e| CatalogError::Io(e.to_string()))?;
+        if !watch(Progress::Reading {
+            done,
+            total,
+            name: &name,
+        }) {
+            // Dropping the transaction rolls it back.
+            return Err(CatalogError::Cancelled);
+        }
 
         let existing: Option<(i64, i64, i64, bool)> = transaction
             .query_row(
@@ -212,9 +285,194 @@ pub fn scan_on(
         seen.push(id);
     }
 
-    report.missing = mark_missing(&transaction, volume_id, &seen)?;
-    transaction.commit()?;
+    report.missing = mark_missing(&transaction, volume_id, &scanned, convention, &seen)?;
+    if dry_run {
+        drop(transaction);
+    } else {
+        transaction.commit()?;
+    }
     Ok(report)
+}
+
+/// Where a volume's paths are measured from, once this folder has been added.
+///
+/// # The bug this replaces
+///
+/// A volume has one `last_mount_path` and every folder on it is stored relative
+/// to that. The scan used to set it to *whatever folder was being scanned* —
+/// which is right for the only thing anyone had done, scanning one library
+/// root, and again, and again. Scan `…/2025` and then `…/2026` and the second
+/// scan re-pointed the volume at `2026`: every photograph from `2025` now
+/// resolved to a path under `2026` where it had never been, and the sweep for
+/// missing files, which covered the whole volume, flagged all of them. Two
+/// commands, and the first folder was gone from the library.
+///
+/// Adding a folder is the first thing the window's import does, so it has to
+/// be safe to do twice.
+///
+/// # What happens instead
+///
+/// Paths stay relative to one root per volume — no schema change, and nothing
+/// for an existing catalog to migrate — but the root **widens** to the nearest
+/// folder that contains everything: what was there and what is being added.
+/// Every folder row on the volume is re-spelled from the new root in the same
+/// transaction as the scan.
+///
+/// Decided on stored spellings, not on the filesystem, so it is one pure
+/// function with one question asked of the disk: is the standing root still
+/// there? If it is not, the volume has been mounted somewhere else or the
+/// library folder has been renamed, and the folder being scanned is taken to be
+/// *where it went* — which is what re-pointing the root was always for.
+#[derive(Debug, PartialEq)]
+enum Rooting {
+    /// The folder scanned is the root: a first scan, the same one again, or a
+    /// library that has moved.
+    Here,
+    /// The folder scanned is inside the standing root, which stays.
+    Inside { base: String },
+    /// The root moves up to `to`, and what was relative to the standing root is
+    /// now under `prefix` from there.
+    Widen { to: String, prefix: String },
+}
+
+impl Rooting {
+    fn decide(
+        standing: Option<&str>,
+        standing_is_there: bool,
+        adding: &str,
+        convention: PathConvention,
+    ) -> Self {
+        let Some(standing) = standing else {
+            return Rooting::Here;
+        };
+        let (lead, was) = components(standing);
+        let (_, now) = components(adding);
+        let same = |a: &str, b: &str| convention.key_for(a) == convention.key_for(b);
+        let shared = was.iter().zip(&now).take_while(|(a, b)| same(a, b)).count();
+        if shared == was.len() && shared == now.len() {
+            return Rooting::Here;
+        }
+        if shared == was.len() {
+            return Rooting::Inside {
+                base: standing.to_string(),
+            };
+        }
+        if !standing_is_there {
+            return Rooting::Here;
+        }
+        // The spelling of the shared part is the standing root's: it is already
+        // in the catalog, and on a filesystem that folds case the two may
+        // differ in ways that do not matter and should not start to.
+        let to = match (lead, shared) {
+            // A drive with nothing under it has to keep its slash: `C:` alone
+            // is "wherever that drive's current directory is".
+            ("", 1) if was[0].ends_with(':') => format!("{}/", was[0]),
+            (lead, 0) => lead.to_string(),
+            (lead, _) => format!("{lead}{}", was[..shared].join("/")),
+        };
+        Rooting::Widen {
+            to,
+            prefix: was[shared..].join("/"),
+        }
+    }
+}
+
+/// What a stored path starts with — `/`, `//` for a share, or nothing for a
+/// drive letter — and the names after it.
+fn components(stored: &str) -> (&str, Vec<&str>) {
+    let names = stored.trim_start_matches('/');
+    let lead = &stored[..stored.len() - names.len()];
+    (lead, names.split('/').filter(|n| !n.is_empty()).collect())
+}
+
+/// `path` as the catalog spells it from `base`: forward slashes, no leading
+/// one, empty for `base` itself.
+fn relative_to(
+    path: &Path,
+    base: &Path,
+    convention: PathConvention,
+) -> Result<String, CatalogError> {
+    let spell = |p: &Path| {
+        CatalogPath::new(p, convention)
+            .map(|c| c.stored().to_string())
+            .map_err(|e| CatalogError::Io(e.to_string()))
+    };
+    let (path, base) = (spell(path)?, spell(base)?);
+    let (_, names) = components(&path);
+    let (_, under) = components(&base);
+    Ok(names[under.len().min(names.len())..].join("/"))
+}
+
+/// The volume's row and where its paths are measured from, if it has one.
+fn standing_root(
+    transaction: &rusqlite::Transaction<'_>,
+    volume: &VolumeId,
+) -> Result<Option<(i64, String)>, CatalogError> {
+    let (kind, uuid, serial, host, share, mount_path) = identity(volume);
+    Ok(transaction
+        .query_row(
+            "SELECT id, last_mount_path FROM volumes
+              WHERE kind = ?1 AND ifnull(uuid,'') = ifnull(?2,'')
+                AND ifnull(windows_serial,-1) = ifnull(?3,-1)
+                AND ifnull(host,'') = ifnull(?4,'') AND ifnull(share,'') = ifnull(?5,'')
+                AND ifnull(mount_path,'') = ifnull(?6,'')",
+            rusqlite::params![kind, uuid, serial, host, share, mount_path],
+            |row| Ok((row.get(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .ok()
+        .and_then(|(id, at): (i64, Option<String>)| Some((id, at?))))
+}
+
+/// Re-spell every folder on a volume from a root further up.
+///
+/// Longest path first. The new spelling of a folder is longer than the old, so
+/// the only row it can collide with on the way is one longer than itself —
+/// which, in this order, has already moved out of the way. The case that shows
+/// it: a library root holding a subfolder with the same name as the prefix.
+fn widen(
+    transaction: &rusqlite::Transaction<'_>,
+    volume_id: i64,
+    to: &str,
+    prefix: &str,
+    convention: PathConvention,
+) -> Result<(), CatalogError> {
+    let mut folders: Vec<(i64, String)> = {
+        let mut statement =
+            transaction.prepare("SELECT id, relative_path FROM folders WHERE volume_id = ?1")?;
+        let rows = statement.query_map([volume_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    folders.sort_by_key(|(_, path)| std::cmp::Reverse(path.len()));
+    let mut was_root = None;
+    for (id, path) in folders {
+        let moved = if path.is_empty() {
+            was_root = Some(id);
+            prefix.to_string()
+        } else {
+            format!("{prefix}/{path}")
+        };
+        let spelt = CatalogPath::new(Path::new(&moved), convention)
+            .map_err(|e| CatalogError::Io(e.to_string()))?;
+        transaction.execute(
+            "UPDATE folders SET relative_path = ?2, path_key = ?3 WHERE id = ?1",
+            rusqlite::params![id, spelt.stored(), spelt.key()],
+        )?;
+    }
+    // What used to be the root is a folder now, and needs the parents a folder
+    // has: the new root, and whatever lies between.
+    if let Some(was_root) = was_root {
+        let above = Path::new(prefix).parent().unwrap_or(Path::new(""));
+        let parent = upsert_folder(transaction, volume_id, above, convention)?;
+        transaction.execute(
+            "UPDATE folders SET parent_id = ?2 WHERE id = ?1",
+            rusqlite::params![was_root, parent],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE volumes SET last_mount_path = ?2 WHERE id = ?1",
+        rusqlite::params![volume_id, to],
+    )?;
+    Ok(())
 }
 
 /// Record what the reader found, overwriting whatever was there.
@@ -245,12 +503,41 @@ fn write_metadata(
     Ok(())
 }
 
-/// Flag rows on this volume that the walk did not reach.
+/// Flag rows **under the folder that was scanned** that the walk did not reach.
+///
+/// It used to be every row on the volume, which was the same thing while a
+/// volume only ever had one folder scanned into it. With two, scanning one
+/// flagged everything in the other as missing for not having been looked at.
 fn mark_missing(
     transaction: &rusqlite::Transaction<'_>,
     volume_id: i64,
+    scanned: &str,
+    convention: PathConvention,
     seen: &[i64],
 ) -> Result<usize, CatalogError> {
+    let under = convention.key_for(scanned);
+    let folders: Vec<i64> = {
+        let mut statement =
+            transaction.prepare("SELECT id, path_key FROM folders WHERE volume_id = ?1")?;
+        let rows = statement.query_map([volume_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.filter_map(Result::ok)
+            .filter(|(_, key)| {
+                under.is_empty()
+                    || *key == under
+                    || key
+                        .strip_prefix(&under)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+            .map(|(id, _)| id)
+            .collect()
+    };
+    let folders = folders
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     // Building an IN list rather than a temp table: `seen` is one row per file
     // and SQLite's default limit is around a million parameters, which is far
     // more than a library scan produces in one pass.
@@ -262,10 +549,10 @@ fn mark_missing(
     let sql = format!(
         "UPDATE files SET missing = 1
           WHERE missing = 0
-            AND folder_id IN (SELECT id FROM folders WHERE volume_id = ?1)
+            AND folder_id IN ({folders})
             AND id NOT IN ({list})"
     );
-    Ok(transaction.execute(&sql, [volume_id])?)
+    Ok(transaction.execute(&sql, [])?)
 }
 
 fn upsert_volume(
@@ -288,19 +575,7 @@ fn upsert_volume(
         PathConvention::CaseInsensitive => "case_insensitive",
         PathConvention::CaseInsensitiveNormalised => "case_insensitive_normalised",
     };
-    let (kind, uuid, serial, host, share, mount_path) = match volume {
-        VolumeId::Uuid(u) => ("uuid", Some(u.clone()), None, None, None, None),
-        VolumeId::WindowsSerial(s) => ("windows_serial", None, Some(*s as i64), None, None, None),
-        VolumeId::NetworkShare { host, share } => (
-            "network_share",
-            None,
-            None,
-            Some(host.clone()),
-            Some(share.clone()),
-            None,
-        ),
-        VolumeId::MountPath(at) => ("mount_path", None, None, None, None, Some(at.clone())),
-    };
+    let (kind, uuid, serial, host, share, mount_path) = identity(volume);
     transaction.execute(
         "INSERT INTO volumes
               (kind, uuid, windows_serial, host, share, mount_path, last_mount_path, path_convention)
@@ -317,6 +592,33 @@ fn upsert_volume(
         rusqlite::params![kind, uuid, serial, host, share, mount_path],
         |row| row.get(0),
     )?)
+}
+
+/// A volume's identity as the columns that hold it.
+#[allow(clippy::type_complexity)]
+fn identity(
+    volume: &VolumeId,
+) -> (
+    &'static str,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    match volume {
+        VolumeId::Uuid(u) => ("uuid", Some(u.clone()), None, None, None, None),
+        VolumeId::WindowsSerial(s) => ("windows_serial", None, Some(*s as i64), None, None, None),
+        VolumeId::NetworkShare { host, share } => (
+            "network_share",
+            None,
+            None,
+            Some(host.clone()),
+            Some(share.clone()),
+            None,
+        ),
+        VolumeId::MountPath(at) => ("mount_path", None, None, None, None, Some(at.clone())),
+    }
 }
 
 /// Create the folder row and every ancestor between it and the root.
@@ -361,13 +663,23 @@ struct Found {
     mtime: i64,
 }
 
-/// Depth-first, not following symlinks, never fatal.
-fn walk(dir: &Path, out: &mut Vec<Found>, report: &mut ScanReport) {
+/// Depth-first, not following symlinks, never fatal. `false` if whoever is
+/// watching said stop, asked once a folder: a card reader listing a deep tree
+/// is the slow part of a scan that has not started reading yet.
+fn walk(
+    dir: &Path,
+    out: &mut Vec<Found>,
+    report: &mut ScanReport,
+    watch: &mut dyn FnMut(Progress<'_>) -> bool,
+) -> bool {
+    if !watch(Progress::Walking { found: out.len() }) {
+        return false;
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => {
             report.unreadable.push(dir.to_path_buf());
-            return;
+            return true;
         }
     };
 
@@ -384,7 +696,9 @@ fn walk(dir: &Path, out: &mut Vec<Found>, report: &mut ScanReport) {
             continue;
         }
         if meta.is_dir() {
-            walk(&path, out, report);
+            if !walk(&path, out, report, watch) {
+                return false;
+            }
             continue;
         }
         if !is_supported(&path) {
@@ -401,6 +715,7 @@ fn walk(dir: &Path, out: &mut Vec<Found>, report: &mut ScanReport) {
             path,
         });
     }
+    true
 }
 
 pub(crate) fn is_supported(path: &Path) -> bool {
@@ -546,6 +861,262 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         rows
+    }
+
+    /// Where the catalog says every photograph is, and whether it is there —
+    /// through the same join everything that opens a file uses.
+    fn whereabouts(catalog: &Catalog) -> Vec<(PathBuf, bool)> {
+        crate::cull::sequence(catalog, &crate::cull::Filter::default())
+            .unwrap()
+            .into_iter()
+            .map(|image| {
+                let path = PathBuf::from(image.path);
+                let there = path.is_file();
+                (path, there)
+            })
+            .collect()
+    }
+
+    fn missing(catalog: &Catalog) -> i64 {
+        catalog
+            .connection()
+            .query_row("SELECT count(*) FROM files WHERE missing = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_second_folder_on_the_same_drive_leaves_the_first_where_it_was() {
+        // The two commands that used to lose a folder: the second scan
+        // re-pointed the volume at `2026`, so everything from `2025` resolved
+        // to a path under `2026` and was flagged missing for not being there.
+        let dir = tempdir();
+        write(&dir.join("photos/2025/a.ARW"), b"raw");
+        write(&dir.join("photos/2025/trip/b.ARW"), b"raw");
+        write(&dir.join("photos/2026/c.ARW"), b"raw");
+        let mut catalog = library(&dir);
+
+        test_scan(&mut catalog, &dir.join("photos/2025"));
+        let second = test_scan(&mut catalog, &dir.join("photos/2026"));
+        assert_eq!((second.added, second.missing), (1, 0));
+
+        let found = whereabouts(&catalog);
+        assert_eq!(found.len(), 3);
+        assert!(found.iter().all(|(_, there)| *there), "{found:?}");
+        assert_eq!(missing(&catalog), 0);
+
+        // And each can be scanned again without disturbing the other.
+        let again = test_scan(&mut catalog, &dir.join("photos/2025"));
+        assert_eq!((again.added, again.unchanged, again.missing), (0, 2, 0));
+        assert!(whereabouts(&catalog).iter().all(|(_, there)| *there));
+    }
+
+    #[test]
+    fn the_order_folders_are_added_in_does_not_matter() {
+        // Inside the root, outside it, above it, beside it: every order ends
+        // with every photograph where the catalog says it is.
+        let folders = ["lib/a", "lib/a/deep", "lib", "other/b", "lib/c"];
+        for start in 0..folders.len() {
+            let dir = tempdir();
+            write(&dir.join("lib/a/1.ARW"), b"raw");
+            write(&dir.join("lib/a/deep/2.ARW"), b"raw");
+            write(&dir.join("lib/c/3.ARW"), b"raw");
+            write(&dir.join("other/b/4.ARW"), b"raw");
+            let mut catalog = library(&dir);
+            for step in 0..folders.len() {
+                let folder = folders[(start + step) % folders.len()];
+                test_scan(&mut catalog, &dir.join(folder));
+                let found = whereabouts(&catalog);
+                assert!(
+                    found.iter().all(|(_, there)| *there),
+                    "after {folder}, starting from {}: {found:?}",
+                    folders[start]
+                );
+                assert_eq!(missing(&catalog), 0, "after {folder}");
+            }
+            assert_eq!(whereabouts(&catalog).len(), 4, "each photograph once");
+        }
+    }
+
+    #[test]
+    fn a_subfolder_named_like_the_folder_above_it_survives_the_root_moving_up() {
+        // `widen` re-spells `` as `trip` while a `trip` already exists under
+        // it. In the wrong order that is a unique-key collision half-way
+        // through re-spelling somebody's library.
+        let dir = tempdir();
+        write(&dir.join("trip/1.ARW"), b"raw");
+        write(&dir.join("trip/trip/2.ARW"), b"raw");
+        write(&dir.join("home/3.ARW"), b"raw");
+        let mut catalog = library(&dir);
+        test_scan(&mut catalog, &dir.join("trip"));
+        test_scan(&mut catalog, &dir.join("home"));
+        let found = whereabouts(&catalog);
+        assert_eq!(found.len(), 3);
+        assert!(found.iter().all(|(_, there)| *there), "{found:?}");
+        // Every folder but the root still has a parent.
+        let orphans: i64 = catalog
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM folders WHERE parent_id IS NULL AND relative_path <> ''",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0);
+    }
+
+    #[test]
+    fn a_file_missing_from_one_folder_is_not_every_other_folders_problem() {
+        let dir = tempdir();
+        write(&dir.join("one/a.ARW"), b"raw");
+        write(&dir.join("two/b.ARW"), b"raw");
+        let mut catalog = library(&dir);
+        test_scan(&mut catalog, &dir.join("one"));
+        test_scan(&mut catalog, &dir.join("two"));
+        std::fs::remove_file(dir.join("one/a.ARW")).unwrap();
+        // Scanning `two` has not looked in `one`, and says nothing about it.
+        assert_eq!(test_scan(&mut catalog, &dir.join("two")).missing, 0);
+        // Scanning `one` has.
+        assert_eq!(test_scan(&mut catalog, &dir.join("one")).missing, 1);
+    }
+
+    #[test]
+    fn a_library_that_has_moved_is_found_where_it_went() {
+        // What re-pointing the root was always for, and still does: the standing
+        // root is gone, so the folder scanned is taken to be where it went.
+        let dir = tempdir();
+        write(&dir.join("was/a.ARW"), b"raw");
+        let mut catalog = library(&dir);
+        test_scan(&mut catalog, &dir.join("was"));
+        std::fs::rename(dir.join("was"), dir.join("now")).unwrap();
+        let report = test_scan(&mut catalog, &dir.join("now"));
+        assert_eq!((report.added, report.unchanged), (0, 1));
+        assert!(whereabouts(&catalog).iter().all(|(_, there)| *there));
+    }
+
+    #[test]
+    fn where_the_root_goes_is_decided_from_spellings() {
+        use PathConvention::{CaseInsensitive, Exact};
+        let decide = |standing, there, adding, convention| {
+            Rooting::decide(standing, there, adding, convention)
+        };
+        assert_eq!(decide(None, false, "/p/2025", Exact), Rooting::Here);
+        assert_eq!(
+            decide(Some("/p/2025"), true, "/p/2025", Exact),
+            Rooting::Here
+        );
+        assert_eq!(
+            decide(Some("/p"), true, "/p/2025", Exact),
+            Rooting::Inside { base: "/p".into() }
+        );
+        assert_eq!(
+            decide(Some("/p/2025"), true, "/p/2026", Exact),
+            Rooting::Widen {
+                to: "/p".into(),
+                prefix: "2025".into()
+            }
+        );
+        // Above what was there: the root is the folder being added.
+        assert_eq!(
+            decide(Some("/p/2025/trip"), true, "/p", Exact),
+            Rooting::Widen {
+                to: "/p".into(),
+                prefix: "2025/trip".into()
+            }
+        );
+        // Nothing in common but the top of the filesystem.
+        assert_eq!(
+            decide(Some("/a/x"), true, "/b/y", Exact),
+            Rooting::Widen {
+                to: "/".into(),
+                prefix: "a/x".into()
+            }
+        );
+        // A drive letter keeps its slash, and its case is nobody's business.
+        assert_eq!(
+            decide(
+                Some("C:/Users/me/2025"),
+                true,
+                "c:/users/ME/2026",
+                CaseInsensitive
+            ),
+            Rooting::Widen {
+                to: "C:/Users/me".into(),
+                prefix: "2025".into()
+            }
+        );
+        assert_eq!(
+            decide(Some("C:/a"), true, "C:/b", CaseInsensitive),
+            Rooting::Widen {
+                to: "C:/".into(),
+                prefix: "a".into()
+            }
+        );
+        // `2025` is not inside `20`.
+        assert_eq!(
+            decide(Some("/p/20"), true, "/p/2025", Exact),
+            Rooting::Widen {
+                to: "/p".into(),
+                prefix: "20".into()
+            }
+        );
+        // The standing root has gone: a library that moved, not a second one.
+        assert_eq!(
+            decide(Some("/p/2025"), false, "/q/2025", Exact),
+            Rooting::Here
+        );
+    }
+
+    #[test]
+    fn a_dry_run_counts_and_keeps_nothing() {
+        let dir = tempdir();
+        write(&dir.join("photos/a.ARW"), b"raw");
+        write(&dir.join("photos/b.ARW"), b"raw");
+        let mut catalog = library(&dir);
+        test_scan(&mut catalog, &dir.join("photos"));
+        write(&dir.join("photos/c.ARW"), b"raw");
+
+        let tried = scan_watched(
+            &mut catalog,
+            &dir.join("photos"),
+            VolumeId::Uuid("test-volume".into()),
+            no_metadata,
+            true,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!((tried.added, tried.unchanged), (1, 2));
+        assert_eq!(filenames(&catalog).len(), 2, "and the catalog is as it was");
+    }
+
+    #[test]
+    fn a_scan_that_is_stopped_keeps_nothing_and_says_how_far_it_got() {
+        let dir = tempdir();
+        for n in 0..5 {
+            write(&dir.join(format!("photos/{n}.ARW")), b"raw");
+        }
+        let mut catalog = library(&dir);
+        let mut heard = Vec::new();
+        let stopped = scan_watched(
+            &mut catalog,
+            &dir.join("photos"),
+            VolumeId::Uuid("test-volume".into()),
+            no_metadata,
+            false,
+            |progress| {
+                if let Progress::Reading { done, total, .. } = progress {
+                    heard.push((done, total));
+                }
+                heard.len() < 3
+            },
+        );
+        assert!(matches!(stopped, Err(CatalogError::Cancelled)));
+        assert_eq!(heard, vec![(0, 5), (1, 5), (2, 5)]);
+        assert!(
+            filenames(&catalog).is_empty(),
+            "one transaction, rolled back"
+        );
     }
 
     #[test]

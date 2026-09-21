@@ -74,7 +74,7 @@ impl PathConvention {
         }
     }
 
-    fn key_for(self, path: &str) -> String {
+    pub(crate) fn key_for(self, path: &str) -> String {
         match self {
             Self::Exact => path.to_string(),
             // ASCII-only folding, which is what NTFS and APFS actually do for
