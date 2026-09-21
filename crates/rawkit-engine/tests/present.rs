@@ -452,13 +452,21 @@ fn where_the_canvas_holds_no_photograph_the_surround_shows() {
         "mid grey is #777"
     );
 
+    // Compared with itself under another surround, not with a number: the
+    // software adapter CI runs on rounds linear 0.5 to 187 where a GPU gives
+    // 188, and the claim is only that the surround does not reach it.
     let photograph = grey_canvas(&gpu, &renderer);
     presenter
         .draw_into(&gpu, &photograph, None, &view, [0, 0, SIZE, SIZE])
         .unwrap();
+    let under_grey = read_back(&gpu, &target);
+    presenter.set_surround(&gpu, [1.0, 1.0, 1.0]);
+    presenter
+        .draw_into(&gpu, &photograph, None, &view, [0, 0, SIZE, SIZE])
+        .unwrap();
     assert_eq!(
-        first(read_back(&gpu, &target)),
-        [188, 188, 188],
+        read_back(&gpu, &target),
+        under_grey,
         "an opaque photograph is untouched"
     );
 }
