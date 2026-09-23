@@ -190,7 +190,13 @@ fn note_hashes(catalog: &Catalog, noted: &[(PathBuf, String)]) -> Result<(), Cat
                                      f.filename, '//', '/') = ?1)",
     )?;
     for (path, hash) in noted {
-        statement.execute(rusqlite::params![path.to_string_lossy(), hash])?;
+        // Spelled as the catalog spells a path — separators normalised, any
+        // verbatim prefix gone — because that is what the join it is compared
+        // with produces. Windows was the one platform where a real path and a
+        // stored one were not the same string, and every hash went nowhere.
+        let spelt =
+            crate::path::CatalogPath::host(path).map_err(|e| CatalogError::Io(e.to_string()))?;
+        statement.execute(rusqlite::params![spelt.stored(), hash])?;
     }
     Ok(())
 }
