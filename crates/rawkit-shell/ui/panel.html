@@ -1239,6 +1239,14 @@
   let atWelcome = null;
   /// Whether a folder is being added. The sheet has the window and the keys.
   let importing = false;
+  /// Whether one of the catalog's own jobs is running, which takes the window
+  /// on the same terms. Its own flag rather than a share in `importing`: both
+  /// sheets are polled, and the one that is idle must not speak for the other —
+  /// a single flag was set true by the care poll and cleared 150 ms later by the
+  /// import poll, so the keyboard came back mid-job.
+  let caring = false;
+  /// Whether a job has the window, whichever it is.
+  const busy = () => importing || caring;
   /// What the shell last said about the photograph and the library, for the
   /// things that count from it rather than draw it.
   let latestView = null;
@@ -4273,8 +4281,9 @@
     // Nothing is open, so nothing that acts on a photograph has one to act on.
     // Dropped without a word: the welcome screen is already saying why.
     if (atWelcome !== false && !command.welcome) return;
-    // A folder is being added, and the shell is standing still for it.
-    if (importing) return;
+    // A folder is being added, or the catalog is being seen to, and the shell
+    // is standing still for it.
+    if (busy()) return;
     const blocked = obstacle(command);
     if (blocked?.kind === "tool")
       return tell("refused", `${blocked.tool.name} is in hand — ${blocked.tool.exits}`);
@@ -4302,10 +4311,12 @@
 
   document.addEventListener("keydown", event => {
     if (event.altKey) return;
-    // A folder is being added: the sheet has the keyboard. Escape is its
-    // Cancel; Tab and Enter are left to the two buttons on it.
-    if (importing) {
-      if (event.key === "Escape") importCancel.click(), event.preventDefault();
+    // A folder is being added, or the catalog is being seen to: that sheet has
+    // the keyboard. Escape is its Cancel or Stop; Tab and Enter are left to the
+    // buttons on it.
+    if (busy()) {
+      if (event.key === "Escape")
+        (caring ? careCancel : importCancel).click(), event.preventDefault();
       return;
     }
     // While the palette is up the keyboard is its box's, however focus got away
@@ -4816,9 +4827,9 @@
   const careBar = document.getElementById("care-bar");
   const careCancel = document.getElementById("care-cancel");
   const drawCare = job => {
-    // The import sheet and this one both take the window; `importing` is what
+    // The import sheet and this one both take the window; `busy()` is what
     // tells the keyboard to stay out of the way.
-    importing = importing || !!job;
+    caring = !!job;
     careSheet.classList.toggle("hidden", !job);
     if (!job) return;
     document.getElementById("care-title").textContent = job.title;

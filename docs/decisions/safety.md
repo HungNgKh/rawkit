@@ -30,6 +30,8 @@ unrecoverable reputationally.
 | S4 | Two missing photographs whose files are identical are **left alone** | Nothing on the disk says which is which, and the wrong answer is worse than none. |
 | S5 | Restoring a backup **never overwrites** | The copy opens as a new catalog beside the old one; the old one is untouched. |
 | S6 | A library that looks empty because its files moved says so, and offers the way out | The welcome screen is where that library lands, and the palette does not open there. |
+| S7 | A file that is already **another photograph's** is left alone | Otherwise the same frame imported twice leaves two catalog rows over one file. |
+| S8 | **One job at a time**, counting the one only asked for | Two connections writing means one of them fails: this process does not wait for a lock. |
 
 ## S1 — by contents
 
@@ -98,6 +100,43 @@ search offered as the first thing on the screen; the palette opens there too,
 and both jobs are marked as working with nothing on screen. A catalog that
 opens with *some* missing says so in the status line.
 
+## S7 — a file somebody else holds
+
+S4 covers two *missing* photographs over one file. The other half is a missing
+photograph whose contents match a file that a photograph **still in the library**
+is pointing at — the same frame imported twice, one copy tidied away and one left
+where it was. Matching by contents alone would hand the missing row the copy that
+is already somebody's, and the library would hold two rows over one file: the
+next time that file moved, or was culled, both rows would be wrong.
+
+So the search builds the set of paths the library already holds — everything not
+missing — and a candidate in that set is counted and passed over rather than
+relinked. The sentence says so: *"1 file here is another photograph's and was
+left alone"*. Guarded by `a_file_another_photograph_already_holds_is_left_alone`.
+
+A folder that could not be listed is now in that sentence too. It was counted
+and dropped, so a search that had silently skipped part of the tree read exactly
+like one that had covered all of it — and the person is the only one who can do
+anything about a folder they cannot read.
+
+## S8 — one job at a time
+
+An import and the catalog's own jobs each run on a connection of their own while
+the render loop stands still, because SQLite here does not wait for a write
+lock — it fails. That only holds if exactly one of them is ever running.
+
+Asking and starting are two steps: a job asked for waits in a pending slot until
+the render loop has flushed, and the loop takes **both** slots in the same tick.
+The busy check therefore counts a job that has only been asked for, and it is one
+check for both kinds — `catalog_busy` — rather than each kind watching only its
+own. `catalog_standing_still` is the same answer for the commands that must be
+refused meanwhile. Guarded by `a_job_only_asked_for_already_counts_as_busy`.
+
+In the window, the two sheets keep separate flags. They share one keyboard but
+are polled separately, and a single flag meant the idle poll spoke for the busy
+one: the care job raised it and the import poll cleared it 150 ms later, handing
+the keyboard back mid-job.
+
 ## Not built, and known
 
 - **Nothing hashes in the background.** "Write down what each photograph is" is
@@ -119,4 +158,6 @@ opens with *some* missing says so in the status line.
 | stopping a long job | `a_search_can_be_stopped`, `a_stop_between_files_keeps_and_lists_what_arrived` |
 | what a copy writes down | `a_copy_writes_down_what_each_photograph_is` |
 | the backups list or where copies go | nothing automatic. By hand: the panel lists what is in the folder, "Copy it now" adds one, "Open a copy" opens a new catalog beside and leaves the old one alone |
+| whether a found file is free to be handed over | `a_file_another_photograph_already_holds_is_left_alone` |
+| what may run while the catalog is busy | `a_job_only_asked_for_already_counts_as_busy` |
 | the welcome screen for a moved library | nothing automatic. By hand: a catalog whose files have all moved must name the number and offer the search |

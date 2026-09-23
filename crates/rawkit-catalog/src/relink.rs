@@ -125,6 +125,12 @@ pub struct Found {
     /// Missing photographs with no hash recorded, which cannot be matched by
     /// contents at all. Counted so the sentence can say why they were not found.
     pub unhashed: usize,
+    /// Files here that another photograph in the library already holds, and
+    /// whose contents match one that is missing. Left alone: this is the same
+    /// photograph imported twice, and pointing the missing row at a file that
+    /// is already somebody's would leave two rows over one file — so the next
+    /// time that file moved, or was culled, both would be wrong.
+    pub already_held: usize,
     /// Folders under the root that could not be read.
     pub unreadable: Vec<PathBuf>,
 }
@@ -190,13 +196,35 @@ pub fn search(
     }
     let sizes: std::collections::HashSet<i64> = missing.iter().map(|(_, _, size)| *size).collect();
 
+    // Where every photograph that is *not* missing is, by comparison key. A
+    // file in this set is already somebody's; whatever it matches, it is not
+    // free to be handed to a missing row.
+    let convention = PathConvention::host();
+    let held: std::collections::HashSet<String> = {
+        let mut statement = catalog.connection().prepare(
+            "SELECT v.last_mount_path || '/' || d.relative_path || '/' || f.filename
+               FROM files f
+               JOIN folders d ON d.id = f.folder_id
+               JOIN volumes v ON v.id = d.volume_id
+              WHERE f.missing = 0",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.filter_map(|row| row.ok())
+            .filter_map(|path| {
+                // `//` from an empty relative path, as everywhere else that
+                // rebuilds a path from these three columns.
+                CatalogPath::new(Path::new(&path.replace("//", "/")), convention).ok()
+            })
+            .map(|path| path.key().to_string())
+            .collect()
+    };
+
     // The files worth reading: the right size, and a kind this library holds.
     let mut candidates = Vec::new();
     if !walk_for(&root, &sizes, &mut candidates, &mut found, &mut watch) {
         return Err(CatalogError::Cancelled);
     }
 
-    let convention = PathConvention::host();
     let volume = crate::VolumeId::resolve(&root)?;
     let total = candidates.len();
     let mut back: Vec<(i64, PathBuf)> = Vec::new();
@@ -218,8 +246,12 @@ pub fn search(
             .filter(|(_, theirs, _)| *theirs == hash)
             .map(|(id, _, _)| *id)
             .collect();
+        let mine = CatalogPath::new(file, convention)
+            .map(|path| held.contains(path.key()))
+            .unwrap_or(false);
         match matching.as_slice() {
             [] => {}
+            _ if mine => found.already_held += 1,
             [id] => {
                 let id = *id;
                 missing.retain(|(held, _, _)| *held != id);
@@ -494,6 +526,7 @@ mod tests {
                 still_missing: 0,
                 ambiguous: 0,
                 unhashed: 0,
+                already_held: 0,
                 unreadable: Vec::new()
             }
         );
@@ -555,6 +588,38 @@ mod tests {
         let found = search(&mut catalog, &now, false, |_| true).unwrap();
         assert_eq!((found.relinked, found.ambiguous), (0, 2));
         assert_eq!(missing_count(&catalog), 2, "both are left missing");
+    }
+
+    #[test]
+    fn a_file_another_photograph_already_holds_is_left_alone() {
+        // The same photograph imported twice: one copy is still where the
+        // catalog thinks it is, the other has gone. Matching by contents alone
+        // would hand the missing row the copy that is already somebody's, and
+        // the library would have two rows over one file.
+        let dir = tempdir();
+        let was = dir.join("photos");
+        std::fs::create_dir_all(&was).unwrap();
+        std::fs::write(was.join("DSC00001.ARW"), b"identical").unwrap();
+        std::fs::write(was.join("DSC00002.ARW"), b"identical").unwrap();
+        let mut catalog = Catalog::open(&dir.join("library.rawkit")).unwrap();
+        let volume = crate::VolumeId::Uuid("test-volume".into());
+        crate::scan::scan_on(&mut catalog, &was, volume.clone(), crate::scan::no_metadata).unwrap();
+        crate::scan::hash_missing(&mut catalog, |_, _| true).unwrap();
+        // One of the two is gone; the other stays exactly where it was.
+        std::fs::remove_file(was.join("DSC00002.ARW")).unwrap();
+        crate::scan::scan_on(&mut catalog, &was, volume, crate::scan::no_metadata).unwrap();
+        assert_eq!(missing_count(&catalog), 1);
+
+        let found = search(&mut catalog, &was, false, |_| true).unwrap();
+        assert_eq!(
+            (found.relinked, found.already_held, found.still_missing),
+            (0, 1, 1)
+        );
+        assert_eq!(missing_count(&catalog), 1, "it is still missing");
+        assert!(
+            path_of(&catalog, "DSC00001.ARW").ends_with("photos/DSC00001.ARW"),
+            "and the photograph that was there still has its file to itself"
+        );
     }
 
     #[test]

@@ -1004,14 +1004,13 @@ fn cull(
     let Some(library) = &state.0 else {
         return Err("no catalog is open".into());
     };
-    // A folder is being added on a connection of its own, which holds the
-    // catalog's write lock; SQLite here does not wait for that, it fails. The
-    // page's sheet takes the keyboard, but it learns of an import by asking,
-    // and a key can arrive before it has asked.
-    if IMPORTING.load(std::sync::atomic::Ordering::Relaxed)
-        || PENDING_IMPORT.lock().expect("import lock").is_some()
-    {
-        return Err("a folder is being added; this will work again in a moment".into());
+    // A job of the catalog's own — adding a folder, finding photographs that
+    // moved — runs on a connection of its own, which holds the catalog's write
+    // lock; SQLite here does not wait for that, it fails. The page's sheet takes
+    // the keyboard, but it learns of a job by asking, and a key can arrive
+    // before it has asked.
+    if catalog_standing_still() {
+        return Err("the catalog is busy; this will work again in a moment".into());
     }
     // Here as well as in the page, which checks first and says which keys put
     // the tool down. The page is where a key arrives, but it is a string nobody
@@ -1319,10 +1318,8 @@ fn leave_for(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
     // the catalog — it rolls back — but the person pressed Add, and would come
     // back to a catalog without the folder and nothing to say why. Closing the
     // window is still allowed: that is somebody asking to leave.
-    if IMPORTING.load(std::sync::atomic::Ordering::Relaxed)
-        || PENDING_IMPORT.lock().expect("import lock").is_some()
-    {
-        return Err("a folder is being added; this will work again when it has finished".into());
+    if catalog_standing_still() {
+        return Err("the catalog is busy; this will work again when it has finished".into());
     }
     leave_now(arguments)
 }
@@ -1543,6 +1540,29 @@ static PENDING_CARE: Mutex<Option<care::Task>> = Mutex::new(None);
 /// The catalog job this process is running, if it is.
 static CARE: Mutex<Option<care::Running>> = Mutex::new(None);
 
+/// Whether the render loop is standing still for a catalog job, or is about to.
+///
+/// `IMPORTING` covers a job already running — it is set for the catalog's own
+/// jobs as much as for an import. The pending slots cover the tick between
+/// asking and starting, which is short and is exactly where a second ask lands.
+fn catalog_standing_still() -> bool {
+    IMPORTING.load(std::sync::atomic::Ordering::Relaxed)
+        || PENDING_IMPORT.lock().expect("import lock").is_some()
+        || PENDING_CARE.lock().expect("care lock").is_some()
+}
+
+/// Whether anything is writing to the catalog, or about to be.
+///
+/// One answer for both the import and the catalog's own jobs, because only one
+/// of them may hold the write lock: this process does not wait for a lock, it
+/// fails.
+fn catalog_busy() -> bool {
+    IMPORT.lock().expect("import lock").is_some()
+        || PENDING_IMPORT.lock().expect("import lock").is_some()
+        || CARE.lock().expect("care lock").is_some()
+        || PENDING_CARE.lock().expect("care lock").is_some()
+}
+
 /// Ask for one of the catalog's own jobs. Refused for the same reasons an
 /// import is: there must be a catalog, nothing else may be writing to it.
 fn begin_care(task: care::Task) -> Result<(), String> {
@@ -1557,7 +1577,11 @@ fn begin_care(task: care::Task) -> Result<(), String> {
     if exporting {
         return Err("an export is still running; try again when it has finished".into());
     }
-    if IMPORT.lock().expect("import lock").is_some() || CARE.lock().expect("care lock").is_some() {
+    // The pending slots count as busy as much as the running ones do: a folder
+    // picked but not yet started is still a write about to happen, and the loop
+    // takes both slots in the same tick — so without this an import and a job
+    // could start together and write through two connections at once.
+    if catalog_busy() {
         return Err("the catalog is already busy".into());
     }
     *PENDING_CARE.lock().expect("care lock") = Some(task);
@@ -1752,8 +1776,8 @@ fn begin_import(folder: &Path) -> Result<(), String> {
     if exporting {
         return Err("an export is still running; add the folder when it has finished".into());
     }
-    if IMPORT.lock().expect("import lock").is_some() {
-        return Err("a folder is already being added".into());
+    if catalog_busy() {
+        return Err("the catalog is already busy — add the folder when it has finished".into());
     }
     *PENDING_IMPORT.lock().expect("import lock") = Some(folder.to_path_buf());
     Ok(())
@@ -8454,6 +8478,25 @@ mod tests {
     /// The notice slot is one process-wide value, so the tests that use it take
     /// turns rather than reading each other's messages.
     static SAYING: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn a_job_only_asked_for_already_counts_as_busy() {
+        // The render loop takes both pending slots in the same tick. Before the
+        // pending slots counted, a folder picked and one of the catalog's own
+        // jobs asked for could both be accepted, and both would start — two
+        // connections writing, and this process does not wait for a lock.
+        assert!(!catalog_busy());
+        *PENDING_IMPORT.lock().expect("import lock") = Some(PathBuf::from("somewhere"));
+        assert!(catalog_busy());
+        assert!(catalog_standing_still());
+        *PENDING_IMPORT.lock().expect("import lock") = None;
+
+        *PENDING_CARE.lock().expect("care lock") = Some(care::Task::Note);
+        assert!(catalog_busy());
+        assert!(catalog_standing_still());
+        *PENDING_CARE.lock().expect("care lock") = None;
+        assert!(!catalog_busy());
+    }
 
     #[test]
     fn the_badge_names_what_a_press_would_do() {

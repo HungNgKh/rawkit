@@ -197,6 +197,24 @@ fn find(shared: &Shared, catalog: &Path, folder: &Path) -> Result<Outcome, Catal
             n => format!("; {n} files here match more than one of them and were left alone"),
         });
     }
+    if found.already_held > 0 {
+        said.push_str(&match found.already_held {
+            1 => "; 1 file here is another photograph's and was left alone".to_string(),
+            n => format!("; {n} files here are other photographs' and were left alone"),
+        });
+    }
+    // A folder that could not be listed is the difference between "it is not in
+    // there" and "part of in there was never looked at", and the person is the
+    // only one who can do anything about it — so it goes in the sentence.
+    if !found.unreadable.is_empty() {
+        said.push_str(&match found.unreadable.len() {
+            1 => format!(
+                "; 1 folder could not be read and was not searched ({})",
+                found.unreadable[0].display()
+            ),
+            n => format!("; {n} folders could not be read and were not searched"),
+        });
+    }
     Ok(Outcome::Finished {
         said,
         put_back: found.relinked,
