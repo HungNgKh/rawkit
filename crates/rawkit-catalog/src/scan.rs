@@ -574,7 +574,7 @@ fn mark_missing(
     Ok(transaction.execute(&sql, [])?)
 }
 
-fn upsert_volume(
+pub(crate) fn upsert_volume(
     transaction: &rusqlite::Transaction<'_>,
     volume: &VolumeId,
     root: &Path,
@@ -641,7 +641,7 @@ fn identity(
 }
 
 /// Create the folder row and every ancestor between it and the root.
-fn upsert_folder(
+pub(crate) fn upsert_folder(
     transaction: &rusqlite::Transaction<'_>,
     volume_id: i64,
     relative: &Path,

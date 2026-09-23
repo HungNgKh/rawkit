@@ -91,6 +91,11 @@ pub fn ingest(
     }
 
     let mut report = IngestReport::default();
+    // Every copy's hash, which the verification already worked out. Written to
+    // the catalog after the scan: it is what finds a photograph again if the
+    // library is ever moved, and reading these files a second time to learn
+    // what this pass already knows would be a waste of a card reader's day.
+    let mut noted: Vec<(PathBuf, String)> = Vec::new();
     let mut found = Vec::new();
     walk(&source, &mut found, &mut report);
     // Ordered by name, so an interrupted import resumes somewhere predictable
@@ -114,11 +119,15 @@ pub fn ingest(
             continue;
         }
         match place(file, &folder, &name, &hash_of) {
-            Ok(Placed::Copied { renamed }) => {
+            Ok(Placed::Copied { renamed, at, hash }) => {
                 report.copied += 1;
                 report.renamed += usize::from(renamed);
+                noted.push((at, hash));
             }
-            Ok(Placed::AlreadyThere) => report.already_there += 1,
+            Ok(Placed::AlreadyThere { at, hash }) => {
+                report.already_there += 1;
+                noted.push((at, hash));
+            }
             Err(e) => report.failed.push((file.clone(), e)),
         }
     }
@@ -136,6 +145,7 @@ pub fn ingest(
         volume,
         &mut metadata,
     )?);
+    note_hashes(catalog, &noted)?;
     Ok(report)
 }
 
@@ -167,10 +177,34 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Write down what each copy is, by the path it landed at. The same join the
+/// rest of the crate rebuilds a file's path with, so a row is found by where it
+/// is rather than by a name that may have been taken.
+fn note_hashes(catalog: &Catalog, noted: &[(PathBuf, String)]) -> Result<(), CatalogError> {
+    let mut statement = catalog.connection().prepare(
+        "UPDATE files SET content_hash = ?2
+          WHERE id = (SELECT f.id FROM files f
+                        JOIN folders d ON d.id = f.folder_id
+                        JOIN volumes v ON v.id = d.volume_id
+                       WHERE replace(v.last_mount_path || '/' || d.relative_path || '/' ||
+                                     f.filename, '//', '/') = ?1)",
+    )?;
+    for (path, hash) in noted {
+        statement.execute(rusqlite::params![path.to_string_lossy(), hash])?;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 enum Placed {
-    Copied { renamed: bool },
-    AlreadyThere,
+    /// Where it landed, and what it is.
+    Copied {
+        renamed: bool,
+        at: PathBuf,
+        hash: String,
+    },
+    /// The same file was already at that path, byte for byte.
+    AlreadyThere { at: PathBuf, hash: String },
 }
 
 /// Copy one file into `folder`, verify it, and give it its name.
@@ -204,7 +238,12 @@ fn place(
         match hash(&target) {
             // Already here, byte for byte. Re-running an import over a card that
             // was half done is the normal case.
-            Ok(existing) if existing == want => return Ok(Placed::AlreadyThere),
+            Ok(existing) if existing == want => {
+                return Ok(Placed::AlreadyThere {
+                    at: target,
+                    hash: want,
+                })
+            }
             // The name is taken by something else. Both are photographs; both
             // stay.
             Ok(_) => {
@@ -231,7 +270,11 @@ fn place(
         let _ = std::fs::remove_file(&partial);
         format!("naming the copy: {e}")
     })?;
-    Ok(Placed::Copied { renamed })
+    Ok(Placed::Copied {
+        renamed,
+        at: target,
+        hash: want,
+    })
 }
 
 /// `("DSC00881", "ARW")`. The extension is kept as written, so a card of `.arw`
@@ -354,6 +397,42 @@ mod tests {
         // finishes, and emptying it is the user's decision to make afterwards.
         assert!(source.join("DCIM/100MSDCF/DSC00001.ARW").exists());
         assert_eq!(report.scanned.expect("a scan followed").added, 2);
+    }
+
+    #[test]
+    fn a_copy_writes_down_what_each_photograph_is() {
+        // The verification already hashed every file. Kept, because it is what
+        // finds a photograph again if the library is moved — and reading them
+        // all a second time to learn it would be a waste of a card reader's day.
+        let dir = tempdir();
+        let source = card(&dir, &[("DSC00001.ARW", b"one"), ("DSC00002.ARW", b"two")]);
+        let library_root = dir.join("photos");
+        let mut catalog = library(&dir);
+        run(
+            &mut catalog,
+            &source,
+            &library_root,
+            &[("DSC00001.ARW", AUGUST_30)],
+        );
+
+        let hashes: Vec<Option<String>> = catalog
+            .connection()
+            .prepare("SELECT content_hash FROM files ORDER BY filename")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(hashes.len(), 2);
+        assert!(hashes.iter().all(|hash| hash.is_some()), "{hashes:?}");
+        assert_eq!(
+            hashes[0].as_deref(),
+            Some(
+                crate::relink::hash_file(&library_root.join("2026/2026-08-30/DSC00001.ARW"))
+                    .unwrap()
+                    .as_str()
+            )
+        );
     }
 
     #[test]
