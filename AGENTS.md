@@ -216,6 +216,10 @@ is worse than none, for the reason a stale comment is.
   why a volume's root widens rather than being re-pointed (adding a second
   folder on a drive used to lose the first), and the scan that can be watched,
   stopped and tried.
+- [`docs/decisions/safety.md`](docs/decisions/safety.md) — looking after a
+  catalog: finding photographs that moved (by contents, never by name), writing
+  down what each photograph is while it is still there, and why restoring a
+  backup never overwrites.
 - [`docs/decisions/previews.md`](docs/decisions/previews.md) — previews that
   build themselves in the window: which thread touches the catalog (one), what
   the second GPU device costs a slider drag, and what is not built yet.
