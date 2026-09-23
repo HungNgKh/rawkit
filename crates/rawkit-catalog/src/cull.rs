@@ -308,6 +308,18 @@ fn read(
     Ok(rows)
 }
 
+/// How many photographs the catalog holds whose file is not where it last saw
+/// it. Zero is the ordinary answer; anything else is what
+/// [`crate::relink::search`] exists for.
+pub fn missing(catalog: &Catalog) -> Result<usize, CatalogError> {
+    let count: i64 = catalog.connection().query_row(
+        "SELECT count(*) FROM images i JOIN files f ON f.id = i.file_id WHERE f.missing = 1",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(count as usize)
+}
+
 /// The ids a filter admits, and nothing else about them.
 ///
 /// For a caller that already holds the photographs and only needs to know which

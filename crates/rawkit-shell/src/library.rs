@@ -1662,6 +1662,11 @@ impl Library {
 
     /// What a grid reports after a click, for the page: the clicks happen on
     /// the canvas and no command carries the sentence back.
+    /// How many photographs are missing from where the catalog last saw them.
+    pub fn missing(&self) -> Result<usize> {
+        Ok(cull::missing(&self.catalog)?)
+    }
+
     /// The folder tree, with counts. See [`rawkit_catalog::folders`].
     pub fn folders(&self) -> Result<Vec<rawkit_catalog::folders::Folder>> {
         Ok(rawkit_catalog::folders::tree(&self.catalog)?)

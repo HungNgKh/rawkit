@@ -138,6 +138,7 @@
 mod building;
 #[cfg(target_os = "linux")]
 mod canvas;
+mod care;
 mod exporting;
 mod frame;
 mod importing;
@@ -1249,6 +1250,12 @@ static WELCOME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 /// A catalog that opened and had nothing in it, for the welcome screen to name.
 static EMPTY_CATALOG: Mutex<Option<PathBuf>> = Mutex::new(None);
 
+/// How many photographs the open catalog cannot find the files of. Read once,
+/// when it opens: it is the number the welcome screen and the status line say,
+/// and a library that looks empty because everything moved has to be able to
+/// say so rather than look like a library with nothing in it.
+static MISSING_AT_OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Where this machine's settings are. Found once, in `setup`, which is the
 /// only place with an application to ask.
 static CONFIG_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
@@ -1406,6 +1413,7 @@ fn entrance() -> serde_json::Value {
         "welcome": WELCOME.load(std::sync::atomic::Ordering::Relaxed),
         "empty": empty.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()),
         "empty_path": empty,
+        "missing": MISSING_AT_OPEN.load(std::sync::atomic::Ordering::Relaxed),
         "recent": recent,
         "now": now(),
     })
@@ -1522,10 +1530,131 @@ static PENDING_IMPORT: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// The import this process is running, if it is. See [`importing`].
 static IMPORT: Mutex<Option<importing::Running>> = Mutex::new(None);
 
-/// Whether the render loop is standing still for an import. It writes nothing
-/// to the catalog while this is set, which is what lets the import's own
-/// connection hold the write lock for as long as a scan takes.
+/// Whether the render loop is standing still for a job with its own connection:
+/// an import, or one of the catalog's own jobs (see [`care`]). It writes nothing
+/// to the catalog while this is set, which is what lets that connection hold the
+/// write lock for as long as a scan or a walk of the library takes.
 static IMPORTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A job somebody has asked for, waiting for the render loop to start it — the
+/// same handover an import makes, and for the same reason.
+static PENDING_CARE: Mutex<Option<care::Task>> = Mutex::new(None);
+
+/// The catalog job this process is running, if it is.
+static CARE: Mutex<Option<care::Running>> = Mutex::new(None);
+
+/// Ask for one of the catalog's own jobs. Refused for the same reasons an
+/// import is: there must be a catalog, nothing else may be writing to it.
+fn begin_care(task: care::Task) -> Result<(), String> {
+    if OPEN_CATALOG.get().and_then(|open| open.as_ref()).is_none() {
+        return Err("there is no catalog open".into());
+    }
+    let exporting = EXPORTING
+        .lock()
+        .expect("export lock")
+        .as_ref()
+        .is_some_and(|export| export.finished.is_none());
+    if exporting {
+        return Err("an export is still running; try again when it has finished".into());
+    }
+    if IMPORT.lock().expect("import lock").is_some() || CARE.lock().expect("care lock").is_some() {
+        return Err("the catalog is already busy".into());
+    }
+    *PENDING_CARE.lock().expect("care lock") = Some(task);
+    Ok(())
+}
+
+/// Start the job's thread. Called by the render loop, once it has flushed.
+fn start_care(task: care::Task) {
+    let Some(catalog) = OPEN_CATALOG.get().and_then(|open| open.clone()) else {
+        return;
+    };
+    let shared = Arc::new(care::Shared::default());
+    *CARE.lock().expect("care lock") = Some(care::Running {
+        shared: shared.clone(),
+        task: task.clone(),
+    });
+    std::thread::spawn(move || {
+        let outcome = care::run(&shared, &catalog, &task);
+        eprintln!("catalog    : {outcome:?}");
+        match outcome {
+            care::Outcome::Finished { said, put_back } if put_back > 0 => {
+                // Photographs that were missing are not missing any more, and
+                // the library in this process was read when they were. Opening
+                // it again is how every other change of that kind is shown.
+                let again = vec![
+                    "--said".into(),
+                    said.clone().into(),
+                    catalog.into_os_string(),
+                ];
+                match leave_now(again) {
+                    Ok(()) => {
+                        shared.said(said);
+                        return;
+                    }
+                    Err(why) => shared.fail(format!(
+                        "{said}, but the catalog could not be reopened to show them: {why}"
+                    )),
+                }
+                return;
+            }
+            care::Outcome::Finished { said, .. } => notice(said),
+            care::Outcome::Cancelled => notice("Stopped; the catalog is as it was"),
+            // The sheet is showing why, and stays until it is dismissed.
+            care::Outcome::Failed => return,
+        }
+        *CARE.lock().expect("care lock") = None;
+    });
+}
+
+/// Look through a folder for the files of photographs that have gone missing.
+#[tauri::command]
+fn find_moved_dialog(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_dialog::DialogExt;
+    if OPEN_CATALOG.get().and_then(|open| open.as_ref()).is_none() {
+        return Err("there is no catalog open to look for".into());
+    }
+    app.dialog().file().pick_folder(|chosen| {
+        let Some(folder) = chosen.and_then(|p| p.into_path().ok()) else {
+            return;
+        };
+        if let Err(why) = begin_care(care::Task::Find(folder)) {
+            tell(Told::from(why.as_str()));
+        }
+    });
+    Ok(())
+}
+
+/// Write down what each photograph is, for the ones with no note yet.
+#[tauri::command]
+fn note_photographs() -> Result<(), String> {
+    begin_care(care::Task::Note)
+}
+
+/// Where the catalog's job is, for the page to draw. `None` when there is none.
+#[tauri::command]
+fn care_progress() -> Option<serde_json::Value> {
+    let care = CARE.lock().expect("care lock");
+    let running = care.as_ref()?;
+    Some(serde_json::json!({
+        "title": running.task.title(),
+        "where": running.task.where_at(),
+        "at": running.shared.stage(),
+    }))
+}
+
+/// Stop the job, or dismiss what it is saying.
+#[tauri::command]
+fn cancel_care() {
+    let mut care = CARE.lock().expect("care lock");
+    let Some(running) = care.as_ref() else {
+        return;
+    };
+    match running.shared.stage() {
+        Some(care::Stage::Failed { .. }) | Some(care::Stage::Done { .. }) | None => *care = None,
+        Some(_) => running.shared.stop(),
+    }
+}
 
 /// Ask for a folder of photographs to be added to the open catalog.
 fn begin_import(folder: &Path) -> Result<(), String> {
@@ -1961,6 +2090,10 @@ fn main() -> Result<()> {
             take_notice,
             entrance,
             add_folder_dialog,
+            find_moved_dialog,
+            note_photographs,
+            care_progress,
+            cancel_care,
             import_progress,
             confirm_import,
             pick_copy_destination,
@@ -2150,6 +2283,18 @@ fn main() -> Result<()> {
                         if let Some(settings) = &settings {
                             recent::note(settings, path, library.count(), now());
                         }
+                        match library.missing() {
+                            Ok(0) => {}
+                            Ok(missing) => {
+                                MISSING_AT_OPEN
+                                    .store(missing, std::sync::atomic::Ordering::Relaxed);
+                                notice(format!(
+                                    "{missing} photographs are not where this catalog last saw \
+                                     them; find them with \"Find photographs that moved\""
+                                ));
+                            }
+                            Err(why) => complain(&why),
+                        }
                         let first = PathBuf::from(&library.current().path);
                         (Some(Arc::new(Mutex::new(library))), Some(first))
                     }
@@ -2160,6 +2305,14 @@ fn main() -> Result<()> {
                             recent::note(settings, path, 0, now());
                         }
                         *EMPTY_CATALOG.lock().expect("entrance lock") = Some(path.clone());
+                        // Empty, or empty *because* every file it holds has
+                        // moved — which looks the same from here and is not.
+                        if let Ok(catalog) = rawkit_catalog::db::Catalog::open(path) {
+                            if let Ok(missing) = rawkit_catalog::cull::missing(&catalog) {
+                                MISSING_AT_OPEN
+                                    .store(missing, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
                         (None, None)
                     }
                     Err(why) => {
@@ -2423,8 +2576,22 @@ fn main() -> Result<()> {
                     }
                     start_import(folder);
                 }
+                // The catalog's own jobs, on the same terms: flushed first, and
+                // then this loop writes nothing until it ends.
+                let caring = PENDING_CARE.lock().expect("care lock").take();
+                if let Some(task) = caring {
+                    saver.flush();
+                    IMPORTING.store(true, std::sync::atomic::Ordering::Relaxed);
+                    #[cfg(target_os = "linux")]
+                    if route == Route::NativeChild {
+                        canvas::hide();
+                    }
+                    start_care(task);
+                }
                 if IMPORTING.load(std::sync::atomic::Ordering::Relaxed) {
-                    if IMPORT.lock().expect("import lock").is_some() {
+                    if IMPORT.lock().expect("import lock").is_some()
+                        || CARE.lock().expect("care lock").is_some()
+                    {
                         return Ok(());
                     }
                     // Over without a relaunch: nothing to add, or stopped.

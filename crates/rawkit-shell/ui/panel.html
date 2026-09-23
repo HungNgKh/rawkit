@@ -333,6 +333,22 @@
   #import .also.failed { color: var(--danger); }
   #import progress { width: 100%; height: 6px; margin: 14px 0 0; accent-color: var(--attention); }
   #import .promise { color: var(--text-tertiary); margin: 22px 0 0; }
+  /* The same sheet as the import's, and deliberately: two jobs that stop the
+     window should not look like two different applications. */
+  #care { position: fixed; inset: 0; z-index: 50; background: var(--ground-panel); overflow-y: auto;
+          padding: 16vh 24px 32px; box-sizing: border-box; }
+  #care.hidden { display: none; }
+  #care .inner { max-width: 640px; margin: 0 auto; }
+  #care .mark { font-size: 12px; letter-spacing: .14em; text-transform: uppercase; color: var(--text-tertiary); }
+  #care h1 { font-size: 22px; font-weight: 500; margin: 10px 0 4px; color: var(--text-primary); }
+  #care .from { color: var(--text-tertiary); margin: 0 0 26px; overflow-wrap: anywhere; }
+  #care .what { font-size: 15px; color: var(--text-primary); margin: 0 0 6px; min-height: 1.4em; }
+  #care .also { color: var(--text-secondary); margin: 0 0 6px; min-height: 1.4em; overflow-wrap: anywhere; }
+  #care .also.failed { color: var(--danger); }
+  #care progress { width: 100%; height: 6px; margin: 14px 0 0; accent-color: var(--attention); }
+  #care .buttons { display: flex; gap: 10px; justify-content: flex-end; margin-top: 28px; }
+  #care .buttons button { font: inherit; padding: 8px 16px; border-radius: 6px; cursor: pointer;
+                          background: var(--ground-raised); border: 1px solid var(--border-subtle); color: var(--text-primary); }
   #import-how { margin: 18px 0 0; }
   #import-how label { display: flex; align-items: baseline; gap: 10px; margin: 8px 0; cursor: pointer; }
   #import-how label > span { color: var(--text-primary); }
@@ -586,6 +602,9 @@
   <p class="lede" id="welcome-lede">A catalog is where rawkit keeps what you decide about your photographs.
     It never changes the photographs themselves.</p>
   <p id="welcome-said" role="status"></p>
+  <div class="ways one" id="welcome-find" hidden>
+    <button class="primary" data-command="find-moved"><b>Find photographs that moved…</b><span>Look through the folder they are in now. They are recognised by what they are, not by where they were</span><kbd></kbd></button>
+  </div>
   <div class="ways one" id="welcome-add" hidden>
     <button class="primary" data-command="add-folder"><b>Add a folder of photographs…</b><span>Where they are, or copied off a card and checked. Nothing is ever moved or renamed</span><kbd></kbd></button>
   </div>
@@ -622,6 +641,23 @@
   <div class="buttons">
     <button id="import-cancel">Cancel</button>
     <button id="import-go" class="primary" hidden></button>
+  </div>
+ </div>
+</div>
+
+<!-- Looking after the catalog: finding photographs that moved, and writing down
+     what each photograph is. Over the window like the import sheet, and for the
+     same reason: while one runs, the shell writes nothing else. -->
+<div id="care" class="hidden" role="dialog" aria-labelledby="care-title">
+ <div class="inner">
+  <div class="mark">The catalog</div>
+  <h1 id="care-title"></h1>
+  <p class="from" id="care-where"></p>
+  <p class="what" id="care-what" role="status"></p>
+  <p class="also" id="care-also"></p>
+  <progress id="care-bar" max="1" value="0" hidden></progress>
+  <div class="buttons">
+    <button id="care-cancel">Stop</button>
   </div>
  </div>
 </div>
@@ -3994,7 +4030,7 @@
       title: "Hide both side panels, or bring them back", run: () => panels("both") },
     { id: "shortcuts", keys: ["?", "f1"], scope: "any", waits: false, group: "Views",
       title: "Keyboard shortcuts", run: () => toggleSheet() },
-    { id: "palette", keys: ["mod+k"], scope: "any", waits: false, group: "Views",
+    { id: "palette", keys: ["mod+k"], scope: "any", waits: false, group: "Views", welcome: true,
       title: "Find a command", run: () => openPalette() },
     // No key, and none needed: the palette is how a command without one is
     // reached, which is what lets there be commands that are not worth a key.
@@ -4141,6 +4177,16 @@
       title: "Open one photograph on its own…", run: () => invoke("open_photograph_dialog").catch(say) },
     { id: "add-folder", keys: ["mod+shift+i"], scope: "any", waits: false, group: "Catalog", welcome: true,
       title: "Add a folder of photographs…", run: () => invoke("add_folder_dialog").catch(say) },
+    // No keys: jobs for the day something went wrong, found by name.
+    // `welcome: true` because this is exactly the screen a library whose
+    // photographs have all moved comes back to: the catalog is open and looks
+    // empty, which is what "every file is missing" looks like from here.
+    { id: "find-moved", keys: [], scope: "any", waits: false, group: "Catalog", welcome: true,
+      title: "Find photographs that moved…",
+      run: () => invoke("find_moved_dialog").catch(say) },
+    { id: "note-photographs", keys: [], scope: "any", waits: false, group: "Catalog", welcome: true,
+      title: "Write down what each photograph is, so it can be found if it moves",
+      run: () => invoke("note_photographs").catch(say) },
     { id: "close-catalog", keys: ["mod+w"], scope: "any", waits: false, group: "Catalog",
       title: "Close what is open", run: () => invoke("close_catalog").catch(say) },
 
@@ -4296,7 +4342,17 @@
       // The key is on the card already, so the tooltip would only say it twice.
       button.removeAttribute("title");
     }
-    if (e.empty) {
+    if (e.empty && e.missing) {
+      // Not an empty catalog: a full one whose files are not where it last saw
+      // them. Saying "no photographs yet" here would be a lie, and the way out
+      // is a different one.
+      document.getElementById("welcome-title").textContent =
+        `${e.empty} is open, and ${e.missing === 1 ? "its one photograph is" : `all ${e.missing.toLocaleString()} of its photographs are`} missing.`;
+      document.getElementById("welcome-lede").textContent =
+        "The files are not where the catalog last saw them — a folder renamed, or a library moved to another disk. Nothing has been lost from the catalog: point it at where they are now.";
+      document.getElementById("welcome-find").hidden = false;
+      document.getElementById("welcome-add").hidden = false;
+    } else if (e.empty) {
       document.getElementById("welcome-title").textContent =
         `${e.empty} is open, and has no photographs in it yet.`;
       document.getElementById("welcome-lede").textContent =
@@ -4725,6 +4781,54 @@
     invoke("confirm_import", { copy: importHow === "copy" }).catch(say));
   importCancel.addEventListener("click", () => invoke("cancel_import").catch(say));
   setInterval(() => invoke("import_progress").then(drawImport).catch(() => {}), 150);
+
+  // ---- The catalog's own jobs ---------------------------------------------------
+  //
+  // Finding photographs that moved, and writing down what each photograph is.
+  // Drawn from the shell the same way the import is: the page holds nothing
+  // about how far along it is.
+  const careSheet = document.getElementById("care");
+  const careBar = document.getElementById("care-bar");
+  const careCancel = document.getElementById("care-cancel");
+  const drawCare = job => {
+    // The import sheet and this one both take the window; `importing` is what
+    // tells the keyboard to stay out of the way.
+    importing = importing || !!job;
+    careSheet.classList.toggle("hidden", !job);
+    if (!job) return;
+    document.getElementById("care-title").textContent = job.title;
+    document.getElementById("care-where").textContent = job.where;
+    const what = document.getElementById("care-what");
+    const also = document.getElementById("care-also");
+    const at = job.at ?? { stage: "looking", found: 0 };
+    also.className = "also";
+    also.textContent = "";
+    careBar.hidden = true;
+    careCancel.textContent = "Stop";
+    if (at.stage === "looking") {
+      what.textContent = at.found
+        ? `Looking… ${counted(at.found)} worth reading so far` : "Looking…";
+    } else if (at.stage === "reading") {
+      what.textContent = at.total
+        ? `Reading ${(at.done + 1).toLocaleString()} of ${at.total.toLocaleString()}`
+        : "Reading…";
+      also.textContent = at.name ?? "";
+      careBar.hidden = !at.total;
+      careBar.max = Math.max(at.total, 1);
+      careBar.value = at.done;
+    } else if (at.stage === "done") {
+      what.textContent = at.said;
+      also.textContent = "Opening the catalog again…";
+      careCancel.textContent = "Close";
+    } else if (at.stage === "failed") {
+      what.textContent = "Nothing was changed.";
+      also.className = "also failed";
+      also.textContent = at.why;
+      careCancel.textContent = "Close";
+    }
+  };
+  careCancel.addEventListener("click", () => invoke("cancel_care").catch(say));
+  setInterval(() => invoke("care_progress").then(drawCare).catch(() => {}), 150);
 
   // The sheet, drawn from the registry when it is asked for.
   const sheet = document.getElementById("sheet");

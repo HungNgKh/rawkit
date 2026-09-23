@@ -236,12 +236,17 @@ pub fn search(
 
     // One transaction: a half-relinked library is a library whose photographs
     // are in two places according to itself.
-    let transaction = catalog.connection().unchecked_transaction()?;
-    let volume_id = crate::scan::upsert_volume(&transaction, &volume, &root, convention)?;
+    let transaction = catalog.connection_mut().transaction()?;
+    // The volume's root **widens** to take this folder in; it is never
+    // re-pointed at it. Pointing a relink at one folder of a library used to
+    // move the whole volume under that folder, so every photograph not found
+    // here — the ones still missing — claimed a path it had never had.
+    let (volume_id, base) = crate::scan::root_for(&transaction, &volume, &root, convention)?;
     for (file_id, path) in back {
         let parent = path.parent().unwrap_or(&root);
-        let relative = parent.strip_prefix(&root).unwrap_or(Path::new(""));
-        let folder_id = crate::scan::upsert_folder(&transaction, volume_id, relative, convention)?;
+        let relative = crate::scan::relative_to(parent, &base, convention)?;
+        let folder_id =
+            crate::scan::upsert_folder(&transaction, volume_id, Path::new(&relative), convention)?;
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -430,7 +435,7 @@ mod tests {
             crate::scan::no_metadata,
         )
         .unwrap();
-        crate::scan::hash_missing(&mut catalog, |_, _| {}).unwrap();
+        crate::scan::hash_missing(&mut catalog, |_, _| true).unwrap();
         // Moved, and the catalog told by a scan of where they were.
         let now = dir.join("elsewhere");
         std::fs::create_dir_all(&now).unwrap();
@@ -499,6 +504,36 @@ mod tests {
     }
 
     #[test]
+    fn finding_one_folder_does_not_move_what_is_still_missing() {
+        // The bug this test is named after, found in the window: the volume's
+        // root was re-pointed at the folder being looked in, so the photographs
+        // *not* found there came to claim a path under it — one they had never
+        // had. A volume's root widens; it is never re-pointed.
+        let dir = tempdir();
+        let (mut catalog, now) = moved_library(&dir);
+        let was = path_of(&catalog, "DSC00002.ARW");
+
+        // Only the subfolder is offered, so the loose photograph is not found.
+        let found = search(&mut catalog, &now.join("photos/day1"), false, |_| true).unwrap();
+        assert_eq!((found.relinked, found.still_missing), (1, 1));
+        assert!(
+            path_of(&catalog, "DSC00001.ARW").ends_with("photos/day1/DSC00001.ARW"),
+            "{}",
+            path_of(&catalog, "DSC00001.ARW")
+        );
+        assert_eq!(
+            path_of(&catalog, "DSC00002.ARW"),
+            was,
+            "the one still missing kept the path it had"
+        );
+
+        // And the rest of the library is found when the folder above is offered.
+        let found = search(&mut catalog, &now, false, |_| true).unwrap();
+        assert_eq!((found.relinked, found.still_missing), (1, 0));
+        assert!(std::path::Path::new(&path_of(&catalog, "DSC00002.ARW")).exists());
+    }
+
+    #[test]
     fn two_copies_of_one_photograph_are_left_alone() {
         // The same bytes under two names: nothing here says which of the two
         // missing photographs is which, and guessing would be worse.
@@ -510,7 +545,7 @@ mod tests {
         let mut catalog = Catalog::open(&dir.join("library.rawkit")).unwrap();
         let volume = crate::VolumeId::Uuid("test-volume".into());
         crate::scan::scan_on(&mut catalog, &was, volume.clone(), crate::scan::no_metadata).unwrap();
-        crate::scan::hash_missing(&mut catalog, |_, _| {}).unwrap();
+        crate::scan::hash_missing(&mut catalog, |_, _| true).unwrap();
         let now = dir.join("elsewhere");
         std::fs::create_dir_all(&now).unwrap();
         std::fs::rename(was.join("DSC00001.ARW"), now.join("DSC00001.ARW")).unwrap();

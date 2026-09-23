@@ -159,47 +159,7 @@ pub fn scan_watched(
     }
 
     let transaction = catalog.connection_mut().transaction()?;
-    // Where this volume's paths are measured from — which adding a second
-    // folder may have to change. See [`Rooting`].
-    let stored_root = CatalogPath::new(&root, convention)
-        .map_err(|e| CatalogError::Io(e.to_string()))?
-        .stored()
-        .to_string();
-    let standing = standing_root(&transaction, &volume)?;
-    // The one question asked of the disk, and it has three answers. "Not
-    // found" is a library that moved. Anything else that is not "there" — a
-    // share that has gone to sleep, a permission that came and went — is
-    // *cannot tell*, and the scan stops rather than guess: guessing "moved"
-    // when it has not re-points the volume, which is the corruption this
-    // function exists to prevent.
-    let standing_is_there = match standing.as_ref().map(|(_, at)| std::fs::metadata(at)) {
-        None => false,
-        Some(Ok(found)) => found.is_dir(),
-        Some(Err(gone)) if gone.kind() == std::io::ErrorKind::NotFound => false,
-        Some(Err(why)) => {
-            let at = standing.as_ref().map_or("", |(_, at)| at.as_str());
-            return Err(CatalogError::Io(format!(
-                "{at} holds photographs already in this catalog and cannot be read just now \
-                 ({why}), so nothing was added — try again when it can"
-            )));
-        }
-    };
-    let rooting = Rooting::decide(
-        standing.as_ref().map(|(_, at)| at.as_str()),
-        standing_is_there,
-        &stored_root,
-        convention,
-    );
-    let base = match &rooting {
-        Rooting::Here => stored_root.clone(),
-        Rooting::Inside { base } => base.clone(),
-        Rooting::Widen { to, .. } => to.clone(),
-    };
-    if let (Rooting::Widen { to, prefix }, Some((volume_id, _))) = (&rooting, &standing) {
-        widen(&transaction, *volume_id, to, prefix, convention)?;
-    }
-    let volume_id = upsert_volume(&transaction, &volume, Path::new(&base), convention)?;
-    let base = PathBuf::from(&base);
+    let (volume_id, base) = root_for(&transaction, &volume, &root, convention)?;
     // The part of the volume this scan looked at, as the catalog spells it.
     // Only files under it can be called missing for not having been seen.
     let scanned = relative_to(&root, &base, convention)?;
@@ -403,7 +363,7 @@ fn components(stored: &str) -> (&str, Vec<&str>) {
 
 /// `path` as the catalog spells it from `base`: forward slashes, no leading
 /// one, empty for `base` itself.
-fn relative_to(
+pub(crate) fn relative_to(
     path: &Path,
     base: &Path,
     convention: PathConvention,
@@ -572,6 +532,59 @@ fn mark_missing(
             AND id NOT IN ({list})"
     );
     Ok(transaction.execute(&sql, [])?)
+}
+
+/// Where this volume's paths are measured from, once this folder is part of it:
+/// the volume row, and the base every folder path is relative to.
+///
+/// A volume's root **widens**; it is never re-pointed at the folder being
+/// looked at. Adding a second folder on a drive used to lose the first, and
+/// pointing a relink at one folder of a library used to move the whole volume
+/// under it — the same mistake, twice. See [`Rooting`].
+pub(crate) fn root_for(
+    transaction: &rusqlite::Transaction<'_>,
+    volume: &VolumeId,
+    root: &Path,
+    convention: PathConvention,
+) -> Result<(i64, PathBuf), CatalogError> {
+    let stored_root = CatalogPath::new(root, convention)
+        .map_err(|e| CatalogError::Io(e.to_string()))?
+        .stored()
+        .to_string();
+    let standing = standing_root(transaction, volume)?;
+    // The one question asked of the disk, and it has three answers. "Not
+    // found" is a library that moved. Anything else that is not "there" — a
+    // share that has gone to sleep, a permission that came and went — is
+    // *cannot tell*, and it stops rather than guess: guessing "moved" when it
+    // has not re-points the volume, which is the corruption this prevents.
+    let standing_is_there = match standing.as_ref().map(|(_, at)| std::fs::metadata(at)) {
+        None => false,
+        Some(Ok(found)) => found.is_dir(),
+        Some(Err(gone)) if gone.kind() == std::io::ErrorKind::NotFound => false,
+        Some(Err(why)) => {
+            let at = standing.as_ref().map_or("", |(_, at)| at.as_str());
+            return Err(CatalogError::Io(format!(
+                "{at} holds photographs already in this catalog and cannot be read just now \
+                 ({why}), so nothing was changed — try again when it can"
+            )));
+        }
+    };
+    let rooting = Rooting::decide(
+        standing.as_ref().map(|(_, at)| at.as_str()),
+        standing_is_there,
+        &stored_root,
+        convention,
+    );
+    let base = match &rooting {
+        Rooting::Here => stored_root.clone(),
+        Rooting::Inside { base } => base.clone(),
+        Rooting::Widen { to, .. } => to.clone(),
+    };
+    if let (Rooting::Widen { to, prefix }, Some((volume_id, _))) = (&rooting, &standing) {
+        widen(transaction, *volume_id, to, prefix, convention)?;
+    }
+    let volume_id = upsert_volume(transaction, volume, Path::new(&base), convention)?;
+    Ok((volume_id, PathBuf::from(base)))
 }
 
 pub(crate) fn upsert_volume(
@@ -748,9 +761,12 @@ pub(crate) fn is_supported(path: &Path) -> bool {
 /// The deferred cost of a scan, made explicit and user-triggered. Files that
 /// cannot be read are left NULL and counted rather than failing the run — an
 /// unplugged drive should not stop the rest from being hashed.
+///
+/// `progress` answers whether to go on; what was written before a stop stays,
+/// because each file is its own row and its own decision.
 pub fn hash_missing(
     catalog: &mut Catalog,
-    mut progress: impl FnMut(usize, usize),
+    mut progress: impl FnMut(usize, usize) -> bool,
 ) -> Result<(usize, usize), CatalogError> {
     let pending: Vec<(i64, String)> = {
         let mut statement = catalog.connection().prepare(
@@ -769,7 +785,9 @@ pub fn hash_missing(
     let total = pending.len();
     let (mut hashed, mut failed) = (0, 0);
     for (index, (id, path)) in pending.into_iter().enumerate() {
-        progress(index, total);
+        if !progress(index, total) {
+            return Ok((hashed, failed));
+        }
         // `//` from joining an empty relative path is harmless to the OS, but
         // tidy it so what lands in an error message is readable.
         let path = path.replace("//", "/");
@@ -1623,7 +1641,7 @@ mod tests {
         let mut catalog = library(&dir);
         test_scan(&mut catalog, &photos);
 
-        let (hashed, failed) = hash_missing(&mut catalog, |_, _| {}).unwrap();
+        let (hashed, failed) = hash_missing(&mut catalog, |_, _| true).unwrap();
         assert_eq!((hashed, failed), (1, 0));
 
         let hash: Option<String> = catalog
@@ -1634,6 +1652,6 @@ mod tests {
         assert_eq!(hash.as_deref(), Some(expected.as_str()));
 
         // And it is idempotent: nothing left to do on a second pass.
-        assert_eq!(hash_missing(&mut catalog, |_, _| {}).unwrap(), (0, 0));
+        assert_eq!(hash_missing(&mut catalog, |_, _| true).unwrap(), (0, 0));
     }
 }

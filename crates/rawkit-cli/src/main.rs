@@ -430,6 +430,7 @@ fn main() -> Result<()> {
                             last = done / step;
                             eprint!("\rhashing    : {done}/{total}");
                         }
+                        true
                     })?;
                 if hashed + failed > 0 {
                     eprintln!();
