@@ -67,6 +67,58 @@ pub fn snapshot(catalog: &crate::db::Catalog) -> Result<Option<PathBuf>, Catalog
     Ok(Some(destination))
 }
 
+/// One copy this module wrote: where it is, how big, and when it was taken.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Copy {
+    pub path: PathBuf,
+    pub bytes: u64,
+    /// Read from the name rather than the filesystem — `YYYY-MM-DDTHH-MM-SSZ`,
+    /// UTC, exactly as [`snapshot`] wrote it. A copied or restored file keeps
+    /// the name it was made under and loses its modification time, and the
+    /// name is the honest answer to "when was this taken".
+    pub taken: String,
+}
+
+/// Every copy of this catalog, newest first.
+///
+/// Only the files this module writes, by the pattern it writes them in: a copy
+/// somebody made by hand and renamed is theirs, not ours to list or to count.
+pub fn list(catalog: &crate::db::Catalog) -> Result<Vec<Copy>, CatalogError> {
+    let (Some(source), Some(dir)) = (catalog.path(), catalog.backup_dir()) else {
+        return Ok(Vec::new());
+    };
+    let stem = source
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "catalog".into());
+    let prefix = format!("{stem}-");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut copies: Vec<Copy> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            if !path.is_file() || !is_ours(&name, &prefix) {
+                return None;
+            }
+            let taken = name
+                .strip_prefix(&prefix)?
+                .strip_suffix(SUFFIX)?
+                .to_string();
+            Some(Copy {
+                bytes: entry.metadata().map(|m| m.len()).unwrap_or(0),
+                path,
+                taken,
+            })
+        })
+        .collect();
+    // The name is the time, so sorting by it is sorting by when.
+    copies.sort_by(|a, b| b.taken.cmp(&a.taken));
+    Ok(copies)
+}
+
 /// Delete all but the newest [`KEEP`] backups.
 ///
 /// The only part of this crate that deletes anything, so it is deliberately

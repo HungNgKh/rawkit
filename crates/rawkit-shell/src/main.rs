@@ -1607,6 +1607,84 @@ fn start_care(task: care::Task) {
     });
 }
 
+/// Every copy of the open catalog, newest first, and where they are kept.
+///
+/// A catalog is copied before every migration and on every close — the two
+/// moments a bad write can happen — and a person who cannot see that has to
+/// take it on trust. This is what the panel shows.
+#[tauri::command]
+fn backups(state: tauri::State<'_, Shelf>) -> Result<serde_json::Value, String> {
+    let Some(library) = state.0.clone() else {
+        return Err("no catalog is open".into());
+    };
+    let library = library.lock().expect("library lock");
+    let copies = rawkit_catalog::backup::list(library.catalog()).map_err(|why| why.to_string())?;
+    Ok(serde_json::json!({
+        "folder": library.catalog().backup_dir().map(|dir| dir.display().to_string()),
+        "keep": rawkit_catalog::backup::KEEP,
+        "copies": copies,
+    }))
+}
+
+/// Copy the catalog now, whatever the automatic ones have done.
+#[tauri::command]
+fn back_up_now(state: tauri::State<'_, Shelf>) -> Result<String, String> {
+    if IMPORTING.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("the catalog is busy; try again when it has finished".into());
+    }
+    let Some(library) = state.0.clone() else {
+        return Err("no catalog is open".into());
+    };
+    let library = library.lock().expect("library lock");
+    match rawkit_catalog::backup::snapshot(library.catalog()) {
+        Ok(Some(path)) => Ok(format!("Copied the catalog to {}", path.display())),
+        Ok(None) => Err("this catalog has nowhere to keep copies".into()),
+        Err(why) => Err(why.to_string()),
+    }
+}
+
+/// Open a copy of the catalog as it was in one of its backups.
+///
+/// **Nothing is overwritten.** The backup is copied to a new catalog beside the
+/// open one and that is what opens; the catalog that was open is left exactly as
+/// it is. Restoring over a library is the one operation here that could lose
+/// work outright — including the work of whoever restores the wrong copy — and
+/// a file that has to be deleted by hand afterwards is a cheap price for that.
+#[tauri::command]
+fn open_backup_copy(path: PathBuf) -> Result<(), String> {
+    let Some(catalog) = OPEN_CATALOG.get().and_then(|open| open.clone()) else {
+        return Err("no catalog is open".into());
+    };
+    let copies = catalog
+        .parent()
+        .ok_or("this catalog has nowhere beside it")?
+        .to_path_buf();
+    let stem = catalog
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "catalog".into());
+    // The whole stamp, which is what the backup is called after the catalog's
+    // own name: `moved-2026-09-23T14-42-26Z` is from `2026-09-23T14-42-26Z`.
+    let taken = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|name| name.strip_prefix(&format!("{stem}-")))
+        .unwrap_or("copy")
+        .to_string();
+    let mut into = copies.join(format!("{stem}-from-{taken}.rawkit"));
+    for attempt in 2.. {
+        if !into.exists() {
+            break;
+        }
+        into = copies.join(format!("{stem}-from-{taken}-{attempt}.rawkit"));
+    }
+    // Copied rather than opened where it is: a backups folder is pruned, and a
+    // catalog opened out of one would be deleted from under somebody.
+    std::fs::copy(&path, &into).map_err(|why| format!("copying that backup: {why}"))?;
+    // Opened like anything else is opened, which is a relaunch (I16).
+    leave_for(vec![into.into_os_string()])
+}
+
 /// Look through a folder for the files of photographs that have gone missing.
 #[tauri::command]
 fn find_moved_dialog(app: tauri::AppHandle) -> Result<(), String> {
@@ -2091,6 +2169,9 @@ fn main() -> Result<()> {
             entrance,
             add_folder_dialog,
             find_moved_dialog,
+            backups,
+            back_up_now,
+            open_backup_copy,
             note_photographs,
             care_progress,
             cancel_care,

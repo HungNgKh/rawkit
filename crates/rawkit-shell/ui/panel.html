@@ -275,6 +275,18 @@
   #export #export-failed { list-style: none; margin: 6px 0 0; padding: 0; color: var(--danger); font-size: 12px; }
   #export #export-failed li { padding: 2px 0; overflow-wrap: anywhere; }
   #export #export-failed li b { color: var(--danger); font-weight: 600; }
+  #backups { position: absolute; inset: 0; z-index: 22; background: var(--ground-panel); overflow-y: auto;
+             padding: 14px 16px 24px; }
+  #backups.hidden { display: none; }
+  #backups header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; }
+  #backups h2 { font-size: 15px; font-weight: 600; margin: 0; color: var(--text-primary); }
+  #backups .hint { color: var(--text-tertiary); font-size: 12px; margin: 8px 0; overflow-wrap: anywhere; }
+  #backups .row { margin: 12px 0; }
+  #backups li { display: flex; align-items: baseline; gap: 8px; margin: 6px 0; }
+  #backups li .when { flex: 1 1 auto; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+  #backups li .size { color: var(--text-tertiary); font-size: 12px; }
+  #backups button.primary { background: var(--attention); border-color: var(--attention);
+                            color: var(--on-attention); font-weight: 600; }
   #job { display: flex; gap: 8px; align-items: baseline; }
   #job button { flex: 0 0 auto; font: inherit; font-size: 12px; padding: 0 6px; }
 
@@ -846,6 +858,17 @@
     <p id="export-last"></p>
     <ol id="export-failed"></ol>
   </div>
+</div>
+<!-- The copies of the catalog: what is kept, and the way back to one. In the
+     right column like the export panel, and for the same reason — nothing the
+     page draws can be over the photograph. -->
+<div id="backups" class="hidden" role="dialog" aria-labelledby="backups-title">
+  <header><h2 id="backups-title">Copies of this catalog</h2><button id="backups-close" aria-label="close">✕</button></header>
+  <p class="hint" id="backups-where"></p>
+  <div class="row"><button id="backups-now" class="primary">Copy it now</button></div>
+  <ol class="saved" id="backups-list"></ol>
+  <p class="empty" id="backups-none" hidden>No copies yet. One is made before every upgrade of the catalog and when it closes.</p>
+  <p class="hint">Opening a copy never overwrites this catalog: the copy is opened as a new catalog beside it, and this one is left as it is.</p>
 </div>
 <div id="sheet" class="hidden" role="dialog" aria-label="keyboard shortcuts"></div>
 <div id="palette" class="hidden" role="dialog" aria-label="find a command">
@@ -4181,6 +4204,8 @@
     // `welcome: true` because this is exactly the screen a library whose
     // photographs have all moved comes back to: the catalog is open and looks
     // empty, which is what "every file is missing" looks like from here.
+    { id: "backups", keys: [], scope: "any", waits: false, group: "Catalog",
+      title: "Copies of this catalog…", run: () => openBackups() },
     { id: "find-moved", keys: [], scope: "any", waits: false, group: "Catalog", welcome: true,
       title: "Find photographs that moved…",
       run: () => invoke("find_moved_dialog").catch(say) },
@@ -4829,6 +4854,61 @@
   };
   careCancel.addEventListener("click", () => invoke("cancel_care").catch(say));
   setInterval(() => invoke("care_progress").then(drawCare).catch(() => {}), 150);
+
+  // ---- The copies of the catalog ------------------------------------------------
+  const backupsPanel = document.getElementById("backups");
+  const backupsList = document.getElementById("backups-list");
+  /// `2026-09-22T14-05-01Z` as the day and time it says, in the reader's own
+  /// words. Read back through UTC: the name is UTC and adding the viewer's zone
+  /// to it would name a moment that is not when the copy was taken.
+  const takenWords = stamp => {
+    const iso = stamp.replace(/T(\d\d)-(\d\d)-(\d\d)Z/, "T$1:$2:$3Z");
+    const at = new Date(iso);
+    if (Number.isNaN(at.getTime())) return stamp;
+    const two = n => String(n).padStart(2, "0");
+    return `${at.getUTCFullYear()}-${two(at.getUTCMonth() + 1)}-${two(at.getUTCDate())} ` +
+           `${two(at.getUTCHours())}:${two(at.getUTCMinutes())} UTC`;
+  };
+  const megabytes = bytes => `${(bytes / 1e6).toFixed(1)} MB`;
+  const drawBackups = async () => {
+    let held;
+    try { held = await invoke("backups"); } catch (e) { return say(e); }
+    document.getElementById("backups-where").textContent = held.folder
+      ? `Kept in ${held.folder} — the newest ${held.keep}.`
+      : "This catalog has nowhere to keep copies.";
+    document.getElementById("backups-none").hidden = held.copies.length > 0;
+    backupsList.replaceChildren(...held.copies.map(copy => {
+      const row = document.createElement("li");
+      const when = document.createElement("span");
+      when.className = "when";
+      when.textContent = takenWords(copy.taken);
+      when.title = copy.path;
+      const size = document.createElement("span");
+      size.className = "size";
+      size.textContent = megabytes(copy.bytes);
+      const open = document.createElement("button");
+      open.textContent = "Open a copy";
+      open.title = "open this one as a new catalog beside the open one; nothing is overwritten";
+      open.addEventListener("click", () => {
+        open.blur();
+        invoke("open_backup_copy", { path: copy.path }).catch(say);
+      });
+      row.append(when, size, open);
+      return row;
+    }));
+  };
+  const openBackups = () => {
+    needRight();
+    sheet.classList.add("hidden");
+    palette.classList.add("hidden");
+    backupsPanel.classList.remove("hidden");
+    drawBackups();
+  };
+  document.getElementById("backups-close")
+    .addEventListener("click", () => backupsPanel.classList.add("hidden"));
+  document.getElementById("backups-now").addEventListener("click", () => {
+    invoke("back_up_now").then(said => { tell("info", said); drawBackups(); }).catch(say);
+  });
 
   // The sheet, drawn from the registry when it is asked for.
   const sheet = document.getElementById("sheet");

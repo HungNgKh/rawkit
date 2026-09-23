@@ -782,7 +782,18 @@ impl Builder {
         // The first named and the rest counted, as an export does it and for
         // the same reason: the cause is nearly always shared.
         if let Some((name, why, _)) = self.failed.first() {
-            said.push(Said::Failed(match self.failed.len() {
+            // Photographs, not failures: one photograph can fail more than once
+            // in a run — a missing file is asked about again the next time its
+            // cell is on screen — and "5 photographs have no preview" of three
+            // photographs is a number nobody can act on.
+            let mut names: Vec<&str> = self
+                .failed
+                .iter()
+                .map(|(name, _, _)| name.as_str())
+                .collect();
+            names.sort_unstable();
+            names.dedup();
+            said.push(Said::Failed(match names.len() {
                 1 => format!("{name} has no preview: {why}"),
                 n => format!("{n} photographs have no preview. The first, {name}: {why}"),
             }));
