@@ -104,10 +104,7 @@ yanked = "deny"
 # makes the dependency honest by naming it.
 #
 # Revisit when Tauri's Linux backend moves to GTK4 or webkitgtk-6.0.
-ignore = [
-    { id = "RUSTSEC-2024-0415", reason = "gtk: GTK3 bindings unmaintained. Required by webkit2gtk; see above." },
-    { id = "RUSTSEC-2024-0417", reason = "gdkx11: same GTK3 family, same reason." },
-]
+ignore = []
 # Vulnerabilities always fail, for every crate in the graph. *Unmaintained*
 # notices only fail for crates this workspace depends on directly.
 #
